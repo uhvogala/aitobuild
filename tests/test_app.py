@@ -14,6 +14,7 @@ import pytest
 
 import aitobuild.app as app_module
 from aitobuild.app import create_app
+from aitobuild.developer_isolation import build_developer_task_bundle, default_developer_isolation_policy
 from aitobuild.runtime import FrameworkAvailability, FrameworkBindings, RuntimeBootstrap
 
 
@@ -660,9 +661,10 @@ def test_developer_agent_approval_rejects_invalid_decisions(
     assert len(agent.calls) == 1
 
 
+@pytest.mark.parametrize("bound_task", [True, False])
 @pytest.mark.parametrize("approved", [True, False])
 def test_native_developer_approval_executes_only_the_saved_operation(
-    test_config, monkeypatch: pytest.MonkeyPatch, tmp_path, approved: bool,
+    test_config, monkeypatch: pytest.MonkeyPatch, tmp_path, approved: bool, bound_task: bool,
 ) -> None:
     import httpx
     from agent_framework import Agent
@@ -679,7 +681,9 @@ def test_native_developer_approval_executes_only_the_saved_operation(
     def model_reply(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         requests.append(body)
-        assert sum(message.get("content") == "ORIGINAL_TASK" for message in body["messages"]) == 1
+        assert sum("ORIGINAL_TASK" in (message.get("content") or "") for message in body["messages"]) == 1
+        if bound_task:
+            assert "developer_run_command" not in [entry["function"]["name"] for entry in body["tools"]]
         if len(requests) == 1:
             message = {"role": "assistant", "content": None, "tool_calls": [{
                 "id": "call-write", "type": "function", "function": {
@@ -711,15 +715,32 @@ def test_native_developer_approval_executes_only_the_saved_operation(
 
     try:
         headers = _internal_headers(test_config)
+        preview_id = None
+        dispatcher_class = app_module.DispatcherAgent
+        if bound_task:
+            dispatcher = dispatcher_class(require_developer_preview=False)
+            bundle = build_developer_task_bundle(
+                task_id="native-scoped-write", objective="Write a scoped test note",
+                acceptance_criteria=("The note has exact approved content",), constraints=(), context_files=(),
+                policy=replace(default_developer_isolation_policy(), allowed_tools=(app_module.IsolationTool.FILESYSTEM,),
+                               allowed_paths=("src/approval-probe.txt",), allowed_command_prefixes=()),
+            )
+            preview = dispatcher.developer_preview_registry.create_or_get(
+                dedupe_key="native-scoped-write", bundle_payload=bundle.to_payload(), source_payload={},
+            )
+            dispatcher.developer_preview_registry.approve(preview.preview_id)
+            preview_id = preview.preview_id
+            monkeypatch.setattr(app_module, "DispatcherAgent", lambda **kwargs: dispatcher)
         first = _create_app_with_fake_agent(test_config, monkeypatch, native_agent())
         response = first.post(
             "/internal/developer/agent/run", headers=headers,
-            json={"input": "ORIGINAL_TASK", "session_id": "native-approval"},
+            json={"input": "ORIGINAL_TASK", "session_id": "native-approval", "preview_id": preview_id},
         )
         assert response.status_code == 200, response.text
         pending = response.json()
         assert pending["completed"] is False
         assert written_file.exists() is False
+        monkeypatch.setattr(app_module, "DispatcherAgent", dispatcher_class)
         restarted = _create_app_with_fake_agent(test_config, monkeypatch, native_agent())
         payload = {
             "session_id": "native-approval", "approved": approved, "include_tool_trace": True,
@@ -728,6 +749,7 @@ def test_native_developer_approval_executes_only_the_saved_operation(
         resumed = restarted.post("/internal/developer/agent/resume", headers=headers, json=payload)
         assert resumed.status_code == 200, resumed.text
         assert resumed.json()["completed"] is True
+        assert resumed.json()["preview_id"] == preview_id
         assert len(resumed.json()["tool_trace"]) == (1 if approved else 0)
         if approved:
             assert written_file.read_text() == "APPROVED"
@@ -793,6 +815,76 @@ def test_developer_approval_cannot_target_another_pending_session(
     )
     assert response.status_code == 409
     assert len(agent.calls) == 2
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_native_task_uses_only_an_approved_persisted_preview(
+    test_config, monkeypatch: pytest.MonkeyPatch, approved: bool,
+) -> None:
+    dispatcher_class = app_module.DispatcherAgent
+    dispatcher = dispatcher_class(require_developer_preview=False)
+    policy = replace(default_developer_isolation_policy(), allowed_paths=("tests/only/",),
+                     allowed_command_prefixes=("git diff",))
+    bundle = build_developer_task_bundle(
+        task_id="approved-task", objective="Inspect the scoped test change",
+        acceptance_criteria=("Report the diff",), constraints=(), context_files=(), policy=policy,
+    )
+    preview = dispatcher.developer_preview_registry.create_or_get(
+        dedupe_key="native-task", bundle_payload=bundle.to_payload(), source_payload={},
+    )
+    if approved:
+        dispatcher.developer_preview_registry.approve(preview.preview_id)
+    monkeypatch.setattr(app_module, "DispatcherAgent", lambda **kwargs: dispatcher)
+    original_builder = app_module.build_role_tools
+    policies = []
+
+    def capture_tools(*, context):
+        if context.bound_session_id:
+            policies.append(context.isolation_policy)
+        return original_builder(context=context)
+
+    monkeypatch.setattr(app_module, "build_role_tools", capture_tools)
+    agent = _FakeDeveloperAgent()
+    client = _create_app_with_fake_agent(test_config, monkeypatch, agent)
+    headers = _internal_headers(test_config)
+    response = client.post(
+        "/internal/developer/agent/run", headers=headers,
+        json={"input": "Inspect tests", "session_id": "bound-task", "preview_id": preview.preview_id},
+    )
+    if not approved:
+        assert response.status_code == 409
+        assert agent.calls == []
+        assert policies == []
+        return
+    assert response.status_code == 200, response.text
+    assert response.json()["task_id"] == bundle.task_id
+    assert policies == [policy]
+    assert agent.calls[0][0].count('"task_id": "approved-task"') == 1
+    assert bundle.objective in agent.calls[0][0]
+    monkeypatch.setattr(app_module, "DispatcherAgent", dispatcher_class)
+    resumed_agent = _FakeDeveloperAgent()
+    restarted = _create_app_with_fake_agent(test_config, monkeypatch, resumed_agent)
+    pending_id = response.json()["pending_approval_requests"][0]["request_id"]
+    tampered = restarted.post(
+        "/internal/developer/agent/resume", headers=headers,
+        json={"session_id": "bound-task", "request_id": pending_id, "approved": True, "policy": {}},
+    )
+    assert tampered.status_code == 400
+    assert resumed_agent.calls == []
+    changed = restarted.post(
+        "/internal/developer/agent/resume", headers=headers,
+        json={"session_id": "bound-task", "request_id": pending_id, "approved": True, "preview_id": "other"},
+    )
+    assert changed.status_code == 409
+    assert resumed_agent.calls == []
+    resumed = restarted.post(
+        "/internal/developer/agent/resume", headers=headers,
+        json={"session_id": "bound-task", "request_id": pending_id, "approved": True},
+    )
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["task_id"] == bundle.task_id
+    assert resumed.json()["preview_id"] == preview.preview_id
+    assert policies == [policy, policy]
 
 
 def test_app_fails_fast_when_browser_enabled_without_container_session(test_config) -> None:

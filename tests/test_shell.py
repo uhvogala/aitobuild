@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ import pytest
 from aitobuild.tools import shell as shell_tools
 from aitobuild.tools import shell_runtime
 from aitobuild.tools.bash import BashResult, ContainerSessionBashAdapter
+from aitobuild.developer_isolation import default_developer_isolation_policy
 
 
 def test_shell_reads_bounded_incremental_output_and_exit_code(tmp_path: Path, monkeypatch) -> None:
@@ -111,3 +113,30 @@ def test_shell_backend_error_does_not_claim_success(tmp_path: Path, monkeypatch)
     result = shell_tools.shell_request(adapter, "dev-one", {"action": "list"})
     assert result["ok"] is False
     assert "List shells" in result["next_action"]
+
+
+def test_shell_start_checks_task_policy_before_session_resolution(tmp_path: Path, monkeypatch) -> None:
+    adapter = ContainerSessionBashAdapter(
+        workspace_root=tmp_path, image="aitobuild-developer:local",
+        container_workdir="/workspace", container_name_prefix="aitobuild-test",
+    )
+    requests = []
+    resolved = []
+
+    def resolve_session(session_id):
+        resolved.append(session_id)
+        return "dev-one"
+
+    def fake_request(adapter, session_id, request):
+        requests.append(request)
+        return {"ok": True}
+
+    monkeypatch.setattr(shell_tools, "shell_request", fake_request)
+    policy = replace(default_developer_isolation_policy(), allowed_command_prefixes=("git diff",))
+    terminal, _processes = shell_tools.build_shell_tools(adapter, resolve_session, policy=policy)
+    for command in ("python -m pytest", None):
+        with pytest.raises(PermissionError, match="policy prefixes"):
+            terminal(action="start", command=command)
+    assert requests == resolved == []
+    assert terminal(action="start", command="git diff --stat")["ok"]
+    assert len(requests) == len(resolved) == 1

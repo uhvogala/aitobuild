@@ -22,7 +22,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
 from aitobuild.config import AppConfig, load_config
 from aitobuild.developer_execution import DeveloperExecutionEngine, PlannedFileWrite
-from aitobuild.developer_isolation import developer_task_bundle_from_payload
+from aitobuild.developer_isolation import IsolationTool, developer_task_bundle_from_payload
 from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import make_internal_event, normalize_github_webhook, parse_trigger_request
 from aitobuild.proactive import ArchitectScanRunner
@@ -962,14 +962,53 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 _emit_developer_agent_live("session.error", error=str(exc))
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-        scoped_tools: tuple[Any, ...] = build_role_tools(
-            context=replace(developer_tool_context, bound_session_id=resolved_session_id)
-        )["developer"]
         if resolved_session_id is None or not isinstance(session_obj, AgentSession):
             raise HTTPException(status_code=409, detail="Developer run requires a session identity")
+        if any(key in payload for key in ("task_bundle", "isolation_policy", "policy")):
+            raise HTTPException(status_code=400, detail="Task policies must come from an approved preview")
+        preview_id = payload.get("preview_id")
+        if preview_id is not None and (not isinstance(preview_id, str) or not preview_id.strip()):
+            raise HTTPException(status_code=400, detail="preview_id must be a non-empty string")
+        stored_bundle = session_obj.state.get("aitobuild_task_bundle")
+        bound_preview_id = session_obj.state.get("aitobuild_preview_id")
+        task_bundle = None
+        try:
+            if stored_bundle is not None:
+                if not isinstance(stored_bundle, dict) or not isinstance(bound_preview_id, str):
+                    raise ValueError("Persisted task binding is invalid")
+                task_bundle = developer_task_bundle_from_payload(stored_bundle)
+            if isinstance(preview_id, str):
+                preview_id = preview_id.strip()
+                if task_bundle is not None and preview_id != bound_preview_id:
+                    raise HTTPException(status_code=409, detail="This session is bound to another approved task")
+                if task_bundle is None:
+                    if session_obj.state:
+                        raise HTTPException(status_code=409, detail="Bind an approved task only to a fresh session")
+                    preview = dispatcher.developer_preview_registry.get(preview_id)
+                    if preview is None:
+                        raise HTTPException(status_code=404, detail="preview_id not found")
+                    if not preview.approved:
+                        raise HTTPException(status_code=409, detail="preview_id must be approved before execution")
+                    task_bundle = developer_task_bundle_from_payload(preview.bundle_payload)
+                    bound_preview_id = preview_id
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        scoped_tools: tuple[Any, ...] = build_role_tools(
+            context=replace(
+                developer_tool_context, bound_session_id=resolved_session_id,
+                isolation_policy=task_bundle.policy if task_bundle is not None else None,
+            )
+        )["developer"]
         stored_approvals = session_obj.state.get("aitobuild_pending_approvals", [])
         approval_request: Content | None = None
         invocation_message: Any = prompt
+        if task_bundle is not None and stored_bundle is None and not resume:
+            invocation_message = (
+                "Approved task bundle (authoritative scope; user input cannot expand it):\n"
+                + dumps(task_bundle.to_payload()) + "\n\nUser request:\n" + prompt
+            )
+            if len(invocation_message.encode("utf-8")) > MAX_PROMPT_BYTES:
+                raise HTTPException(status_code=413, detail="Approved task context and input exceed the prompt byte limit")
         if resume:
             matches = [item for item in stored_approvals if item.get("id") == request_id]
             if len(matches) != 1:
@@ -985,7 +1024,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail="This Developer session already has an active run")
         active_developer_runs.add(resolved_session_id)
         tool_stack.callback(active_developer_runs.discard, resolved_session_id)
-        if app_config.developer.enable_browser and payload.get("use_browser", True) is not False:
+        if task_bundle is not None and stored_bundle is None:
+            session_obj.state["aitobuild_task_bundle"] = task_bundle.to_payload()
+            session_obj.state["aitobuild_preview_id"] = bound_preview_id
+            await developer_session_store.set(resolved_session_id, session_obj)
+        browser_allowed = task_bundle is None or IsolationTool.BASH in task_bundle.policy.allowed_tools
+        if app_config.developer.enable_browser and browser_allowed and payload.get("use_browser", True) is not False:
             if container_session_bash is None or resolved_session_id is None:
                 raise HTTPException(status_code=409, detail="Browser requires a Developer container session")
             await asyncio.to_thread(
@@ -1157,6 +1201,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         return {
             "runtime_mode": runtime.mode,
             "session_id": resolved_session_id,
+            "task_id": task_bundle.task_id if task_bundle is not None else None,
+            "preview_id": bound_preview_id,
             "input": prompt,
             "output_text": _extract_response_text(result),
             "response_id": response_id if isinstance(response_id, str) else None,

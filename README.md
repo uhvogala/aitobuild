@@ -27,7 +27,7 @@ human retaining merge authority.
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, capability-audit tests, verified hosted CI baseline | Background tick driver, durable state, tracing, stronger isolation |
 
-Verified locally: **193 tests pass**, Ruff and mypy pass. The original patch-repair
+Verified locally: **202 tests pass**, Ruff and mypy pass. The original patch-repair
 failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
 sessions, managed terminals/processes, native memory/restart and browser tools
 have live integration evidence. Real Grok and Kimi evaluations retain strict
@@ -330,6 +330,7 @@ Developer Agent runtime flow:
 2. Execute one turn with `POST /internal/developer/agent/run` and payload:
 	- `input` (required string)
 	- `session_id` (optional string)
+	- `preview_id` (optional approved preview, bound only to a fresh session)
 	- `create_session` (optional bool)
 	- `auto_approve_tools` (optional bool, default `false`)
 	- `max_approval_rounds` (optional int, default `3`)
@@ -348,6 +349,17 @@ the caller cannot replace its arguments or supply a new task input. New prompts
 are blocked while approval is pending. Unknown, cross-session or consumed
 request IDs are rejected. Approval resumes the same native session without
 replaying the original task, including after a server restart.
+
+To carry an approved task into native execution, start a fresh session with
+`preview_id` from `/internal/developer/preview/approve`. The server snapshots
+that preview's task bundle, adds its objective/acceptance criteria/constraints
+once to the initial task context, and restores its policy on later runs/resumes.
+It does not accept caller-supplied policies or allow switching previews on the
+same session. Responses include `task_id` and `preview_id`. Repository file and
+search tools use the task's path scope; excluded repository tool categories are
+not exposed. Direct commands and managed-shell starts use the task's prefixes,
+which are also shown in tool descriptions. Without `preview_id`, the existing
+standalone prototype remains available and is not an approved task workflow.
 
 `/internal/developer/agent/run` uses the runtime-bound native Developer Agent when available; in descriptor/mock mode it fails with `409` by design.
 
@@ -377,8 +389,13 @@ Developer task package with:
 Default policy allows edits under `src/` and `tests/` and blocks paths like `.git/` and `.venv/`.
 
 Current checks are prototype guardrails, not complete sandbox enforcement.
-The constrained run endpoint checks command prefixes and file-write counts;
-native agent commands do not apply the same bundle command-prefix checks.
+The constrained run endpoint checks command prefixes and file-write counts.
+Preview-bound native runs use the saved bundle's paths, repository tool categories
+and command-prefix checks for direct commands and managed-shell starts. Standalone
+native runs do not enforce an approved bundle. Native file-change counts and
+total task deadlines remain unenforced; shell input and scripts are not parsed
+as independently authorized commands. Durable memory/browser behavior and
+network/resource restrictions do not yet have a complete task-policy contract.
 Shell commands can have side effects beyond their apparent prefix. The declared
 task-wide runtime budget is not enforced as a total wall-clock budget; separate
 command and invoke timeouts exist. Policy parity, approval scope, and resource
@@ -397,6 +414,9 @@ continuation executes: a failed or interrupted continuation cannot be blindly
 replayed. Inspect its private checkout/history before deciding how to recover.
 The active-session guard is process-local; cross-worker coordination and durable
 task/approval auditing remain pending.
+An approved bundle snapshot persists with a bound native session, but the
+preview registry itself is still in memory. Scope changes require a fresh,
+newly approved task session; there is no automatic task rebinding.
 
 ## Repository hygiene
 

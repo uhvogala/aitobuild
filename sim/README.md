@@ -176,6 +176,12 @@ and can be approved or rejected through `/internal/developer/agent/resume` with
 token. It restores the saved operation, not caller-supplied arguments. Consumed
 decisions cannot be replayed even after failure; distributed recovery remains
 pending. The harness's automatic approval flag still bypasses per-call review.
+
+For API testing of approved-task scope, pass an approved `preview_id` on a fresh
+native session. Its saved policy controls repository paths/tool exposure and
+direct/managed-start command prefixes across restart. The existing simulation
+and evaluation runner still exercise the standalone copied-fixture prototype;
+they do not prove complete task budget, shell or network isolation.
 An incomplete agent run now makes the simulation fail rather than appearing successful.
 
 Require `runtime_mode=foundry` or `openai`, `ready_for_run=true`,

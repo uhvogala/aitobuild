@@ -41,7 +41,7 @@ execute task code against the aitobuild service checkout.
 | Architect/meetings | Metadata scan and GroupChatBuilder construction | Execution and review integration missing |
 | Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current local gates: **193 tests pass**; Ruff and mypy pass. Both original patch-repair
+Current local gates: **202 tests pass**; Ruff and mypy pass. Both original patch-repair
 failures are fixed, with ambiguous matching still rejected. Live tool evaluations
 check artifact correctness, tool coverage, context guards and zero unexpected
 errors; provider failures/timeouts are visible failures, not waived successes.
@@ -86,8 +86,12 @@ Exit criteria:
 Status: **partial implementation, not accepted**. Depends on M0. Prepared Docker,
 native model and optional browser paths have live evidence. Manual approve/reject
 continuation now persists across restarts, with native SDK execution, rejection,
-duplicate, cross-session and failure/timeout regressions. Consistent task-policy
-enforcement and zero-error full live acceptance remain pending; local approval
+duplicate, cross-session and failure/timeout regressions. Native runs can bind
+an approved preview to a fresh session, preserving its task context/policy across
+restart and rejecting policy replacement. Repository paths/tool categories and
+direct/managed-start command prefixes use that saved policy. File-change/time
+budgets, interactive shell and memory/browser/network policy parity, hardened
+isolation and zero-error full live acceptance remain pending; local approval
 tests use a mocked model transport, not a fresh live-model certification.
 
 Deliverables:

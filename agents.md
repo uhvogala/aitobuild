@@ -37,7 +37,7 @@ Important limits:
 - Dispatch returns task metadata; it does not yet drive a GitHub branch/PR worker.
 - GitHub writes are mock-only; meetings are constructed, not executed.
 - Scheduler ticks require a caller; application state is in memory.
-- Native agent commands and preview-run policies are not equivalent. Do not describe prototype checks or Docker bind mounts as hardened isolation.
+- Native runs may bind an approved preview to a fresh session and persist its task policy. Repository paths/tool categories and direct/managed-start command prefixes then use that policy; standalone runs and file-change/time/interactive/network limits still lack complete parity. Do not describe prototype checks or Docker bind mounts as hardened isolation.
 - Native pending approvals and sessions persist locally; distributed coordination, durable task/approval auditing, and PM/Architect tool wiring remain pending.
 
 Key endpoints:
@@ -64,7 +64,7 @@ installs ripgrep, runs these gates and the mock fixture simulation, and retains
 available reports on failure. Hosted run 37308813245 passed at `c6edaef` with
 180 tests and a retained simulation artifact; M0 is accepted.
 
-Verification snapshot (2026-10-05): 193 local tests pass; Ruff and mypy pass.
+Verification snapshot (2026-10-05): 202 local tests pass; Ruff and mypy pass.
 Live Grok/Kimi tool evaluation remains stricter than tool coverage: require
 artifact correctness, completion, successful cleanup and zero unexpected errors.
 
@@ -75,6 +75,7 @@ Local workflow:
 - Require `succeeded=true` and zero command exit codes; do not infer success from HTTP status alone.
 - Session-bound operations use private copied checkouts; unscoped subprocess runs use the API working directory.
 - Pending native approvals resume via `/internal/developer/agent/resume` with the session ID, saved request ID and boolean decision. Decisions are consumed before execution; failed/interrupted continuations are not blindly replayable. Approval tests cover the native SDK with a mocked model transport, not full live acceptance.
+- Native approved-task runs take `preview_id` on a fresh session. The server snapshots the approved bundle; later runs/resumes restore it even if the preview registry was lost. Caller-supplied policies and switching tasks in that session are rejected. No-preview runs retain prototype behavior.
 - Use `uv run python -m sim.evaluate_tools --model <deployment>` for live tool evaluations.
 - Models use `developer_edit_file(path, old_text, new_text)` for exact unique-span edits. Legacy patch parsing is opt-in, not a model-facing default; do not repair ambiguous matches or bypass stale edits with whole-file writes.
 - Ripgrep is installed in both images. Use `developer_find_files` for glob discovery and `developer_search_files` for bounded literal/regex content search; prefer narrow paths/globs and reuse `next_offset` only when more results are needed.

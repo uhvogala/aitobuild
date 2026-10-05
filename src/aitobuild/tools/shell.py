@@ -10,6 +10,7 @@ from uuid import uuid4
 from agent_framework import tool
 from pydantic import Field
 
+from aitobuild.developer_isolation import DeveloperIsolationPolicy, is_command_allowed
 from aitobuild.policy import AgentRole
 from aitobuild.tools.bash import ContainerSessionBashAdapter
 
@@ -65,6 +66,7 @@ def shell_request(
 
 def build_shell_tools(
     adapter: ContainerSessionBashAdapter, resolve_session: Callable[[str | None], str | None],
+    *, policy: DeveloperIsolationPolicy | None = None,
 ) -> tuple[Callable[..., Any], ...]:
     def invoke(request: dict[str, Any]) -> dict[str, Any]:
         session_id = resolve_session(None)
@@ -94,6 +96,9 @@ def build_shell_tools(
         wait_seconds: Annotated[float, Field(description="Bounded wait for exit; 0 returns immediately. Does not kill the job.", ge=0, le=30)] = 0,
         max_output_chars: Annotated[int, Field(description="Output budget; keep 6000 unless more detail is needed.", ge=256, le=24000)] = 6000,
     ) -> dict[str, Any]:
+        if action == "start" and policy is not None:
+            if not is_command_allowed(command if command is not None else "bash", policy=policy):
+                raise PermissionError("Command is outside allowed task policy prefixes")
         return invoke({"action": action, "shell_id": shell_id, "command": command, "text": text,
                        "control": control, "cursor": cursor, "wait_seconds": wait_seconds,
                        "max_output_chars": max_output_chars})

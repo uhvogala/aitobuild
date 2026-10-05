@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
+from aitobuild.developer_isolation import IsolationTool, default_developer_isolation_policy
 from aitobuild.policy import AgentRole
 from aitobuild.tools import MockBashAdapter, MockFilesystemAdapter
 from aitobuild.tools.bash import BashResult
@@ -139,6 +141,58 @@ def test_developer_tool_read_write_roundtrip(tmp_path: Path) -> None:
 
     command_result = run_command("uv run pytest", session_id=None)
     assert command_result["exit_code"] == 0
+
+
+def test_developer_tools_use_supplied_task_policy(tmp_path: Path) -> None:
+    class CountingBashAdapter(MockBashAdapter):
+        calls = 0
+
+        def run(self, *, role: AgentRole, command: str, session_id: str | None = None) -> BashResult:
+            self.calls += 1
+            return super().run(role=role, command=command, session_id=session_id)
+
+    bash = CountingBashAdapter()
+    policy = replace(
+        default_developer_isolation_policy(), allowed_command_prefixes=("git diff",),
+        allowed_paths=("tests/only/",),
+    )
+    context = DeveloperToolContext(
+        bash_adapter=bash, filesystem_adapter=MockFilesystemAdapter(), workspace_root=tmp_path,
+        require_human_approval_for_repo_writes=False, isolation_policy=policy,
+    )
+    run_command, read_file, write_file = build_role_tools(context=context)["developer"][:3]
+    assert "Task command prefixes: git diff" in run_command.description
+    assert "Task allowed paths: tests/only/" in read_file.description
+    with pytest.raises(PermissionError, match="policy prefixes"):
+        run_command("python -m pytest")
+    assert bash.calls == 0
+    assert run_command("git diff --stat")["exit_code"] == 0
+    assert bash.calls == 1
+    assert write_file("tests/only/example.txt", "allowed")["written"]
+    assert read_file("tests/only/example.txt") == "allowed"
+    with pytest.raises(ValueError, match="outside"):
+        write_file("src/example.txt", "denied")
+    assert not (tmp_path / "src" / "example.txt").exists()
+
+
+def test_standalone_tool_commands_keep_prototype_behavior(tmp_path: Path) -> None:
+    run_command = _developer_tools(tmp_path)[0]
+    assert run_command("custom-runner --help")["exit_code"] == 0
+
+
+@pytest.mark.parametrize("allowed_tool,excluded", [
+    (IsolationTool.FILESYSTEM, {"developer_run_command", "developer_start_session", "developer_stop_session"}),
+    (IsolationTool.BASH, {"developer_read_file", "developer_write_file", "developer_edit_file", "developer_find_files", "developer_search_files"}),
+])
+def test_developer_tools_exclude_disallowed_task_categories(tmp_path: Path, allowed_tool, excluded) -> None:
+    context = DeveloperToolContext(
+        bash_adapter=MockBashAdapter(), filesystem_adapter=MockFilesystemAdapter(), workspace_root=tmp_path,
+        require_human_approval_for_repo_writes=False,
+        isolation_policy=replace(default_developer_isolation_policy(), allowed_tools=(allowed_tool,)),
+    )
+    names = {tool.name for tool in build_role_tools(context=context)["developer"]}
+    assert names.isdisjoint(excluded)
+    assert names
 
 
 def test_developer_session_tools_fail_when_container_mode_disabled(tmp_path: Path) -> None:

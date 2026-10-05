@@ -124,9 +124,9 @@ These items describe code and local test coverage, not production certification.
 - Agent-driven fixture evaluations record tool coverage, artifact correctness, errors, latency and token/cache usage for deployed Grok/Kimi models. Oversized tool results spill to private files with paged retrieval; oversized prompts are rejected before invocation.
 - Targeted edits use structured exact-text replacement with unique-match rejection; legacy free-form patch parsing is opt-in. Focused same-task Grok/Kimi editing probes pass with zero tool errors and independent pytest verification.
 - Ripgrep-backed file discovery and literal/regex content search use allowed private roots, ignore-aware glob filtering and bounded pagination. Focused Grok/Kimi search probes pass with zero errors and unchanged fixture source.
-- Preview command defaults cover common interpreters, package managers, Git, builds, shell scripts and filesystem utilities. Explicit task-specific policies remain supported; token-prefix matching is not a security boundary and does not govern native-agent command tools.
+- Preview command defaults cover common interpreters, package managers, Git, builds, shell scripts and filesystem utilities. Native runs can snapshot an approved preview's task context/policy in a fresh session; scoped repository tools and direct/managed-start commands reuse it after restart, with no caller-supplied policy or session rebinding. Standalone native prototypes remain available; token-prefix matching is not a security boundary.
 - GitHub Actions baseline workflow uses Python 3.14, locked uv dependencies and ripgrep for pytest/Ruff/mypy plus the mock fixture simulation, retaining available reports on failure. Hosted run 37308813245 passed at `c6edaef` with 180 tests and a retained simulation report, accepting M0.
-- Verification on 2026-10-05: 193 local tests pass, `ruff` and `mypy src` pass. Native approval tests include a mocked model transport; consistent policy enforcement and a zero-unexpected-error full live evaluation remain M1 requirements.
+- Verification on 2026-10-05: 202 local tests pass, `ruff` and `mypy src` pass. Native task-bound approval tests include a mocked model transport; complete policy/budget enforcement and a zero-unexpected-error full live evaluation remain M1 requirements.
 
 ### Current Limits
 
@@ -135,7 +135,7 @@ These items describe code and local test coverage, not production certification.
 - GitHub branch/commit/PR operations are not implemented; the adapter records mock issue proposals.
 - Meetings construct workflows without executing them, and proactive scans interpret supplied metadata rather than inspecting a repository.
 - Scheduler ticks require an external caller; application state is in memory and does not survive restart.
-- The native agent endpoint is separate from preview-based execution and lacks equivalent bundle command enforcement, distributed coordination and durable task/approval audit records.
+- Native runs without a bound preview remain prototypes. Task-bound repository tools and direct/managed-start commands enforce the saved policy, but file-change/time budgets, interactive shell, memory/browser/network constraints, distributed coordination and durable task/approval audit records remain pending.
 - Docker bind mounts and command-prefix checks do not establish a hardened sandbox; total task budgets remain declarative.
 - The capability matrix tests check entries, not duplicate implementations; the successful CI baseline does not prove no-duplicate capability enforcement.
 - Docker, MCP, and live-model paths need fresh integration evidence before being considered operational.

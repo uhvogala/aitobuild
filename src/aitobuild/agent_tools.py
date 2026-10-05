@@ -10,7 +10,9 @@ from typing import Annotated, Any, Callable, Literal
 from agent_framework import tool
 from pydantic import Field
 
-from aitobuild.developer_isolation import default_developer_isolation_policy, is_path_allowed
+from aitobuild.developer_isolation import (
+    DeveloperIsolationPolicy, IsolationTool, default_developer_isolation_policy, is_command_allowed, is_path_allowed,
+)
 from aitobuild.patching import apply_update_hunks, parse_patch_document
 from aitobuild.policy import (
     ActionClass,
@@ -45,6 +47,7 @@ class DeveloperToolContext:
     bound_session_id: str | None = None
     output_dir: Path | None = None
     use_legacy_patch_tool: bool = False
+    isolation_policy: DeveloperIsolationPolicy | None = None
 
 
 def build_role_tools(*, context: DeveloperToolContext) -> dict[str, tuple[ToolFunc, ...]]:
@@ -57,7 +60,7 @@ def build_developer_tools(*, context: DeveloperToolContext) -> tuple[ToolFunc, .
     if context.enable_mcp_adapters and context.mcp_tool_adapter is None:
         raise RuntimeError("MCP adapters enabled but no MCP tool adapter was provided")
 
-    policy = default_developer_isolation_policy()
+    policy = context.isolation_policy or default_developer_isolation_policy()
     active_session_id: str | None = None
 
     def _preview(value: Any, *, max_chars: int = 160) -> str:
@@ -154,6 +157,8 @@ def build_developer_tools(*, context: DeveloperToolContext) -> tuple[ToolFunc, .
         tool_name = "developer_run_command"
         if not 256 <= max_output_chars <= 24000:
             raise ValueError("max_output_chars must be 256..24000; use 6000 for concise output")
+        if context.isolation_policy is not None and not is_command_allowed(command, policy=policy):
+            raise PermissionError("Command is outside allowed task policy prefixes")
         resolved_session_id = _resolve_session_id(session_id)
         _emit_tool_live(
             "call.start",
@@ -740,9 +745,34 @@ def build_developer_tools(*, context: DeveloperToolContext) -> tuple[ToolFunc, .
         developer_search_files,
     )
     if isinstance(context.container_session_adapter, ContainerSessionBashAdapter):
-        tools += build_shell_tools(context.container_session_adapter, _resolve_session_id)
+        tools += build_shell_tools(context.container_session_adapter, _resolve_session_id, policy=context.isolation_policy)
     if context.output_dir is not None and context.bound_session_id is not None:
         tools += (build_output_reader(context.output_dir / context.bound_session_id),)
+    if IsolationTool.FILESYSTEM not in policy.allowed_tools:
+        filesystem_names = {
+            "developer_read_file", "developer_write_file", "developer_edit_file", "developer_apply_patch",
+            "developer_find_files", "developer_search_files",
+        }
+        tools = tuple(tool_func for tool_func in tools if getattr(tool_func, "name", None) not in filesystem_names)
+    if IsolationTool.BASH not in policy.allowed_tools:
+        bash_names = {
+            "developer_run_command", "developer_start_session", "developer_stop_session",
+            "developer_shell", "developer_processes",
+        }
+        tools = tuple(tool_func for tool_func in tools if getattr(tool_func, "name", None) not in bash_names)
+    if context.isolation_policy is not None:
+        for tool_func in tools:
+            name = getattr(tool_func, "name", None)
+            description = getattr(tool_func, "description", "")
+            if name in {"developer_run_command", "developer_shell"}:
+                description += "\nTask command prefixes: " + ", ".join(policy.allowed_command_prefixes)
+            if name in {
+                "developer_read_file", "developer_write_file", "developer_edit_file", "developer_apply_patch",
+                "developer_find_files", "developer_search_files",
+            }:
+                description += "\nTask allowed paths: " + ", ".join(policy.allowed_paths)
+                description += "\nTask blocked paths: " + ", ".join(policy.blocked_paths)
+            setattr(tool_func, "description", description)
     return tools
 
 def _normalize_workspace_relative_path(path: str) -> str:
