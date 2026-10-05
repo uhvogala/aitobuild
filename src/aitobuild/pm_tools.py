@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Annotated, Any, Callable
@@ -22,9 +23,32 @@ ToolFunc = Callable[..., Any]
 
 @dataclass
 class PlanDraftStore:
-    """Local PM plan drafts awaiting human approval before issue creation."""
+    """Local PM plan drafts awaiting human approval before issue creation.
+
+    Operator approval freezes an immutable content snapshot. Mutations after
+    approval (or while awaiting approval) invalidate the prior approval, matching
+    the Developer preview renew-on-scope-change pattern. Issue creation must use
+    the approved snapshot, never the mutable draft fields alone.
+    """
 
     drafts: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    @staticmethod
+    def _content_snapshot(record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "title": str(record["title"]),
+            "summary": str(record["summary"]),
+            "acceptance_criteria": list(record.get("acceptance_criteria") or []),
+            "labels": list(record.get("labels") or []),
+            "repository": record.get("repository"),
+        }
+
+    def _invalidate_approval(self, record: dict[str, Any]) -> None:
+        if record.get("approval_state") in {"approved", "awaiting_human_approval"}:
+            record["approval_state"] = "draft"
+            record["approval_request_id"] = None
+            record.pop("approved_snapshot", None)
+            record.pop("approved_at", None)
 
     def upsert(
         self,
@@ -68,19 +92,24 @@ class PlanDraftStore:
             "approval_request_id": existing.get("approval_request_id"),
             "updated_at": datetime.now(tz=UTC).isoformat(),
         }
+        if "approved_snapshot" in existing:
+            record["approved_snapshot"] = deepcopy(existing["approved_snapshot"])
+        if "approved_at" in existing:
+            record["approved_at"] = existing["approved_at"]
+        self._invalidate_approval(record)
         self.drafts[identity] = record
         return dict(record)
 
-    def set_acceptance_criteria(self, *, draft_id: str, acceptance_criteria: list[str]) -> dict[str, Any]:
+    def set_acceptance_criteria(
+        self, *, draft_id: str, acceptance_criteria: list[str]
+    ) -> dict[str, Any]:
         record = self._require(draft_id)
         criteria = [item.strip() for item in acceptance_criteria if item and item.strip()]
         if not criteria:
             raise ValueError("acceptance_criteria must contain at least one non-empty item")
         record["acceptance_criteria"] = criteria
         record["updated_at"] = datetime.now(tz=UTC).isoformat()
-        if record.get("approval_state") in {"approved", "awaiting_human_approval"}:
-            record["approval_state"] = "draft"
-            record["approval_request_id"] = None
+        self._invalidate_approval(record)
         return dict(record)
 
     def request_approval(self, *, draft_id: str) -> dict[str, Any]:
@@ -90,10 +119,14 @@ class PlanDraftStore:
         request_id = f"plan-approval-{uuid4().hex[:10]}"
         record["approval_state"] = "awaiting_human_approval"
         record["approval_request_id"] = request_id
+        record.pop("approved_snapshot", None)
+        record.pop("approved_at", None)
         record["updated_at"] = datetime.now(tz=UTC).isoformat()
         return dict(record)
 
-    def mark_approved(self, *, draft_id: str, approval_request_id: str | None = None) -> dict[str, Any]:
+    def mark_approved(
+        self, *, draft_id: str, approval_request_id: str | None = None
+    ) -> dict[str, Any]:
         """Operator-only approval. Must not be callable from agent tools."""
         record = self._require(draft_id)
         if record.get("approval_state") != "awaiting_human_approval":
@@ -101,14 +134,34 @@ class PlanDraftStore:
         expected = record.get("approval_request_id")
         if approval_request_id is not None and expected != approval_request_id:
             raise PermissionError("approval_request_id does not match the pending plan approval")
+        # Freeze immutable content at approve time (Developer preview pattern).
+        record["approved_snapshot"] = self._content_snapshot(record)
         record["approval_state"] = "approved"
+        record["approved_at"] = datetime.now(tz=UTC).isoformat()
         record["updated_at"] = datetime.now(tz=UTC).isoformat()
         return dict(record)
+
+    def get_approved_snapshot(self, draft_id: str) -> dict[str, Any]:
+        """Return the immutable operator-approved content for issue creation."""
+        record = self._require(draft_id)
+        if record.get("approval_state") != "approved":
+            raise PermissionError(
+                "plan draft is not operator-approved for issue creation; "
+                "approve via POST /internal/pm/plan/approve"
+            )
+        snapshot = record.get("approved_snapshot")
+        if not isinstance(snapshot, dict):
+            raise PermissionError(
+                "approved plan is missing an immutable content snapshot; renew approval"
+            )
+        return deepcopy(snapshot)
 
     def list_drafts(self, *, pending_only: bool = False, limit: int = 50) -> list[dict[str, Any]]:
         items = list(self.drafts.values())
         if pending_only:
-            items = [item for item in items if item.get("approval_state") == "awaiting_human_approval"]
+            items = [
+                item for item in items if item.get("approval_state") == "awaiting_human_approval"
+            ]
         items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         return [dict(item) for item in items[: max(1, min(limit, 500))]]
 
@@ -124,7 +177,12 @@ class PlanDraftStore:
 
 @dataclass
 class IssueWriteApprovalStore:
-    """Operator-gated approvals for PM issue update/link mutations."""
+    """Operator-gated approvals for PM issue update/link mutations.
+
+    Approvals are content-bound: the payload frozen at approve time is the only
+    content that may be executed. Agent retries with alternate title/body/links
+    are ignored in favor of the stored approved payload.
+    """
 
     requests: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -133,7 +191,7 @@ class IssueWriteApprovalStore:
         record = {
             "approval_request_id": request_id,
             "kind": kind,
-            "payload": dict(payload),
+            "payload": deepcopy(payload),
             "approval_state": "awaiting_human_approval",
             "updated_at": datetime.now(tz=UTC).isoformat(),
         }
@@ -144,24 +202,45 @@ class IssueWriteApprovalStore:
         record = self._require(approval_request_id)
         if record.get("approval_state") != "awaiting_human_approval":
             raise PermissionError("issue write is not awaiting human approval")
+        # Freeze immutable payload at approve time.
+        record["approved_payload"] = deepcopy(record["payload"])
         record["approval_state"] = "approved"
+        record["approved_at"] = datetime.now(tz=UTC).isoformat()
         record["updated_at"] = datetime.now(tz=UTC).isoformat()
         return dict(record)
 
     def consume_approved(self, *, approval_request_id: str, kind: str) -> dict[str, Any]:
+        """Consume an approved request and return the frozen approved payload.
+
+        Callers must execute using the returned ``approved_payload`` only; they
+        must not apply agent-supplied alternate title/body/link arguments.
+        """
         record = self._require(approval_request_id)
         if record.get("kind") != kind:
             raise PermissionError("approval_request_id kind mismatch")
         if record.get("approval_state") != "approved":
             raise PermissionError("issue write is not human-approved")
+        approved_payload = record.get("approved_payload")
+        if not isinstance(approved_payload, dict):
+            raise PermissionError(
+                "approved issue write is missing an immutable payload snapshot; renew approval"
+            )
         record["approval_state"] = "consumed"
         record["updated_at"] = datetime.now(tz=UTC).isoformat()
-        return dict(record)
+        return {
+            "approval_request_id": record["approval_request_id"],
+            "kind": record["kind"],
+            "approval_state": "consumed",
+            "approved_payload": deepcopy(approved_payload),
+            "updated_at": record["updated_at"],
+        }
 
     def list_requests(self, *, pending_only: bool = False, limit: int = 50) -> list[dict[str, Any]]:
         items = list(self.requests.values())
         if pending_only:
-            items = [item for item in items if item.get("approval_state") == "awaiting_human_approval"]
+            items = [
+                item for item in items if item.get("approval_state") == "awaiting_human_approval"
+            ]
         items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         return [dict(item) for item in items[: max(1, min(limit, 500))]]
 
@@ -240,15 +319,20 @@ def build_pm_tools(
         approval_mode="always_require",
         description=(
             "Create or update a local plan draft (title, summary, optional criteria/labels). "
+            "Editing after approval (or while awaiting approval) invalidates the prior approval. "
             "Does not create a GitHub issue until a human approves the draft via the internal API."
         ),
     )
     def pm_draft_plan(
         title: Annotated[str, Field(description="Issue/plan title.")],
         summary: Annotated[str, Field(description="Problem statement / plan summary.")],
-        acceptance_criteria: Annotated[list[str] | None, Field(description="Optional criteria list.")] = None,
+        acceptance_criteria: Annotated[
+            list[str] | None, Field(description="Optional criteria list.")
+        ] = None,
         labels: Annotated[list[str] | None, Field(description="Optional labels.")] = None,
-        repository: Annotated[str | None, Field(description="Target repository owner/name.")] = None,
+        repository: Annotated[
+            str | None, Field(description="Target repository owner/name.")
+        ] = None,
         draft_id: Annotated[str | None, Field(description="Existing draft id to update.")] = None,
     ) -> dict[str, Any]:
         assert_role_action_allowed(role, ActionClass.READ_ONLY)
@@ -268,10 +352,14 @@ def build_pm_tools(
     )
     def pm_set_acceptance_criteria(
         draft_id: Annotated[str, Field(description="Plan draft id.")],
-        acceptance_criteria: Annotated[list[str], Field(description="Non-empty acceptance criteria.")],
+        acceptance_criteria: Annotated[
+            list[str], Field(description="Non-empty acceptance criteria.")
+        ],
     ) -> dict[str, Any]:
         assert_role_action_allowed(role, ActionClass.READ_ONLY)
-        return drafts.set_acceptance_criteria(draft_id=draft_id, acceptance_criteria=acceptance_criteria)
+        return drafts.set_acceptance_criteria(
+            draft_id=draft_id, acceptance_criteria=acceptance_criteria
+        )
 
     @tool(
         name="pm_request_plan_approval",
@@ -305,8 +393,12 @@ def build_pm_tools(
         ),
     )
     def pm_create_issue(
-        draft_id: Annotated[str | None, Field(description="Operator-approved plan draft id.")] = None,
-        title: Annotated[str | None, Field(description="Issue title when not using a draft.")] = None,
+        draft_id: Annotated[
+            str | None, Field(description="Operator-approved plan draft id.")
+        ] = None,
+        title: Annotated[
+            str | None, Field(description="Issue title when not using a draft.")
+        ] = None,
         body: Annotated[str | None, Field(description="Issue body when not using a draft.")] = None,
         labels: Annotated[list[str] | None, Field(description="Optional labels.")] = None,
         repository: Annotated[str | None, Field(description="owner/name repository.")] = None,
@@ -322,20 +414,25 @@ def build_pm_tools(
     ) -> dict[str, Any]:
         del approved  # Agent-supplied approval is never authoritative.
         if draft_id is not None:
-            draft = drafts.get(draft_id)
             if require_human_approval_for_repo_writes:
-                if draft.get("approval_state") != "approved":
-                    raise PermissionError(
-                        "plan draft is not operator-approved for issue creation; "
-                        "approve via POST /internal/pm/plan/approve"
-                    )
-            issue_title = str(draft["title"])
-            issue_body = _issue_body(
-                summary=str(draft["summary"]),
-                acceptance_criteria=list(draft["acceptance_criteria"]),
-            )
-            issue_labels = tuple(draft.get("labels") or ())
-            issue_repo = _repo(repository or draft.get("repository"))
+                # Content-bound: create only from the immutable approved snapshot.
+                snapshot = drafts.get_approved_snapshot(draft_id)
+                issue_title = str(snapshot["title"])
+                issue_body = _issue_body(
+                    summary=str(snapshot["summary"]),
+                    acceptance_criteria=list(snapshot["acceptance_criteria"]),
+                )
+                issue_labels = tuple(snapshot.get("labels") or ())
+                issue_repo = _repo(repository or snapshot.get("repository"))
+            else:
+                draft = drafts.get(draft_id)
+                issue_title = str(draft["title"])
+                issue_body = _issue_body(
+                    summary=str(draft["summary"]),
+                    acceptance_criteria=list(draft["acceptance_criteria"]),
+                )
+                issue_labels = tuple(draft.get("labels") or ())
+                issue_repo = _repo(repository or draft.get("repository"))
         else:
             if require_human_approval_for_repo_writes:
                 raise PermissionError(
@@ -379,7 +476,8 @@ def build_pm_tools(
         description=(
             "Update a GitHub issue title/body/state/labels. When approval gating is enabled, omit "
             "approval_request_id to create a pending operator approval, then retry after "
-            "POST /internal/pm/issue-write/approve."
+            "POST /internal/pm/issue-write/approve. Retries execute the approved payload only; "
+            "alternate title/body arguments are ignored."
         ),
     )
     def pm_update_issue(
@@ -387,7 +485,9 @@ def build_pm_tools(
         title: Annotated[str | None, Field(description="Optional new title.")] = None,
         body: Annotated[str | None, Field(description="Optional new body.")] = None,
         state: Annotated[str | None, Field(description="Optional state: open or closed.")] = None,
-        labels: Annotated[list[str] | None, Field(description="Optional full label replacement.")] = None,
+        labels: Annotated[
+            list[str] | None, Field(description="Optional full label replacement.")
+        ] = None,
         repository: Annotated[str | None, Field(description="owner/name repository.")] = None,
         approval_request_id: Annotated[
             str | None,
@@ -395,7 +495,9 @@ def build_pm_tools(
         ] = None,
         approved: Annotated[
             bool | None,
-            Field(description="Ignored. Human approval comes from the issue-write store / internal API."),
+            Field(
+                description="Ignored. Human approval comes from the issue-write store / internal API."
+            ),
         ] = None,
     ) -> dict[str, Any]:
         del approved
@@ -419,7 +521,17 @@ def build_pm_tools(
                         "then call pm_update_issue again with approval_request_id."
                     ),
                 }
-            write_approvals.consume_approved(approval_request_id=approval_request_id, kind="update_issue")
+            # Content-bound: execute the frozen approved payload only (ignore agent args).
+            consumed = write_approvals.consume_approved(
+                approval_request_id=approval_request_id, kind="update_issue"
+            )
+            approved_payload = consumed["approved_payload"]
+            issue_repo = str(approved_payload["repository"])
+            issue_number = int(approved_payload["issue_number"])
+            title = approved_payload.get("title")
+            body = approved_payload.get("body")
+            state = approved_payload.get("state")
+            labels = approved_payload.get("labels")
 
         issue = github.update_issue(
             role=role,
@@ -440,13 +552,16 @@ def build_pm_tools(
         description=(
             "Record a relationship between two issues. When approval gating is enabled, omit "
             "approval_request_id to create a pending operator approval, then retry after "
-            "POST /internal/pm/issue-write/approve."
+            "POST /internal/pm/issue-write/approve. Retries execute the approved payload only; "
+            "alternate link arguments are ignored."
         ),
     )
     def pm_link_issues(
         issue_number: Annotated[int, Field(ge=1)],
         related_issue_number: Annotated[int, Field(ge=1)],
-        relationship: Annotated[str, Field(description="Relationship label, e.g. blocks.")] = "blocks",
+        relationship: Annotated[
+            str, Field(description="Relationship label, e.g. blocks.")
+        ] = "blocks",
         repository: Annotated[str | None, Field(description="owner/name repository.")] = None,
         approval_request_id: Annotated[
             str | None,
@@ -454,7 +569,9 @@ def build_pm_tools(
         ] = None,
         approved: Annotated[
             bool | None,
-            Field(description="Ignored. Human approval comes from the issue-write store / internal API."),
+            Field(
+                description="Ignored. Human approval comes from the issue-write store / internal API."
+            ),
         ] = None,
     ) -> dict[str, Any]:
         del approved
@@ -476,7 +593,15 @@ def build_pm_tools(
                         "then call pm_link_issues again with approval_request_id."
                     ),
                 }
-            write_approvals.consume_approved(approval_request_id=approval_request_id, kind="link_issues")
+            # Content-bound: execute the frozen approved payload only (ignore agent args).
+            consumed = write_approvals.consume_approved(
+                approval_request_id=approval_request_id, kind="link_issues"
+            )
+            approved_payload = consumed["approved_payload"]
+            issue_repo = str(approved_payload["repository"])
+            issue_number = int(approved_payload["issue_number"])
+            related_issue_number = int(approved_payload["related_issue_number"])
+            relationship = str(approved_payload.get("relationship") or "blocks")
 
         return github.link_issues(
             role=role,

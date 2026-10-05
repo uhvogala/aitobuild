@@ -125,7 +125,9 @@ def test_architect_pr_review_and_memory_roundtrip(tmp_path: Path) -> None:
     review = tools["architect_submit_pr_review"](12, "REQUEST_CHANGES", "Please extract a helper.")
     assert review["event"] == "REQUEST_CHANGES"
     assert len(github.reviews) == 1
-    recorded = tools["architect_memory_record"]("helper-extraction", "Extract shared validation helper.")
+    recorded = tools["architect_memory_record"](
+        "helper-extraction", "Extract shared validation helper."
+    )
     matches = tools["architect_memory_query"]("validation helper")
     assert recorded["memory_id"] in {item["memory_id"] for item in matches["matches"]}
 
@@ -148,7 +150,9 @@ def test_architect_approve_gated_by_config(tmp_path: Path) -> None:
     with pytest.raises(PermissionError, match="APPROVE reviews are disabled"):
         blocked["architect_submit_pr_review"](3, "APPROVE", "LGTM")
     allowed = _tool_map(
-        build_role_tools(context=_context(tmp_path, github=github, allow_pr_approve=True))["architect"]
+        build_role_tools(context=_context(tmp_path, github=github, allow_pr_approve=True))[
+            "architect"
+        ]
     )
     review = allowed["architect_submit_pr_review"](3, "APPROVE", "LGTM")
     assert review["event"] == "APPROVE"
@@ -156,7 +160,9 @@ def test_architect_approve_gated_by_config(tmp_path: Path) -> None:
 
 def test_architect_run_command_rejects_mutations(tmp_path: Path) -> None:
     tools = _tool_map(build_role_tools(context=_context(tmp_path))["architect"])
-    with pytest.raises(PermissionError, match="mutating|metacharacter|outside allowed|dangerous|expansion"):
+    with pytest.raises(
+        PermissionError, match="mutating|metacharacter|outside allowed|dangerous|expansion"
+    ):
         tools["architect_run_command"]("echo hi > src/out.txt")
     with pytest.raises(PermissionError, match="metacharacter|dangerous|expansion"):
         tools["architect_run_command"]("pytest -q; rm -rf /")
@@ -193,9 +199,11 @@ def test_architect_read_file_roundtrip(tmp_path: Path) -> None:
     tools = _tool_map(build_role_tools(context=_context(tmp_path))["architect"])
     assert tools["architect_read_file"]("src/mod.py") == "value = 1\n"
     found = tools["architect_find_files"]("**/*.py", "src")
-    assert "src/mod.py" in found["results"] or any(
-        item.get("path") == "src/mod.py" for item in found.get("results", [])
-    ) or "src/mod.py" in str(found)
+    assert (
+        "src/mod.py" in found["results"]
+        or any(item.get("path") == "src/mod.py" for item in found.get("results", []))
+        or "src/mod.py" in str(found)
+    )
 
 
 def test_pm_plan_approval_requires_operator_store_not_agent_flag(tmp_path: Path) -> None:
@@ -237,9 +245,9 @@ def test_pm_update_and_link_require_operator_issue_write_approval(tmp_path: Path
         issue=GitHubIssue(number=4, title="Child", body="Task", state="open", labels=("backlog",)),
     )
     tools = _tool_map(
-        build_role_tools(
-            context=_context(tmp_path, github=github, issue_write_store=write_store)
-        )["pm"]
+        build_role_tools(context=_context(tmp_path, github=github, issue_write_store=write_store))[
+            "pm"
+        ]
     )
     backlog = tools["pm_list_backlog"](labels=["backlog"])
     assert backlog["issue_count"] == 2
@@ -274,6 +282,108 @@ def test_pm_update_and_link_require_operator_issue_write_approval(tmp_path: Path
     assert github.links
 
 
+def test_pm_draft_edit_after_approve_invalidates_and_create_uses_snapshot(tmp_path: Path) -> None:
+    """Editing after approve clears approval; create uses frozen snapshot, not mutable fields."""
+    github = MockGitHubAdapter()
+    plan_store = PlanDraftStore()
+    tools = _tool_map(
+        build_role_tools(context=_context(tmp_path, github=github, plan_store=plan_store))["pm"]
+    )
+    draft = tools["pm_draft_plan"](
+        "Approved title",
+        "Approved summary.",
+        acceptance_criteria=["Criterion A"],
+        labels=["pm"],
+    )
+    draft_id = draft["draft_id"]
+    pending = tools["pm_request_plan_approval"](draft_id)
+    plan_store.mark_approved(
+        draft_id=draft_id,
+        approval_request_id=pending["approval_request_id"],
+    )
+    approved = plan_store.get(draft_id)
+    assert approved["approval_state"] == "approved"
+    assert approved["approved_snapshot"]["title"] == "Approved title"
+
+    # Agent rewrites the mutable draft after approval — must invalidate.
+    rewritten = tools["pm_draft_plan"](
+        "Malicious rewrite",
+        "Steal the secrets.",
+        acceptance_criteria=["Evil criterion"],
+        draft_id=draft_id,
+    )
+    assert rewritten["approval_state"] == "draft"
+    assert rewritten.get("approved_snapshot") is None
+    with pytest.raises(PermissionError, match="operator-approved"):
+        tools["pm_create_issue"](draft_id)
+
+    # Re-approve, then mutate store fields underneath the snapshot — create still uses snapshot.
+    tools["pm_set_acceptance_criteria"](draft_id, ["Criterion A restored"])
+    tools["pm_draft_plan"](
+        "Approved title",
+        "Approved summary.",
+        acceptance_criteria=["Criterion A"],
+        labels=["pm"],
+        draft_id=draft_id,
+    )
+    pending2 = tools["pm_request_plan_approval"](draft_id)
+    plan_store.mark_approved(
+        draft_id=draft_id,
+        approval_request_id=pending2["approval_request_id"],
+    )
+    # Simulate tampering with mutable draft fields while leaving approval_state alone.
+    plan_store.drafts[draft_id]["title"] = "Tampered title"
+    plan_store.drafts[draft_id]["summary"] = "Tampered summary"
+    created = tools["pm_create_issue"](draft_id)
+    assert created["created"] is True
+    assert created["issue"]["title"] == "Approved title"
+    assert "Tampered" not in created["issue"]["body"]
+    assert "Approved summary" in created["issue"]["body"]
+
+
+def test_pm_issue_write_execute_uses_stored_approved_payload(tmp_path: Path) -> None:
+    """After approve, retries with alternate args still execute the frozen payload."""
+    github = MockGitHubAdapter()
+    write_store = IssueWriteApprovalStore()
+    github.seed_issue(
+        repository="uhvogala/aitobuild_example",
+        issue=GitHubIssue(number=9, title="Epic", body="Parent", state="open", labels=("backlog",)),
+    )
+    github.seed_issue(
+        repository="uhvogala/aitobuild_example",
+        issue=GitHubIssue(number=10, title="Child", body="Task", state="open", labels=("backlog",)),
+    )
+    tools = _tool_map(
+        build_role_tools(context=_context(tmp_path, github=github, issue_write_store=write_store))[
+            "pm"
+        ]
+    )
+
+    pending_update = tools["pm_update_issue"](9, title="Approved title", body="Approved body")
+    write_store.mark_approved(approval_request_id=pending_update["approval_request_id"])
+    # Agent retries with different content — stored payload wins.
+    updated = tools["pm_update_issue"](
+        9,
+        title="Evil title",
+        body="Evil body",
+        approval_request_id=pending_update["approval_request_id"],
+    )
+    assert updated["updated"] is True
+    assert updated["issue"]["title"] == "Approved title"
+    assert updated["issue"]["body"] == "Approved body"
+
+    pending_link = tools["pm_link_issues"](9, 10, "blocks")
+    write_store.mark_approved(approval_request_id=pending_link["approval_request_id"])
+    linked = tools["pm_link_issues"](
+        9,
+        10,
+        "duplicates",  # alternate relationship ignored
+        approval_request_id=pending_link["approval_request_id"],
+    )
+    assert linked["relationship"] == "blocks"
+    assert github.links[-1]["relationship"] == "blocks"
+
+
 def test_ghcli_adapter_enforces_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = GhCliGitHubAdapter(
         default_repository="uhvogala/aitobuild",
@@ -292,7 +402,14 @@ def test_ghcli_adapter_enforces_allowlist(monkeypatch: pytest.MonkeyPatch) -> No
                 "labels": [],
                 "html_url": "https://github.com/uhvogala/aitobuild/issues/1",
             }
-        return {"number": 2, "title": "n", "body": "b", "state": "open", "labels": [], "html_url": "x"}
+        return {
+            "number": 2,
+            "title": "n",
+            "body": "b",
+            "state": "open",
+            "labels": [],
+            "html_url": "x",
+        }
 
     monkeypatch.setattr(adapter, "_api", fake_api)
     issue = adapter.get_issue(repository="uhvogala/aitobuild", issue_number=1)
