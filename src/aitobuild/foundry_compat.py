@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from agent_framework import FileMemoryProvider, tool as af_tool
+from agent_framework import FileMemoryProvider
 
 
 def inline_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
@@ -44,7 +44,7 @@ def _schema_needs_ref_inline(schema: dict[str, Any]) -> bool:
 
 def sanitize_function_tool_schemas_for_foundry(tools: list[Any]) -> None:
     """Inline ``$ref``/``$defs`` in FunctionTool parameter schemas in-place."""
-    for index, tool_item in enumerate(tools):
+    for tool_item in tools:
         parameters = getattr(tool_item, "parameters", None)
         if not callable(parameters):
             continue
@@ -54,16 +54,8 @@ def sanitize_function_tool_schemas_for_foundry(tools: list[Any]) -> None:
         inlined = inline_json_schema_refs(schema)
         if inlined == schema:
             continue
-        func = getattr(tool_item, "func", None)
-        name = getattr(tool_item, "name", None)
-        if func is None or not name:
-            continue
-        tools[index] = af_tool(
-            name=name,
-            description=getattr(tool_item, "description", "") or "",
-            schema=inlined,
-            approval_mode=getattr(tool_item, "approval_mode", "never_require"),
-        )(func)
+        schema.clear()
+        schema.update(inlined)
 
 
 class FoundryCompatibleFileMemoryProvider(FileMemoryProvider):
