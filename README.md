@@ -204,8 +204,6 @@ export AITOBUILD_GITHUB_DEFAULT_REPOSITORY="uhvogala/aitobuild"
 # Comma-separated owner/name allowlist required for gh_cli (also auto-includes default + developer repository sources).
 export AITOBUILD_GITHUB_ALLOWED_REPOS="uhvogala/aitobuild"
 export AITOBUILD_WEB_SEARCH_ADAPTER="mock"
-# Architect APPROVE PR reviews are off by default (COMMENT / REQUEST_CHANGES still allowed).
-export AITOBUILD_ARCHITECT_ALLOW_PR_APPROVE="false"
 ```
 
 For Azure OpenAI v1, set `AITOBUILD_FOUNDRY_ENDPOINT` to the resource URL ending

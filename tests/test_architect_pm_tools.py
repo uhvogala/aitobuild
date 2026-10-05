@@ -561,6 +561,30 @@ def test_mock_publish_commit_and_draft_pr_respect_allowlist() -> None:
         require_human_approval_for_repo_writes=True,
     )
     assert updated.number == 1 and "updated" in updated.body
+    reused = adapter.create_or_update_draft_pull_request(
+        role=AgentRole.DEVELOPER,
+        repository="uhvogala/aitobuild_example",
+        title="aitobuild: probe",
+        body="Closes #1\nreused-by-head",
+        head_branch="aitobuild/issue-1-deadbeefdeadbeef",
+        base_ref="main",
+        issue_number=1,
+        approved=True,
+        require_human_approval_for_repo_writes=True,
+    )
+    assert reused.number == 1 and "reused-by-head" in reused.body
+    with pytest.raises(ValueError, match="aitobuild/"):
+        adapter.create_or_update_draft_pull_request(
+            role=AgentRole.DEVELOPER,
+            repository="uhvogala/aitobuild_example",
+            title="aitobuild: probe",
+            body="Closes #1",
+            head_branch="feature/not-scoped",
+            base_ref="main",
+            issue_number=1,
+            approved=True,
+            require_human_approval_for_repo_writes=True,
+        )
     with pytest.raises(ValueError, match="aitobuild/"):
         adapter.upsert_branch_commit(
             role=AgentRole.DEVELOPER,

@@ -42,7 +42,7 @@ execute task code against the aitobuild service checkout.
 | Architect/meetings | Metadata scan and GroupChatBuilder construction | Execution and review integration missing |
 | Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current local gates: **325 tests pass** with real Docker probes enabled; Ruff and mypy pass. Both original patch-repair
+Current local gates: **327 tests pass** with real Docker probes enabled; Ruff and mypy pass. Both original patch-repair
 failures are fixed, with ambiguous matching still rejected. Live tool evaluations
 check artifact correctness, tool coverage, context guards and zero unexpected
 errors; provider failures/timeouts are visible failures, not waived successes.
@@ -178,11 +178,15 @@ resume from interrupted `publishing`, persists `pull_number`/`head_sha` before t
 terminal state, and create-or-updates the same draft PR under an `aitobuild/`
 branch prefix. Live `gh` adapters get a request timeout; durable mock
 `published` is refused on the HTTP path. PR bodies include verification evidence.
+Cleanup (issues #4/#6): failed publish with persisted `head_sha` (no `pull_number`)
+is resumable; create-or-update re-finds an open draft by head branch and re-checks
+the `aitobuild/` prefix; stale `architect_allow_pr_approve` config is removed;
+Architect COMMENT reviews assert `commit_id` reaches the adapter.
 M2 is not accepted end to end until a designated live trial meets the exit
 criteria below.
 
-Local verification: `AITOBUILD_RUN_DELIVERY_DOCKER_TEST=1 uv run pytest` (325 tests;
-ordinary gate 323 passed/two skipped), `uv run ruff check .`, and
+Local verification: `AITOBUILD_RUN_DELIVERY_DOCKER_TEST=1 uv run pytest` (327 tests;
+ordinary gate 325 passed/two skipped), `uv run ruff check .`, and
 `uv run mypy src`; mock copied-fixture simulation has `succeeded=true`, actual
 command exit 0 and the generated artifact. No hosted CI or new live-model/GitHub
 trial was run for this slice. The designated live repository remains inactive;

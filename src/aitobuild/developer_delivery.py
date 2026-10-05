@@ -72,6 +72,17 @@ class DeliveryPreparation:
         return asdict(self)
 
 
+def _publication_is_resumable(publication: dict[str, Any] | None) -> bool:
+    """True when a failed publish left enough identity to safely continue."""
+    if not isinstance(publication, dict):
+        return False
+    pull_number = publication.get("pull_number")
+    if type(pull_number) is int and pull_number > 0:
+        return True
+    head_sha = publication.get("head_sha")
+    return isinstance(head_sha, str) and re.fullmatch(r"[0-9a-f]{40}", head_sha) is not None
+
+
 class DeveloperDeliveryWorker:
     def __init__(
         self, *, preview_registry: DeveloperPreviewRegistry, state_dir: Path,
@@ -388,10 +399,11 @@ class DeveloperDeliveryWorker:
                 record = self._load(directory)
             if record is None:
                 raise ValueError("Delivery not found")
-            resumable_failed = (
-                record.state == "failed"
-                and isinstance(record.publication, dict)
-                and isinstance(record.publication.get("pull_number"), int)
+            publication_prior = (
+                record.publication if isinstance(record.publication, dict) else None
+            )
+            resumable_failed = record.state == "failed" and _publication_is_resumable(
+                publication_prior
             )
             if record.state == "failed" and not resumable_failed:
                 return record

@@ -31,7 +31,6 @@ class SchedulerConfig:
 @dataclass(slots=True, frozen=True)
 class PolicyConfig:
     require_human_approval_for_repo_writes: bool
-    architect_allow_pr_approve: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -200,10 +199,6 @@ def load_config() -> AppConfig:
         require_human_approval_for_repo_writes=_as_bool(
             getenv("AITOBUILD_REQUIRE_APPROVAL_FOR_REPO_WRITES"),
             default=True,
-        ),
-        architect_allow_pr_approve=_as_bool(
-            getenv("AITOBUILD_ARCHITECT_ALLOW_PR_APPROVE"),
-            default=False,
         ),
     )
 

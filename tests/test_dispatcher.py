@@ -1138,6 +1138,111 @@ def test_publish_resumes_interrupted_publishing_and_reuses_pull(
     assert "Verification" in resumed.publication["body"]
 
 
+
+def test_publish_resumes_failed_with_head_sha_without_pull(
+    implemented_delivery, verification_adapter, monkeypatch,
+) -> None:
+    from aitobuild.tools.github import MockGitHubAdapter
+    from dataclasses import replace
+
+    worker, preview_id, _, _ = implemented_delivery
+    monkeypatch.setattr(
+        delivery_module,
+        "shell_request",
+        lambda *a, **k: {"ok": True, "status": "exited", "exit_code": 0, "output": "ok", "next_cursor": 1},
+    )
+    worker.verify(preview_id, adapter=verification_adapter)
+    github = MockGitHubAdapter(
+        allowed_repositories=frozenset({"fixture/widgets"}),
+        enforce_allowlist=True,
+    )
+    published = worker.publish(
+        preview_id,
+        github=github,
+        require_human_approval_for_repo_writes=True,
+        allow_mock_publication=True,
+    )
+    assert published.state == "published"
+    pull_number = published.publication["pull_number"]
+    head_sha = published.publication["head_sha"]
+    # Failed after commit, before pull_number persist; orphan PR still exists on the head branch.
+    directory = worker._task_dir(preview_id)
+    failed = replace(
+        published,
+        state="failed",
+        error="simulated create-before-persist failure",
+        head_revision=published.base_revision,
+        publication={
+            key: value
+            for key, value in published.publication.items()
+            if key not in {"published_at", "pull_number", "html_url", "draft"}
+        },
+    )
+    assert "pull_number" not in failed.publication
+    assert failed.publication["head_sha"] == head_sha
+    worker._save(directory, failed)
+    resumed = worker.publish(
+        preview_id,
+        github=github,
+        require_human_approval_for_repo_writes=True,
+        allow_mock_publication=True,
+    )
+    assert resumed.state == "published", resumed.error
+    assert resumed.publication["pull_number"] == pull_number
+    assert resumed.publication["head_sha"] == head_sha
+    assert len(github.branch_commits) == 1
+    assert len(github.pull_requests["fixture/widgets"]) == 1
+
+
+def test_publish_create_or_update_reuses_open_draft_by_head_without_persisted_number(
+    implemented_delivery, verification_adapter, monkeypatch,
+) -> None:
+    """Create-before-persist: adapter finds the open draft by head branch."""
+    from aitobuild.tools.github import MockGitHubAdapter
+    from dataclasses import replace
+
+    worker, preview_id, _, _ = implemented_delivery
+    monkeypatch.setattr(
+        delivery_module,
+        "shell_request",
+        lambda *a, **k: {"ok": True, "status": "exited", "exit_code": 0, "output": "ok", "next_cursor": 1},
+    )
+    worker.verify(preview_id, adapter=verification_adapter)
+    github = MockGitHubAdapter(
+        allowed_repositories=frozenset({"fixture/widgets"}),
+        enforce_allowlist=True,
+    )
+    published = worker.publish(
+        preview_id,
+        github=github,
+        require_human_approval_for_repo_writes=True,
+        allow_mock_publication=True,
+    )
+    pull_number = published.publication["pull_number"]
+    directory = worker._task_dir(preview_id)
+    # publishing with head_sha but no pull_number (crash window after create).
+    interrupted = replace(
+        published,
+        state="publishing",
+        head_revision=published.base_revision,
+        publication={
+            key: value
+            for key, value in published.publication.items()
+            if key not in {"published_at", "pull_number", "html_url", "draft"}
+        },
+    )
+    worker._save(directory, interrupted)
+    resumed = worker.publish(
+        preview_id,
+        github=github,
+        require_human_approval_for_repo_writes=True,
+        allow_mock_publication=True,
+    )
+    assert resumed.state == "published"
+    assert resumed.publication["pull_number"] == pull_number
+    assert len(github.pull_requests["fixture/widgets"]) == 1
+
+
 def test_architect_review_published_draft_from_publication_only(
     implemented_delivery, verification_adapter, monkeypatch,
 ) -> None:
@@ -1178,6 +1283,7 @@ def test_architect_review_published_draft_from_publication_only(
     assert reviewed.architect_review["body"].startswith(ARCHITECT_REVIEW_BODY_PREFIX)
     assert reviewed.architect_review["head_sha"] == published.publication["head_sha"]
     assert len(github.reviews) == 1
+    assert github.reviews[0].commit_id == published.publication["head_sha"]
     again = worker.get_published_pull_request(preview_id, github=github)
     assert again["architect_review"]["event"] == "COMMENT"
     with pytest.raises(ValueError, match="distinct Architect reviewer|COMMENT only"):
