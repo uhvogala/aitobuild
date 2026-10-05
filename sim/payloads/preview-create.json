@@ -1,0 +1,11 @@
+{
+  "github_event": "issues",
+  "action": "opened",
+  "delivery_id": "sim-delivery-002",
+  "body": {
+    "issue": {
+      "number": 101,
+      "title": "Simulation task: add small helper"
+    }
+  }
+}

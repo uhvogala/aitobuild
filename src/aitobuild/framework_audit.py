@@ -1,0 +1,56 @@
+"""Agent Framework capability audit matrix for overlap prevention."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import StrEnum
+
+
+class CapabilityDecision(StrEnum):
+    REUSE_NATIVE = "reuse_native"
+    WRAP_NATIVE = "wrap_native"
+    CUSTOM_BUILD = "custom_build"
+
+
+@dataclass(slots=True, frozen=True)
+class CapabilityAuditItem:
+    capability: str
+    decision: CapabilityDecision
+    rationale: str
+
+
+def phase1_capability_matrix() -> tuple[CapabilityAuditItem, ...]:
+    return (
+        CapabilityAuditItem(
+            capability="agent_roles_and_instructions",
+            decision=CapabilityDecision.REUSE_NATIVE,
+            rationale="Use Agent primitive with role-specific instructions.",
+        ),
+        CapabilityAuditItem(
+            capability="chat_client_transport",
+            decision=CapabilityDecision.REUSE_NATIVE,
+            rationale="Use FoundryChatClient as the primary model transport.",
+        ),
+        CapabilityAuditItem(
+            capability="meeting_bootstrap",
+            decision=CapabilityDecision.WRAP_NATIVE,
+            rationale="Wrap GroupChatBuilder with project-specific meeting metadata.",
+        ),
+        CapabilityAuditItem(
+            capability="webhook_normalization",
+            decision=CapabilityDecision.CUSTOM_BUILD,
+            rationale="Project-specific payload normalization and policy metadata.",
+        ),
+        CapabilityAuditItem(
+            capability="trigger_deduplication",
+            decision=CapabilityDecision.CUSTOM_BUILD,
+            rationale="Project-specific idempotency behavior for retries and scheduler events.",
+        ),
+    )
+
+
+def ensure_decision_exists(capability: str) -> CapabilityDecision:
+    for item in phase1_capability_matrix():
+        if item.capability == capability:
+            return item.decision
+    raise KeyError(f"Capability '{capability}' is missing from phase1 capability matrix")
