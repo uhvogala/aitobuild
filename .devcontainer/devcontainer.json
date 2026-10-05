@@ -3,7 +3,11 @@
 {
 	"name": "Python 3",
 	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
-	"image": "mcr.microsoft.com/devcontainers/python:3-3.14-trixie",
+	"build": {
+		"dockerfile": "Dockerfile",
+		"context": ".."
+	},
+	"initializeCommand": "python3 .devcontainer/export-host-certs.py",
 	"features": {
 		"ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
 			"moby": false

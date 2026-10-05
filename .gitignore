@@ -1,4 +1,5 @@
 .venv/
+.devcontainer/certs/host/
 .devcontainer/certs/*.crt
 .devcontainer/certs/*.pem
 sim/.env.simulation.local

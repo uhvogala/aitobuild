@@ -2,14 +2,31 @@ Corporate certificate setup (generic)
 
 Use this when your company performs TLS inspection and you need internal root or intermediate CAs trusted in the dev container.
 
+Automatic host trust export
+
+Container initialization runs `python3 .devcontainer/export-host-certs.py` on the host
+and exports its trusted public certificates into `.devcontainer/certs/host/`.
+Python 3 must be available on the host. Generated exports are ignored by Git.
+The Dockerfile imports CA certificates before dev container features are installed,
+so feature downloads can use the host's trust store.
+
+If initialization runs inside a container, it reuses existing host exports rather
+than replacing them with container trust. If none exist, run the command above on
+the host before rebuilding. Explicit PEM or DER sources can also be supplied:
+`python3 .devcontainer/export-host-certs.py --source /path/to/company-root-ca.crt`.
+
 Auto-import source folder in this repository:
 - .devcontainer/certs
 
 Accepted file extensions:
 - .crt
 - .pem
+- .cer
 
-During container creation, .devcontainer/post-create.sh copies cert files from .devcontainer/certs into /usr/local/share/ca-certificates/ and runs update-ca-certificates so curl, git, pip, python requests, and uv trust corporate TLS certificates.
+During image creation, .devcontainer/import-certs.sh normalizes PEM and DER CA
+certificates, deduplicates them, and updates the container trust store. The existing
+post-create step also imports .crt and .pem files so curl, git, pip, python requests,
+and uv trust corporate TLS certificates.
 
 macOS: find and export corporate CA certs
 
