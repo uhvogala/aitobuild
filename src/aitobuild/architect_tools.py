@@ -25,6 +25,7 @@ from aitobuild.tools.github import GitHubAdapter, MockGitHubAdapter
 from aitobuild.tools.mcp_adapters import MCPDeveloperToolAdapter
 from aitobuild.tools.search import search_workspace
 from aitobuild.tools.web_search import WebSearchAdapter
+from aitobuild.developer_delivery import DeveloperDeliveryWorker
 
 
 ToolFunc = Callable[..., Any]
@@ -92,8 +93,7 @@ def build_architect_tools(
     isolation_policy: DeveloperIsolationPolicy | None = None,
     bound_session_id: str | None = None,
     prepared_workspace: Path | None = None,
-    default_repository: str | None = None,
-    allow_pr_approve: bool = False,
+    delivery_worker: DeveloperDeliveryWorker | None = None,
 ) -> tuple[ToolFunc, ...]:
     policy = isolation_policy or default_architect_isolation_policy()
     github = github_adapter or MockGitHubAdapter()
@@ -166,11 +166,6 @@ def build_architect_tools(
             raise ValueError("path must not traverse parent directories")
         return normalized
 
-    def _repo(repository: str | None) -> str:
-        resolved = (repository or default_repository or "").strip()
-        if not resolved:
-            raise ValueError("repository is required (owner/name)")
-        return resolved
 
     @tool(
         name="architect_run_command",
@@ -380,54 +375,60 @@ def build_architect_tools(
         return {"session_id": session_id, "closed": closed}
 
     @tool(
-        name="architect_get_pr",
-        approval_mode="always_require",
-        description="Fetch a pull request summary including changed files for review.",
-    )
-    def architect_get_pr(
-        pull_number: Annotated[int, Field(ge=1, description="Pull request number.")],
-        repository: Annotated[
-            str | None,
-            Field(description="owner/name repository; defaults to configured repository."),
-        ] = None,
-    ) -> dict[str, Any]:
-        assert_role_action_allowed(role, ActionClass.READ_ONLY)
-        pr = github.get_pull_request(repository=_repo(repository), pull_number=pull_number)
-        return pr.to_dict()
-
-    @tool(
-        name="architect_submit_pr_review",
+        name="architect_get_published_pr",
         approval_mode="always_require",
         description=(
-            "Submit a GitHub PR review (APPROVE, REQUEST_CHANGES, or COMMENT). "
-            "Architect may review but must not author implementation files."
+            "Fetch the draft pull request for a published delivery. "
+            "Resolves repository/PR/head only from delivery publication (preview_id); "
+            "no repository or pull_number override."
         ),
     )
-    def architect_submit_pr_review(
-        pull_number: Annotated[int, Field(ge=1)],
-        event: Annotated[
-            Literal["APPROVE", "REQUEST_CHANGES", "COMMENT"],
-            Field(description="GitHub review event."),
-        ],
-        body: Annotated[str, Field(description="Review commentary for the Developer/human.")],
-        repository: Annotated[str | None, Field(description="owner/name repository.")] = None,
+    def architect_get_published_pr(
+        preview_id: Annotated[str, Field(description="Published delivery preview_id.")],
     ) -> dict[str, Any]:
-        if event == "APPROVE" and not allow_pr_approve:
-            raise PermissionError(
-                "Architect APPROVE reviews are disabled; set AITOBUILD_ARCHITECT_ALLOW_PR_APPROVE=true "
-                "to enable, or use COMMENT / REQUEST_CHANGES"
-            )
-        review = github.submit_pr_review(
-            role=role,
-            repository=_repo(repository),
-            pull_number=pull_number,
-            event=event,
-            body=body,
+        assert_role_action_allowed(role, ActionClass.READ_ONLY)
+        if delivery_worker is None:
+            raise ValueError("Delivery worker is not configured for Architect review")
+        cleaned = preview_id.strip()
+        if not cleaned:
+            raise ValueError("preview_id must be non-empty")
+        return delivery_worker.get_published_pull_request(cleaned, github=github)
+
+    @tool(
+        name="architect_submit_published_pr_review",
+        approval_mode="always_require",
+        description=(
+            "Submit a COMMENT review on a published delivery's draft PR. "
+            "PR identity comes only from publication; REQUEST_CHANGES/APPROVE/merge are unavailable "
+            "until a distinct reviewer GitHub identity exists. Review body is length-capped and framed."
+        ),
+    )
+    def architect_submit_published_pr_review(
+        preview_id: Annotated[str, Field(description="Published delivery preview_id.")],
+        event: Annotated[
+            Literal["COMMENT"],
+            Field(description="GitHub review event (COMMENT only on this path)."),
+        ],
+        body: Annotated[str, Field(description="Review commentary (length-capped).")],
+    ) -> dict[str, Any]:
+        assert_role_action_allowed(role, ActionClass.PR_REVIEW)
+        if delivery_worker is None:
+            raise ValueError("Delivery worker is not configured for Architect review")
+        cleaned = preview_id.strip()
+        if not cleaned:
+            raise ValueError("preview_id must be non-empty")
+        record = delivery_worker.submit_architect_review(
+            cleaned, github=github, event=event, body=body,
         )
-        return review.to_dict()
+        return {
+            "preview_id": record.preview_id,
+            "state": record.state,
+            "architect_review": dict(record.architect_review or {}),
+        }
 
     @tool(
         name="architect_memory_query",
+
         approval_mode="always_require",
         description="Query durable Architect memory for prior architectural decisions and conventions.",
     )
@@ -471,8 +472,8 @@ def build_architect_tools(
         architect_search_files,
         architect_start_session,
         architect_stop_session,
-        architect_get_pr,
-        architect_submit_pr_review,
+        architect_get_published_pr,
+        architect_submit_published_pr_review,
         architect_memory_query,
         architect_memory_record,
         build_web_search_tool(role=role, adapter=web_search_adapter),

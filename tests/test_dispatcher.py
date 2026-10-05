@@ -1136,3 +1136,104 @@ def test_publish_resumes_interrupted_publishing_and_reuses_pull(
     assert resumed.publication["pull_number"] == pull_number
     assert len(github.pull_requests["fixture/widgets"]) == 1
     assert "Verification" in resumed.publication["body"]
+
+
+def test_architect_review_published_draft_from_publication_only(
+    implemented_delivery, verification_adapter, monkeypatch,
+) -> None:
+    from aitobuild.tools.github import MockGitHubAdapter
+    from aitobuild.developer_delivery import ARCHITECT_REVIEW_BODY_PREFIX
+
+    worker, preview_id, _, _ = implemented_delivery
+    monkeypatch.setattr(
+        delivery_module,
+        "shell_request",
+        lambda *a, **k: {"ok": True, "status": "exited", "exit_code": 0, "output": "ok", "next_cursor": 1},
+    )
+    worker.verify(preview_id, adapter=verification_adapter)
+    github = MockGitHubAdapter(
+        allowed_repositories=frozenset({"fixture/widgets"}),
+        enforce_allowlist=True,
+    )
+    published = worker.publish(
+        preview_id,
+        github=github,
+        require_human_approval_for_repo_writes=True,
+        allow_mock_publication=True,
+    )
+    assert published.state == "published"
+    pull = worker.get_published_pull_request(preview_id, github=github)
+    assert pull["number"] == published.publication["pull_number"]
+    assert pull["draft"] is True
+    assert pull["head_matches_publication"] is True
+    assert pull["repository"] == "fixture/widgets"
+    reviewed = worker.submit_architect_review(
+        preview_id,
+        github=github,
+        event="COMMENT",
+        body="Please extract a helper before merge.",
+    )
+    assert reviewed.architect_review is not None
+    assert reviewed.architect_review["event"] == "COMMENT"
+    assert reviewed.architect_review["body"].startswith(ARCHITECT_REVIEW_BODY_PREFIX)
+    assert reviewed.architect_review["head_sha"] == published.publication["head_sha"]
+    assert len(github.reviews) == 1
+    again = worker.get_published_pull_request(preview_id, github=github)
+    assert again["architect_review"]["event"] == "COMMENT"
+    with pytest.raises(ValueError, match="distinct Architect reviewer|COMMENT only"):
+        worker.submit_architect_review(
+            preview_id, github=github, event="REQUEST_CHANGES", body="Needs changes.",
+        )
+    with pytest.raises(ValueError, match="allows only COMMENT"):
+        worker.submit_architect_review(
+            preview_id, github=github, event="APPROVE", body="LGTM",
+        )
+    with pytest.raises(ValueError, match="exceeds"):
+        worker.submit_architect_review(
+            preview_id, github=github, event="COMMENT", body="x" * 5000,
+        )
+
+
+def test_architect_review_refuses_when_publication_head_moved(
+    implemented_delivery, verification_adapter, monkeypatch,
+) -> None:
+    from aitobuild.tools.github import MockGitHubAdapter, GitHubPullRequest
+
+    worker, preview_id, _, _ = implemented_delivery
+    monkeypatch.setattr(
+        delivery_module,
+        "shell_request",
+        lambda *a, **k: {"ok": True, "status": "exited", "exit_code": 0, "output": "ok", "next_cursor": 1},
+    )
+    worker.verify(preview_id, adapter=verification_adapter)
+    github = MockGitHubAdapter(
+        allowed_repositories=frozenset({"fixture/widgets"}),
+        enforce_allowlist=True,
+    )
+    published = worker.publish(
+        preview_id,
+        github=github,
+        require_human_approval_for_repo_writes=True,
+        allow_mock_publication=True,
+    )
+    pull_number = published.publication["pull_number"]
+    current = github.pull_requests["fixture/widgets"][pull_number]
+    github.pull_requests["fixture/widgets"][pull_number] = GitHubPullRequest(
+        number=current.number,
+        title=current.title,
+        body=current.body,
+        state=current.state,
+        head_ref=current.head_ref,
+        base_ref=current.base_ref,
+        draft=current.draft,
+        html_url=current.html_url,
+        repository=current.repository,
+        changed_files=current.changed_files,
+        head_sha="f" * 40,
+    )
+    fetched = worker.get_published_pull_request(preview_id, github=github)
+    assert fetched["head_matches_publication"] is False
+    with pytest.raises(ValueError, match="head SHA no longer matches|head SHA changed"):
+        worker.submit_architect_review(
+            preview_id, github=github, event="COMMENT", body="Looks fine overall.",
+        )

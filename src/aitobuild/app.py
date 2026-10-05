@@ -327,7 +327,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             plan_draft_store=plan_draft_store,
             issue_write_store=issue_write_store,
             default_repository=app_config.github.default_repository,
-            allow_pr_approve=app_config.policy.architect_allow_pr_approve,
+            delivery_worker=delivery_worker,
         )
     role_tools = build_role_tools(context=developer_tool_context)
 

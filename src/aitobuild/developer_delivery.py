@@ -35,6 +35,11 @@ from aitobuild.tools.bash import ContainerSessionBashAdapter, _normalize_session
 from aitobuild.tools.shell import shell_request
 
 
+ARCHITECT_REVIEW_BODY_MAX = 2000
+ARCHITECT_REVIEW_BODY_PREFIX = "aitobuild Architect review\n\n"
+_ARCHITECT_REVIEW_EVENTS = frozenset({"COMMENT"})
+
+
 @dataclass(frozen=True, slots=True)
 class LocalRepositorySource:
     repository: str
@@ -61,6 +66,7 @@ class DeliveryPreparation:
     verification_commands: list[str] = field(default_factory=list)
     verification: dict[str, Any] | None = None
     publication: dict[str, Any] | None = None
+    architect_review: dict[str, Any] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -576,6 +582,149 @@ class DeveloperDeliveryWorker:
             self._save(directory, record)
             return record
 
+    def get_published_pull_request(
+        self, preview_id: str, *, github: GitHubAdapter,
+    ) -> dict[str, Any]:
+        """Resolve a published draft PR from delivery publication only."""
+        directory = self._task_dir(preview_id)
+        with FileLock(str(directory) + ".lock", timeout=10):
+            record = self._load(directory)
+            if record is None:
+                raise ValueError("Delivery not found")
+            publication = dict(self._require_published_publication(record))
+            preview = record.preview_id
+            prior_review = dict(record.architect_review) if record.architect_review else None
+        pull = github.get_pull_request(
+            repository=str(publication["repository"]),
+            pull_number=int(publication["pull_number"]),
+        )
+        expected_head = str(publication["head_sha"]).lower()
+        live_head = (pull.head_sha or "").lower() or None
+        head_matches = live_head == expected_head
+        if pull.head_ref != publication["branch"]:
+            raise ValueError("Published pull request head ref does not match the delivery branch")
+        if not pull.draft or pull.state != "open":
+            raise ValueError("Published pull request must remain an open draft")
+        payload = pull.to_dict()
+        payload["preview_id"] = preview
+        payload["expected_head_sha"] = expected_head
+        payload["head_matches_publication"] = head_matches
+        if prior_review is not None:
+            payload["architect_review"] = prior_review
+        return payload
+
+    def submit_architect_review(
+        self,
+        preview_id: str,
+        *,
+        github: GitHubAdapter,
+        event: str,
+        body: str,
+    ) -> DeliveryPreparation:
+        """Submit COMMENT against the published draft; persist last review.
+
+        REQUEST_CHANGES stays disabled until a distinct reviewer GitHub identity
+        is configured (same-token self-reviews 422 on GitHub).
+        """
+        directory = self._task_dir(preview_id)
+        with FileLock(str(directory) + ".lock", timeout=10):
+            record = self._load(directory)
+            if record is None:
+                raise ValueError("Delivery not found")
+            publication = dict(self._require_published_publication(record))
+        cleaned_event = str(event).strip().upper()
+        if cleaned_event == "REQUEST_CHANGES":
+            raise ValueError(
+                "REQUEST_CHANGES requires a distinct Architect reviewer GitHub identity; "
+                "this slice allows COMMENT only to avoid same-token self-review failures"
+            )
+        if cleaned_event not in _ARCHITECT_REVIEW_EVENTS:
+            raise ValueError("Published-draft Architect review allows only COMMENT")
+        review_body = self._normalize_architect_review_body(body)
+        expected_head = str(publication["head_sha"]).lower()
+        pull = github.get_pull_request(
+            repository=str(publication["repository"]),
+            pull_number=int(publication["pull_number"]),
+        )
+        live_head = (pull.head_sha or "").lower()
+        if live_head != expected_head:
+            raise ValueError(
+                "Published draft head SHA no longer matches delivery publication; "
+                "call architect_get_published_pr and retry only if the delivery was republished"
+            )
+        if pull.head_ref != publication["branch"]:
+            raise ValueError("Published pull request head ref does not match the delivery branch")
+        if not pull.draft or pull.state != "open":
+            raise ValueError("Published pull request must remain an open draft")
+        review = github.submit_pr_review(
+            role=AgentRole.ARCHITECT,
+            repository=str(publication["repository"]),
+            pull_number=int(publication["pull_number"]),
+            event="COMMENT",
+            body=review_body,
+            commit_id=expected_head,
+        )
+        architect_review = {
+            "event": "COMMENT",
+            "body": review_body,
+            "review_id": review.review_id,
+            "html_url": review.html_url,
+            "head_sha": expected_head,
+            "pull_number": int(publication["pull_number"]),
+            "repository": str(publication["repository"]),
+            "reviewed_at": datetime.now(tz=UTC).isoformat(),
+        }
+        with FileLock(str(directory) + ".lock", timeout=10):
+            record = self._load(directory)
+            if record is None:
+                raise ValueError("Delivery not found")
+            current = self._require_published_publication(record)
+            if str(current["head_sha"]).lower() != expected_head:
+                raise ValueError(
+                    "Published draft head SHA changed while submitting the review; "
+                    "call architect_get_published_pr after republication"
+                )
+            if int(current["pull_number"]) != int(publication["pull_number"]):
+                raise ValueError("Published pull request identity changed during review submit")
+            record = replace(
+                record,
+                architect_review=architect_review,
+                updated_at=datetime.now(tz=UTC).isoformat(),
+                error=None,
+            )
+            self._save(directory, record)
+            return record
+
+    @staticmethod
+    def _normalize_architect_review_body(body: str) -> str:
+        cleaned = str(body).replace("\x00", "").strip()
+        if not cleaned:
+            raise ValueError("Architect review body must be non-empty")
+        max_content = ARCHITECT_REVIEW_BODY_MAX - len(ARCHITECT_REVIEW_BODY_PREFIX)
+        if max_content <= 0 or len(cleaned) > max_content:
+            raise ValueError(
+                f"Architect review body exceeds {max_content} characters"
+            )
+        return f"{ARCHITECT_REVIEW_BODY_PREFIX}{cleaned}"
+
+    @staticmethod
+    def _require_published_publication(record: DeliveryPreparation) -> dict[str, Any]:
+        if record.state != "published":
+            raise ValueError("Architect review requires a published delivery")
+        publication = record.publication
+        if not isinstance(publication, dict):
+            raise ValueError("Published delivery lacks publication identity")
+        for key in ("repository", "branch", "head_sha"):
+            if not isinstance(publication.get(key), str) or not publication[key]:
+                raise ValueError("Published delivery lacks publication identity")
+        if type(publication.get("pull_number")) is not int or publication["pull_number"] <= 0:
+            raise ValueError("Published delivery lacks a draft pull request number")
+        if publication.get("draft") is not True:
+            raise ValueError("Published delivery must record a draft pull request")
+        if re.fullmatch(r"[0-9a-f]{40}", str(publication["head_sha"]).lower()) is None:
+            raise ValueError("Published delivery head SHA is invalid")
+        return publication
+
     @staticmethod
     def _publication_metadata(
         bundle: DeveloperTaskBundle, record: DeliveryPreparation
@@ -825,6 +974,24 @@ class DeveloperDeliveryWorker:
                 )
                 or record.state == "failed" and (not isinstance(record.error, str) or not record.error)):
             raise ValueError("Invalid persisted delivery outcome")
+        if record.architect_review is not None:
+            review = record.architect_review
+            if not isinstance(review, dict):
+                raise ValueError("Invalid persisted Architect review payload")
+            if review.get("event") not in _ARCHITECT_REVIEW_EVENTS:
+                raise ValueError("Invalid persisted Architect review event")
+            for key in ("body", "head_sha", "repository", "reviewed_at"):
+                if not isinstance(review.get(key), str) or not review[key]:
+                    raise ValueError("Invalid persisted Architect review field")
+            if type(review.get("pull_number")) is not int or review["pull_number"] <= 0:
+                raise ValueError("Invalid persisted Architect review pull number")
+            datetime.fromisoformat(review["reviewed_at"])
+            if record.state != "published" or not isinstance(record.publication, dict):
+                raise ValueError("Architect review requires a published delivery")
+            if review["head_sha"] != record.publication.get("head_sha"):
+                raise ValueError("Architect review head SHA differs from publication")
+            if review["pull_number"] != record.publication.get("pull_number"):
+                raise ValueError("Architect review pull number differs from publication")
         datetime.fromisoformat(record.approved_at)
         datetime.fromisoformat(record.updated_at)
         return record

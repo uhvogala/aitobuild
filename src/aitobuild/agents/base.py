@@ -33,7 +33,7 @@ def default_agent_specs() -> tuple[AgentSpec, ...]:
             instructions=(
                 "You are the Architect agent. Review architecture and code quality and suggest "
                 "improvements. Use architect_read_file/find/search and stricter architect_run_command "
-                "for analysis, architect_get_pr and architect_submit_pr_review for reviews, and "
+                "for analysis, architect_get_published_pr and architect_submit_published_pr_review for published-draft reviews, and "
                 "architect_memory_query/record for durable decisions. Prefer web_search for cheap "
                 "lookups; use browser tools only when explicitly available. Do not author "
                 "implementation code or merge policy bypasses."
