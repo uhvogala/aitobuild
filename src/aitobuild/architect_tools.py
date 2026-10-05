@@ -25,6 +25,7 @@ from aitobuild.tools.github import GitHubAdapter, MockGitHubAdapter
 from aitobuild.tools.mcp_adapters import MCPDeveloperToolAdapter
 from aitobuild.tools.search import search_workspace
 from aitobuild.tools.web_search import WebSearchAdapter
+from aitobuild.developer_delivery import DeveloperDeliveryWorker
 
 
 ToolFunc = Callable[..., Any]
@@ -94,6 +95,7 @@ def build_architect_tools(
     prepared_workspace: Path | None = None,
     default_repository: str | None = None,
     allow_pr_approve: bool = False,
+    delivery_worker: DeveloperDeliveryWorker | None = None,
 ) -> tuple[ToolFunc, ...]:
     policy = isolation_policy or default_architect_isolation_policy()
     github = github_adapter or MockGitHubAdapter()
@@ -427,7 +429,60 @@ def build_architect_tools(
         return review.to_dict()
 
     @tool(
+        name="architect_get_published_pr",
+        approval_mode="always_require",
+        description=(
+            "Fetch the draft pull request for a published delivery. "
+            "Resolves repository/PR/head only from delivery publication (preview_id); "
+            "no repository or pull_number override."
+        ),
+    )
+    def architect_get_published_pr(
+        preview_id: Annotated[str, Field(description="Published delivery preview_id.")],
+    ) -> dict[str, Any]:
+        assert_role_action_allowed(role, ActionClass.READ_ONLY)
+        if delivery_worker is None:
+            raise ValueError("Delivery worker is not configured for Architect review")
+        cleaned = preview_id.strip()
+        if not cleaned:
+            raise ValueError("preview_id must be non-empty")
+        return delivery_worker.get_published_pull_request(cleaned, github=github)
+
+    @tool(
+        name="architect_submit_published_pr_review",
+        approval_mode="always_require",
+        description=(
+            "Submit COMMENT or REQUEST_CHANGES on a published delivery's draft PR. "
+            "PR identity comes only from publication; APPROVE and merge are unavailable. "
+            "Review body is length-capped and framed."
+        ),
+    )
+    def architect_submit_published_pr_review(
+        preview_id: Annotated[str, Field(description="Published delivery preview_id.")],
+        event: Annotated[
+            Literal["COMMENT", "REQUEST_CHANGES"],
+            Field(description="GitHub review event (APPROVE unavailable on this path)."),
+        ],
+        body: Annotated[str, Field(description="Review commentary (length-capped).")],
+    ) -> dict[str, Any]:
+        assert_role_action_allowed(role, ActionClass.PR_REVIEW)
+        if delivery_worker is None:
+            raise ValueError("Delivery worker is not configured for Architect review")
+        cleaned = preview_id.strip()
+        if not cleaned:
+            raise ValueError("preview_id must be non-empty")
+        record = delivery_worker.submit_architect_review(
+            cleaned, github=github, event=event, body=body,
+        )
+        return {
+            "preview_id": record.preview_id,
+            "state": record.state,
+            "architect_review": dict(record.architect_review or {}),
+        }
+
+    @tool(
         name="architect_memory_query",
+
         approval_mode="always_require",
         description="Query durable Architect memory for prior architectural decisions and conventions.",
     )
@@ -473,6 +528,8 @@ def build_architect_tools(
         architect_stop_session,
         architect_get_pr,
         architect_submit_pr_review,
+        architect_get_published_pr,
+        architect_submit_published_pr_review,
         architect_memory_query,
         architect_memory_record,
         build_web_search_tool(role=role, adapter=web_search_adapter),

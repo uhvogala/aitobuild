@@ -74,6 +74,8 @@ def test_build_role_tools_includes_architect_and_pm(tmp_path: Path) -> None:
         "architect_stop_session",
         "architect_get_pr",
         "architect_submit_pr_review",
+        "architect_get_published_pr",
+        "architect_submit_published_pr_review",
         "architect_memory_query",
         "architect_memory_record",
         "web_search",

@@ -206,6 +206,15 @@ Exit criteria:
 
 Status: **scaffolding only**. Depends on M2.
 
+Architect draft-PR review slice (2026-10-05): published deliveries expose
+`architect_get_published_pr` / `architect_submit_published_pr_review` bound to
+publication identity only (`preview_id` → repository/PR/head). Reviews allow
+`COMMENT` and `REQUEST_CHANGES` with a framed, length-capped body; `APPROVE` and
+merge stay off on this path. Last review persists on the delivery; submit refuses
+when the live head SHA diverges from publication. Meetings and Developer fix
+loops remain later work.
+
+
 Deliverables:
 - Give the Architect read/review tools and repository analysis, not implementation-write privileges.
 - Route review results into fix requests, human review, or blocker-resolution meetings.

@@ -87,6 +87,7 @@ class GitHubPullRequest:
     html_url: str | None = None
     repository: str | None = None
     changed_files: tuple[str, ...] = ()
+    head_sha: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +101,7 @@ class GitHubPullRequest:
             "html_url": self.html_url,
             "repository": self.repository,
             "changed_files": list(self.changed_files),
+            "head_sha": self.head_sha,
         }
 
 
@@ -390,9 +392,29 @@ class MockGitHubAdapter:
     def get_pull_request(self, *, repository: str, pull_number: int) -> GitHubPullRequest:
         repository = self._resolve_repository(repository)
         try:
-            return self.pull_requests[repository][pull_number]
+            pull = self.pull_requests[repository][pull_number]
         except KeyError as exc:
             raise LookupError(f"Pull request #{pull_number} not found in {repository}") from exc
+        if pull.head_sha:
+            return pull
+        head_sha = self._branch_heads.get(repository, {}).get(pull.head_ref)
+        if not head_sha:
+            return pull
+        enriched = GitHubPullRequest(
+            number=pull.number,
+            title=pull.title,
+            body=pull.body,
+            state=pull.state,
+            head_ref=pull.head_ref,
+            base_ref=pull.base_ref,
+            draft=pull.draft,
+            html_url=pull.html_url,
+            repository=pull.repository,
+            changed_files=pull.changed_files,
+            head_sha=head_sha,
+        )
+        self.pull_requests[repository][pull_number] = enriched
+        return enriched
 
     def submit_pr_review(
         self,
@@ -515,6 +537,7 @@ class MockGitHubAdapter:
                 html_url=current.html_url or f"https://example.test/{repo}/pull/{existing_pull_number}",
                 repository=repo,
                 changed_files=current.changed_files,
+                head_sha=self._branch_heads.get(repo, {}).get(cleaned_head) or current.head_sha,
             )
             repo_prs[existing_pull_number] = updated
             return updated
@@ -531,6 +554,7 @@ class MockGitHubAdapter:
             html_url=f"https://example.test/{repo}/pull/{number}",
             repository=repo,
             changed_files=(),
+            head_sha=self._branch_heads.get(repo, {}).get(cleaned_head),
         )
         repo_prs[number] = created
         return created
@@ -1071,6 +1095,8 @@ def _pull_request_from_api(
     base_raw = raw.get("base")
     head: dict[str, Any] = head_raw if isinstance(head_raw, dict) else {}
     base: dict[str, Any] = base_raw if isinstance(base_raw, dict) else {}
+    head_sha_raw = head.get("sha")
+    head_sha = str(head_sha_raw).lower() if isinstance(head_sha_raw, str) and head_sha_raw else None
     return GitHubPullRequest(
         number=int(raw["number"]),
         title=str(raw.get("title") or ""),
@@ -1082,4 +1108,5 @@ def _pull_request_from_api(
         html_url=str(raw["html_url"]) if raw.get("html_url") else None,
         repository=repository,
         changed_files=changed_files,
+        head_sha=head_sha,
     )

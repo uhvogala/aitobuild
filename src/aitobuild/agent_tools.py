@@ -21,6 +21,7 @@ from aitobuild.policy import (
     assert_role_action_allowed,
 )
 from aitobuild.architect_tools import ARCHITECT_SESSION_PREFIX, build_architect_tools
+from aitobuild.developer_delivery import DeveloperDeliveryWorker
 from aitobuild.meetings import MeetingRegistry
 from aitobuild.pm_tools import IssueWriteApprovalStore, PlanDraftStore, build_pm_tools
 from aitobuild.tools import (
@@ -65,6 +66,7 @@ class DeveloperToolContext:
     issue_write_store: IssueWriteApprovalStore | None = None
     default_repository: str | None = None
     allow_pr_approve: bool = False
+    delivery_worker: DeveloperDeliveryWorker | None = None
 
 
 def build_role_tools(*, context: DeveloperToolContext) -> dict[str, tuple[ToolFunc, ...]]:
@@ -91,6 +93,7 @@ def build_role_tools(*, context: DeveloperToolContext) -> dict[str, tuple[ToolFu
             prepared_workspace=context.prepared_workspace,
             default_repository=context.default_repository,
             allow_pr_approve=context.allow_pr_approve,
+            delivery_worker=context.delivery_worker,
         ),
         AgentRole.PM.value: build_pm_tools(
             github_adapter=context.github_adapter,
