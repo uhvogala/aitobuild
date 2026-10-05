@@ -20,14 +20,17 @@ human retaining merge authority.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Ingress and routing | Signed webhooks, internal auth, repository issue extraction, durable approvals and local checkout-preparation worker | Worker implementation/verification/publication |
+| Ingress and routing | Signed webhooks, internal auth, repository issue extraction, durable approvals, target implementation and independent verification | Gated publication |
 | Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
 | Native model runtime | Foundry binding, Developer invocation and persisted manual approvals | Reproducible live-model acceptance run and consistent task-policy enforcement |
 | GitHub integration | Webhook input and mock issue-proposal adapter | Real issue, branch, commit, and PR operations |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **266 tests pass**, Ruff and mypy pass. The original patch-repair
+Verified locally: **325 tests pass** with both opt-in prepared-target Docker
+probes enabled; the ordinary gate has 323 passes and two Docker skips. Ruff and
+mypy pass. Docker probes cover independent pytest success/failure and cleanup.
+The original patch-repair
 failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
 sessions, managed terminals/processes, native memory/restart and browser tools
 have live integration evidence. Real Grok and Kimi evaluations retain strict
@@ -293,10 +296,9 @@ dispatched task returns `dedupe` without creating another task. Inspect the queu
 with `pending_only=false` to recover `approved` or `dispatched` records. These
 states describe metadata routing, not worker execution or completion.
 
-Repository issue bundles remain blocked by both Developer execution endpoints
-and the legacy execution harness until native execution is connected to the
-prepared target checkout. Checkout preparation is available below; target code
-execution, delivery commits, pushes and PR operations remain absent. No live
+Repository issue bundles require the prepared-target native execution path below.
+The legacy run endpoint and harness remain blocked for issue tasks. Delivery
+commits, pushes and PR operations remain absent. No live
 GitHub trial has run for this slice. Other trigger dedupe, meetings and scheduler
 state remain in memory; this is not distributed storage.
 
@@ -309,7 +311,7 @@ sources. The service checkout, overlapping paths and linked service worktrees
 are rejected as target sources.
 
 ```bash
-export AITOBUILD_DEVELOPER_REPOSITORY_SOURCES='[{"repository":"fixture/widgets","repository_id":101,"path":"/absolute/path/to/target-seed"}]'
+export AITOBUILD_DEVELOPER_REPOSITORY_SOURCES='[{"repository":"fixture/widgets","repository_id":101,"path":"/absolute/path/to/target-seed","verification_commands":["PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider"]}]'
 ```
 
 After creating and approving an issue preview with a resolved base SHA, prepare
@@ -346,10 +348,77 @@ The API fixture checks exercise approval-to-checkout and restart recovery:
 uv run pytest tests/test_app.py -k delivery_api -v
 ```
 
-The next M2 slice connects constrained native implementation and post-change
-verification to this checkout. Publication remains a separate gated step.
+### Implement an approved issue
 
-Developer practical run flow:
+Use `AITOBUILD_DEVELOPER_EXECUTION_MODE=container_session` and the prepared
+Developer image for actual target commands; `mock` remains a test-only backend.
+In a dev container, keep Developer state under the mounted service workspace so
+Docker can resolve the host path. Start a fresh native session with the approved,
+prepared preview:
+
+```bash
+curl --fail -H "X-Internal-Token: $AITOBUILD_INTERNAL_API_TOKEN" \
+	-H 'Content-Type: application/json' \
+	-d '{"preview_id":"dp-...","session_id":"issue-demo","input":"Implement the approved issue and run its tests","auto_approve_tools":false}' \
+	http://127.0.0.1:8000/internal/developer/agent/run
+```
+
+File tools edit the prepared checkout directly; commands use that same checkout
+read-only in the offline constrained container. No service-seeded copy is made.
+One native session owns the delivery. A local task lock prevents concurrent
+invocations, including across application instances. Saved approvals resume via
+`/internal/developer/agent/resume` with `session_id`, `request_id` and `approved`.
+Restart restores the immutable task, target checkout, reservations and original
+deadline; approval waits do not reset that deadline.
+
+Delivery states are `implementing`, `awaiting_tool_approval`, `implemented` and
+`failed`, in addition to preparation states. `implemented` only means the native
+turn finished: it is not independent verification or publication approval.
+After implementation begins, prepare returns the existing lifecycle record
+without reseeding; use the status endpoint to inspect progress. Rejection,
+failure, interruption or expiry blocks replay, retains artifacts and aborts the
+budget. Terminal outcomes close the task container. Browser/arbitrary MCP and
+legacy issue execution remain prohibited.
+
+### Independently verify the target
+
+Configure `verification_commands` before preparing the task. Preparation pins
+the ordered plan; commands must fit the approved policy. An empty plan permits
+preparation/implementation but cannot be verified. Requests cannot supply or
+replace commands, source paths or policies; changing the pinned plan requires a
+new approved task, not resetting the existing task's budget.
+
+After the native delivery reaches `implemented`, trigger the server-owned gate:
+
+```bash
+curl --fail -H "X-Internal-Token: $AITOBUILD_INTERNAL_API_TOKEN" \
+	-H 'Content-Type: application/json' \
+	-d '{"preview_id":"dp-..."}' \
+	http://127.0.0.1:8000/internal/developer/delivery/verify
+```
+
+Require `accepted=true` and `delivery.state=verified`, not HTTP 200 or model text.
+The verifier runs every pinned command in a fresh private Docker session, using
+the same read-only target, offline/resource-limited profile and original task
+deadline. Only confirmed process exits with integer code 0 and successful
+container cleanup qualify. Mock execution cannot certify a task.
+
+The durable record carries command results, bounded output previews/log paths,
+the verifier session, timestamps and a whole-checkout fingerprint. Bounded logs
+live beside the delivery state. Changed files must be allowed and already
+reserved against the task budget. The fingerprint must remain unchanged during
+verification. Duplicate successful requests check integrity without rerunning
+commands, including after restart; changed verified content becomes a failure.
+Status stays readable during `verifying`, while the task lock blocks duplicate
+execution. Failed commands, missing exits, expiry, interruption or cleanup errors
+preserve artifacts, abort the original budget and block automatic replay.
+
+`verified` certifies this snapshot against the operator's command plan, not
+semantic completeness, review approval or permission to publish. Publication
+must recheck the snapshot and required approval. Delivery commit/push/draft-PR
+publication is the next M2 slice and remains unimplemented; there is no self-merge.
+
+Developer prototype run flow (non-issue previews only):
 
 1. Create and approve a preview (`/internal/developer/preview` and `/internal/developer/preview/approve`).
 2. Execute a constrained Developer run via `POST /internal/developer/run` with:

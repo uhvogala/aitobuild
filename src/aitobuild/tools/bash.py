@@ -109,6 +109,7 @@ class ContainerSessionBashAdapter:
         self._run_as_current_user = run_as_current_user
         self._timeout_seconds = timeout_seconds
         self._containers: dict[str, str] = {}
+        self._session_workspaces: dict[str, Path] = {}
         workspace_key = str(self._bind_source_path or self._workspace_root.resolve())
         workspace_hash = sha256(workspace_key.encode()).hexdigest()[:16]
         self._workspace_hash = workspace_hash
@@ -140,6 +141,8 @@ class ContainerSessionBashAdapter:
     ) -> tuple[str, str]:
         if read_only_workspace and deadline is None:
             raise ValueError("Approved-task containers require an absolute deadline")
+        if session_id in self._session_workspaces and not read_only_workspace:
+            raise PermissionError("Prepared target checkouts require the approved-task container profile")
         raw_session = (session_id or f"sess-{uuid4()}").strip()
         if not raw_session:
             raise ValueError("session_id must be non-empty")
@@ -149,7 +152,7 @@ class ContainerSessionBashAdapter:
         existing = self._containers.get(normalized_session)
         if existing is not None:
             if read_only_workspace:
-                self._assert_task_container(existing)
+                self._assert_task_container(existing, session_id=normalized_session, deadline=deadline)
             return normalized_session, existing
 
         container_name = _container_name_for_session(
@@ -161,7 +164,7 @@ class ContainerSessionBashAdapter:
         )
         if container_name in running_container_names:
             if read_only_workspace:
-                self._assert_task_container(container_name)
+                self._assert_task_container(container_name, session_id=normalized_session, deadline=deadline)
             self._containers[normalized_session] = container_name
             return normalized_session, container_name
 
@@ -174,8 +177,7 @@ class ContainerSessionBashAdapter:
                 timeout_seconds=self._timeout_seconds,
             )
 
-        relative_workspace = self.get_workspace_root(normalized_session).relative_to(self._workspace_root)
-        mount_source = self._resolve_bind_source() / relative_workspace
+        mount_source = self._mount_source(normalized_session)
         self._prepare_data_volume(normalized_session)
         command = [
             "docker",
@@ -229,7 +231,7 @@ class ContainerSessionBashAdapter:
         self._containers[normalized_session] = container_name
         return normalized_session, container_name
 
-    def _assert_task_container(self, container_name: str) -> None:
+    def _assert_task_container(self, container_name: str, *, session_id: str, deadline: float | None) -> None:
         result = _run_process(
             command=["docker", "inspect", container_name, "--format", "{{json .}}"],
             timeout_seconds=self._timeout_seconds,
@@ -246,6 +248,17 @@ class ContainerSessionBashAdapter:
                 and all(mount["Destination"] in {self._container_workdir, self.home_dir, "/tmp"} for mount in mounts)
                 and config["Config"]["Cmd"][:2] == ["python", "-c"]
             )
+            if session_id in self._session_workspaces:
+                command = config["Config"]["Cmd"]
+                safe = safe and (
+                    repo_mount.get("Source") == str(self._mount_source(session_id))
+                    and repo_mount.get("Type") == "bind"
+                    and host.get("PidsLimit") == 256 and host.get("Memory") == 1024 ** 3
+                    and host.get("NanoCpus") == 2_000_000_000
+                    and len(command) == 4
+                    and command[2] == "import sys,time; time.sleep(max(0, float(sys.argv[1])-time.time()))"
+                    and deadline is not None and 0 < float(command[3]) <= deadline + 1
+                )
         except (ValueError, KeyError, TypeError, StopIteration):
             safe = False
         if not safe:
@@ -274,13 +287,52 @@ class ContainerSessionBashAdapter:
             pass
         return base
 
+    def bind_session_workspace(self, *, session_id: str, workspace: Path) -> None:
+        from filelock import FileLock
+
+        identity = _normalize_session_id(session_id)
+        root = workspace.resolve(strict=True)
+        if root == self._workspace_root or not (root / ".git").is_dir() or (root / ".git").is_symlink():
+            raise ValueError("Prepared task workspace must be an independent target checkout")
+        lock_path = self._workspace_root / ".aitobuild/container-locks" / (identity + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(lock_path), timeout=self._timeout_seconds):
+            existing = self._session_workspaces.get(identity)
+            if existing is not None and existing != root:
+                raise ValueError("This container session is already bound to another target checkout")
+            self._session_workspaces[identity] = root
+
+    def _mount_source(self, session_id: str) -> Path:
+        workspace = self.get_workspace_root(session_id)
+        if workspace.is_relative_to(self._workspace_root):
+            return self._resolve_bind_source() / workspace.relative_to(self._workspace_root)
+        if not Path("/.dockerenv").exists():
+            return workspace
+        if self._bind_source_path is None:
+            inspected = _run_process(
+                command=["docker", "inspect", os.uname().nodename, "--format", "{{json .Mounts}}"],
+                timeout_seconds=self._timeout_seconds,
+            )
+            try:
+                matches = [mount for mount in json.loads(inspected.stdout)
+                           if workspace.is_relative_to(mount["Destination"])]
+                if inspected.exit_code == 0 and matches:
+                    mount = max(matches, key=lambda item: len(item["Destination"]))
+                    return Path(mount["Source"]) / workspace.relative_to(mount["Destination"])
+            except (ValueError, TypeError, KeyError):
+                pass
+        raise ValueError("Prepared checkout is not host-visible; place Developer state under the mounted service workspace")
+
     def get_workspace_root(self, session_id: str) -> Path:
-        return self._workspace_root / ".aitobuild" / "workspaces" / _normalize_session_id(session_id)
+        identity = _normalize_session_id(session_id)
+        return self._session_workspaces.get(identity, self._workspace_root / ".aitobuild" / "workspaces" / identity)
 
     def data_volume_subpath(self, session_id: str) -> str:
         return f"{self._workspace_hash}/{_normalize_session_id(session_id)}"
 
     def _prepare_workspace(self, session_id: str) -> None:
+        if session_id in self._session_workspaces:
+            return
         prepare_developer_workspace(self._workspace_root, session_id)
 
     def _prepare_data_volume(self, session_id: str) -> None:

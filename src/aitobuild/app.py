@@ -16,6 +16,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
+from filelock import Timeout as FileLockTimeout
 
 from agent_framework import AgentSession, Content, FileSessionStore, FunctionInvocationContext, function_middleware
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -240,7 +241,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         preview_registry=dispatcher.developer_preview_registry, state_dir=developer_state_dir,
         service_root=workspace_root, command_timeout_seconds=app_config.developer.command_timeout_seconds,
         repository_sources=tuple(
-            LocalRepositorySource(source.repository, source.repository_id, Path(source.path))
+            LocalRepositorySource(source.repository, source.repository_id, Path(source.path), source.verification_commands)
             for source in app_config.developer.repository_sources
         ),
     )
@@ -656,6 +657,28 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"accepted": record.state == "prepared", "delivery": record.to_payload()}
+
+    @app.post("/internal/developer/delivery/verify")
+    def verify_developer_delivery(
+        payload: dict[str, Any],
+        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    ) -> dict[str, Any]:
+        _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+        if set(payload) != {"preview_id"}:
+            raise HTTPException(status_code=400, detail="Verification accepts only preview_id; commands are pinned at preparation")
+        preview_id = payload.get("preview_id")
+        if not isinstance(preview_id, str) or not preview_id.strip():
+            raise HTTPException(status_code=400, detail="preview_id must be a non-empty string")
+        preview_id = preview_id.strip()
+        try:
+            if delivery_worker.get(preview_id) is None:
+                raise HTTPException(status_code=404, detail="Delivery not found")
+            if app_config.developer.execution_mode != "container_session" or container_session_bash is None or app_config.developer.enable_mcp_adapters:
+                raise HTTPException(status_code=409, detail="Independent verification requires constrained Docker without MCP adapters")
+            record = delivery_worker.verify(preview_id, adapter=container_session_bash)
+        except (ValueError, OSError, FileLockTimeout) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"accepted": record.state == "verified", "delivery": record.to_payload()}
 
     @app.get("/internal/developer/delivery/{preview_id}")
     def get_developer_delivery(
@@ -1076,9 +1099,17 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         task_budget = None
+        prepared_workspace = None
+        delivery_record = None
         if task_bundle is not None:
             if task_bundle.issue_context is not None:
-                raise HTTPException(status_code=409, detail="Repository issue execution requires the disposable-checkout delivery worker execution path; it is not implemented")
+                try:
+                    delivery_record = delivery_worker.get(str(bound_preview_id))
+                    if delivery_record is None or delivery_record.bundle_payload != loads(dumps(task_bundle.to_payload())):
+                        raise ValueError("Repository issue execution requires a prepared disposable-checkout delivery worker task with matching approved scope")
+                    prepared_workspace = Path(delivery_record.checkout_path)
+                except (ValueError, OSError) as error:
+                    raise HTTPException(status_code=409, detail=str(error)) from error
             if app_config.developer.execution_mode not in {"mock", "container_session"}:
                 raise HTTPException(status_code=409, detail="Approved native tasks require container isolation")
             if app_config.developer.enable_mcp_adapters or payload.get("use_browser", False) is True:
@@ -1086,9 +1117,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             try:
                 task_budget = DeveloperTaskBudget(
                     path=developer_state_dir / "budgets" / (sha256(str(bound_preview_id).encode()).hexdigest() + ".json"),
-                    bundle=task_bundle, create=stored_bundle is None,
+                    bundle=task_bundle, create=stored_bundle is None and task_bundle.issue_context is None,
                 )
-                task_budget.remaining_seconds()
+                if delivery_record is None:
+                    task_budget.remaining_seconds()
             except TimeoutError as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
             except (ValueError, OSError) as error:
@@ -1097,16 +1129,26 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         def invocation_timeout() -> float:
             return min(invoke_timeout_seconds, task_budget.remaining_seconds()) if task_budget else invoke_timeout_seconds
 
-        async def close_task_container() -> None:
-            if task_budget is not None and container_session_bash is not None:
-                closed = await asyncio.to_thread(container_session_bash.close_session, session_id=resolved_session_id)
-                if not closed and resolved_session_id in await asyncio.to_thread(container_session_bash.list_session_ids):
-                    raise HTTPException(status_code=500, detail="Approved task container cleanup failed")
+        task_container_closed = False
+        cleanup_session_id = delivery_record.session_id or resolved_session_id if delivery_record is not None else resolved_session_id
 
-        async def fail_task() -> None:
+        async def close_task_container() -> None:
+            nonlocal task_container_closed
+            if task_container_closed:
+                return
+            if task_budget is not None and container_session_bash is not None:
+                closed = await asyncio.to_thread(container_session_bash.close_session, session_id=cleanup_session_id)
+                if not closed and cleanup_session_id in await asyncio.to_thread(container_session_bash.list_session_ids):
+                    raise HTTPException(status_code=500, detail="Approved task container cleanup failed")
+            task_container_closed = True
+
+        async def fail_task(reason: str = "Native implementation failed or was interrupted") -> None:
             try:
                 if task_budget is not None:
                     task_budget.abort()
+                if delivery_record is not None:
+                    await asyncio.to_thread(delivery_worker.finish_implementation, str(bound_preview_id),
+                                            session_id=resolved_session_id, error=reason)
             finally:
                 await close_task_container()
 
@@ -1124,6 +1166,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 developer_tool_context, bound_session_id=resolved_session_id,
                 isolation_policy=task_bundle.policy if task_bundle is not None else None,
                 task_budget=task_budget,
+                prepared_workspace=prepared_workspace,
             )
         )["developer"]
         stored_approvals = session_obj.state.get("aitobuild_pending_approvals", [])
@@ -1151,6 +1194,28 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail="This Developer session already has an active run")
         active_developer_runs.add(resolved_session_id)
         tool_stack.callback(active_developer_runs.discard, resolved_session_id)
+        if delivery_record is not None and task_bundle is not None:
+            try:
+                tool_stack.enter_context(delivery_worker.implementation_lock(str(bound_preview_id)))
+                delivery_record = await asyncio.to_thread(
+                    delivery_worker.begin_implementation, str(bound_preview_id), bundle=task_bundle,
+                    session_id=resolved_session_id, resume=resume,
+                )
+            except (ValueError, RuntimeError, OSError, FileLockTimeout) as error:
+                current = await asyncio.to_thread(delivery_worker.get, str(bound_preview_id))
+                if current is not None and current.state == "failed":
+                    await close_task_container()
+                raise HTTPException(status_code=409, detail=str(error)) from error
+
+            async def fail_unfinished_delivery() -> None:
+                current = await asyncio.to_thread(delivery_worker.get, str(bound_preview_id))
+                if current is not None and current.state == "implementing":
+                    await fail_task()
+
+            tool_stack.push_async_callback(fail_unfinished_delivery)
+            if container_session_bash is not None and prepared_workspace is not None:
+                await asyncio.to_thread(container_session_bash.bind_session_workspace,
+                                        session_id=resolved_session_id, workspace=prepared_workspace)
         if task_bundle is not None and stored_bundle is None:
             session_obj.state["aitobuild_task_bundle"] = task_bundle.to_payload()
             session_obj.state["aitobuild_preview_id"] = bound_preview_id
@@ -1175,6 +1240,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 item for item in stored_approvals if item.get("id") != request_id
             ]
             await developer_session_store.set(resolved_session_id, session_obj)
+            if delivery_record is not None and approved is False:
+                await fail_task("Human rejected native tool approval; automatic replay is blocked")
+                raise HTTPException(status_code=409, detail="Native delivery failed after human rejection")
 
         async def persist_result(response: Any) -> None:
             if isinstance(session_obj, AgentSession):
@@ -1320,6 +1388,13 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         pending_requests = _extract_user_input_requests(result)
         if not pending_requests:
             await close_task_container()
+        if delivery_record is not None:
+            await asyncio.to_thread(delivery_worker.finish_implementation, str(bound_preview_id),
+                                    session_id=resolved_session_id, pending=bool(pending_requests))
+            delivery_record = await asyncio.to_thread(delivery_worker.get, str(bound_preview_id))
+            if delivery_record is not None and delivery_record.state == "failed":
+                await close_task_container()
+                raise HTTPException(status_code=409, detail=delivery_record.error)
         response_id = getattr(result, "response_id", None)
         _emit_developer_agent_live(
             "run.finish",
@@ -1336,6 +1411,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "session_id": resolved_session_id,
             "task_id": task_bundle.task_id if task_bundle is not None else None,
             "preview_id": bound_preview_id,
+            **({"delivery_state": delivery_record.state} if delivery_record is not None else {}),
             "input": prompt,
             "output_text": _extract_response_text(result),
             "response_id": response_id if isinstance(response_id, str) else None,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 import asyncio
 import hmac
 import json
@@ -254,6 +255,319 @@ def _create_app_with_fake_agent(test_config, monkeypatch: pytest.MonkeyPatch, fa
 
     monkeypatch.setattr(app_module, "bootstrap_runtime", fake_bootstrap_runtime)
     return TestClient(create_app(test_config))
+
+
+@pytest.fixture
+def prepared_native_issue(test_config, repository_issue_body, local_issue_repository, monkeypatch):
+    source, revision = local_issue_repository
+    config = replace(test_config, developer=replace(test_config.developer, repository_sources=(
+        RepositorySourceConfig("fixture/widgets", 101, str(source), ("PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider",)),
+    )))
+    repository_issue_body["issue"]["title"] = "Write scoped target probes"
+    repository_issue_body["issue"]["body"] = "## Acceptance Criteria\n- src/target-probe.txt contains TARGET.\n- tests/target-probe.txt contains CHECKED."
+    agent = _FakeDeveloperAgent()
+    client = _create_app_with_fake_agent(config, monkeypatch, agent)
+    headers = _internal_headers(config)
+    preview = client.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "action": "opened", "body": repository_issue_body,
+    }).json()
+    payload = {"preview_id": preview["preview_id"]}
+    assert client.post("/internal/developer/preview/approve", headers=headers,
+                       json={**payload, "base_revision": revision}).status_code == 200
+    response = client.post("/internal/developer/delivery/prepare", headers=headers, json=payload)
+    assert response.status_code == 200 and response.json()["accepted"], response.text
+    return config, client, payload, response.json()["delivery"], agent
+
+
+@pytest.fixture
+def verification_api(prepared_native_issue, monkeypatch):
+    config, _, payload, record, _ = prepared_native_issue
+    sessions = []
+
+    class RecordingContainer(app_module.ContainerSessionBashAdapter):
+        def create_session(self, *, session_id=None, read_only_workspace=False, deadline=None):
+            assert read_only_workspace and deadline is not None
+            sessions.append(session_id)
+            return session_id, "test-container"
+
+        def close_session(self, *, session_id):
+            return True
+
+    class WritingAgent(_FakeDeveloperAgent):
+        async def run(self, messages, *, session=None, tools=None, **kwargs):
+            write = next(tool for tool in tools if tool.name == "developer_write_file")
+            write("src/target-probe.txt", "TARGET", approved=True)
+            write("tests/target-probe.txt", "CHECKED", approved=True)
+            return await super().run(messages, session=session)
+
+    monkeypatch.setattr(app_module, "ContainerSessionBashAdapter", RecordingContainer)
+    config = replace(config, developer=replace(config.developer, execution_mode="container_session"))
+    client = _create_app_with_fake_agent(config, monkeypatch, WritingAgent(require_approval=False))
+    response = client.post("/internal/developer/agent/run", headers=_internal_headers(config), json={
+        **payload, "input": "Implement the probes", "session_id": "verify-api-native",
+    })
+    assert response.status_code == 200 and response.json()["delivery_state"] == "implemented", response.text
+    return config, client, payload, record, sessions
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_delivery_verification_api_uses_pinned_commands_and_persists_outcome(verification_api, monkeypatch, exit_code) -> None:
+    import aitobuild.developer_delivery as delivery_module
+
+    config, client, payload, record, sessions = verification_api
+    calls = []
+
+    def shell_reply(adapter, session_id, request):
+        calls.append((session_id, request))
+        return {"ok": True, "status": "exited", "exit_code": exit_code, "output": "verification evidence"}
+
+    monkeypatch.setattr(delivery_module, "shell_request", shell_reply)
+    headers = _internal_headers(config)
+    route = "/internal/developer/delivery/verify"
+    assert client.post(route, json=payload).status_code == 401
+    assert client.post(route, headers=headers, json={**payload, "commands": ["true"]}).status_code == 400
+    assert client.post(route, headers=headers, json={"preview_id": "unknown"}).status_code == 404
+    response = client.post(route, headers=headers, json=payload)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["accepted"] is (exit_code == 0)
+    delivery = result["delivery"]
+    assert delivery["state"] == ("verified" if exit_code == 0 else "failed")
+    assert calls[0][1]["command"] == record["verification_commands"][0]
+    assert calls[0][0] != "verify-api-native" and calls[0][0] in sessions
+    assert delivery["verification"]["commands"][0]["exit_code"] == exit_code
+    restarted_agent = _FakeDeveloperAgent(require_approval=False)
+    restarted = _create_app_with_fake_agent(config, monkeypatch, restarted_agent)
+    duplicate = restarted.post(route, headers=headers, json=payload)
+    assert duplicate.status_code == 200 and duplicate.json() == result
+    assert len(calls) == 1 and restarted_agent.calls == []
+    assert restarted.get(f"/internal/developer/delivery/{payload['preview_id']}", headers=headers).json()["delivery"] == delivery
+    assert client.post("/internal/developer/agent/run", headers=headers, json={
+        **payload, "input": "Do not replace verified content", "session_id": "verification-replay",
+    }).status_code == 409
+
+
+def test_delivery_verification_rejects_mock_backend(prepared_native_issue) -> None:
+    config, client, payload, _, _ = prepared_native_issue
+    response = client.post("/internal/developer/delivery/verify", headers=_internal_headers(config), json=payload)
+    assert response.status_code == 409 and "constrained Docker" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("commands", ["pytest", [None], [""], ["python\x00oops"], ["python " + "x" * 8192], ["pytest"] * 17])
+def test_repository_source_config_rejects_invalid_verification_plan(monkeypatch, tmp_path, commands) -> None:
+    monkeypatch.setenv("AITOBUILD_WEBHOOK_SECRET", "test-secret")
+    monkeypatch.setenv("AITOBUILD_INTERNAL_API_TOKEN", "test-token")
+    monkeypatch.setenv("AITOBUILD_DEVELOPER_REPOSITORY_SOURCES", json.dumps([
+        {"repository": "fixture/widgets", "repository_id": 101, "path": str(tmp_path), "verification_commands": commands},
+    ]))
+    with pytest.raises(ValueError, match="verification_commands"):
+        load_config()
+
+
+def test_repository_source_config_loads_verification_plan(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AITOBUILD_WEBHOOK_SECRET", "test-secret")
+    monkeypatch.setenv("AITOBUILD_INTERNAL_API_TOKEN", "test-token")
+    monkeypatch.setenv("AITOBUILD_DEVELOPER_REPOSITORY_SOURCES", json.dumps([
+        {"repository": "fixture/widgets", "repository_id": 101, "path": str(tmp_path), "verification_commands": ["python -m pytest -q"]},
+    ]))
+    assert load_config().developer.repository_sources[0].verification_commands == ("python -m pytest -q",)
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_native_issue_sdk_approval_targets_the_prepared_checkout_after_restart(
+    prepared_native_issue, monkeypatch, tmp_path, approved,
+) -> None:
+    import httpx
+    from agent_framework import Agent
+    from agent_framework.openai import OpenAIChatCompletionClient
+    from openai import AsyncOpenAI
+    from aitobuild.agents import default_agent_specs
+    from aitobuild.runtime import _build_role_agent_handles
+
+    config, _, payload, record, _ = prepared_native_issue
+    target = Path(record["checkout_path"])
+    budget_path = Path(config.developer.state_dir) / "budgets" / (sha256(payload["preview_id"].encode()).hexdigest() + ".json")
+    initial_budget = json.loads(budget_path.read_text())
+    requests = []
+
+    def model_reply(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        assert sum("TARGET_TASK" in (message.get("content") or "") for message in body["messages"]) == 1
+        if len(requests) < 3:
+            if len(requests) == 2:
+                assert (target / "src/target-probe.txt").read_text() == "TARGET"
+            path, content = ("src/target-probe.txt", "TARGET") if len(requests) == 1 else ("tests/target-probe.txt", "CHECKED")
+            message = {"role": "assistant", "content": None, "tool_calls": [{
+                "id": f"write-{len(requests)}", "type": "function", "function": {
+                    "name": "developer_write_file", "arguments": json.dumps({"path": path, "content": content, "approved": True}),
+                },
+            }]}
+            finish = "tool_calls"
+        else:
+            assert (target / "tests/target-probe.txt").read_text() == "CHECKED"
+            message, finish = {"role": "assistant", "content": "DONE"}, "stop"
+        return httpx.Response(200, json={
+            "id": f"response-{len(requests)}", "object": "chat.completion", "created": 1,
+            "model": "test-model", "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+        })
+
+    openai_client = AsyncOpenAI(api_key="test-key", http_client=httpx.AsyncClient(transport=httpx.MockTransport(model_reply)))
+    model_client = OpenAIChatCompletionClient(model="test-model", async_client=openai_client)
+
+    def native_client():
+        agent = _build_role_agent_handles(
+            default_agent_specs(), client=model_client, agent_class=Agent, role_tools=None,
+            developer_state_dir=tmp_path / "native-state",
+        )["developer"]
+        return _create_app_with_fake_agent(config, monkeypatch, agent)
+
+    try:
+        headers = _internal_headers(config)
+        client = native_client()
+        response = client.post("/internal/developer/agent/run", headers=headers, json={
+            **payload, "input": "TARGET_TASK", "session_id": "issue-sdk",
+        })
+        assert response.status_code == 200, response.text
+        assert response.json()["delivery_state"] == "awaiting_tool_approval"
+        assert not (target / "src/target-probe.txt").exists()
+        for turn in range(2 if approved else 1):
+            decision = {"session_id": "issue-sdk", "approved": approved,
+                        "request_id": response.json()["pending_approval_requests"][0]["request_id"]}
+            client = native_client()
+            response = client.post("/internal/developer/agent/resume", headers=headers, json=decision)
+            assert response.status_code == (200 if approved else 409), response.text
+            if approved:
+                assert response.json()["delivery_state"] == ("awaiting_tool_approval" if turn == 0 else "implemented")
+        final = client.get(f"/internal/developer/delivery/{payload['preview_id']}", headers=headers).json()["delivery"]
+        assert final["state"] == ("implemented" if approved else "failed")
+        assert final["session_id"] == "issue-sdk"
+        budget = json.loads(budget_path.read_text())
+        assert budget["deadline"] == initial_budget["deadline"]
+        assert budget["reserved_paths"] == (["src/target-probe.txt", "tests/target-probe.txt"] if approved else [])
+        assert (target / "src/target-probe.txt").exists() is approved
+        assert len(requests) == (3 if approved else 1)
+        assert client.post("/internal/developer/agent/resume", headers=headers, json=decision).status_code == 409
+        assert client.post("/internal/developer/agent/run", headers=headers, json={
+            **payload, "input": "Do not replay", "session_id": "other-issue-sdk",
+        }).status_code == 409
+        assert not (Path.cwd() / ".aitobuild/workspaces/issue-sdk").exists()
+        assert (Path(final["source_path"]) / "README.md").read_text() == "Fixture baseline\n"
+    finally:
+        asyncio.run(openai_client.close())
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "timeout"])
+def test_native_issue_terminal_state_budget_and_container_cleanup(prepared_native_issue, monkeypatch, outcome) -> None:
+    config, _, payload, _, _ = prepared_native_issue
+    closed = []
+    bindings = []
+
+    class RecordingContainer(app_module.ContainerSessionBashAdapter):
+        def bind_session_workspace(self, *, session_id, workspace):
+            bindings.append((session_id, workspace))
+            super().bind_session_workspace(session_id=session_id, workspace=workspace)
+
+        def close_session(self, *, session_id):
+            closed.append(session_id)
+            return True
+
+    class TerminalAgent(_FakeDeveloperAgent):
+        async def run(self, messages, *, session=None):
+            if outcome == "error":
+                raise RuntimeError("Implementation failed")
+            if outcome == "timeout":
+                raise asyncio.TimeoutError("Implementation expired")
+            return await super().run(messages, session=session)
+
+    monkeypatch.setattr(app_module, "ContainerSessionBashAdapter", RecordingContainer)
+    config = replace(config, developer=replace(config.developer, execution_mode="container_session"))
+    client = _create_app_with_fake_agent(config, monkeypatch, TerminalAgent(require_approval=False))
+    headers = _internal_headers(config)
+    response = client.post("/internal/developer/agent/run", headers=headers, json={
+        **payload, "input": "Implement", "session_id": "issue-terminal",
+    })
+    assert response.status_code == {"success": 200, "error": 500, "timeout": 504}[outcome], response.text
+    record = client.get(f"/internal/developer/delivery/{payload['preview_id']}", headers=headers).json()["delivery"]
+    assert record["state"] == ("implemented" if outcome == "success" else "failed")
+    assert closed == ["issue-terminal"]
+    assert bindings == [("issue-terminal", Path(record["checkout_path"]))]
+    budget_path = Path(config.developer.state_dir) / "budgets" / (sha256(payload["preview_id"].encode()).hexdigest() + ".json")
+    assert json.loads(budget_path.read_text()).get("aborted", False) is (outcome != "success")
+    assert client.post("/internal/developer/agent/run", headers=headers, json={
+        **payload, "input": "Do not replay", "session_id": "another-issue-terminal",
+    }).status_code == 409
+
+
+def test_native_issue_deadline_includes_approval_wait_and_restart(prepared_native_issue, monkeypatch) -> None:
+    config, client, payload, record, _ = prepared_native_issue
+    headers = _internal_headers(config)
+    response = client.post("/internal/developer/agent/run", headers=headers, json={
+        **payload, "input": "Implement", "session_id": "issue-expired",
+    })
+    assert response.status_code == 200, response.text
+    budget_path = Path(config.developer.state_dir) / "budgets" / (sha256(payload["preview_id"].encode()).hexdigest() + ".json")
+    before = json.loads(budget_path.read_text())
+    closed = []
+
+    class RecordingContainer(app_module.ContainerSessionBashAdapter):
+        def close_session(self, *, session_id):
+            closed.append(session_id)
+            return True
+
+    monkeypatch.setattr(app_module, "ContainerSessionBashAdapter", RecordingContainer)
+    config = replace(config, developer=replace(config.developer, execution_mode="container_session"))
+    monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: 1e30)
+    agent = _FakeDeveloperAgent()
+    restarted = _create_app_with_fake_agent(config, monkeypatch, agent)
+    response = restarted.post("/internal/developer/agent/resume", headers=headers, json={
+        "session_id": "issue-expired", "approved": True,
+        "request_id": response.json()["pending_approval_requests"][0]["request_id"],
+    })
+    assert response.status_code == 409 and "expired" in response.json()["detail"], response.text
+    assert agent.calls == []
+    assert closed == ["issue-expired"]
+    assert restarted.get(f"/internal/developer/delivery/{payload['preview_id']}", headers=headers).json()["delivery"]["state"] == "failed"
+    after = json.loads(budget_path.read_text())
+    assert after["aborted"] and after["deadline"] == before["deadline"]
+    assert (Path(record["checkout_path"]) / "README.md").read_text() == "Fixture baseline\n"
+
+
+def test_native_issue_duplicate_invocation_is_blocked_across_app_instances(prepared_native_issue, monkeypatch) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    config, _, payload, _, _ = prepared_native_issue
+    entered, release = Event(), Event()
+
+    class BlockingAgent(_FakeDeveloperAgent):
+        async def run(self, messages, *, session=None):
+            entered.set()
+            assert await asyncio.to_thread(release.wait, 5)
+            return await super().run(messages, session=session)
+
+    first_agent = BlockingAgent(require_approval=False)
+    first = _create_app_with_fake_agent(config, monkeypatch, first_agent)
+    second_agent = _FakeDeveloperAgent(require_approval=False)
+    second = _create_app_with_fake_agent(config, monkeypatch, second_agent)
+    headers = _internal_headers(config)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        running = executor.submit(first.post, "/internal/developer/agent/run", headers=headers, json={
+            **payload, "input": "Implement", "session_id": "issue-active",
+        })
+        try:
+            assert entered.wait(5)
+            duplicate = second.post("/internal/developer/agent/run", headers=headers, json={
+                **payload, "input": "Do not duplicate", "session_id": "issue-duplicate",
+            })
+            assert duplicate.status_code == 409, duplicate.text
+            assert second_agent.calls == []
+            assert second.get(f"/internal/developer/delivery/{payload['preview_id']}", headers=headers).json()["delivery"]["state"] == "implementing"
+        finally:
+            release.set()
+        result = running.result()
+        assert result.status_code == 200 and result.json()["delivery_state"] == "implemented", result.text
 
 
 def test_health_endpoint(test_config) -> None:

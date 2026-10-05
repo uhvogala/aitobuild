@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -10,6 +11,73 @@ from aitobuild.tools.bash import BashResult, ContainerSessionBashAdapter
 
 def _fake_success(command: list[str]) -> BashResult:
     return BashResult(command=" ".join(command), exit_code=0, stdout="ok", stderr="")
+
+
+def test_prepared_checkout_binding_skips_service_seed_and_requires_profile(monkeypatch, tmp_path: Path) -> None:
+    recorded = []
+
+    def fake_run_process(*, command, timeout_seconds):
+        recorded.append(command)
+        if command[:2] == ["docker", "ps"]:
+            return BashResult(command=" ".join(command), exit_code=0, stdout="", stderr="")
+        return _fake_success(command)
+
+    monkeypatch.setattr(bash_module, "_run_process", fake_run_process)
+    target = tmp_path / ".aitobuild/developer/deliveries/task/repo"
+    (target / ".git").mkdir(parents=True)
+    adapter = ContainerSessionBashAdapter(
+        workspace_root=tmp_path, image="prepared", container_workdir="/workspace",
+        container_name_prefix="test-target", bind_source_path="/host/service",
+    )
+    adapter.bind_session_workspace(session_id="target-task", workspace=target)
+    assert adapter.get_workspace_root("target-task") == target
+    with pytest.raises(PermissionError, match="profile"):
+        adapter.create_session(session_id="target-task")
+    adapter.create_session(session_id="target-task", read_only_workspace=True, deadline=10000000000.0)
+    command = next(command for command in recorded if command[:3] == ["docker", "run", "-d"])
+    assert command[command.index("-v") + 1] == "/host/service/.aitobuild/developer/deliveries/task/repo:/workspace:ro"
+    assert command[command.index("--network") + 1] == "none" and "--read-only" in command
+    assert not (tmp_path / ".aitobuild/workspaces/target-task").exists()
+    other = tmp_path / "other"
+    (other / ".git").mkdir(parents=True)
+    with pytest.raises(ValueError, match="another target"):
+        adapter.bind_session_workspace(session_id="target-task", workspace=other)
+
+
+@pytest.mark.parametrize("mismatch", [None, "source", "resources", "expiry"])
+def test_prepared_container_reuse_checks_the_exact_host_checkout(monkeypatch, tmp_path, mismatch) -> None:
+    target = tmp_path / ".aitobuild/developer/deliveries/task/repo"
+    (target / ".git").mkdir(parents=True)
+    adapter = ContainerSessionBashAdapter(
+        workspace_root=tmp_path, image="prepared", container_workdir="/workspace",
+        container_name_prefix="test-target", bind_source_path="/host/service",
+    )
+    adapter.bind_session_workspace(session_id="target-task", workspace=target)
+    container = f"{adapter._container_name_prefix}-target-task"
+    commands = []
+
+    def fake_run_process(*, command, timeout_seconds):
+        commands.append(command)
+        if command[:2] == ["docker", "ps"]:
+            return BashResult(command=" ".join(command), exit_code=0, stdout=container, stderr="")
+        if command[:3] == ["docker", "inspect", container]:
+            config = {"HostConfig": {"ReadonlyRootfs": True, "NetworkMode": "none", "CapDrop": ["ALL"],
+                                      "SecurityOpt": ["no-new-privileges:true"], "PidsLimit": 256,
+                                      "Memory": 0 if mismatch == "resources" else 1024 ** 3, "NanoCpus": 2_000_000_000},
+                      "Mounts": [{"Destination": "/workspace", "RW": False, "Type": "bind",
+                                  "Source": "/host/service" if mismatch == "source" else "/host/service/.aitobuild/developer/deliveries/task/repo"}],
+                      "Config": {"Cmd": ["python", "-c", "import sys,time; time.sleep(max(0, float(sys.argv[1])-time.time()))",
+                                         "10000000100.0" if mismatch == "expiry" else "10000000000.0"]}}
+            return BashResult(command=" ".join(command), exit_code=0, stdout=json.dumps(config), stderr="")
+        return _fake_success(command)
+
+    monkeypatch.setattr(bash_module, "_run_process", fake_run_process)
+    if mismatch is not None:
+        with pytest.raises(PermissionError, match="profile"):
+            adapter.create_session(session_id="target-task", read_only_workspace=True, deadline=10000000000.0)
+    else:
+        assert adapter.create_session(session_id="target-task", read_only_workspace=True, deadline=10000000000.0) == ("target-task", container)
+    assert not any(command[:3] == ["docker", "run", "-d"] for command in commands)
 
 
 def test_parallel_container_starts_share_one_creation(monkeypatch, tmp_path: Path) -> None:

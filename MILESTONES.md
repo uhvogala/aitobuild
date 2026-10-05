@@ -42,7 +42,7 @@ execute task code against the aitobuild service checkout.
 | Architect/meetings | Metadata scan and GroupChatBuilder construction | Execution and review integration missing |
 | Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current local gates: **266 tests pass**; Ruff and mypy pass. Both original patch-repair
+Current local gates: **325 tests pass** with real Docker probes enabled; Ruff and mypy pass. Both original patch-repair
 failures are fixed, with ambiguous matching still rejected. Live tool evaluations
 check artifact correctness, tool coverage, context guards and zero unexpected
 errors; provider failures/timeouts are visible failures, not waived successes.
@@ -147,10 +147,33 @@ and restart return one pristine prepared checkout; interrupted/modified/expired
 preparation fails closed instead of replaying side effects. Timeout cleanup,
 failure artifacts and configuration/auth regressions pass. This is host Git
 metadata preparation from trusted local seeds, not target code execution or a
-hardened hostile-repository sandbox. Native issue execution and all publication
-operations remain blocked/unimplemented.
+hardened hostile-repository sandbox. All publication operations remain blocked/unimplemented.
 
-Local verification: `uv run pytest` (266 tests), `uv run ruff check .`, and
+Native implementation slice (2026-10-05): approved native issue runs now bind the
+prepared checkout directly to file tools and constrained offline Docker commands.
+One durable session owns the delivery; a local task lock spans model invocation.
+Saved approvals and edits survive restart without reseeding or resetting the
+deadline/reservations. Interruptions, failures, rejection and expiry block replay,
+abort the budget and retain artifacts; terminal containers are cleaned up.
+Native completion persists `implemented`, not verified/publishable. Real SDK
+approval replay, exact target identity, concurrent app instances and terminal
+outcomes have regressions. An opt-in actual Docker probe passes two offline
+target tests and removes its container/temporary volume.
+
+Independent verification slice (2026-10-05): preparation pins operator-configured
+commands; the authenticated verify endpoint accepts only preview identity. A fresh
+constrained Docker session runs the plan against the completed target using the
+original budget/deadline. Durable evidence records confirmed integer exit codes,
+bounded output, timestamps, cleanup and checkout fingerprint. Reserved-path,
+mutation, expiry, concurrent invocation, interrupted recovery and malformed
+evidence guards pass. Verified duplicate requests recheck integrity without
+re-execution. Actual Docker probes demonstrate verified exit 0 and terminal exit 5
+failure despite the Developer's own tests passing, with artifacts and cleanup.
+`verified` is command-plan evidence, not publication approval. GitHub publication
+remains pending; M2 is not accepted end to end.
+
+Local verification: `AITOBUILD_RUN_DELIVERY_DOCKER_TEST=1 uv run pytest` (325 tests;
+ordinary gate 323 passed/two skipped), `uv run ruff check .`, and
 `uv run mypy src`; mock copied-fixture simulation has `succeeded=true`, actual
 command exit 0 and the generated artifact. No hosted CI or new live-model/GitHub
 trial was run for this slice. The designated live repository remains inactive;
@@ -221,7 +244,7 @@ Exit criteria:
 1. Maintain the green exact-text edit and legacy patch regressions; validate broader live editing tasks without weakening unique-match rejection.
 2. Maintain the green hosted M0 baseline and run CI for new slices.
 3. Preserve the constrained approved-task Grok/Kimi acceptance; never use the framework repository as a target.
-4. Connect constrained native implementation and post-change verification to prepared target checkouts, then add least-privilege verified commit/draft-PR publication with durable dedupe.
+4. Add least-privilege approved commit/draft-PR publication with durable dedupe; recheck independent verification and the exact target snapshot before side effects.
 5. Start staged supervised trials in the designated test repository when a concrete slice is ready, with approved scope and applicable safeguards; do not wait for full M2 delivery.
 
 Update this snapshot when a milestone's exit checks have actually run. Record

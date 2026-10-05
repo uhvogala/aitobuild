@@ -5,8 +5,10 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 import json
+import os
 from typing import Any
 import subprocess
+from uuid import uuid4
 
 import pytest
 
@@ -14,6 +16,7 @@ from aitobuild.developer_isolation import developer_task_bundle_from_payload
 from aitobuild.developer_execution import DeveloperExecutionEngine, PlannedFileWrite
 from aitobuild.developer_delivery import DeveloperDeliveryWorker, LocalRepositorySource
 import aitobuild.developer_delivery as delivery_module
+from aitobuild.tools.bash import ContainerSessionBashAdapter
 from aitobuild.developer_preview import DeveloperPreviewRegistry
 from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import EventOrigin, EventType, make_internal_event
@@ -449,6 +452,412 @@ def test_interrupted_preparation_fails_closed_after_restart(approved_delivery, t
     assert final_budget["deadline"] == initial_budget["deadline"]
     assert restarted.prepare(preview_id) == failed
     assert json.loads(budget_path.read_text()) == final_budget
+
+
+def test_native_delivery_continues_approved_edits_without_reseeding_or_reset(approved_delivery, tmp_path) -> None:
+    registry, worker, preview_id, source, _ = approved_delivery
+    record = worker.prepare(preview_id)
+    bundle = developer_task_bundle_from_payload(record.bundle_payload)
+    budget_path = next((tmp_path / "state/budgets").glob("*.json"))
+    before = json.loads(budget_path.read_text())
+    with worker.implementation_lock(preview_id):
+        worker.begin_implementation(preview_id, bundle=bundle, session_id="issue-native", resume=False)
+        (Path(record.checkout_path) / "README.md").write_text("Approved edit\n")
+        worker.finish_implementation(preview_id, session_id="issue-native", pending=True)
+    restarted = DeveloperDeliveryWorker(
+        preview_registry=registry, state_dir=tmp_path / "state", service_root=Path.cwd(),
+        repository_sources=(LocalRepositorySource("fixture/widgets", 101, source),),
+    )
+    with pytest.raises(ValueError, match="another native session"):
+        restarted.begin_implementation(preview_id, bundle=bundle, session_id="other-session", resume=True)
+    with restarted.implementation_lock(preview_id):
+        resumed = restarted.begin_implementation(preview_id, bundle=bundle, session_id="issue-native", resume=True)
+        assert resumed.state == "implementing"
+        assert (Path(record.checkout_path) / "README.md").read_text() == "Approved edit\n"
+        restarted.finish_implementation(preview_id, session_id="issue-native")
+    assert restarted.get(preview_id).state == "implemented"
+    assert restarted.prepare(preview_id).state == "implemented"
+    assert json.loads(budget_path.read_text()) == before
+    with pytest.raises(ValueError, match="automatic replay"):
+        restarted.begin_implementation(preview_id, bundle=bundle, session_id="issue-native", resume=False)
+
+
+def test_interrupted_native_delivery_aborts_and_preserves_artifacts(approved_delivery, tmp_path) -> None:
+    registry, worker, preview_id, source, _ = approved_delivery
+    record = worker.prepare(preview_id)
+    bundle = developer_task_bundle_from_payload(record.bundle_payload)
+    worker.begin_implementation(preview_id, bundle=bundle, session_id="interrupted", resume=False)
+    artifact = Path(record.checkout_path) / "README.md"
+    artifact.write_text("Retain partial implementation\n")
+    budget_path = next((tmp_path / "state/budgets").glob("*.json"))
+    before = json.loads(budget_path.read_text())
+    restarted = DeveloperDeliveryWorker(
+        preview_registry=registry, state_dir=tmp_path / "state", service_root=Path.cwd(),
+        repository_sources=(LocalRepositorySource("fixture/widgets", 101, source),),
+    )
+    with pytest.raises(ValueError, match="Interrupted"):
+        restarted.begin_implementation(preview_id, bundle=bundle, session_id="interrupted", resume=False)
+    assert restarted.get(preview_id).state == "failed"
+    after = json.loads(budget_path.read_text())
+    assert after["aborted"] and after["deadline"] == before["deadline"]
+    assert artifact.read_text() == "Retain partial implementation\n"
+    assert restarted.prepare(preview_id).state == "failed"
+
+
+def test_native_delivery_lock_blocks_concurrent_worker(approved_delivery) -> None:
+    from filelock import Timeout
+
+    _, worker, preview_id, _, _ = approved_delivery
+    worker.prepare(preview_id)
+    with worker.implementation_lock(preview_id):
+        with pytest.raises(Timeout):
+            with worker.implementation_lock(preview_id):
+                pytest.fail("Duplicate native invocation acquired the task lock")
+    assert worker.get(preview_id).state == "prepared"
+
+
+@pytest.fixture
+def implemented_delivery(approved_delivery, tmp_path):
+    from aitobuild.developer_isolation import DeveloperTaskBudget
+
+    registry, _, preview_id, source, _ = approved_delivery
+    worker = DeveloperDeliveryWorker(
+        preview_registry=registry, state_dir=tmp_path / "state", service_root=Path.cwd(),
+        repository_sources=(LocalRepositorySource("fixture/widgets", 101, source, ("python -m pytest -q",)),),
+    )
+    record = worker.prepare(preview_id)
+    bundle = developer_task_bundle_from_payload(record.bundle_payload)
+    budget_path = next((tmp_path / "state/budgets").glob("*.json"))
+    budget = DeveloperTaskBudget(path=budget_path, bundle=bundle, create=False)
+    with worker.implementation_lock(preview_id):
+        worker.begin_implementation(preview_id, bundle=bundle, session_id="verification-developer", resume=False)
+        budget.reserve_paths(("src/probe.py",))
+        target = Path(record.checkout_path) / "src/probe.py"
+        target.parent.mkdir()
+        target.write_text("def probe():\n    return True\n")
+        worker.finish_implementation(preview_id, session_id="verification-developer")
+    return worker, preview_id, budget_path, source
+
+
+@pytest.fixture
+def verification_adapter(tmp_path):
+    class RecordingAdapter(ContainerSessionBashAdapter):
+        def __init__(self):
+            super().__init__(workspace_root=tmp_path, image="prepared", container_workdir="/workspace", container_name_prefix="verify-test")
+            self.created = []
+            self.closed = []
+
+        def create_session(self, *, session_id=None, read_only_workspace=False, deadline=None):
+            self.created.append((session_id, read_only_workspace, deadline))
+            return session_id, "test-verifier"
+
+        def close_session(self, *, session_id):
+            self.closed.append(session_id)
+            return True
+
+    return RecordingAdapter()
+
+
+def test_verification_records_real_exit_evidence_and_dedupes_restart(implemented_delivery, verification_adapter, monkeypatch, tmp_path) -> None:
+    worker, preview_id, budget_path, source = implemented_delivery
+    before = json.loads(budget_path.read_text())
+    calls = []
+
+    def shell_reply(adapter, session_id, request):
+        calls.append(request)
+        return {"ok": True, "status": "exited", "exit_code": 0, "output": "2 passed", "next_cursor": 8}
+
+    monkeypatch.setattr(delivery_module, "shell_request", shell_reply)
+    record = worker.verify(preview_id, adapter=verification_adapter)
+    assert record.state == "verified", record.error
+    assert record.verification_commands == ["python -m pytest -q"]
+    evidence = record.verification
+    assert evidence["session_id"] != record.session_id
+    assert evidence["commands"][0]["exit_code"] == 0
+    assert evidence["cleanup_succeeded"]
+    assert (Path(record.checkout_path).parent / evidence["commands"][0]["output_path"]).read_text() == "2 passed"
+    assert verification_adapter.created[0][1] is True
+    assert verification_adapter.created[0][2] == pytest.approx(before["deadline"], abs=1)
+    assert verification_adapter.closed == [evidence["session_id"]]
+    restarted = DeveloperDeliveryWorker(
+        preview_registry=DeveloperPreviewRegistry(), state_dir=tmp_path / "state", service_root=Path.cwd(),
+        repository_sources=(LocalRepositorySource("fixture/widgets", 101, source, ("python -m pytest -q",)),),
+    )
+    assert restarted.verify(preview_id, adapter=verification_adapter) == record
+    assert len(calls) == 1 and len(verification_adapter.created) == 1
+    assert json.loads(budget_path.read_text()) == before
+
+
+@pytest.mark.parametrize("exit_code", [1, 124, None, False, "0"])
+def test_verification_failure_aborts_budget_and_cannot_replay(implemented_delivery, verification_adapter, monkeypatch, exit_code) -> None:
+    worker, preview_id, budget_path, _ = implemented_delivery
+    before = json.loads(budget_path.read_text())
+    calls = []
+
+    def shell_reply(*arguments):
+        calls.append(arguments)
+        return {"ok": True, "status": "exited", "exit_code": exit_code, "output": "failed tests"}
+
+    monkeypatch.setattr(delivery_module, "shell_request", shell_reply)
+    failed = worker.verify(preview_id, adapter=verification_adapter)
+    assert failed.state == "failed" and failed.error
+    assert failed.verification["commands"][0]["exit_code"] == exit_code
+    assert verification_adapter.closed == [failed.verification["session_id"]]
+    after = json.loads(budget_path.read_text())
+    assert after["aborted"] and after["deadline"] == before["deadline"]
+    assert after["reserved_paths"] == before["reserved_paths"]
+    assert worker.verify(preview_id, adapter=verification_adapter) == failed
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("mutation", ["before", "during", "after"])
+def test_verification_blocks_unreserved_and_mutated_checkout(implemented_delivery, verification_adapter, monkeypatch, mutation) -> None:
+    worker, preview_id, budget_path, _ = implemented_delivery
+    record = worker.get(preview_id)
+    target = Path(record.checkout_path) / "src/probe.py"
+    calls = []
+
+    def shell_reply(*arguments):
+        calls.append(arguments)
+        if mutation == "during":
+            target.write_text("Changed while verifying\n")
+        return {"ok": True, "status": "exited", "exit_code": 0, "output": "passed"}
+
+    monkeypatch.setattr(delivery_module, "shell_request", shell_reply)
+    if mutation == "before":
+        (target.parent / "unreserved.py").write_text("Unexpected change\n")
+    record = worker.verify(preview_id, adapter=verification_adapter)
+    if mutation == "after":
+        assert record.state == "verified"
+        target.write_text("Changed after verifying\n")
+        record = worker.verify(preview_id, adapter=verification_adapter)
+    assert record.state == "failed" and record.error
+    assert json.loads(budget_path.read_text())["aborted"]
+    assert len(calls) == (0 if mutation == "before" else 1)
+
+
+def test_verification_cleanup_failure_blocks_success(implemented_delivery, verification_adapter, monkeypatch) -> None:
+    worker, preview_id, budget_path, _ = implemented_delivery
+    monkeypatch.setattr(delivery_module, "shell_request", lambda *arguments: {"ok": True, "status": "exited", "exit_code": 0})
+    monkeypatch.setattr(verification_adapter, "close_session", lambda **arguments: False)
+    record = worker.verify(preview_id, adapter=verification_adapter)
+    assert record.state == "failed" and "cleanup" in record.error
+    assert json.loads(budget_path.read_text())["aborted"]
+
+
+@pytest.mark.parametrize("status", [None, "failed"])
+def test_verification_requires_confirmed_exit_even_with_zero_code(implemented_delivery, verification_adapter, monkeypatch, status) -> None:
+    worker, preview_id, budget_path, _ = implemented_delivery
+    monkeypatch.setattr(delivery_module, "shell_request", lambda *arguments: {
+        "ok": True, "status": status, "exit_code": 0, "output": "not confirmed",
+    })
+    record = worker.verify(preview_id, adapter=verification_adapter)
+    assert record.state == "failed" and "confirm process exit" in record.error
+    assert record.verification["commands"][0]["exit_code"] == 0
+    assert json.loads(budget_path.read_text())["aborted"]
+
+
+def test_verification_timeout_preserves_command_log_and_deadline(implemented_delivery, verification_adapter, monkeypatch) -> None:
+    worker, preview_id, budget_path, _ = implemented_delivery
+    before = json.loads(budget_path.read_text())
+    clock = [0]
+
+    def shell_reply(*arguments):
+        clock[0] = 10000
+        return {"ok": True, "status": "running", "shell_id": "job", "output": "partial output", "next_cursor": 14}
+
+    monkeypatch.setattr(delivery_module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(delivery_module, "shell_request", shell_reply)
+    record = worker.verify(preview_id, adapter=verification_adapter)
+    assert record.state == "failed" and "deadline" in record.error
+    result = record.verification["commands"][0]
+    assert result["exit_code"] is None
+    assert (Path(record.checkout_path).parent / result["output_path"]).read_text() == "partial output"
+    assert json.loads(budget_path.read_text())["deadline"] == before["deadline"]
+    assert verification_adapter.closed
+
+
+def test_verification_interruption_aborts_without_reset(implemented_delivery, verification_adapter, monkeypatch) -> None:
+    worker, preview_id, budget_path, _ = implemented_delivery
+
+    def crash(*arguments):
+        raise KeyboardInterrupt("verification interrupted")
+
+    monkeypatch.setattr(delivery_module, "shell_request", crash)
+    with pytest.raises(KeyboardInterrupt):
+        worker.verify(preview_id, adapter=verification_adapter)
+    assert worker.get(preview_id).state == "failed"
+    assert json.loads(budget_path.read_text())["aborted"]
+    assert verification_adapter.closed
+
+
+def test_verification_requires_implementation_and_a_pinned_plan(approved_delivery, verification_adapter) -> None:
+    registry, worker, preview_id, _, _ = approved_delivery
+    record = worker.prepare(preview_id)
+    with pytest.raises(ValueError, match="completed native implementation"):
+        worker.verify(preview_id, adapter=verification_adapter)
+    bundle = developer_task_bundle_from_payload(registry.get(preview_id).bundle_payload)
+    worker.begin_implementation(preview_id, bundle=bundle, session_id="no-plan-native", resume=False)
+    worker.finish_implementation(preview_id, session_id="no-plan-native")
+    with pytest.raises(ValueError, match="No verification plan"):
+        worker.verify(preview_id, adapter=verification_adapter)
+    assert verification_adapter.created == []
+    assert worker.get(preview_id).verification_commands == record.verification_commands == []
+
+
+@pytest.mark.parametrize("change", ["plan", "source"])
+def test_verification_cannot_replace_the_pinned_target_or_plan(implemented_delivery, verification_adapter, tmp_path, change) -> None:
+    worker, preview_id, budget_path, source = implemented_delivery
+    before = json.loads(budget_path.read_text())
+    changed = DeveloperDeliveryWorker(
+        preview_registry=DeveloperPreviewRegistry(), state_dir=tmp_path / "state", service_root=Path.cwd(),
+        repository_sources=(LocalRepositorySource("fixture/widgets", 101, tmp_path / "other" if change == "source" else source,
+                                                  ("true",) if change == "plan" else ("python -m pytest -q",)),),
+    )
+    with pytest.raises(ValueError, match="target/plan differs"):
+        changed.verify(preview_id, adapter=verification_adapter)
+    assert worker.get(preview_id).state == "implemented"
+    assert json.loads(budget_path.read_text()) == before
+    assert verification_adapter.created == []
+
+
+def test_verification_expiry_aborts_the_original_budget(implemented_delivery, verification_adapter, monkeypatch) -> None:
+    worker, preview_id, budget_path, _ = implemented_delivery
+    before = json.loads(budget_path.read_text())
+    monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: 1e30)
+    record = worker.verify(preview_id, adapter=verification_adapter)
+    assert record.state == "failed" and "expired" in record.error
+    after = json.loads(budget_path.read_text())
+    assert after["deadline"] == before["deadline"] and after["aborted"]
+    assert verification_adapter.created == []
+
+
+def test_verification_restart_aborts_interrupted_run_and_closes_its_session(implemented_delivery, verification_adapter) -> None:
+    from dataclasses import replace
+
+    worker, preview_id, budget_path, _ = implemented_delivery
+    record = worker.get(preview_id)
+    directory = Path(record.checkout_path).parent
+    worker._save(directory, replace(record, state="verifying", verification={
+        "session_id": "verify-interrupted", "commands": [], "checkout_digest": "0" * 64,
+        "started_at": datetime.now(tz=UTC).isoformat(), "cleanup_succeeded": False,
+    }))
+    failed = worker.verify(preview_id, adapter=verification_adapter)
+    assert failed.state == "failed" and "Interrupted" in failed.error
+    assert json.loads(budget_path.read_text())["aborted"]
+    assert verification_adapter.created == [] and verification_adapter.closed == ["verify-interrupted"]
+    assert worker.verify(preview_id, adapter=verification_adapter) == failed
+
+
+def test_verification_live_status_and_concurrent_rejection(implemented_delivery, verification_adapter, monkeypatch) -> None:
+    from threading import Event
+    from filelock import Timeout
+
+    worker, preview_id, _, _ = implemented_delivery
+    entered, release = Event(), Event()
+
+    def shell_reply(*arguments):
+        entered.set()
+        assert release.wait(5)
+        return {"ok": True, "status": "exited", "exit_code": 0, "output": "passed"}
+
+    monkeypatch.setattr(delivery_module, "shell_request", shell_reply)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        running = executor.submit(worker.verify, preview_id, adapter=verification_adapter)
+        try:
+            assert entered.wait(5)
+            assert worker.get(preview_id).state == "verifying"
+            with pytest.raises(Timeout):
+                worker.verify(preview_id, adapter=verification_adapter)
+            assert worker.get(preview_id).state == "verifying"
+        finally:
+            release.set()
+        assert running.result().state == "verified"
+
+
+@pytest.mark.parametrize("field,value", [("checkout_digest", "not-a-digest"), ("cleanup_succeeded", False),
+                                        ("commands", []), ("session_id", "verification-developer"),
+                                        ("started_at", None), ("completed_at", 123)])
+def test_verification_corrupt_persisted_evidence_is_rejected(implemented_delivery, verification_adapter, monkeypatch, field, value) -> None:
+    worker, preview_id, _, _ = implemented_delivery
+    monkeypatch.setattr(delivery_module, "shell_request", lambda *arguments: {"ok": True, "status": "exited", "exit_code": 0})
+    record = worker.verify(preview_id, adapter=verification_adapter)
+    path = Path(record.checkout_path).parent / "state.json"
+    state = json.loads(path.read_text())
+    state["record"]["verification"][field] = value
+    path.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="verification"):
+        worker.get(preview_id)
+
+
+@pytest.mark.skipif(os.environ.get("AITOBUILD_RUN_DELIVERY_DOCKER_TEST") != "1", reason="Opt-in prepared-image Docker check")
+@pytest.mark.parametrize("verification_succeeds", [True, False])
+def test_prepared_target_native_tools_execute_in_constrained_docker(approved_delivery, verification_succeeds) -> None:
+    from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
+    from aitobuild.developer_isolation import DeveloperTaskBudget
+    from aitobuild.tools import MockBashAdapter, MockFilesystemAdapter
+    from aitobuild.tools.bash import ContainerSessionBashAdapter
+
+    registry, _, preview_id, source, _ = approved_delivery
+    identity = "delivery-probe-" + uuid4().hex[:12]
+    state = Path.cwd() / "sim/.run-artifacts" / identity
+    verification_command = "PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider" + ("" if verification_succeeds else " -k no_such_test")
+    worker = DeveloperDeliveryWorker(
+        preview_registry=registry, state_dir=state, service_root=Path.cwd(),
+        repository_sources=(LocalRepositorySource("fixture/widgets", 101, source, (verification_command,)),),
+    )
+    record = worker.prepare(preview_id)
+    assert record.state == "prepared", record.error
+    bundle = developer_task_bundle_from_payload(record.bundle_payload)
+    budget_path = next((state / "budgets").glob("*.json"))
+    budget = DeveloperTaskBudget(path=budget_path, bundle=bundle, create=False)
+    initial_budget = json.loads(budget_path.read_text())
+    adapter = ContainerSessionBashAdapter(
+        workspace_root=Path.cwd(), image="aitobuild-developer:local", container_workdir="/workspace",
+        container_name_prefix=identity, data_volume_name=identity,
+    )
+    adapter.bind_session_workspace(session_id=identity, workspace=Path(record.checkout_path))
+    tools = {tool.name: tool for tool in build_role_tools(context=DeveloperToolContext(
+        bash_adapter=MockBashAdapter(), filesystem_adapter=MockFilesystemAdapter(),
+        workspace_root=Path.cwd(), require_human_approval_for_repo_writes=True,
+        container_session_adapter=adapter, bound_session_id=identity, isolation_policy=bundle.policy,
+        task_budget=budget, prepared_workspace=Path(record.checkout_path),
+    ))["developer"]}
+    try:
+        with worker.implementation_lock(preview_id):
+            worker.begin_implementation(preview_id, bundle=bundle, session_id=identity, resume=False)
+            tools["developer_write_file"]("src/widgets.py", "def validate_name(name):\n    if not name:\n        raise ValueError('Empty name')\n    return name\n", approved=True)
+            tools["developer_write_file"]("tests/test_widgets.py", "import sys\nfrom pathlib import Path\nimport pytest\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\nfrom widgets import validate_name\n\ndef test_empty():\n    with pytest.raises(ValueError):\n        validate_name('')\n\ndef test_existing():\n    assert validate_name('Known') == 'Known'\n", approved=True)
+            result = tools["developer_run_command"]("PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider")
+            assert result["exit_code"] == 0, result
+            container = adapter.get_container_name(session_id=identity)
+            inspected = subprocess.run(["docker", "inspect", container], check=True, capture_output=True, text=True)
+            config = json.loads(inspected.stdout)[0]
+            assert config["HostConfig"]["ReadonlyRootfs"] and config["HostConfig"]["NetworkMode"] == "none"
+            repo = next(mount for mount in config["Mounts"] if mount["Destination"] == "/workspace")
+            assert not repo["RW"] and repo["Source"].endswith(str(Path(record.checkout_path).relative_to(Path.cwd())))
+            worker.finish_implementation(preview_id, session_id=identity)
+            print(json.dumps({"artifact_dir": str(state), "command": result["command"], "exit_code": result["exit_code"],
+                              "output": result["stdout"], "delivery_state": worker.get(preview_id).state}))
+        assert adapter.close_session(session_id=identity)
+        verified = worker.verify(preview_id, adapter=adapter)
+        assert verified.state == ("verified" if verification_succeeds else "failed"), verified.error
+        evidence = verified.verification
+        assert evidence["session_id"] != identity
+        assert evidence["commands"][0]["exit_code"] == (0 if verification_succeeds else 5)
+        assert evidence["cleanup_succeeded"]
+        assert adapter.list_session_ids() == ()
+        print(json.dumps({"artifact_dir": str(state), "verification": evidence, "delivery_state": verified.state}))
+    finally:
+        adapter.close_session(session_id=identity)
+        assert identity not in adapter.list_session_ids()
+        subprocess.run(["docker", "volume", "rm", identity], check=True, capture_output=True)
+    final_budget = json.loads(budget_path.read_text())
+    assert final_budget["deadline"] == initial_budget["deadline"]
+    assert final_budget["reserved_paths"] == ["src/widgets.py", "tests/test_widgets.py"]
+    assert final_budget.get("aborted", False) is (not verification_succeeds)
+    assert (source / "README.md").read_text() == "Fixture baseline\n"
+    assert not (source / "src").exists()
 
 
 def test_concurrent_preparation_creates_one_checkout(approved_delivery, tmp_path) -> None:

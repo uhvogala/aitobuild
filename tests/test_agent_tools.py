@@ -38,6 +38,30 @@ def test_build_role_tools_includes_developer_toolset(tmp_path: Path) -> None:
     assert {"developer_find_files", "developer_search_files"} <= names
 
 
+def test_native_file_tools_edit_the_prepared_checkout_not_a_service_copy(tmp_path: Path) -> None:
+    service = tmp_path / "service"
+    service.mkdir()
+    target = tmp_path / "prepared"
+    (target / "src").mkdir(parents=True)
+    (target / "src/example.py").write_text("before")
+    bundle = build_developer_task_bundle(
+        task_id="target-task", objective="Edit target", acceptance_criteria=["Target changed"],
+        constraints=[], context_files=[],
+    )
+    context = DeveloperToolContext(
+        bash_adapter=MockBashAdapter(), filesystem_adapter=MockFilesystemAdapter(),
+        workspace_root=service, require_human_approval_for_repo_writes=True,
+        bound_session_id="target-session", prepared_workspace=target, isolation_policy=bundle.policy,
+        task_budget=DeveloperTaskBudget(path=tmp_path / "budget.json", bundle=bundle),
+    )
+    tools = build_role_tools(context=context)["developer"]
+    tools[3]("src/example.py", "before", "after", approved=True)
+    assert (target / "src/example.py").read_text() == "after"
+    assert not (service / ".aitobuild/workspaces").exists()
+    with pytest.raises(ValueError, match="approved task"):
+        build_role_tools(context=replace(context, task_budget=None))
+
+
 def test_budgeted_writes_restore_counts_and_reject_before_side_effects(tmp_path: Path) -> None:
     policy = replace(default_developer_isolation_policy(), max_file_changes=1)
     bundle = build_developer_task_bundle(

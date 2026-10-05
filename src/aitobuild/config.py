@@ -44,6 +44,7 @@ class RepositorySourceConfig:
     repository: str
     repository_id: int
     path: str
+    verification_commands: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -112,7 +113,8 @@ def _parse_repository_sources(raw: str) -> tuple[RepositorySourceConfig, ...]:
         raise ValueError("AITOBUILD_DEVELOPER_REPOSITORY_SOURCES must be a JSON array")
     sources: list[RepositorySourceConfig] = []
     for item in items:
-        if not isinstance(item, dict) or set(item) != {"repository", "repository_id", "path"}:
+        if (not isinstance(item, dict) or not {"repository", "repository_id", "path"} <= set(item)
+            or set(item) - {"repository", "repository_id", "path", "verification_commands"}):
             raise ValueError("Repository sources require repository, repository_id and path")
         repository, repository_id, path = item["repository"], item["repository_id"], item["path"]
         if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", repository):
@@ -123,7 +125,12 @@ def _parse_repository_sources(raw: str) -> tuple[RepositorySourceConfig, ...]:
             raise ValueError("Repository source path must be an absolute local path")
         if any(source.repository == repository.lower() or source.repository_id == repository_id for source in sources):
             raise ValueError("Repository source names and IDs must be unique")
-        sources.append(RepositorySourceConfig(repository.lower(), repository_id, path))
+        commands = item.get("verification_commands", [])
+        if (not isinstance(commands, list) or len(commands) > 16
+            or not all(isinstance(command, str) and command.strip() and "\x00" not in command
+                   and len(command.encode("utf-8")) <= 8192 for command in commands)):
+            raise ValueError("verification_commands must contain at most 16 nonempty command strings of at most 8192 bytes")
+        sources.append(RepositorySourceConfig(repository.lower(), repository_id, path, tuple(commands)))
     return tuple(sources)
 
 

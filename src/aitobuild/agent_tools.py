@@ -49,6 +49,7 @@ class DeveloperToolContext:
     use_legacy_patch_tool: bool = False
     isolation_policy: DeveloperIsolationPolicy | None = None
     task_budget: DeveloperTaskBudget | None = None
+    prepared_workspace: Path | None = None
 
 
 def build_role_tools(*, context: DeveloperToolContext) -> dict[str, tuple[ToolFunc, ...]]:
@@ -58,6 +59,8 @@ def build_role_tools(*, context: DeveloperToolContext) -> dict[str, tuple[ToolFu
 
 
 def build_developer_tools(*, context: DeveloperToolContext) -> tuple[ToolFunc, ...]:
+    if context.prepared_workspace is not None and (context.bound_session_id is None or context.task_budget is None):
+        raise ValueError("Prepared workspace tools require an approved task and bound session")
     if context.enable_mcp_adapters and context.mcp_tool_adapter is None:
         raise RuntimeError("MCP adapters enabled but no MCP tool adapter was provided")
 
@@ -128,6 +131,8 @@ def build_developer_tools(*, context: DeveloperToolContext) -> tuple[ToolFunc, .
         return active_session_id
 
     def _workspace_root_for_session(session_id: str | None) -> Path:
+        if context.prepared_workspace is not None:
+            return context.prepared_workspace
         if context.container_session_adapter is not None and session_id:
             return context.container_session_adapter.get_workspace_root(session_id)
         if context.bound_session_id is not None and session_id:

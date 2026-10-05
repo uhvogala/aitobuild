@@ -26,8 +26,24 @@ The local checkout-preparation API has a separate disposable-Git-fixture probe:
 becomes one pinned private checkout/local task branch, then survives restart;
 failure records are retained without automatic replay. See the
 [checkout preparation setup](../README.md#prepare-an-approved-target-checkout)
-for the server-side source allowlist and operator endpoints. This is not model
-implementation, post-change verification or GitHub publication.
+for the server-side source allowlist and operator endpoints.
+
+Prepared-target native implementation has SDK approval/restart regressions with
+mocked model transport: `uv run pytest tests/test_app.py -k native_issue -v`.
+The real offline Docker tool probe is opt-in and requires the existing prepared
+`aitobuild-developer:local` image:
+
+```bash
+AITOBUILD_RUN_DELIVERY_DOCKER_TEST=1 uv run pytest tests/test_dispatcher.py::test_prepared_target_native_tools_execute_in_constrained_docker -v -s
+```
+
+It creates a disposable target and retained state under `sim/.run-artifacts`,
+edits target source/tests, then independently runs pinned commands in a fresh
+constrained session. Both cases first pass Developer tests; one independently
+passes (verified), the other exits 5 (failed). They check read-only/offline mounts,
+preserved budgets, retained evidence and container/temporary-volume cleanup.
+It does not call a live model or GitHub. Publication remains pending;
+`implemented` is not verified, and `verified` is not publication approval.
 
 - .env.simulation: runnable default environment values.
 - .env.simulation.example: starter template for local overrides.
