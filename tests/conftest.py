@@ -8,10 +8,12 @@ import pytest
 from aitobuild.config import (
     AppConfig,
     DeveloperConfig,
+    GitHubConfig,
     PolicyConfig,
     RuntimeConfig,
     SchedulerConfig,
     SecurityConfig,
+    WebSearchConfig,
 )
 
 
@@ -83,4 +85,6 @@ def test_config(tmp_path: Path) -> AppConfig:
             mcp_filesystem_write_tool_name="write_file",
             state_dir=str(tmp_path / "developer-state"),
         ),
+        github=GitHubConfig(adapter="mock", default_repository="uhvogala/aitobuild_example"),
+        web_search=WebSearchConfig(adapter="mock"),
     )

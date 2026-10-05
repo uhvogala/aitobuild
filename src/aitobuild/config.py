@@ -34,6 +34,17 @@ class PolicyConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class GitHubConfig:
+    adapter: str = "mock"
+    default_repository: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class WebSearchConfig:
+    adapter: str = "mock"
+
+
+@dataclass(slots=True, frozen=True)
 class SecurityConfig:
     require_internal_auth: bool
     internal_api_token: str | None
@@ -77,6 +88,8 @@ class AppConfig:
     policy: PolicyConfig
     security: SecurityConfig
     developer: DeveloperConfig
+    github: GitHubConfig
+    web_search: WebSearchConfig
 
 
 DEFAULT_SCAN_CRON = "0 8 * * *"
@@ -159,6 +172,19 @@ def load_config() -> AppConfig:
             getenv("AITOBUILD_REQUIRE_APPROVAL_FOR_REPO_WRITES"),
             default=True,
         )
+    )
+
+    github_default_repository = getenv("AITOBUILD_GITHUB_DEFAULT_REPOSITORY")
+    github = GitHubConfig(
+        adapter=(getenv("AITOBUILD_GITHUB_ADAPTER", "mock") or "mock").strip() or "mock",
+        default_repository=(
+            github_default_repository.strip()
+            if github_default_repository and github_default_repository.strip()
+            else None
+        ),
+    )
+    web_search = WebSearchConfig(
+        adapter=(getenv("AITOBUILD_WEB_SEARCH_ADAPTER", "mock") or "mock").strip() or "mock",
     )
 
     require_internal_auth = _as_bool(getenv("AITOBUILD_REQUIRE_INTERNAL_AUTH"), default=True)
@@ -248,6 +274,11 @@ def load_config() -> AppConfig:
             "AITOBUILD_SCHEDULER_QUIET_START_HOUR and AITOBUILD_SCHEDULER_QUIET_END_HOUR must both be set"
         )
 
+    if github.adapter not in {"mock", "gh", "gh_cli", "cli"}:
+        raise ValueError("AITOBUILD_GITHUB_ADAPTER must be mock or gh_cli")
+    if web_search.adapter not in {"mock", "duckduckgo", "ddg", "live"}:
+        raise ValueError("AITOBUILD_WEB_SEARCH_ADAPTER must be mock or duckduckgo")
+
     return AppConfig(
         webhook_secret=webhook_secret,
         runtime=runtime,
@@ -255,4 +286,6 @@ def load_config() -> AppConfig:
         policy=policy,
         security=security,
         developer=developer,
+        github=github,
+        web_search=web_search,
     )

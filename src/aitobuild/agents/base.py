@@ -21,7 +21,10 @@ def default_agent_specs() -> tuple[AgentSpec, ...]:
             name="PM Agent",
             instructions=(
                 "You are the PM agent. Convert epics into scoped issues with acceptance criteria. "
-                "Do not write implementation code."
+                "Use pm_draft_plan, pm_set_acceptance_criteria, and pm_request_plan_approval before "
+                "pm_create_issue. Issue writes require human approval. Prefer web_search for cheap "
+                "lookups; use browser tools only when explicitly available. Do not write "
+                "implementation code."
             ),
         ),
         AgentSpec(
@@ -29,7 +32,11 @@ def default_agent_specs() -> tuple[AgentSpec, ...]:
             name="Architect Agent",
             instructions=(
                 "You are the Architect agent. Review architecture and code quality and suggest "
-                "improvements. Do not author implementation code."
+                "improvements. Use architect_read_file/find/search and stricter architect_run_command "
+                "for analysis, architect_get_pr and architect_submit_pr_review for reviews, and "
+                "architect_memory_query/record for durable decisions. Prefer web_search for cheap "
+                "lookups; use browser tools only when explicitly available. Do not author "
+                "implementation code or merge policy bypasses."
             ),
         ),
         AgentSpec(

@@ -150,6 +150,25 @@ def default_developer_isolation_policy() -> DeveloperIsolationPolicy:
     )
 
 
+
+def default_architect_isolation_policy() -> DeveloperIsolationPolicy:
+    """Stricter read-only analysis policy for Architect workspace tools."""
+    return DeveloperIsolationPolicy(
+        allowed_tools=(IsolationTool.GITHUB, IsolationTool.FILESYSTEM, IsolationTool.BASH),
+        allowed_paths=("src/", "tests/", "README.md", "pyproject.toml", "PLAN.md", "MILESTONES.md"),
+        blocked_paths=(".git/", ".venv/", "secrets/", ".aitobuild/"),
+        allowed_command_prefixes=(
+            "uv", "python", "python3", "pytest", "ruff", "mypy", "coverage",
+            "npm", "npx", "pnpm", "yarn", "eslint", "prettier", "tsc",
+            "git", "rg", "grep", "find", "ls", "tree", "cat", "head", "tail", "wc",
+            "sort", "uniq", "cut", "tr", "sed", "awk", "diff", "file", "stat", "du",
+            "which", "printf", "echo", "pwd", "true", "false", "test", "[", "timeout", "env",
+        ),
+        max_file_changes=0,
+        max_runtime_minutes=30,
+    )
+
+
 def build_developer_task_bundle(
     *,
     task_id: str,

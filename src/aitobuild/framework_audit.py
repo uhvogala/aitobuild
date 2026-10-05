@@ -66,6 +66,26 @@ def phase1_capability_matrix() -> tuple[CapabilityAuditItem, ...]:
             decision=CapabilityDecision.CUSTOM_BUILD,
             rationale="Project-specific seed-once checkouts and per-Developer Docker volume subdirectories.",
         ),
+        CapabilityAuditItem(
+            capability="architect_pr_review_tools",
+            decision=CapabilityDecision.CUSTOM_BUILD,
+            rationale="Architect GitHub PR get/review tools with role-gated PR_REVIEW policy.",
+        ),
+        CapabilityAuditItem(
+            capability="architect_memory",
+            decision=CapabilityDecision.CUSTOM_BUILD,
+            rationale="Architect-specific durable JSONL memory query/record tools separate from Developer FileMemoryProvider.",
+        ),
+        CapabilityAuditItem(
+            capability="pm_backlog_tools",
+            decision=CapabilityDecision.CUSTOM_BUILD,
+            rationale="PM backlog/issue tools with human-approval gates over mock or gh CLI GitHub adapters.",
+        ),
+        CapabilityAuditItem(
+            capability="shared_web_search",
+            decision=CapabilityDecision.CUSTOM_BUILD,
+            rationale="Cheap shared web_search snippet adapter; browser MCP remains optional and heavier.",
+        ),
     )
 
 

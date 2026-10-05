@@ -32,7 +32,9 @@ from aitobuild.events import make_internal_event, normalize_github_webhook, pars
 from aitobuild.proactive import ArchitectScanRunner
 from aitobuild.runtime import bootstrap_runtime, kickoff_meeting_bootstrap
 from aitobuild.scheduler import scheduler_from_config
+from aitobuild.pm_tools import PlanDraftStore
 from aitobuild.tools import (
+    ArchitectMemoryStore,
     BashAdapter,
     ContainerSessionBashAdapter,
     FilesystemAdapter,
@@ -42,6 +44,8 @@ from aitobuild.tools import (
     MockBashAdapter,
     MockFilesystemAdapter,
     SubprocessBashAdapter,
+    build_github_adapter,
+    build_web_search_adapter,
 )
 from aitobuild.triggers import InMemoryDedupeStore, TriggerEngine
 from aitobuild.tools.mcp_adapters import build_browser_tool
@@ -296,6 +300,13 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             workspace_root=workspace_root,
         )
 
+    github_adapter = build_github_adapter(
+        mode=app_config.github.adapter,
+        default_repository=app_config.github.default_repository,
+    )
+    web_search_adapter = build_web_search_adapter(mode=app_config.web_search.adapter)
+    architect_memory = ArchitectMemoryStore(developer_state_dir / "architect_memory.jsonl")
+    plan_draft_store = PlanDraftStore()
     developer_tool_context = DeveloperToolContext(
             bash_adapter=bash_adapter,
             filesystem_adapter=filesystem_adapter,
@@ -306,6 +317,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             enable_mcp_adapters=app_config.developer.enable_mcp_adapters,
             enable_agent_live_logs=app_config.developer.enable_agent_live_logs,
             output_dir=developer_state_dir / "outputs",
+            github_adapter=github_adapter,
+            meeting_registry=dispatcher.meeting_registry,
+            web_search_adapter=web_search_adapter,
+            architect_memory=architect_memory,
+            plan_draft_store=plan_draft_store,
+            default_repository=app_config.github.default_repository,
         )
     role_tools = build_role_tools(context=developer_tool_context)
 
