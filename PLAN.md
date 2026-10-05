@@ -117,7 +117,7 @@ These items describe code and local test coverage, not production certification.
 - Session-bound Developer tool wiring using native per-run tools for files, terminal jobs, processes and optional browser MCP.
 - MCP-backed Developer command/filesystem adapters with explicit fail-fast behavior (no local fallback in MCP mode).
 - Developer Agent diagnostics endpoint (`/internal/runtime/developer-agent`) for runtime readiness, tool inventory, and session support visibility.
-- Developer Agent run endpoint (`/internal/developer/agent/run`) with persistent native sessions/history/memory, same-session concurrency protection and in-call auto-approval replay. Manual HTTP approval replay remains pending.
+- Developer Agent run/resume endpoints with persistent native sessions/history/memory and saved approval requests. Manual approve/reject restores the exact saved operation after restart, rejects duplicate/cross-session decisions, and blocks task replacement while pending. Same-session protection remains process-local; interrupted continuations fail closed rather than automatically replaying side effects.
 - Capability audit matrix for reuse/wrap/custom decisions.
 - Host certificate export and pre-feature dev container trust bootstrap, with generated certificates excluded from Git.
 - Local subprocess simulation repaired to use uv-installed pytest, with explicit success reporting and nonzero failure exits.
@@ -125,8 +125,8 @@ These items describe code and local test coverage, not production certification.
 - Targeted edits use structured exact-text replacement with unique-match rejection; legacy free-form patch parsing is opt-in. Focused same-task Grok/Kimi editing probes pass with zero tool errors and independent pytest verification.
 - Ripgrep-backed file discovery and literal/regex content search use allowed private roots, ignore-aware glob filtering and bounded pagination. Focused Grok/Kimi search probes pass with zero errors and unchanged fixture source.
 - Preview command defaults cover common interpreters, package managers, Git, builds, shell scripts and filesystem utilities. Explicit task-specific policies remain supported; token-prefix matching is not a security boundary and does not govern native-agent command tools.
-- GitHub Actions baseline workflow uses Python 3.14, locked uv dependencies and ripgrep for pytest/Ruff/mypy plus the mock fixture simulation, retaining available reports on failure. Local workflow commands and syntax are verified; the first hosted run remains pending.
-- Verification on 2026-10-05: 180 tests pass, `ruff` and `mypy src` pass. CI enforcement and a zero-unexpected-error full live evaluation remain milestone acceptance requirements.
+- GitHub Actions baseline workflow uses Python 3.14, locked uv dependencies and ripgrep for pytest/Ruff/mypy plus the mock fixture simulation, retaining available reports on failure. Hosted run 37308813245 passed at `c6edaef` with 180 tests and a retained simulation report, accepting M0.
+- Verification on 2026-10-05: 193 local tests pass, `ruff` and `mypy src` pass. Native approval tests include a mocked model transport; consistent policy enforcement and a zero-unexpected-error full live evaluation remain M1 requirements.
 
 ### Current Limits
 
@@ -135,9 +135,9 @@ These items describe code and local test coverage, not production certification.
 - GitHub branch/commit/PR operations are not implemented; the adapter records mock issue proposals.
 - Meetings construct workflows without executing them, and proactive scans interpret supplied metadata rather than inspecting a repository.
 - Scheduler ticks require an external caller; application state is in memory and does not survive restart.
-- The native agent endpoint is separate from preview-based execution and lacks equivalent bundle command enforcement and durable approval/session replay.
+- The native agent endpoint is separate from preview-based execution and lacks equivalent bundle command enforcement, distributed coordination and durable task/approval audit records.
 - Docker bind mounts and command-prefix checks do not establish a hardened sandbox; total task budgets remain declarative.
-- The CI workflow has not yet been verified on GitHub. The capability matrix tests check entries, not duplicate implementations.
+- The capability matrix tests check entries, not duplicate implementations; the successful CI baseline does not prove no-duplicate capability enforcement.
 - Docker, MCP, and live-model paths need fresh integration evidence before being considered operational.
 
 ### Pending Items
@@ -155,7 +155,7 @@ These items describe code and local test coverage, not production certification.
 
 ### Next Execution Order
 
-1. Verify the first hosted baseline CI run (M0).
+1. Preserve the accepted CI-enforced baseline (M0).
 2. Validate one constrained, live Developer task in a disposable repository (M1).
 3. Connect an approved GitHub issue to a worker, task branch, verified commit, and draft PR (M2).
 4. Add Architect review and bounded, executed blocker-resolution meetings (M3).
@@ -163,3 +163,8 @@ These items describe code and local test coverage, not production certification.
 6. Introduce PM backlog planning for a supervised product-team pilot (M5).
 
 See [MILESTONES.md](MILESTONES.md) for dependencies, acceptance criteria, and the immediate work queue.
+
+The designated future live GitHub target is
+[uhvogala/aitobuild_example](https://github.com/uhvogala/aitobuild_example).
+Do not activate it until M1 controls and the M2 delivery path are ready for an
+explicitly approved trial; current simulations remain copied-fixture only.

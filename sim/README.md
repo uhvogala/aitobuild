@@ -8,6 +8,14 @@ It does not validate issue-to-PR delivery or complete product-team automation.
 The subprocess baseline was verified on 2026-10-05; Docker, live-model, and MCP
 paths remain integration checks in [MILESTONES.md](../MILESTONES.md).
 
+## Future Real Repository
+
+[uhvogala/aitobuild_example](https://github.com/uhvogala/aitobuild_example) is
+reserved for future supervised live GitHub trials. This harness does not target
+or modify it. Keep using copied fixtures until the M1 controls and M2 delivery
+path are ready for an explicitly approved trial, then review its repository
+layout/toolchain and use scoped branches, draft PRs and least-privilege access.
+
 ## What it includes
 
 - .env.simulation: runnable default environment values.
@@ -111,8 +119,8 @@ to avoid root-owned files in bind-mounted repos. Set it to `false` only when roo
 ## Live Model
 
 This makes billable model calls and can execute tools. Use only a disposable
-fixture and trusted prompts; native command policies and manual approval/session
-continuation still have gaps. `--auto-approve-agent-tools` grants tool approvals
+fixture and trusted prompts; native task-policy parity and distributed recovery
+still have gaps. `--auto-approve-agent-tools` grants tool approvals
 without per-call human review and is not suitable for untrusted tasks.
 
 1. Use [sim/.env.simulation.live.example](.env.simulation.live.example) for an ignored local env file; set a Foundry project or Azure `/openai/v1` endpoint, deployment name, and prepared image. Disable mock fallback.
@@ -162,7 +170,12 @@ the model is asking to call the `developer_start_session` tool before continuing
 If `approval_round_limit_reached=true`, increase `--agent-max-approval-rounds`
 for a fresh run and inspect the retained sandbox before retrying. The current
 HTTP API persists native sessions, history and memory by `session_id`, and prevents
-concurrent agent runs with the same identity. Manual HTTP approval replay is still pending.
+concurrent agent runs with the same identity. Pending approvals persist locally
+and can be approved or rejected through `/internal/developer/agent/resume` with
+`session_id`, `request_id` and a strict boolean `approved`, using the internal
+token. It restores the saved operation, not caller-supplied arguments. Consumed
+decisions cannot be replayed even after failure; distributed recovery remains
+pending. The harness's automatic approval flag still bypasses per-call review.
 An incomplete agent run now makes the simulation fail rather than appearing successful.
 
 Require `runtime_mode=foundry` or `openai`, `ready_for_run=true`,

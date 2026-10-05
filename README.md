@@ -22,12 +22,12 @@ human retaining merge authority.
 | --- | --- | --- |
 | Ingress and routing | Signed webhooks, authenticated internal APIs, deduplication, deterministic dispatch | Durable task worker and repository-specific task extraction |
 | Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
-| Native model runtime | Foundry binding and Developer agent invocation | Reproducible live-model acceptance run and resumable approvals |
+| Native model runtime | Foundry binding, Developer invocation and persisted manual approvals | Reproducible live-model acceptance run and consistent task-policy enforcement |
 | GitHub integration | Webhook input and mock issue-proposal adapter | Real issue, branch, commit, and PR operations |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
-| Operations | Tick endpoint, policy checks, capability-audit tests, CI baseline workflow | Background tick driver, durable state, verified hosted CI run, tracing, stronger isolation |
+| Operations | Tick endpoint, policy checks, capability-audit tests, verified hosted CI baseline | Background tick driver, durable state, tracing, stronger isolation |
 
-Verified locally: **180 tests pass**, Ruff and mypy pass. The original patch-repair
+Verified locally: **193 tests pass**, Ruff and mypy pass. The original patch-repair
 failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
 sessions, managed terminals/processes, native memory/restart and browser tools
 have live integration evidence. Real Grok and Kimi evaluations retain strict
@@ -37,7 +37,14 @@ The [CI workflow](.github/workflows/ci.yml) is configured for pushes, pull reque
 and manual runs on Python 3.14 with locked uv dependencies and ripgrep. It runs
 pytest, Ruff, mypy and the mock fixture simulation, retaining an available
 simulation report for 14 days even on failure. It needs no Azure credentials.
-The first hosted run remains unverified; M0 is not yet accepted.
+The [hosted baseline](https://github.com/uhvogala/aitobuild/actions/runs/37308813245)
+passed at `c6edaef`, with 180 tests and the simulation artifact retained. M0 is
+accepted; the additional M1 approval tests are verified locally.
+
+Future real-repo trials will use
+[uhvogala/aitobuild_example](https://github.com/uhvogala/aitobuild_example), once
+the required M1 controls and M2 delivery path are ready for an approved trial.
+It is not configured or used by current simulations; keep using copied fixtures.
 
 See [agent tool evaluation](sim/README.md#agent-tool-evaluation) for model comparison,
 token/cache usage and artifact checks. Large tool outputs are saved to private
@@ -207,6 +214,7 @@ API key from an ignored local environment file. Runtime mode is `openai`.
 - `POST /internal/developer/run`
 - `GET /internal/runtime/developer-agent`
 - `POST /internal/developer/agent/run`
+- `POST /internal/developer/agent/resume`
 - `GET /internal/escalations`
 
 All `/internal/*` endpoints require `X-Internal-Token` by default. Webhooks
@@ -327,9 +335,19 @@ Developer Agent runtime flow:
 	- `max_approval_rounds` (optional int, default `3`)
 3. Inspect `pending_approval_requests`, `completed`, and
 	`approval_round_limit_reached`. The endpoint can replay approvals within one
-	call when `auto_approve_tools=true`, but does not accept manual approval
-	responses. Native sessions/history persist by identity, but manual continuation
-	of a pending approval is not implemented.
+	call when `auto_approve_tools=true`. For human review, leave it false and
+	submit a decision to `POST /internal/developer/agent/resume`:
+
+```json
+{"session_id": "<returned-session-id>", "request_id": "<pending-request-id>", "approved": true}
+```
+
+Use `approved=false` to reject. Both endpoints require `X-Internal-Token` when
+internal authentication is enabled. The server restores the saved native request;
+the caller cannot replace its arguments or supply a new task input. New prompts
+are blocked while approval is pending. Unknown, cross-session or consumed
+request IDs are rejected. Approval resumes the same native session without
+replaying the original task, including after a server restart.
 
 `/internal/developer/agent/run` uses the runtime-bound native Developer Agent when available; in descriptor/mock mode it fails with `409` by design.
 
@@ -372,8 +390,13 @@ Deduplication, previews, meetings, escalation events, and session mappings are
 in memory. Restarting the server loses that application state, and reload mode
 can invalidate previews. Docker containers may outlive the API process; use
 `/internal/developer/session/stop-all` to clean up containers discovered under
-the configured name prefix. Native agent session persistence and recovery are
-not implemented.
+the configured name prefix. Native AgentSession, history, memory and pending
+approvals persist in the configured local state directory; these are trusted
+plaintext files, not a distributed worker store. Decisions are consumed before
+continuation executes: a failed or interrupted continuation cannot be blindly
+replayed. Inspect its private checkout/history before deciding how to recover.
+The active-session guard is process-local; cross-worker coordination and durable
+task/approval auditing remain pending.
 
 ## Repository hygiene
 

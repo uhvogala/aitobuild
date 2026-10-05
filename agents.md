@@ -21,6 +21,7 @@ Project orientation:
 - [PLAN.md](PLAN.md): target architecture and implementation snapshot
 - [MILESTONES.md](MILESTONES.md): ordered delivery milestones and acceptance criteria
 - [sim/README.md](sim/README.md): disposable-fixture simulation and optional live-model checks
+- Future live GitHub target: https://github.com/uhvogala/aitobuild_example. Documented only; do not activate it until the required M1 controls and M2 delivery path are ready for an explicitly approved trial.
 
 Current foundation scope:
 - FastAPI ingress with webhook and internal trigger endpoints
@@ -37,7 +38,7 @@ Important limits:
 - GitHub writes are mock-only; meetings are constructed, not executed.
 - Scheduler ticks require a caller; application state is in memory.
 - Native agent commands and preview-run policies are not equivalent. Do not describe prototype checks or Docker bind mounts as hardened isolation.
-- PM and Architect tool wiring, durable approvals, and session recovery remain pending.
+- Native pending approvals and sessions persist locally; distributed coordination, durable task/approval auditing, and PM/Architect tool wiring remain pending.
 
 Key endpoints:
 - GET /health
@@ -47,6 +48,7 @@ Key endpoints:
 - POST /internal/developer/run
 - GET /internal/runtime/developer-agent
 - POST /internal/developer/agent/run
+- POST /internal/developer/agent/resume
 - POST /internal/developer/session/start, /stop, and /stop-all
 
 Internal endpoints require `X-Internal-Token` by default. Normal startup requires
@@ -59,9 +61,10 @@ Quality gates (from repository root):
 
 The GitHub Actions baseline workflow uses Python 3.14 and `uv sync --locked`,
 installs ripgrep, runs these gates and the mock fixture simulation, and retains
-available reports on failure. Hosted verification remains pending.
+available reports on failure. Hosted run 37308813245 passed at `c6edaef` with
+180 tests and a retained simulation artifact; M0 is accepted.
 
-Verification snapshot (2026-10-05): 180 tests pass; Ruff and mypy pass.
+Verification snapshot (2026-10-05): 193 local tests pass; Ruff and mypy pass.
 Live Grok/Kimi tool evaluation remains stricter than tool coverage: require
 artifact correctness, completion, successful cleanup and zero unexpected errors.
 
@@ -71,6 +74,7 @@ Local workflow:
 	for copied-fixture execution; clear Foundry endpoint/API-key settings for a mock-only run.
 - Require `succeeded=true` and zero command exit codes; do not infer success from HTTP status alone.
 - Session-bound operations use private copied checkouts; unscoped subprocess runs use the API working directory.
+- Pending native approvals resume via `/internal/developer/agent/resume` with the session ID, saved request ID and boolean decision. Decisions are consumed before execution; failed/interrupted continuations are not blindly replayable. Approval tests cover the native SDK with a mocked model transport, not full live acceptance.
 - Use `uv run python -m sim.evaluate_tools --model <deployment>` for live tool evaluations.
 - Models use `developer_edit_file(path, old_text, new_text)` for exact unique-span edits. Legacy patch parsing is opt-in, not a model-facing default; do not repair ambiguous matches or bypass stale edits with whole-file writes.
 - Ripgrep is installed in both images. Use `developer_find_files` for glob discovery and `developer_search_files` for bounded literal/regex content search; prefer narrow paths/globs and reuse `next_offset` only when more results are needed.

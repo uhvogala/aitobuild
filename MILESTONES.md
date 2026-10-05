@@ -17,6 +17,16 @@ assumed API. MCP is an optional integration path, not a prerequisite for the MVP
 The first working-system milestone is **M2**, not merely a healthy API or a
 mock simulation. Full backlog autonomy is a later goal, not the current state.
 
+## Future Live Repository
+
+[uhvogala/aitobuild_example](https://github.com/uhvogala/aitobuild_example) is the
+designated future repository for supervised real GitHub trials. It is not a
+current execution target. Continue using disposable copied fixtures until the
+M1 controls and M2 delivery path are ready for an explicitly approved trial.
+Before activation, review its layout and toolchain, grant least-privilege access,
+and use scoped task branches and draft PRs with human merge authority. Do not
+execute task code against the aitobuild service checkout.
+
 ## Where We Left Off
 
 | Area | Evidence | Status |
@@ -29,9 +39,9 @@ mock simulation. Full backlog autonomy is a later goal, not the current state.
 | MCP shell/filesystem | Native stdio transport adapter, configurable names | Optional; compatibility validation pending |
 | GitHub output | Mock issue-proposal adapter only | Branch/commit/PR delivery missing |
 | Architect/meetings | Metadata scan and GroupChatBuilder construction | Execution and review integration missing |
-| Operations | Manual tick API, capability matrix tests and CI baseline workflow | Hosted CI run unverified; durable worker/state and tracing missing |
+| Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current gates: **180 tests pass**; Ruff and mypy pass. Both original patch-repair
+Current local gates: **193 tests pass**; Ruff and mypy pass. Both original patch-repair
 failures are fixed, with ambiguous matching still rejected. Live tool evaluations
 check artifact correctness, tool coverage, context guards and zero unexpected
 errors; provider failures/timeouts are visible failures, not waived successes.
@@ -44,7 +54,7 @@ local pipeline, not GitHub delivery or production isolation.
 ## Restart Checklist
 
 1. Read this document, then use the [README quick start](README.md#quick-start).
-2. Run `uv sync --locked` and the three quality gates. Verify the first hosted CI run before accepting M0.
+2. Run `uv sync --locked` and the three quality gates. M0's hosted baseline is accepted; continue with M1.
 3. Clear inherited Foundry endpoint/API-key settings and run the [local simulation](sim/README.md#local-baseline).
 4. Require the preview/replay routes, `accepted=true`, zero command exit codes, `generated_file_exists=true`, and `succeeded=true` in the report.
 5. For API-only testing, configure both secrets, start Uvicorn on loopback, and check health plus authenticated Developer readiness. Mock readiness is expected to be false.
@@ -52,10 +62,13 @@ local pipeline, not GitHub delivery or production isolation.
 
 ## M0: Reproducible Baseline
 
-Status: **in progress**. Local tests and quality gates are green. The
-[CI workflow](.github/workflows/ci.yml) implements the locked Python 3.14 gates
-and mock fixture simulation with report retention; its first hosted run remains
-unverified. M1/M2 are not accepted on local evidence alone.
+Status: **accepted on 2026-10-05**. The
+[hosted baseline run](https://github.com/uhvogala/aitobuild/actions/runs/37308813245)
+passed at `c6edaef`, including 180 tests, Ruff, mypy and the mock fixture, and
+retained the `simulation-report` artifact. Certificate tests now generate their
+own test CA instead of relying on the runner's default trust store. The
+[CI workflow](.github/workflows/ci.yml) uses locked Python 3.14 dependencies.
+M1/M2 are not accepted by this baseline result.
 
 Deliverables:
 - Maintain the repaired patch behavior while preserving rejection of ambiguous or unsafe patches.
@@ -71,8 +84,11 @@ Exit criteria:
 ## M1: Constrained Live Developer Task
 
 Status: **partial implementation, not accepted**. Depends on M0. Prepared Docker,
-native model and optional browser paths have live evidence. Consistent policy
-enforcement, manual approval continuation and zero-error acceptance remain pending.
+native model and optional browser paths have live evidence. Manual approve/reject
+continuation now persists across restarts, with native SDK execution, rejection,
+duplicate, cross-session and failure/timeout regressions. Consistent task-policy
+enforcement and zero-error full live acceptance remain pending; local approval
+tests use a mocked model transport, not a fresh live-model certification.
 
 Deliverables:
 - Prepare a session image with its test toolchain and CA trust; validate bind paths and non-root ownership.

@@ -16,7 +16,7 @@ from time import perf_counter
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
-from agent_framework import AgentSession, FileSessionStore, FunctionInvocationContext, function_middleware
+from agent_framework import AgentSession, Content, FileSessionStore, FunctionInvocationContext, function_middleware
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 
 from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
@@ -94,7 +94,7 @@ def _serialize_user_input_request(request: Any) -> dict[str, Any]:
     function_call = getattr(request, "function_call", None)
     function_name = getattr(function_call, "name", None)
     function_args = getattr(function_call, "arguments", None)
-    request_id = getattr(request, "request_id", None)
+    request_id = getattr(request, "request_id", None) or getattr(request, "id", None)
 
     return {
         "request_id": request_id if isinstance(request_id, str) else None,
@@ -817,6 +817,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         payload: dict[str, Any],
         x_internal_token: str | None,
         tool_stack: AsyncExitStack,
+        *, resume: bool = False,
     ) -> dict[str, Any]:
         _assert_internal_auth(config=app_config, provided_token=x_internal_token)
 
@@ -835,15 +836,27 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             )
 
         input_raw = payload.get("input")
-        if not isinstance(input_raw, str) or not input_raw.strip():
+        if resume and "input" in payload:
+            raise HTTPException(status_code=400, detail="Approval continuation cannot supply a new input")
+        if not resume and (not isinstance(input_raw, str) or not input_raw.strip()):
             raise HTTPException(status_code=400, detail="input must be a non-empty string")
-        if len(input_raw.encode("utf-8")) > MAX_PROMPT_BYTES:
+        if isinstance(input_raw, str) and len(input_raw.encode("utf-8")) > MAX_PROMPT_BYTES:
             raise HTTPException(status_code=413, detail=(
                 f"input exceeds {MAX_PROMPT_BYTES} UTF-8 bytes; put large content in workspace files "
                 "and ask the Developer to read only the relevant section"
             ))
-        user_prompt = input_raw.strip()
+        user_prompt = input_raw.strip() if isinstance(input_raw, str) else ""
         prompt = user_prompt
+
+        request_id = payload.get("request_id")
+        approved = payload.get("approved")
+        if resume:
+            if not isinstance(request_id, str) or not request_id.strip():
+                raise HTTPException(status_code=400, detail="request_id must be a non-empty string")
+            if not isinstance(approved, bool):
+                raise HTTPException(status_code=400, detail="approved must be a boolean")
+            if "arguments" in payload or "function_name" in payload:
+                raise HTTPException(status_code=400, detail="Approval continuation cannot change the operation")
 
         auto_approve_tools = bool(payload.get("auto_approve_tools", False))
         max_approval_rounds_raw = payload.get("max_approval_rounds", 3)
@@ -904,6 +917,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         if session_id_raw is not None and not isinstance(session_id_raw, str):
             raise HTTPException(status_code=400, detail="session_id must be a string when provided")
         session_id = session_id_raw.strip() if isinstance(session_id_raw, str) else None
+        if resume and not session_id:
+            raise HTTPException(status_code=400, detail="Approval continuation requires session_id")
 
         create_session_requested = True
         if session_id:
@@ -926,6 +941,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             try:
                 if session_obj is None and session_id:
                     session_obj = await developer_session_store.get(session_id)
+                if resume and session_obj is None:
+                    raise HTTPException(status_code=404, detail="Developer session not found")
                 if session_obj is None:
                     session_obj, resolved_session_id = _create_agent_session(
                         developer_handle,
@@ -939,6 +956,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     "session.ready",
                     resolved_session_id=resolved_session_id,
                 )
+            except HTTPException:
+                raise
             except Exception as exc:
                 _emit_developer_agent_live("session.error", error=str(exc))
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -946,8 +965,21 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         scoped_tools: tuple[Any, ...] = build_role_tools(
             context=replace(developer_tool_context, bound_session_id=resolved_session_id)
         )["developer"]
-        if resolved_session_id is None:
+        if resolved_session_id is None or not isinstance(session_obj, AgentSession):
             raise HTTPException(status_code=409, detail="Developer run requires a session identity")
+        stored_approvals = session_obj.state.get("aitobuild_pending_approvals", [])
+        approval_request: Content | None = None
+        invocation_message: Any = prompt
+        if resume:
+            matches = [item for item in stored_approvals if item.get("id") == request_id]
+            if len(matches) != 1:
+                raise HTTPException(status_code=409, detail="Approval request is not pending in this session")
+            approval_request = Content.from_dict(matches[0])
+            invocation_message = _build_approval_replay_message(
+                approval_request.to_function_approval_response(approved=approved is True)
+            )
+        elif stored_approvals:
+            raise HTTPException(status_code=409, detail="Resolve pending approvals before submitting a new input")
         run_middleware.append(build_output_guard(developer_state_dir / "outputs" / resolved_session_id))
         if resolved_session_id in active_developer_runs:
             raise HTTPException(status_code=409, detail="This Developer session already has an active run")
@@ -967,6 +999,19 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             await tool_stack.enter_async_context(browser_tool)
             scoped_tools = (*scoped_tools, browser_tool)
 
+        if approval_request is not None:
+            session_obj.state["aitobuild_pending_approvals"] = [
+                item for item in stored_approvals if item.get("id") != request_id
+            ]
+            await developer_session_store.set(resolved_session_id, session_obj)
+
+        async def persist_result(response: Any) -> None:
+            if isinstance(session_obj, AgentSession):
+                session_obj.state["aitobuild_pending_approvals"] = [
+                    request.to_dict() for request in _extract_user_input_requests(response)
+                ]
+                await developer_session_store.set(resolved_session_id, session_obj)
+
         try:
             invoke_started = perf_counter()
             _emit_developer_agent_live(
@@ -979,7 +1024,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             result = await asyncio.wait_for(
                 _invoke_agent_run(
                     agent_handle=developer_handle,
-                    message=prompt,
+                    message=invocation_message,
                     session=session_obj,
                     tools=scoped_tools,
                     middleware=run_middleware,
@@ -988,8 +1033,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             )
             first_pending = _extract_user_input_requests(result)
             record_usage(result)
-            if isinstance(session_obj, AgentSession) and resolved_session_id:
-                await developer_session_store.set(resolved_session_id, session_obj)
+            await persist_result(result)
             _emit_developer_agent_live(
                 "invoke.end",
                 round=0,
@@ -1064,8 +1108,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 )
                 round_pending = _extract_user_input_requests(result)
                 record_usage(result)
-                if isinstance(session_obj, AgentSession) and resolved_session_id:
-                    await developer_session_store.set(resolved_session_id, session_obj)
+                await persist_result(result)
                 _emit_developer_agent_live(
                     "invoke.end",
                     round=approval_rounds,
@@ -1139,6 +1182,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         async with AsyncExitStack() as tool_stack:
             return await _run_developer_agent(payload, x_internal_token, tool_stack)
+
+    @app.post("/internal/developer/agent/resume")
+    async def resume_developer_agent(
+        payload: dict[str, Any],
+        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    ) -> dict[str, Any]:
+        async with AsyncExitStack() as tool_stack:
+            return await _run_developer_agent(payload, x_internal_token, tool_stack, resume=True)
 
     @app.get("/internal/escalations")
     def list_escalations(

@@ -5,10 +5,10 @@ import asyncio
 import hmac
 import json
 from hashlib import sha256
-from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
-from agent_framework import AgentSession, FileSessionStore
+from agent_framework import AgentSession, Content, FileSessionStore, Message
 from fastapi.testclient import TestClient
 import pytest
 
@@ -30,19 +30,15 @@ def _internal_headers(test_config) -> dict[str, str]:
 _FakeSession = AgentSession
 
 
-class _FakeApprovalRequest:
-    def __init__(self) -> None:
-        self.request_id = "req-1"
-        self.function_call = SimpleNamespace(
-            name="developer_run_command",
+def _fake_approval_request() -> Content:
+    request_id = uuid4().hex
+    return Content.from_function_approval_request(
+        request_id,
+        Content.from_function_call(
+            request_id, "developer_run_command", id=request_id,
             arguments={"command": "pytest --version"},
-        )
-
-    def to_function_approval_response(self, approved: bool) -> dict[str, Any]:
-        return {
-            "approved": approved,
-            "request_id": self.request_id,
-        }
+        ),
+    )
 
 
 class _FakeRunResult:
@@ -53,8 +49,9 @@ class _FakeRunResult:
 
 
 class _FakeDeveloperAgent:
-    def __init__(self) -> None:
+    def __init__(self, *, require_approval: bool = True) -> None:
         self.calls: list[tuple[Any, str | None]] = []
+        self.require_approval = require_approval
 
     def create_session(self, *, session_id: str | None = None) -> _FakeSession:
         return _FakeSession(session_id=session_id or "fake-session")
@@ -65,11 +62,16 @@ class _FakeDeveloperAgent:
             session.state["turn_count"] = session.state.get("turn_count", 0) + 1
 
         if not isinstance(messages, str):
-            return _FakeRunResult(text="command executed", user_input_requests=[], response_id="resp-2")
+            return _FakeRunResult(
+                text="command executed" if messages.contents[0].approved else "command rejected",
+                user_input_requests=[], response_id="resp-2",
+            )
+        if not self.require_approval:
+            return _FakeRunResult(text="done", user_input_requests=[])
 
         return _FakeRunResult(
             text="approval needed",
-            user_input_requests=[_FakeApprovalRequest()],
+            user_input_requests=[_fake_approval_request()],
             response_id="resp-1",
         )
 
@@ -575,13 +577,13 @@ def test_app_fails_fast_when_mcp_enabled_without_container_session(test_config) 
 
 
 def test_developer_agent_session_survives_app_restart(test_config, monkeypatch: pytest.MonkeyPatch) -> None:
-    first = _create_app_with_fake_agent(test_config, monkeypatch, _FakeDeveloperAgent())
+    first = _create_app_with_fake_agent(test_config, monkeypatch, _FakeDeveloperAgent(require_approval=False))
     response = first.post(
         "/internal/developer/agent/run", headers=_internal_headers(test_config),
         json={"input": "First turn", "session_id": "dev-one"},
     )
     assert response.status_code == 200, response.text
-    restarted = _create_app_with_fake_agent(test_config, monkeypatch, _FakeDeveloperAgent())
+    restarted = _create_app_with_fake_agent(test_config, monkeypatch, _FakeDeveloperAgent(require_approval=False))
     response = restarted.post(
         "/internal/developer/agent/run", headers=_internal_headers(test_config),
         json={"input": "Second turn", "session_id": "dev-one"},
@@ -590,6 +592,207 @@ def test_developer_agent_session_survives_app_restart(test_config, monkeypatch: 
     restored = asyncio.run(FileSessionStore(test_config.developer.state_dir + "/sessions").get("dev-one"))
     assert restored is not None
     assert restored.state["turn_count"] == 2
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_developer_agent_approval_resumes_after_restart(
+    test_config, monkeypatch: pytest.MonkeyPatch, approved: bool,
+) -> None:
+    first_agent = _FakeDeveloperAgent()
+    first = _create_app_with_fake_agent(test_config, monkeypatch, first_agent)
+    headers = _internal_headers(test_config)
+    pending = first.post(
+        "/internal/developer/agent/run", headers=headers,
+        json={"input": "Run tests", "session_id": "approval-task"},
+    ).json()
+    request = pending["pending_approval_requests"][0]
+    assert request["request_id"]
+    blocked = first.post(
+        "/internal/developer/agent/run", headers=headers,
+        json={"input": "Different task", "session_id": "approval-task"},
+    )
+    assert blocked.status_code == 409
+    assert len(first_agent.calls) == 1
+    resumed_agent = _FakeDeveloperAgent()
+    restarted = _create_app_with_fake_agent(test_config, monkeypatch, resumed_agent)
+    payload = {"session_id": "approval-task", "request_id": request["request_id"], "approved": approved}
+    response = restarted.post("/internal/developer/agent/resume", headers=headers, json=payload)
+    assert response.status_code == 200, response.text
+    assert response.json()["completed"] is True
+    assert response.json()["output_text"] == ("command executed" if approved else "command rejected")
+    assert len(resumed_agent.calls) == 1
+    message, session_id = resumed_agent.calls[0]
+    assert isinstance(message, Message)
+    assert session_id == "approval-task"
+    assert message.contents[0].type == "function_approval_response"
+    assert message.contents[0].approved is approved
+    assert message.contents[0].function_call.arguments == {"command": "pytest --version"}
+    replay = restarted.post("/internal/developer/agent/resume", headers=headers, json=payload)
+    assert replay.status_code == 409
+    assert len(resumed_agent.calls) == 1
+
+
+@pytest.mark.parametrize("changes,status", [
+    ({"session_id": "missing"}, 404),
+    ({"session_id": ""}, 400),
+    ({"request_id": "stale"}, 409),
+    ({"approved": "false"}, 400),
+    ({"input": "Replace the task"}, 400),
+    ({"arguments": {"command": "different"}}, 400),
+])
+def test_developer_agent_approval_rejects_invalid_decisions(
+    test_config, monkeypatch: pytest.MonkeyPatch, changes: dict[str, Any], status: int,
+) -> None:
+    agent = _FakeDeveloperAgent()
+    client = _create_app_with_fake_agent(test_config, monkeypatch, agent)
+    headers = _internal_headers(test_config)
+    pending = client.post(
+        "/internal/developer/agent/run", headers=headers,
+        json={"input": "Run tests", "session_id": "approval-task"},
+    ).json()
+    payload = {
+        "session_id": "approval-task", "request_id": pending["pending_approval_requests"][0]["request_id"],
+        "approved": True, **changes,
+    }
+    unauthorized = client.post("/internal/developer/agent/resume", json=payload)
+    assert unauthorized.status_code == 401
+    response = client.post("/internal/developer/agent/resume", headers=headers, json=payload)
+    assert response.status_code == status, response.text
+    assert len(agent.calls) == 1
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_native_developer_approval_executes_only_the_saved_operation(
+    test_config, monkeypatch: pytest.MonkeyPatch, tmp_path, approved: bool,
+) -> None:
+    import httpx
+    from agent_framework import Agent
+    from agent_framework.openai import OpenAIChatCompletionClient
+    from openai import AsyncOpenAI
+    from aitobuild.agents import default_agent_specs
+    from aitobuild.runtime import _build_role_agent_handles
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "src").mkdir()
+    written_file = tmp_path / ".aitobuild" / "workspaces" / "native-approval" / "src" / "approval-probe.txt"
+    requests: list[dict[str, Any]] = []
+
+    def model_reply(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        assert sum(message.get("content") == "ORIGINAL_TASK" for message in body["messages"]) == 1
+        if len(requests) == 1:
+            message = {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call-write", "type": "function", "function": {
+                    "name": "developer_write_file",
+                    "arguments": json.dumps({"path": "src/approval-probe.txt", "content": "APPROVED", "approved": True}),
+                },
+            }]}
+            finish = "tool_calls"
+        else:
+            assert sum(message["role"] == "tool" for message in body["messages"]) == 1
+            assert written_file.exists() is approved
+            message = {"role": "assistant", "content": "DONE"}
+            finish = "stop"
+        return httpx.Response(200, json={
+            "id": f"response-{len(requests)}", "object": "chat.completion", "created": 1,
+            "model": "test-model", "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+        })
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(model_reply))
+    openai_client = AsyncOpenAI(api_key="test-key", http_client=http_client)
+    model_client = OpenAIChatCompletionClient(model="test-model", async_client=openai_client)
+
+    def native_agent() -> Any:
+        return _build_role_agent_handles(
+            default_agent_specs(), client=model_client, agent_class=Agent, role_tools=None,
+            developer_state_dir=tmp_path / "developer-state",
+        )["developer"]
+
+    try:
+        headers = _internal_headers(test_config)
+        first = _create_app_with_fake_agent(test_config, monkeypatch, native_agent())
+        response = first.post(
+            "/internal/developer/agent/run", headers=headers,
+            json={"input": "ORIGINAL_TASK", "session_id": "native-approval"},
+        )
+        assert response.status_code == 200, response.text
+        pending = response.json()
+        assert pending["completed"] is False
+        assert written_file.exists() is False
+        restarted = _create_app_with_fake_agent(test_config, monkeypatch, native_agent())
+        payload = {
+            "session_id": "native-approval", "approved": approved, "include_tool_trace": True,
+            "request_id": pending["pending_approval_requests"][0]["request_id"],
+        }
+        resumed = restarted.post("/internal/developer/agent/resume", headers=headers, json=payload)
+        assert resumed.status_code == 200, resumed.text
+        assert resumed.json()["completed"] is True
+        assert len(resumed.json()["tool_trace"]) == (1 if approved else 0)
+        if approved:
+            assert written_file.read_text() == "APPROVED"
+        assert len(requests) == 2
+        duplicate = restarted.post("/internal/developer/agent/resume", headers=headers, json=payload)
+        assert duplicate.status_code == 409
+        assert len(requests) == 2
+    finally:
+        asyncio.run(openai_client.close())
+
+
+@pytest.mark.parametrize("error,status", [(RuntimeError("provider unavailable"), 500), (asyncio.TimeoutError(), 504)])
+def test_failed_developer_approval_cannot_be_replayed(
+    test_config, monkeypatch: pytest.MonkeyPatch, error: Exception, status: int,
+) -> None:
+    headers = _internal_headers(test_config)
+    first = _create_app_with_fake_agent(test_config, monkeypatch, _FakeDeveloperAgent())
+    pending = first.post(
+        "/internal/developer/agent/run", headers=headers,
+        json={"input": "Run tests", "session_id": "failed-approval"},
+    ).json()
+    payload = {
+        "session_id": "failed-approval", "approved": True,
+        "request_id": pending["pending_approval_requests"][0]["request_id"],
+    }
+
+    class FailingAgent(_FakeDeveloperAgent):
+        async def run(self, messages: Any, *, session: AgentSession | None = None) -> _FakeRunResult:
+            self.calls.append((messages, session.session_id if session else None))
+            raise error
+
+    failing_agent = FailingAgent()
+    restarted = _create_app_with_fake_agent(test_config, monkeypatch, failing_agent)
+    failed = restarted.post("/internal/developer/agent/resume", headers=headers, json=payload)
+    assert failed.status_code == status
+    assert len(failing_agent.calls) == 1
+    retry_agent = _FakeDeveloperAgent()
+    restarted_again = _create_app_with_fake_agent(test_config, monkeypatch, retry_agent)
+    replay = restarted_again.post("/internal/developer/agent/resume", headers=headers, json=payload)
+    assert replay.status_code == 409
+    assert retry_agent.calls == []
+
+
+def test_developer_approval_cannot_target_another_pending_session(
+    test_config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _FakeDeveloperAgent()
+    client = _create_app_with_fake_agent(test_config, monkeypatch, agent)
+    headers = _internal_headers(test_config)
+    first = client.post(
+        "/internal/developer/agent/run", headers=headers,
+        json={"input": "First task", "session_id": "first-task"},
+    ).json()
+    second = client.post(
+        "/internal/developer/agent/run", headers=headers,
+        json={"input": "Second task", "session_id": "second-task"},
+    ).json()
+    assert first["pending_approval_requests"][0]["request_id"] != second["pending_approval_requests"][0]["request_id"]
+    response = client.post(
+        "/internal/developer/agent/resume", headers=headers,
+        json={"session_id": "second-task", "approved": True,
+              "request_id": first["pending_approval_requests"][0]["request_id"]},
+    )
+    assert response.status_code == 409
+    assert len(agent.calls) == 2
 
 
 def test_app_fails_fast_when_browser_enabled_without_container_session(test_config) -> None:
