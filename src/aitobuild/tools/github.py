@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from hashlib import sha1, sha256
 import json
-from subprocess import CalledProcessError, run
+import re
+from subprocess import CalledProcessError, TimeoutExpired, run
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
@@ -117,6 +121,23 @@ class GitHubPullRequestReview:
         }
 
 
+
+@dataclass(slots=True, frozen=True)
+class GitHubBlobChange:
+    """One scoped file change published as a Git blob (bytes + mode + git blob SHA)."""
+
+    mode: Literal["100644", "100755"]
+    content: bytes
+    blob_sha: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "content_base64": base64.b64encode(self.content).decode("ascii"),
+            "blob_sha": self.blob_sha,
+        }
+
+
 class GitHubAdapter(Protocol):
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue: ...
 
@@ -188,6 +209,34 @@ class GitHubAdapter(Protocol):
         require_human_approval_for_repo_writes: bool,
     ) -> None: ...
 
+    def upsert_branch_commit(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        branch: str,
+        base_sha: str,
+        commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+    ) -> str: ...
+
+    def create_or_update_draft_pull_request(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        title: str,
+        body: str,
+        head_branch: str,
+        base_ref: str,
+        issue_number: int,
+        existing_pull_number: int | None = None,
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+    ) -> GitHubPullRequest: ...
+
 
 @dataclass
 class MockGitHubAdapter:
@@ -198,10 +247,12 @@ class MockGitHubAdapter:
     pull_requests: dict[str, dict[int, GitHubPullRequest]] = field(default_factory=dict)
     reviews: list[GitHubPullRequestReview] = field(default_factory=list)
     links: list[dict[str, Any]] = field(default_factory=list)
+    branch_commits: list[dict[str, Any]] = field(default_factory=list)
     allowed_repositories: frozenset[str] | None = None
     enforce_allowlist: bool = False
     _next_issue: int = 1
     _next_pr: int = 1
+    _branch_heads: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def _resolve_repository(self, repository: str) -> str:
         return assert_repository_allowed(
@@ -369,6 +420,121 @@ class MockGitHubAdapter:
         self.reviews.append(review)
         return review
 
+
+    def upsert_branch_commit(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        branch: str,
+        base_sha: str,
+        commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+    ) -> str:
+        assert_role_action_allowed(role, ActionClass.REPO_WRITE)
+        assert_repo_write_approval(
+            require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+            approved=approved,
+        )
+        repo = self._resolve_repository(repository)
+        _validate_publish_commit_inputs(
+            branch=branch, base_sha=base_sha, commit_message=commit_message, files=files
+        )
+        encoded_files = {
+            path: None if change is None else change.to_dict()
+            for path, change in sorted(files.items())
+        }
+        payload = {
+            "repository": repo,
+            "branch": branch.strip(),
+            "base_sha": base_sha.lower(),
+            "commit_message": commit_message.strip(),
+            "files": encoded_files,
+            "tree_fingerprint": _tree_fingerprint(files),
+        }
+        head_sha = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:40]
+        self.branch_commits.append({**payload, "head_sha": head_sha})
+        self._branch_heads.setdefault(repo, {})[branch.strip()] = head_sha
+        return head_sha
+
+    def create_or_update_draft_pull_request(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        title: str,
+        body: str,
+        head_branch: str,
+        base_ref: str,
+        issue_number: int,
+        existing_pull_number: int | None = None,
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+    ) -> GitHubPullRequest:
+        assert_role_action_allowed(role, ActionClass.REPO_WRITE)
+        assert_repo_write_approval(
+            require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+            approved=approved,
+        )
+        repo = self._resolve_repository(repository)
+        cleaned_title = title.strip()
+        cleaned_body = body.strip()
+        cleaned_head = head_branch.strip()
+        cleaned_base = base_ref.strip()
+        if not cleaned_title or not cleaned_body or not cleaned_head or not cleaned_base:
+            raise ValueError("draft PR title, body, head_branch, and base_ref must be non-empty")
+        if type(issue_number) is not int or issue_number <= 0:
+            raise ValueError("issue_number must be a positive integer")
+        if existing_pull_number is not None and (
+            type(existing_pull_number) is not int or existing_pull_number <= 0
+        ):
+            raise ValueError("existing_pull_number must be a positive integer when provided")
+        repo_prs = self.pull_requests.setdefault(repo, {})
+        if existing_pull_number is not None:
+            current = repo_prs.get(existing_pull_number)
+            if current is None:
+                raise ValueError(f"Pull request #{existing_pull_number} was not found")
+            if current.head_ref != cleaned_head:
+                raise ValueError(
+                    f"Pull request #{existing_pull_number} head ref does not match the delivery branch"
+                )
+            if not current.draft:
+                raise ValueError(
+                    f"Pull request #{existing_pull_number} is not a draft; refusing update"
+                )
+            updated = GitHubPullRequest(
+                number=existing_pull_number,
+                title=cleaned_title,
+                body=cleaned_body,
+                state=current.state,
+                head_ref=cleaned_head,
+                base_ref=cleaned_base,
+                draft=True,
+                html_url=current.html_url or f"https://example.test/{repo}/pull/{existing_pull_number}",
+                repository=repo,
+                changed_files=current.changed_files,
+            )
+            repo_prs[existing_pull_number] = updated
+            return updated
+        number = self._next_pr
+        self._next_pr += 1
+        created = GitHubPullRequest(
+            number=number,
+            title=cleaned_title,
+            body=cleaned_body,
+            state="open",
+            head_ref=cleaned_head,
+            base_ref=cleaned_base,
+            draft=True,
+            html_url=f"https://example.test/{repo}/pull/{number}",
+            repository=repo,
+            changed_files=(),
+        )
+        repo_prs[number] = created
+        return created
+
     def create_issue_proposal(
         self,
         *,
@@ -441,7 +607,10 @@ class GhCliGitHubAdapter:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=60,
             )
+        except TimeoutExpired as exc:
+            raise RuntimeError(f"gh api timed out for {method} {endpoint}") from exc
         except CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             raise RuntimeError(f"gh api failed for {method} {endpoint}: {detail}") from exc
@@ -615,6 +784,158 @@ class GhCliGitHubAdapter:
             html_url=str(raw.get("html_url")) if isinstance(raw, dict) and raw.get("html_url") else None,
         )
 
+
+    def upsert_branch_commit(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        branch: str,
+        base_sha: str,
+        commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+    ) -> str:
+        assert_role_action_allowed(role, ActionClass.REPO_WRITE)
+        assert_repo_write_approval(
+            require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+            approved=approved,
+        )
+        repo = self._resolve_repository(repository)
+        _validate_publish_commit_inputs(
+            branch=branch, base_sha=base_sha, commit_message=commit_message, files=files
+        )
+        base = self._api(f"repos/{repo}/git/commits/{base_sha.lower()}")
+        if not isinstance(base, dict) or not isinstance(base.get("tree"), dict):
+            raise RuntimeError("Unexpected GitHub base commit response")
+        base_tree = base["tree"].get("sha")
+        if not isinstance(base_tree, str) or not base_tree:
+            raise RuntimeError("Base commit is missing a tree SHA")
+        tree_entries: list[dict[str, Any]] = []
+        for path_name in sorted(files):
+            change = files[path_name]
+            if change is None:
+                tree_entries.append({"path": path_name, "mode": "100644", "type": "blob", "sha": None})
+                continue
+            blob = self._api(
+                f"repos/{repo}/git/blobs",
+                method="POST",
+                payload={
+                    "content": base64.b64encode(change.content).decode("ascii"),
+                    "encoding": "base64",
+                },
+            )
+            if not isinstance(blob, dict) or not isinstance(blob.get("sha"), str):
+                raise RuntimeError(f"Failed to create blob for {path_name}")
+            if blob["sha"] != change.blob_sha:
+                raise RuntimeError(
+                    f"GitHub blob SHA mismatch for {path_name}: "
+                    f"expected {change.blob_sha}, got {blob['sha']}"
+                )
+            tree_entries.append(
+                {"path": path_name, "mode": change.mode, "type": "blob", "sha": blob["sha"]}
+            )
+        tree = self._api(
+            f"repos/{repo}/git/trees",
+            method="POST",
+            payload={"base_tree": base_tree, "tree": tree_entries},
+        )
+        if not isinstance(tree, dict) or not isinstance(tree.get("sha"), str):
+            raise RuntimeError("Failed to create GitHub tree")
+        commit = self._api(
+            f"repos/{repo}/git/commits",
+            method="POST",
+            payload={
+                "message": commit_message.strip(),
+                "tree": tree["sha"],
+                "parents": [base_sha.lower()],
+            },
+        )
+        if not isinstance(commit, dict) or not isinstance(commit.get("sha"), str):
+            raise RuntimeError("Failed to create GitHub commit")
+        if not isinstance(commit.get("tree"), dict) or commit["tree"].get("sha") != tree["sha"]:
+            raise RuntimeError("Published commit tree SHA does not match the uploaded tree")
+        head_sha = commit["sha"]
+        try:
+            self._api(
+                f"repos/{repo}/git/refs",
+                method="POST",
+                payload={"ref": f"refs/heads/{branch.strip()}", "sha": head_sha},
+            )
+        except RuntimeError:
+            self._api(
+                f"repos/{repo}/git/refs/heads/{branch.strip()}",
+                method="PATCH",
+                payload={"sha": head_sha, "force": False},
+            )
+        return head_sha
+
+    def create_or_update_draft_pull_request(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        title: str,
+        body: str,
+        head_branch: str,
+        base_ref: str,
+        issue_number: int,
+        existing_pull_number: int | None = None,
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+    ) -> GitHubPullRequest:
+        assert_role_action_allowed(role, ActionClass.REPO_WRITE)
+        assert_repo_write_approval(
+            require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+            approved=approved,
+        )
+        repo = self._resolve_repository(repository)
+        cleaned_title = title.strip()
+        cleaned_body = body.strip()
+        cleaned_head = head_branch.strip()
+        cleaned_base = base_ref.strip()
+        if not cleaned_title or not cleaned_body or not cleaned_head or not cleaned_base:
+            raise ValueError("draft PR title, body, head_branch, and base_ref must be non-empty")
+        if type(issue_number) is not int or issue_number <= 0:
+            raise ValueError("issue_number must be a positive integer")
+        if existing_pull_number is not None and (
+            type(existing_pull_number) is not int or existing_pull_number <= 0
+        ):
+            raise ValueError("existing_pull_number must be a positive integer when provided")
+        if existing_pull_number is not None:
+            current = self.get_pull_request(repository=repo, pull_number=existing_pull_number)
+            if current.head_ref != cleaned_head:
+                raise ValueError(
+                    f"Pull request #{existing_pull_number} head ref does not match the delivery branch"
+                )
+            if not current.draft:
+                raise ValueError(
+                    f"Pull request #{existing_pull_number} is not a draft; refusing update"
+                )
+            raw = self._api(
+                f"repos/{repo}/pulls/{existing_pull_number}",
+                method="PATCH",
+                payload={
+                    "title": cleaned_title,
+                    "body": cleaned_body,
+                    "base": cleaned_base,
+                },
+            )
+            return _pull_request_from_api(raw, repository=repo, changed_files=())
+        raw = self._api(
+            f"repos/{repo}/pulls",
+            method="POST",
+            payload={
+                "title": cleaned_title,
+                "body": cleaned_body,
+                "head": cleaned_head,
+                "base": cleaned_base,
+                "draft": True,
+            },
+        )
+        return _pull_request_from_api(raw, repository=repo, changed_files=())
+
     def create_issue_proposal(
         self,
         *,
@@ -631,6 +952,65 @@ class GhCliGitHubAdapter:
         # Keep parity with MockGitHubAdapter: record the proposal only.
         # Callers that need a live issue must invoke create_issue explicitly.
         self.proposals.append(proposal)
+
+
+
+def _git_blob_sha(content: bytes) -> str:
+    return sha1(b"blob %d\x00" % len(content) + content).hexdigest()
+
+
+def _tree_fingerprint(files: Mapping[str, GitHubBlobChange | None]) -> str:
+    entries = []
+    for path_name in sorted(files):
+        change = files[path_name]
+        if change is None:
+            entries.append({"path": path_name, "deleted": True})
+        else:
+            entries.append({"path": path_name, "mode": change.mode, "blob_sha": change.blob_sha})
+    return sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()
+
+
+def _validate_publish_commit_inputs(
+    *,
+    branch: str,
+    base_sha: str,
+    commit_message: str,
+    files: Mapping[str, GitHubBlobChange | None],
+) -> None:
+    cleaned_branch = branch.strip() if isinstance(branch, str) else ""
+    if (
+        not cleaned_branch
+        or not cleaned_branch.startswith("aitobuild/")
+        or cleaned_branch.endswith("/")
+        or ".." in cleaned_branch
+        or re.fullmatch(r"[A-Za-z0-9._/-]+", cleaned_branch) is None
+    ):
+        raise ValueError("branch must be an aitobuild/ task ref name")
+    if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
+        raise ValueError("base_sha must be a resolved lowercase commit SHA")
+    if not isinstance(commit_message, str) or not commit_message.strip():
+        raise ValueError("commit_message must be non-empty")
+    if not isinstance(files, Mapping) or not files:
+        raise ValueError("publish commit requires a non-empty scoped file map")
+    for path_name, change in files.items():
+        if (
+            not isinstance(path_name, str)
+            or not path_name.strip()
+            or path_name.startswith("/")
+            or any(part == ".." for part in path_name.split("/"))
+        ):
+            raise ValueError("publish file paths must be relative and scoped")
+        if change is None:
+            continue
+        if not isinstance(change, GitHubBlobChange):
+            raise ValueError("publish file changes must be GitHubBlobChange values")
+        if change.mode not in {"100644", "100755"}:
+            raise ValueError("publish file mode must be 100644 or 100755")
+        if not isinstance(change.content, (bytes, bytearray)):
+            raise ValueError("publish file contents must be raw bytes")
+        if change.blob_sha != _git_blob_sha(bytes(change.content)):
+            raise ValueError(f"publish blob SHA mismatch for {path_name}")
+
 
 
 def build_github_adapter(
