@@ -20,14 +20,14 @@ human retaining merge authority.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Ingress and routing | Signed webhooks, authenticated internal APIs, deterministic dispatch, repository issue extraction and durable approved-task deduplication | Disposable-checkout delivery worker |
+| Ingress and routing | Signed webhooks, internal auth, repository issue extraction, durable approvals and local checkout-preparation worker | Worker implementation/verification/publication |
 | Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
 | Native model runtime | Foundry binding, Developer invocation and persisted manual approvals | Reproducible live-model acceptance run and consistent task-policy enforcement |
 | GitHub integration | Webhook input and mock issue-proposal adapter | Real issue, branch, commit, and PR operations |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **242 tests pass**, Ruff and mypy pass. The original patch-repair
+Verified locally: **266 tests pass**, Ruff and mypy pass. The original patch-repair
 failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
 sessions, managed terminals/processes, native memory/restart and browser tools
 have live integration evidence. Real Grok and Kimi evaluations retain strict
@@ -42,10 +42,12 @@ passed at `c6edaef`, with 180 tests and the simulation artifact retained. M0 is
 accepted. M1's constrained native profile has passing Grok/Kimi approved-task
 fixture trials; the broad standalone tool suite is not fully certified.
 
-Future real-repo trials will use
-[uhvogala/aitobuild_example](https://github.com/uhvogala/aitobuild_example), once
-the required M1 controls and M2 delivery path are ready for an approved trial.
-It is not configured or used by current simulations; keep using copied fixtures.
+Supervised real-repository trials use
+[uhvogala/aitobuild_example](https://github.com/uhvogala/aitobuild_example).
+Staged trials may start as soon as a concrete workflow slice is ready to test;
+full M2 delivery is not a prerequisite. Require approved task scope, explicit
+repository configuration, disposable checkouts and the safeguards applicable to
+that slice. The current simulation harness still uses copied fixtures.
 
 See [agent tool evaluation](sim/README.md#agent-tool-evaluation) for model comparison,
 token/cache usage and artifact checks. Large tool outputs are saved to private
@@ -209,6 +211,8 @@ API key from an ignored local environment file. Runtime mode is `openai`.
 - `POST /internal/developer/preview`
 - `POST /internal/developer/preview/approve`
 - `GET /internal/developer/previews`
+- `POST /internal/developer/delivery/prepare`
+- `GET /internal/developer/delivery/{preview_id}`
 - `POST /internal/developer/session/start`
 - `POST /internal/developer/session/stop`
 - `POST /internal/developer/session/stop-all`
@@ -273,8 +277,9 @@ for extracted repository issue previews in this slice.
 Webhooks do not supply a base commit SHA. Approve the preview through
 `POST /internal/developer/preview/approve` with `preview_id` and `base_revision`,
 a resolved 40-character target commit SHA supplied by the operator. The service
-validates SHA syntax and pins it in the approved bundle; target repository
-membership/checkout verification must be implemented by the future worker.
+validates SHA syntax and pins it in the approved bundle. The checkout-preparation
+worker additionally verifies that the commit belongs to the configured seed's
+approved base branch before creating a private checkout.
 The approved issue context, criteria, constraints, and policy cannot be replaced.
 Changed issue scope with a new delivery creates a new pending task; changing
 scope under an existing delivery or replacing an approved base is rejected.
@@ -288,11 +293,61 @@ dispatched task returns `dedupe` without creating another task. Inspect the queu
 with `pending_only=false` to recover `approved` or `dispatched` records. These
 states describe metadata routing, not worker execution or completion.
 
-Repository issue bundles are blocked by both Developer execution endpoints and
-the legacy execution harness until a disposable target-checkout worker exists.
-This slice performs no clone, target command, branch, commit, or PR operation.
-The designated future live repository remains inactive. Other trigger dedupe,
-meetings, and scheduler state remain in memory; this is not distributed storage.
+Repository issue bundles remain blocked by both Developer execution endpoints
+and the legacy execution harness until native execution is connected to the
+prepared target checkout. Checkout preparation is available below; target code
+execution, delivery commits, pushes and PR operations remain absent. No live
+GitHub trial has run for this slice. Other trigger dedupe, meetings and scheduler
+state remain in memory; this is not distributed storage.
+
+### Prepare an approved target checkout
+
+Configure trusted local Git seeds on the server before startup. Requests cannot
+supply or replace source paths. The repository name and numeric GitHub ID must
+match the approved issue context exactly; the default configuration enables no
+sources. The service checkout, overlapping paths and linked service worktrees
+are rejected as target sources.
+
+```bash
+export AITOBUILD_DEVELOPER_REPOSITORY_SOURCES='[{"repository":"fixture/widgets","repository_id":101,"path":"/absolute/path/to/target-seed"}]'
+```
+
+After creating and approving an issue preview with a resolved base SHA, prepare
+it through the authenticated operator endpoint:
+
+```bash
+curl --fail -H "X-Internal-Token: $AITOBUILD_INTERNAL_API_TOKEN" \
+	-H 'Content-Type: application/json' \
+	-d '{"preview_id":"dp-..."}' \
+	http://127.0.0.1:8000/internal/developer/delivery/prepare
+```
+
+Require `accepted=true` and `delivery.state=prepared`, not just HTTP 200. Inspect
+saved state with `GET /internal/developer/delivery/{preview_id}`. Preparation
+creates a task-local independent Git clone at the approved base and one
+deterministic local task branch. It performs no remote fetch/push, submodule
+update, target test/build command, delivery commit or PR operation. Git metadata
+operations run on the host with a sanitized environment, hooks/fsmonitor disabled
+and local-only transport, not through an agent sandbox; use trusted seeds.
+
+Delivery records and `preparation.log` live in
+`.aitobuild/developer/deliveries/<preview-id-hash>/` by default. The record exposes
+the private `checkout_path`, base/head revisions, approved snapshot and errors.
+Preparation shares the preview's persisted absolute deadline and file budget;
+Git command timeouts terminate their process group and retain output. Repeated
+prepare calls validate and return the same pristine checkout rather than cloning
+again. Interrupted preparation, changed checkout state, verification errors or
+expiry become terminal failures with artifacts retained and the budget aborted.
+Failed records are not silently retried; automatic recovery is not implemented.
+
+The API fixture checks exercise approval-to-checkout and restart recovery:
+
+```bash
+uv run pytest tests/test_app.py -k delivery_api -v
+```
+
+The next M2 slice connects constrained native implementation and post-change
+verification to this checkout. Publication remains a separate gated step.
 
 Developer practical run flow:
 

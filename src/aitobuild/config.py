@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from os import getenv
+from pathlib import Path
+import re
 
 
 @dataclass(slots=True, frozen=True)
@@ -37,6 +40,13 @@ class SecurityConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class RepositorySourceConfig:
+    repository: str
+    repository_id: int
+    path: str
+
+
+@dataclass(slots=True, frozen=True)
 class DeveloperConfig:
     require_preview_before_dispatch: bool
     execution_mode: str
@@ -55,6 +65,7 @@ class DeveloperConfig:
     state_dir: str = ".aitobuild/developer"
     session_data_volume: str | None = None
     enable_browser: bool = False
+    repository_sources: tuple[RepositorySourceConfig, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -90,6 +101,30 @@ def _optional_hour(value: str | None) -> int | None:
     if parsed < 0 or parsed > 23:
         raise ValueError("quiet window hour values must be within 0..23")
     return parsed
+
+
+def _parse_repository_sources(raw: str) -> tuple[RepositorySourceConfig, ...]:
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError("AITOBUILD_DEVELOPER_REPOSITORY_SOURCES must be a JSON array") from error
+    if not isinstance(items, list):
+        raise ValueError("AITOBUILD_DEVELOPER_REPOSITORY_SOURCES must be a JSON array")
+    sources: list[RepositorySourceConfig] = []
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"repository", "repository_id", "path"}:
+            raise ValueError("Repository sources require repository, repository_id and path")
+        repository, repository_id, path = item["repository"], item["repository_id"], item["path"]
+        if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", repository):
+            raise ValueError("Repository source name must be owner/repository")
+        if not isinstance(repository_id, int) or isinstance(repository_id, bool) or repository_id < 1:
+            raise ValueError("Repository source ID must be a positive integer")
+        if not isinstance(path, str) or not Path(path).is_absolute():
+            raise ValueError("Repository source path must be an absolute local path")
+        if any(source.repository == repository.lower() or source.repository_id == repository_id for source in sources):
+            raise ValueError("Repository source names and IDs must be unique")
+        sources.append(RepositorySourceConfig(repository.lower(), repository_id, path))
+    return tuple(sources)
 
 
 def load_config() -> AppConfig:
@@ -168,6 +203,7 @@ def load_config() -> AppConfig:
         state_dir=getenv("AITOBUILD_DEVELOPER_STATE_DIR", ".aitobuild/developer").strip(),
         session_data_volume=getenv("AITOBUILD_DEVELOPER_SESSION_DATA_VOLUME", "").strip() or None,
         enable_browser=_as_bool(getenv("AITOBUILD_DEVELOPER_ENABLE_BROWSER"), default=False),
+        repository_sources=_parse_repository_sources(getenv("AITOBUILD_DEVELOPER_REPOSITORY_SOURCES", "[]")),
     )
 
     if developer.execution_mode not in {"mock", "subprocess", "container_session"}:

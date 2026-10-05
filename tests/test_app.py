@@ -14,6 +14,7 @@ import pytest
 
 import aitobuild.app as app_module
 from aitobuild.app import create_app
+from aitobuild.config import RepositorySourceConfig, load_config
 from aitobuild.developer_isolation import IsolationTool, build_developer_task_bundle, default_developer_isolation_policy
 from aitobuild.runtime import FrameworkAvailability, FrameworkBindings, RuntimeBootstrap
 
@@ -87,6 +88,99 @@ def test_repository_issue_execution_cannot_use_service_checkout(test_config, rep
         assert response.status_code == 409, response.text
         assert "disposable-checkout delivery worker" in response.json()["detail"]
     assert agent.calls == []
+
+
+def test_delivery_prepare_requires_auth_approval_and_configured_source(test_config, repository_issue_body) -> None:
+    client = TestClient(create_app(test_config))
+    headers = _internal_headers(test_config)
+    route = "/internal/developer/delivery/prepare"
+    assert client.post(route, json={"preview_id": "unknown"}).status_code == 401
+    assert client.get("/internal/developer/delivery/unknown").status_code == 401
+    assert client.post(route, headers=headers, json={"preview_id": "unknown"}).status_code == 404
+    preview = client.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "action": "opened", "body": repository_issue_body,
+    }).json()
+    payload = {"preview_id": preview["preview_id"]}
+    unapproved = client.post(route, headers=headers, json=payload)
+    assert unapproved.status_code == 409
+    approval = client.post("/internal/developer/preview/approve", headers=headers, json={
+        **payload, "base_revision": "a" * 40,
+    })
+    assert approval.status_code == 200
+    unconfigured = client.post(route, headers=headers, json=payload)
+    assert unconfigured.status_code == 409
+    assert "operator-configured" in unconfigured.json()["detail"]
+
+
+def test_delivery_api_prepares_a_pinned_checkout_and_recovers_it(test_config, repository_issue_body, local_issue_repository) -> None:
+    source, revision = local_issue_repository
+    config = replace(test_config, developer=replace(test_config.developer, repository_sources=(
+        RepositorySourceConfig("fixture/widgets", 101, str(source)),
+    )))
+    headers = _internal_headers(config)
+    client = TestClient(create_app(config))
+    preview = client.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "action": "opened", "body": repository_issue_body,
+    }).json()
+    payload = {"preview_id": preview["preview_id"]}
+    approval = client.post("/internal/developer/preview/approve", headers=headers, json={
+        **payload, "base_revision": revision,
+    })
+    assert approval.status_code == 200
+    assert client.post("/internal/developer/delivery/prepare", headers=headers,
+                       json={**payload, "source_path": "/tmp/override"}).status_code == 400
+    prepared = client.post("/internal/developer/delivery/prepare", headers=headers, json=payload)
+    assert prepared.status_code == 200, prepared.text
+    assert prepared.json()["accepted"] is True
+    record = prepared.json()["delivery"]
+    assert record["state"] == "prepared"
+    assert record["base_revision"] == record["head_revision"] == revision
+    assert record["bundle_payload"] == approval.json()["bundle"]
+    assert record["checkout_path"] != str(source)
+    restarted = TestClient(create_app(config))
+    assert restarted.get(f"/internal/developer/delivery/{preview['preview_id']}", headers=headers).json()["delivery"] == record
+    assert restarted.post("/internal/developer/delivery/prepare", headers=headers, json=payload).json()["delivery"] == record
+
+
+def test_delivery_api_persists_failures_without_blind_retry(test_config, repository_issue_body, tmp_path) -> None:
+    config = replace(test_config, developer=replace(test_config.developer, repository_sources=(
+        RepositorySourceConfig("fixture/widgets", 101, str(tmp_path / "missing-source")),
+    )))
+    client = TestClient(create_app(config))
+    headers = _internal_headers(config)
+    preview = client.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "action": "opened", "body": repository_issue_body,
+    }).json()
+    payload = {"preview_id": preview["preview_id"]}
+    client.post("/internal/developer/preview/approve", headers=headers, json={**payload, "base_revision": "a" * 40})
+    failed = client.post("/internal/developer/delivery/prepare", headers=headers, json=payload)
+    assert failed.status_code == 200
+    assert failed.json()["accepted"] is False
+    record = failed.json()["delivery"]
+    assert record["state"] == "failed" and record["error"]
+    restarted = TestClient(create_app(config))
+    assert restarted.get(f"/internal/developer/delivery/{preview['preview_id']}", headers=headers).json()["delivery"] == record
+    assert restarted.post("/internal/developer/delivery/prepare", headers=headers, json=payload).json()["delivery"] == record
+
+
+@pytest.mark.parametrize("raw", ["{}", "invalid", "[{}]", '[{"repository":"fixture/widgets","repository_id":true,"path":"/tmp/fixture"}]',
+                               '[{"repository":"fixture/widgets","repository_id":101,"path":"relative"}]',
+                               '[{"repository":"fixture/widgets","repository_id":101,"path":"/tmp/one"},{"repository":"Fixture/Widgets","repository_id":102,"path":"/tmp/two"}]'])
+def test_repository_source_config_rejects_invalid_settings(monkeypatch, raw) -> None:
+    monkeypatch.setenv("AITOBUILD_WEBHOOK_SECRET", "test-secret")
+    monkeypatch.setenv("AITOBUILD_INTERNAL_API_TOKEN", "test-token")
+    monkeypatch.setenv("AITOBUILD_DEVELOPER_REPOSITORY_SOURCES", raw)
+    with pytest.raises(ValueError):
+        load_config()
+
+
+def test_repository_source_config_loads_explicit_mapping(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AITOBUILD_WEBHOOK_SECRET", "test-secret")
+    monkeypatch.setenv("AITOBUILD_INTERNAL_API_TOKEN", "test-token")
+    monkeypatch.setenv("AITOBUILD_DEVELOPER_REPOSITORY_SOURCES", json.dumps([
+        {"repository": "Fixture/Widgets", "repository_id": 101, "path": str(tmp_path)},
+    ]))
+    assert load_config().developer.repository_sources == (RepositorySourceConfig("fixture/widgets", 101, str(tmp_path)),)
 
 
 _FakeSession = AgentSession

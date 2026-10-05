@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 from typing import Any
 import pytest
 
@@ -24,6 +25,21 @@ def repository_issue_body() -> dict[str, Any]:
         },
         "assignee": {"login": "fixture-developer"},
     }
+
+
+@pytest.fixture
+def local_issue_repository(tmp_path: Path) -> tuple[Path, str]:
+    source = tmp_path / "target-source"
+    source.mkdir()
+    subprocess.run(["git", "-c", "init.templateDir=", "init", "--initial-branch=main", str(source)], check=True, capture_output=True)
+    (source / "README.md").write_text("Fixture baseline\n")
+    subprocess.run(["git", "-C", str(source), "add", "README.md"], check=True, capture_output=True)
+    subprocess.run([
+        "git", "-C", str(source), "-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture",
+        "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "-m", "Fixture baseline",
+    ], check=True, capture_output=True)
+    revision = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    return source, revision
 
 
 @pytest.fixture

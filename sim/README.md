@@ -11,12 +11,23 @@ paths remain integration checks in [MILESTONES.md](../MILESTONES.md).
 ## Future Real Repository
 
 [uhvogala/aitobuild_example](https://github.com/uhvogala/aitobuild_example) is
-reserved for future supervised live GitHub trials. This harness does not target
-or modify it. Keep using copied fixtures until the M1 controls and M2 delivery
-path are ready for an explicitly approved trial, then review its repository
-layout/toolchain and use scoped branches, draft PRs and least-privilege access.
+the designated repository for supervised live GitHub trials. This harness does
+not target or modify it. Staged trials may start as soon as a concrete workflow
+slice is ready to test, without waiting for full M2 delivery. Review its layout
+and toolchain, configure the target explicitly and validate the safeguards for
+the tested slice. Use approved scope, disposable checkouts, scoped branches,
+draft PRs and least-privilege access, with human merge authority. Keep copied
+fixtures for repeatable regression checks.
 
 ## What it includes
+
+The local checkout-preparation API has a separate disposable-Git-fixture probe:
+`uv run pytest tests/test_app.py -k delivery_api -v`. It verifies an approved issue
+becomes one pinned private checkout/local task branch, then survives restart;
+failure records are retained without automatic replay. See the
+[checkout preparation setup](../README.md#prepare-an-approved-target-checkout)
+for the server-side source allowlist and operator endpoints. This is not model
+implementation, post-change verification or GitHub publication.
 
 - .env.simulation: runnable default environment values.
 - .env.simulation.example: starter template for local overrides.

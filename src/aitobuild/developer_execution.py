@@ -66,7 +66,7 @@ class DeveloperExecutionEngine:
         if bundle.issue_context is not None:
             return DeveloperExecutionResult(
                 accepted=False,
-                reason="Repository issue execution requires the disposable-checkout delivery worker",
+                reason="Repository issue execution requires the disposable-checkout delivery worker execution path",
                 command_outcomes=(), file_write_outcomes=(),
             )
         command_outcomes: list[CommandOutcome] = []

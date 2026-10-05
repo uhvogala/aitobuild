@@ -22,6 +22,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 
 from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
 from aitobuild.config import AppConfig, load_config
+from aitobuild.developer_delivery import DeveloperDeliveryWorker, LocalRepositorySource
 from aitobuild.developer_execution import DeveloperExecutionEngine, PlannedFileWrite
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import DeveloperPreviewRegistry
@@ -234,6 +235,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     dispatcher = DispatcherAgent(
         require_developer_preview=app_config.developer.require_preview_before_dispatch,
         developer_preview_registry=DeveloperPreviewRegistry(developer_state_dir / "previews.json"),
+    )
+    delivery_worker = DeveloperDeliveryWorker(
+        preview_registry=dispatcher.developer_preview_registry, state_dir=developer_state_dir,
+        service_root=workspace_root, command_timeout_seconds=app_config.developer.command_timeout_seconds,
+        repository_sources=tuple(
+            LocalRepositorySource(source.repository, source.repository_id, Path(source.path))
+            for source in app_config.developer.repository_sources
+        ),
     )
     scheduler = scheduler_from_config(app_config.scheduler)
     architect_scan_runner = ArchitectScanRunner()
@@ -628,6 +637,40 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             ],
         }
 
+    @app.post("/internal/developer/delivery/prepare")
+    def prepare_developer_delivery(
+        payload: dict[str, Any],
+        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    ) -> dict[str, Any]:
+        _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+        if set(payload) != {"preview_id"}:
+            raise HTTPException(status_code=400, detail="Delivery preparation accepts only preview_id; configure sources on the server")
+        preview_id = payload.get("preview_id")
+        if not isinstance(preview_id, str) or not preview_id.strip():
+            raise HTTPException(status_code=400, detail="preview_id must be a non-empty string")
+        preview_id = preview_id.strip()
+        if dispatcher.developer_preview_registry.get(preview_id) is None:
+            raise HTTPException(status_code=404, detail="preview_id not found")
+        try:
+            record = delivery_worker.prepare(preview_id)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"accepted": record.state == "prepared", "delivery": record.to_payload()}
+
+    @app.get("/internal/developer/delivery/{preview_id}")
+    def get_developer_delivery(
+        preview_id: str,
+        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    ) -> dict[str, Any]:
+        _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+        try:
+            record = delivery_worker.get(preview_id)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if record is None:
+            raise HTTPException(status_code=404, detail="Delivery preparation not found")
+        return {"delivery": record.to_payload()}
+
     @app.post("/internal/developer/session/start")
     def start_developer_session(
         payload: dict[str, Any] | None = None,
@@ -739,7 +782,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=f"Invalid preview bundle payload: {exc}") from exc
 
         if bundle.issue_context is not None:
-            raise HTTPException(status_code=409, detail="Repository issue execution requires the disposable-checkout delivery worker; it is not implemented")
+            raise HTTPException(status_code=409, detail="Repository issue execution requires the disposable-checkout delivery worker execution path; it is not implemented")
 
         commands_raw = payload.get("commands", [])
         if not isinstance(commands_raw, list) or not all(isinstance(item, str) for item in commands_raw):
@@ -1035,7 +1078,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         task_budget = None
         if task_bundle is not None:
             if task_bundle.issue_context is not None:
-                raise HTTPException(status_code=409, detail="Repository issue execution requires the disposable-checkout delivery worker; it is not implemented")
+                raise HTTPException(status_code=409, detail="Repository issue execution requires the disposable-checkout delivery worker execution path; it is not implemented")
             if app_config.developer.execution_mode not in {"mock", "container_session"}:
                 raise HTTPException(status_code=409, detail="Approved native tasks require container isolation")
             if app_config.developer.enable_mcp_adapters or payload.get("use_browser", False) is True:

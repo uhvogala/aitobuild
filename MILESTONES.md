@@ -20,10 +20,11 @@ mock simulation. Full backlog autonomy is a later goal, not the current state.
 ## Future Live Repository
 
 [uhvogala/aitobuild_example](https://github.com/uhvogala/aitobuild_example) is the
-designated future repository for supervised real GitHub trials. It is not a
-current execution target. Continue using disposable copied fixtures until the
-M1 controls and M2 delivery path are ready for an explicitly approved trial.
-Before activation, review its layout and toolchain, grant least-privilege access,
+designated repository for supervised real GitHub trials. Staged trials may start
+as soon as a concrete workflow slice is ready to test; full M2 delivery is not a
+prerequisite. Keep copied fixtures for repeatable regression checks and validate
+the safeguards required by each slice before testing it against this repository.
+Before each trial, review its layout and toolchain, grant least-privilege access,
 and use scoped task branches and draft PRs with human merge authority. Do not
 execute task code against the aitobuild service checkout.
 
@@ -41,7 +42,7 @@ execute task code against the aitobuild service checkout.
 | Architect/meetings | Metadata scan and GroupChatBuilder construction | Execution and review integration missing |
 | Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current local gates: **242 tests pass**; Ruff and mypy pass. Both original patch-repair
+Current local gates: **266 tests pass**; Ruff and mypy pass. Both original patch-repair
 failures are fixed, with ambiguous matching still rejected. Live tool evaluations
 check artifact correctness, tool coverage, context guards and zero unexpected
 errors; provider failures/timeouts are visible failures, not waived successes.
@@ -133,12 +134,23 @@ operator-supplied base SHA and the exact scope/policy. Local locked, atomic sync
 preview storage persists approval, stable scope-derived task identity, delivery
 aliases and metadata dispatch markers. Restart, concurrent duplicate delivery,
 immutable scope/base, changed-scope reapproval and malformed-state rejection have
-regressions. Repository issue tasks cannot use the existing execution endpoints
-or legacy harness; the disposable-checkout worker and all publication operations
-remain absent. `dispatched` means metadata was returned, not that work ran.
-Base SHA repository membership must be verified by the future worker.
+regressions. `dispatched` means metadata was returned, not that work ran.
 
-Local verification: `uv run pytest` (242 tests), `uv run ruff check .`, and
+Checkout-preparation slice (2026-10-05): authenticated prepare/status endpoints
+consume approved issue snapshots with explicit name/ID/local-seed configuration.
+The worker validates base commit membership in the configured base branch,
+creates one private independent clone and deterministic local task branch, and
+persists preparing/prepared/failed transitions, base/head and approved context.
+It rejects service checkouts and linked worktrees, retains logs/partial checkouts,
+and shares the existing absolute deadline without resetting it. Concurrent calls
+and restart return one pristine prepared checkout; interrupted/modified/expired
+preparation fails closed instead of replaying side effects. Timeout cleanup,
+failure artifacts and configuration/auth regressions pass. This is host Git
+metadata preparation from trusted local seeds, not target code execution or a
+hardened hostile-repository sandbox. Native issue execution and all publication
+operations remain blocked/unimplemented.
+
+Local verification: `uv run pytest` (266 tests), `uv run ruff check .`, and
 `uv run mypy src`; mock copied-fixture simulation has `succeeded=true`, actual
 command exit 0 and the generated artifact. No hosted CI or new live-model/GitHub
 trial was run for this slice. The designated live repository remains inactive;
@@ -209,8 +221,8 @@ Exit criteria:
 1. Maintain the green exact-text edit and legacy patch regressions; validate broader live editing tasks without weakening unique-match rejection.
 2. Maintain the green hosted M0 baseline and run CI for new slices.
 3. Preserve the constrained approved-task Grok/Kimi acceptance; never use the framework repository as a target.
-4. Extend the durable M2 preparation states with worker/verification/failure recovery and GitHub permissions, then implement the smallest disposable-checkout issue-to-draft-PR worker.
-5. Keep the designated live repository inactive until the worker is ready and a supervised trial is explicitly approved.
+4. Connect constrained native implementation and post-change verification to prepared target checkouts, then add least-privilege verified commit/draft-PR publication with durable dedupe.
+5. Start staged supervised trials in the designated test repository when a concrete slice is ready, with approved scope and applicable safeguards; do not wait for full M2 delivery.
 
 Update this snapshot when a milestone's exit checks have actually run. Record
 the date, commands, observed result, and any unvalidated external dependencies;

@@ -6,11 +6,14 @@ from copy import deepcopy
 from pathlib import Path
 import json
 from typing import Any
+import subprocess
 
 import pytest
 
 from aitobuild.developer_isolation import developer_task_bundle_from_payload
 from aitobuild.developer_execution import DeveloperExecutionEngine, PlannedFileWrite
+from aitobuild.developer_delivery import DeveloperDeliveryWorker, LocalRepositorySource
+import aitobuild.developer_delivery as delivery_module
 from aitobuild.developer_preview import DeveloperPreviewRegistry
 from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import EventOrigin, EventType, make_internal_event
@@ -364,3 +367,221 @@ def test_repository_task_events_are_explicitly_supported(repository_issue_body, 
     result = DispatcherAgent().route(event)
     assert result.route == "developer.unsupported"
     assert not result.accepted
+
+
+@pytest.mark.parametrize("repository", ["fixture/widgets", "uhvogala/aitobuild_example"])
+def test_delivery_prepares_only_the_approved_base_in_a_private_checkout(tmp_path, repository_issue_body, repository, local_issue_repository) -> None:
+    repository_issue_body["repository"]["full_name"] = repository
+    source, revision = local_issue_repository
+    registry = DeveloperPreviewRegistry(tmp_path / "state" / "previews.json")
+    dispatcher = DispatcherAgent(developer_preview_registry=registry)
+    preview = dispatcher.create_developer_preview(
+        dedupe_key="github:prepare", github_event="issues", action="opened", body=repository_issue_body,
+    )
+    worker = DeveloperDeliveryWorker(
+        preview_registry=registry, state_dir=tmp_path / "state", service_root=Path.cwd(),
+        repository_sources=(LocalRepositorySource(repository, 101, source),),
+    )
+    with pytest.raises(ValueError, match="approval"):
+        worker.prepare(preview.preview_id)
+    approved = registry.approve(preview.preview_id, base_revision=revision)
+    for sources in ((), (LocalRepositorySource(repository, 102, source),)):
+        unconfigured = DeveloperDeliveryWorker(
+            preview_registry=registry, state_dir=tmp_path / "state", service_root=Path.cwd(),
+            repository_sources=sources,
+        )
+        with pytest.raises(ValueError, match="operator-configured"):
+            unconfigured.prepare(preview.preview_id)
+        assert unconfigured.get(preview.preview_id) is None
+    record = worker.prepare(preview.preview_id)
+    assert record.state == "prepared"
+    assert record.base_revision == revision == record.head_revision
+    assert record.bundle_payload == approved.bundle_payload
+    checkout = Path(record.checkout_path)
+    assert checkout != source
+    assert (checkout / "README.md").read_text() == "Fixture baseline\n"
+    assert subprocess.run(["git", "-C", str(checkout), "branch", "--show-current"], check=True, capture_output=True, text=True).stdout.strip() == record.branch
+    restarted = DeveloperDeliveryWorker(
+        preview_registry=DeveloperPreviewRegistry(tmp_path / "state" / "previews.json"),
+        state_dir=tmp_path / "state", service_root=Path.cwd(),
+        repository_sources=(LocalRepositorySource(repository, 101, source),),
+    )
+    assert restarted.prepare(preview.preview_id) == record
+    assert subprocess.run(["git", "-C", str(source), "branch", "--show-current"], check=True, capture_output=True, text=True).stdout.strip() == "main"
+
+
+@pytest.fixture
+def approved_delivery(tmp_path, repository_issue_body, local_issue_repository):
+    source, revision = local_issue_repository
+    registry = DeveloperPreviewRegistry(tmp_path / "state" / "previews.json")
+    preview = DispatcherAgent(developer_preview_registry=registry).create_developer_preview(
+        dedupe_key="github:worker", github_event="issues", action="opened", body=repository_issue_body,
+    )
+    registry.approve(preview.preview_id, base_revision=revision)
+    worker = DeveloperDeliveryWorker(
+        preview_registry=registry, state_dir=tmp_path / "state", service_root=Path.cwd(),
+        repository_sources=(LocalRepositorySource("fixture/widgets", 101, source),),
+    )
+    return registry, worker, preview.preview_id, source, revision
+
+
+def test_interrupted_preparation_fails_closed_after_restart(approved_delivery, tmp_path, monkeypatch) -> None:
+    registry, worker, preview_id, source, _ = approved_delivery
+
+    def crash(*arguments, **kwargs):
+        raise KeyboardInterrupt("Simulated interruption")
+
+    monkeypatch.setattr(worker, "_git", crash)
+    with pytest.raises(KeyboardInterrupt):
+        worker.prepare(preview_id)
+    assert worker.get(preview_id).state == "preparing"
+    budget_path = next((tmp_path / "state" / "budgets").glob("*.json"))
+    initial_budget = json.loads(budget_path.read_text())
+    restarted = DeveloperDeliveryWorker(
+        preview_registry=registry, state_dir=tmp_path / "state", service_root=Path.cwd(),
+        repository_sources=(LocalRepositorySource("fixture/widgets", 101, source),),
+    )
+    failed = restarted.prepare(preview_id)
+    assert failed.state == "failed" and "Interrupted" in failed.error
+    assert not Path(failed.checkout_path).exists()
+    final_budget = json.loads(budget_path.read_text())
+    assert final_budget["aborted"]
+    assert final_budget["deadline"] == initial_budget["deadline"]
+    assert restarted.prepare(preview_id) == failed
+    assert json.loads(budget_path.read_text()) == final_budget
+
+
+def test_concurrent_preparation_creates_one_checkout(approved_delivery, tmp_path) -> None:
+    registry, first, preview_id, source, _ = approved_delivery
+    second = DeveloperDeliveryWorker(
+        preview_registry=registry, state_dir=tmp_path / "state", service_root=Path.cwd(),
+        repository_sources=(LocalRepositorySource("fixture/widgets", 101, source),),
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        records = list(pool.map(lambda worker: worker.prepare(preview_id), (first, second)))
+    assert records[0] == records[1]
+    assert records[0].state == "prepared"
+    assert len(list((tmp_path / "state" / "deliveries").glob("*/repo"))) == 1
+
+
+def test_preparation_rejects_service_checkout_sources(approved_delivery, tmp_path) -> None:
+    registry, _, preview_id, source, _ = approved_delivery
+    worker = DeveloperDeliveryWorker(
+        preview_registry=registry, state_dir=tmp_path / "state", service_root=source,
+        repository_sources=(LocalRepositorySource("fixture/widgets", 101, source),),
+    )
+    failed = worker.prepare(preview_id)
+    assert failed.state == "failed" and "service checkout" in failed.error
+    assert not Path(failed.checkout_path).exists()
+
+
+def test_preparation_rejects_linked_service_worktrees(approved_delivery, tmp_path) -> None:
+    registry, _, preview_id, source, revision = approved_delivery
+    linked = tmp_path / "linked"
+    subprocess.run(["git", "-C", str(source), "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", str(linked), revision], check=True, capture_output=True)
+    worker = DeveloperDeliveryWorker(
+        preview_registry=registry, state_dir=tmp_path / "state", service_root=source,
+        repository_sources=(LocalRepositorySource("fixture/widgets", 101, linked),),
+    )
+    failed = worker.prepare(preview_id)
+    assert failed.state == "failed" and "linked service worktree" in failed.error
+
+
+def test_preparation_base_is_pinned_when_source_advances(approved_delivery) -> None:
+    _, worker, preview_id, source, revision = approved_delivery
+    (source / "README.md").write_text("Later content\n")
+    subprocess.run(["git", "-C", str(source), "-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "-am", "Later"], check=True, capture_output=True)
+    record = worker.prepare(preview_id)
+    assert record.state == "prepared" and record.head_revision == revision
+    assert (Path(record.checkout_path) / "README.md").read_text() == "Fixture baseline\n"
+
+
+def test_preparation_rejects_commit_outside_the_base_branch(tmp_path, repository_issue_body, local_issue_repository) -> None:
+    source, revision = local_issue_repository
+    unrelated = subprocess.run([
+        "git", "-C", str(source), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit-tree", f"{revision}^{{tree}}", "-m", "Unrelated root",
+    ], check=True, capture_output=True, text=True).stdout.strip()
+    registry = DeveloperPreviewRegistry(tmp_path / "state" / "previews.json")
+    preview = DispatcherAgent(developer_preview_registry=registry).create_developer_preview(
+        dedupe_key="github:unrelated", github_event="issues", action="opened", body=repository_issue_body,
+    )
+    registry.approve(preview.preview_id, base_revision=unrelated)
+    worker = DeveloperDeliveryWorker(
+        preview_registry=registry, state_dir=tmp_path / "state", service_root=Path.cwd(),
+        repository_sources=(LocalRepositorySource("fixture/widgets", 101, source),),
+    )
+    record = worker.prepare(preview.preview_id)
+    assert record.state == "failed" and record.error
+    assert not Path(record.checkout_path).exists()
+    assert (Path(record.checkout_path).parent / "preparation.log").exists()
+
+
+def test_modified_prepared_checkout_is_not_silently_recreated(approved_delivery) -> None:
+    _, worker, preview_id, _, _ = approved_delivery
+    record = worker.prepare(preview_id)
+    checkout = Path(record.checkout_path)
+    (checkout / "README.md").write_text("Retain failure artifact\n")
+    failed = worker.prepare(preview_id)
+    assert failed.state == "failed" and "modified" in failed.error
+    assert (checkout / "README.md").read_text() == "Retain failure artifact\n"
+
+
+@pytest.mark.parametrize("field,value", [("branch", "wrong"), ("checkout_path", "/tmp/wrong"), ("preview_id", "wrong")])
+def test_delivery_state_identity_is_validated(approved_delivery, field, value) -> None:
+    _, worker, preview_id, _, _ = approved_delivery
+    record = worker.prepare(preview_id)
+    state_path = Path(record.checkout_path).parent / "state.json"
+    data = json.loads(state_path.read_text())
+    data["record"][field] = value
+    state_path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="identity"):
+        worker.get(preview_id)
+
+
+def test_preparation_timeout_kills_process_group_and_retains_diagnostics(approved_delivery, tmp_path, monkeypatch) -> None:
+    _, worker, preview_id, _, _ = approved_delivery
+    killed = []
+
+    class TimedOutProcess:
+        pid = 987654321
+        returncode = -9
+
+        def __init__(self, command, **kwargs):
+            self.command = command
+            self.calls = 0
+            assert kwargs["start_new_session"] is True
+            assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired(self.command, timeout)
+            return "Retained stdout", "Retained stderr"
+
+    monkeypatch.setattr(delivery_module.subprocess, "Popen", TimedOutProcess)
+    monkeypatch.setattr(delivery_module.os, "killpg", lambda pid, signal_number: killed.append((pid, signal_number)))
+    failed = worker.prepare(preview_id)
+    assert failed.state == "failed" and "deadline" in failed.error
+    assert killed == [(TimedOutProcess.pid, delivery_module.signal.SIGKILL)]
+    log = json.loads((Path(failed.checkout_path).parent / "preparation.log").read_text())
+    assert log["timed_out"] and log["exit_code"] == -9
+    assert log["stdout"] == "Retained stdout" and log["stderr"] == "Retained stderr"
+    assert json.loads(next((tmp_path / "state" / "budgets").glob("*.json")).read_text())["aborted"]
+
+
+def test_preparation_restart_does_not_reset_expired_deadline(approved_delivery, tmp_path) -> None:
+    _, worker, preview_id, _, _ = approved_delivery
+    record = worker.prepare(preview_id)
+    budget_path = next((tmp_path / "state" / "budgets").glob("*.json"))
+    budget = json.loads(budget_path.read_text())
+    budget["deadline"] = 0
+    budget_path.write_text(json.dumps(budget))
+    log_path = Path(record.checkout_path).parent / "preparation.log"
+    initial_log = log_path.read_text()
+    failed = worker.prepare(preview_id)
+    assert failed.state == "failed" and "expired" in failed.error
+    final_budget = json.loads(budget_path.read_text())
+    assert final_budget["deadline"] == 0 and final_budget["aborted"]
+    assert log_path.read_text() == initial_log
