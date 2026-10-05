@@ -191,6 +191,26 @@ or correct model behavior.
 
 ## Agent Tool Evaluation
 
+M1 constrained acceptance uses the explicitly approved native profile:
+
+```bash
+uv run python -m sim.evaluate_tools --approved-task --model grok-4.6 \
+  --output sim/.run-artifacts/approved-task-grok.json
+uv run python -m sim.evaluate_tools --approved-task --model Kimi-K2.7-Code \
+  --invoke-timeout 360 --output sim/.run-artifacts/approved-task-kimi.json
+```
+
+Both scoped trials passed on 2026-10-05. The bundle allows only the source/test
+files and pytest prefix, with two file reservations and a five-minute deadline.
+Commands run offline on a read-only repository; the image supplies pytest.
+Reports require AST artifact correctness, only approved files changed, actual
+pytest exit 0, persisted reservations, completion, zero unexpected tool errors
+and automatic cleanup; they retain actual diffs and traces. This certifies that
+small profile, not the broader standalone suite below or GitHub delivery.
+Earlier failed trials are retained without reclassification. Docker probes also
+verified write protection, offline execution, no service credentials/socket and
+absolute PID-1 expiry via daemon die events.
+
 [evaluate_tools.py](evaluate_tools.py) reuses the copied-fixture simulation and
 native Developer API. It makes billable model calls and auto-approves tools only
 inside disposable Developer workspaces. It does not validate GitHub delivery.

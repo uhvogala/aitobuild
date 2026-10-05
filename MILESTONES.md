@@ -41,7 +41,7 @@ execute task code against the aitobuild service checkout.
 | Architect/meetings | Metadata scan and GroupChatBuilder construction | Execution and review integration missing |
 | Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current local gates: **202 tests pass**; Ruff and mypy pass. Both original patch-repair
+Current local gates: **212 tests pass**; Ruff and mypy pass. Both original patch-repair
 failures are fixed, with ambiguous matching still rejected. Live tool evaluations
 check artifact correctness, tool coverage, context guards and zero unexpected
 errors; provider failures/timeouts are visible failures, not waived successes.
@@ -54,7 +54,7 @@ local pipeline, not GitHub delivery or production isolation.
 ## Restart Checklist
 
 1. Read this document, then use the [README quick start](README.md#quick-start).
-2. Run `uv sync --locked` and the three quality gates. M0's hosted baseline is accepted; continue with M1.
+2. Run `uv sync --locked` and the three quality gates. M0 and the constrained native M1 profile are accepted; continue with M2.
 3. Clear inherited Foundry endpoint/API-key settings and run the [local simulation](sim/README.md#local-baseline).
 4. Require the preview/replay routes, `accepted=true`, zero command exit codes, `generated_file_exists=true`, and `succeeded=true` in the report.
 5. For API-only testing, configure both secrets, start Uvicorn on loopback, and check health plus authenticated Developer readiness. Mock readiness is expected to be false.
@@ -83,16 +83,30 @@ Exit criteria:
 
 ## M1: Constrained Live Developer Task
 
-Status: **partial implementation, not accepted**. Depends on M0. Prepared Docker,
-native model and optional browser paths have live evidence. Manual approve/reject
-continuation now persists across restarts, with native SDK execution, rejection,
-duplicate, cross-session and failure/timeout regressions. Native runs can bind
-an approved preview to a fresh session, preserving its task context/policy across
-restart and rejecting policy replacement. Repository paths/tool categories and
-direct/managed-start command prefixes use that saved policy. File-change/time
-budgets, interactive shell and memory/browser/network policy parity, hardened
-isolation and zero-error full live acceptance remain pending; local approval
-tests use a mocked model transport, not a fresh live-model certification.
+Status: **accepted for the constrained native profile on 2026-10-05**. Depends
+on M0. Explicit task previews bind immutable policy/context to a fresh session;
+saved native approvals survive restart and reject duplicate or altered decisions.
+Cross-process-locked ledgers enforce unique pre-write file reservations and one
+wall-clock deadline across sessions/restarts. Failed/timed-out tasks are aborted,
+not silently retried. Canonical filesystem paths cannot bypass blocked scope.
+
+The approved profile requires Docker (or inert mock tools), a read-only repository
+and root filesystem, offline execution, dropped capabilities and bounded
+CPU/memory/processes. It rejects browser/arbitrary MCP execution and legacy
+execution of a native-bound preview. PID-1 expiry bounds detached work; success,
+error, timeout and rejection have cleanup regressions. Docker probes verified
+read-only writes, no outbound network/service credentials/socket, deadline die
+events and removal. This is not hostile-tenant sandbox certification.
+
+`uv run python -m sim.evaluate_tools --approved-task --model grok-4.6` and the
+same command with `--model Kimi-K2.7-Code --invoke-timeout 360` passed: two scoped
+files, correct artifacts, actual pytest exit 0, persisted reservations, completed
+runs, zero unexpected tool errors and automatic container cleanup. Reports remain
+under ignored `sim/.run-artifacts/`; earlier failed trials remain failures.
+`uv run pytest`, Ruff, mypy and the mock fixture simulation pass locally. Hosted
+CI has not yet run this slice. Broader standalone tool coverage, browser/MCP,
+distributed coordination, quotas and unattended hardening remain outside M1
+acceptance and must not be implied by this focused trial.
 
 Deliverables:
 - Prepare a session image with its test toolchain and CA trust; validate bind paths and non-root ownership.
@@ -175,10 +189,10 @@ Exit criteria:
 ## Immediate Work Queue
 
 1. Maintain the green exact-text edit and legacy patch regressions; validate broader live editing tasks without weakening unique-match rejection.
-2. Add CI for the verified local path and record the green M0 baseline.
-3. Extend live Developer fixture acceptance beyond the passing focused Grok/Kimi editing probe; never use the framework repository as a target.
-4. Close native-agent policy and approval/session gaps before claiming M1 complete.
-5. Specify the task state machine and GitHub permissions, then implement the smallest issue-to-draft-PR worker for M2.
+2. Maintain the green hosted M0 baseline and run CI for new slices.
+3. Preserve the constrained approved-task Grok/Kimi acceptance; never use the framework repository as a target.
+4. Specify the task state machine and GitHub permissions, then implement the smallest issue-to-draft-PR worker for M2.
+5. Keep the designated live repository inactive until the worker is ready and a supervised trial is explicitly approved.
 
 Update this snapshot when a milestone's exit checks have actually run. Record
 the date, commands, observed result, and any unvalidated external dependencies;

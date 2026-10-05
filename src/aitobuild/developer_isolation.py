@@ -6,7 +6,13 @@ from dataclasses import asdict, dataclass
 from enum import StrEnum
 import re
 import shlex
+import json
+from pathlib import Path
+from time import time
+from math import isfinite
 from typing import Any
+
+from filelock import FileLock
 
 
 class IsolationTool(StrEnum):
@@ -38,6 +44,72 @@ class DeveloperTaskBundle:
         payload = asdict(self)
         payload["policy"]["allowed_tools"] = [tool.value for tool in self.policy.allowed_tools]
         return payload
+
+
+class DeveloperTaskBudget:
+    def __init__(self, *, path: Path, bundle: DeveloperTaskBundle, create: bool = True) -> None:
+        self.path = path
+        self.bundle = bundle
+        self._snapshot = json.loads(json.dumps(bundle.to_payload()))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = FileLock(str(path) + ".lock", timeout=10)
+        if bundle.policy.max_file_changes < 0 or bundle.policy.max_runtime_minutes <= 0:
+            raise ValueError("Task budgets require nonnegative file count and positive runtime")
+        with self._lock:
+            if not path.exists():
+                if not create:
+                    raise ValueError("Persisted task budget is missing; a new approved task is required")
+                self._save({"task_id": bundle.task_id, "bundle": bundle.to_payload(), "deadline": time() + bundle.policy.max_runtime_minutes * 60,
+                            "reserved_paths": []})
+            self._load()
+
+    def _load(self, *, allow_aborted: bool = False) -> dict[str, Any]:
+        state = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or state.get("task_id") != self.bundle.task_id:
+            raise ValueError("Task budget identity does not match the approved task")
+        if state.get("bundle") != self._snapshot:
+            raise ValueError("Task budget does not match the approved task snapshot")
+        if not allow_aborted and state.get("aborted", False) is not False:
+            raise TimeoutError("Approved task was aborted; a new approved task is required")
+        deadline = state.get("deadline")
+        paths = state.get("reserved_paths")
+        if not isinstance(deadline, (int, float)) or isinstance(deadline, bool) or not isfinite(deadline):
+            raise ValueError("Task budget deadline is invalid")
+        if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+            raise ValueError("Task budget file reservations are invalid")
+        if len(set(paths)) > self.bundle.policy.max_file_changes:
+            raise ValueError("Persisted file reservations exceed the approved budget")
+        return state
+
+    def _save(self, state: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(state), encoding="utf-8")
+        temporary.replace(self.path)
+
+    def remaining_seconds(self) -> float:
+        with self._lock:
+            remaining = float(self._load()["deadline"]) - time()
+        if remaining <= 0:
+            raise TimeoutError("Approved task runtime budget has expired; a new approved task is required")
+        return remaining
+
+    def abort(self) -> None:
+        with self._lock:
+            state = self._load(allow_aborted=True)
+            state["aborted"] = True
+            self._save(state)
+
+    def reserve_paths(self, paths: tuple[str, ...]) -> None:
+        with self._lock:
+            state = self._load()
+            if float(state["deadline"]) <= time():
+                raise TimeoutError("Approved task runtime budget has expired; no files were written")
+            reserved = sorted(set(state["reserved_paths"]) | set(paths))
+            if len(reserved) > self.bundle.policy.max_file_changes:
+                raise PermissionError(f"Task file budget exceeds max_file_changes={self.bundle.policy.max_file_changes}")
+            state["reserved_paths"] = reserved
+            self._save(state)
 
 
 def default_developer_isolation_policy() -> DeveloperIsolationPolicy:

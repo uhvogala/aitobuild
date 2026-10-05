@@ -37,7 +37,7 @@ Important limits:
 - Dispatch returns task metadata; it does not yet drive a GitHub branch/PR worker.
 - GitHub writes are mock-only; meetings are constructed, not executed.
 - Scheduler ticks require a caller; application state is in memory.
-- Native runs may bind an approved preview to a fresh session and persist its task policy. Repository paths/tool categories and direct/managed-start command prefixes then use that policy; standalone runs and file-change/time/interactive/network limits still lack complete parity. Do not describe prototype checks or Docker bind mounts as hardened isolation.
+- Preview-bound native tasks persist policy, unique-path pre-write reservations and a shared absolute deadline. Use the constrained Docker profile: read-only repo/root, offline commands and interactive input, dropped capabilities, CPU/memory/PID limits, expiry and terminal-outcome cleanup. Browser/arbitrary MCP adapters and legacy execution of native-bound previews are rejected. Standalone/unbound execution remains a prototype; do not call this a hardened hostile-tenant sandbox.
 - Native pending approvals and sessions persist locally; distributed coordination, durable task/approval auditing, and PM/Architect tool wiring remain pending.
 
 Key endpoints:
@@ -64,7 +64,10 @@ installs ripgrep, runs these gates and the mock fixture simulation, and retains
 available reports on failure. Hosted run 37308813245 passed at `c6edaef` with
 180 tests and a retained simulation artifact; M0 is accepted.
 
-Verification snapshot (2026-10-05): 202 local tests pass; Ruff and mypy pass.
+Verification snapshot (2026-10-05): 212 local tests pass; Ruff and mypy pass.
+M1 constrained native Grok/Kimi approved-task fixtures pass with actual tests,
+persisted budgets, zero unexpected errors and automatic cleanup. M2 is next;
+the designated live GitHub repository remains inactive.
 Live Grok/Kimi tool evaluation remains stricter than tool coverage: require
 artifact correctness, completion, successful cleanup and zero unexpected errors.
 

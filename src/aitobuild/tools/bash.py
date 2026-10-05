@@ -123,7 +123,23 @@ class ContainerSessionBashAdapter:
             container_user = f"{os.getuid()}:{os.getgid()}"
         self._container_user = container_user
 
-    def create_session(self, *, session_id: str | None = None) -> tuple[str, str]:
+    def create_session(
+        self, *, session_id: str | None = None, read_only_workspace: bool = False,
+        deadline: float | None = None,
+    ) -> tuple[str, str]:
+        from filelock import FileLock
+
+        identity = _normalize_session_id(session_id or f"sess-{uuid4()}")
+        lock_path = self._workspace_root / ".aitobuild/container-locks" / (identity + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(lock_path), timeout=self._timeout_seconds):
+            return self._create_session(session_id=identity, read_only_workspace=read_only_workspace, deadline=deadline)
+
+    def _create_session(
+        self, *, session_id: str, read_only_workspace: bool, deadline: float | None,
+    ) -> tuple[str, str]:
+        if read_only_workspace and deadline is None:
+            raise ValueError("Approved-task containers require an absolute deadline")
         raw_session = (session_id or f"sess-{uuid4()}").strip()
         if not raw_session:
             raise ValueError("session_id must be non-empty")
@@ -132,6 +148,8 @@ class ContainerSessionBashAdapter:
 
         existing = self._containers.get(normalized_session)
         if existing is not None:
+            if read_only_workspace:
+                self._assert_task_container(existing)
             return normalized_session, existing
 
         container_name = _container_name_for_session(
@@ -142,6 +160,8 @@ class ContainerSessionBashAdapter:
             _list_container_names(timeout_seconds=self._timeout_seconds)
         )
         if container_name in running_container_names:
+            if read_only_workspace:
+                self._assert_task_container(container_name)
             self._containers[normalized_session] = container_name
             return normalized_session, container_name
 
@@ -166,7 +186,7 @@ class ContainerSessionBashAdapter:
             "-w",
             self._container_workdir,
             "-v",
-            f"{mount_source}:{self._container_workdir}",
+            f"{mount_source}:{self._container_workdir}" + (":ro" if read_only_workspace else ""),
             "--mount",
             f"type=volume,source={self.data_volume_name},target={self.home_dir},"
             f"volume-subpath={self.data_volume_subpath(normalized_session)}",
@@ -179,18 +199,26 @@ class ContainerSessionBashAdapter:
             "-e",
             f"PATH={self.home_dir}/.local/bin:/usr/local/bin:/usr/bin:/bin",
         ]
+        if read_only_workspace:
+            command.extend([
+                "--network", "none", "--read-only", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges:true", "--pids-limit", "256",
+                "--memory", "1g", "--cpus", "2", "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m",
+            ])
         if self._container_user is not None:
             # Keep writes on bind-mounted workspace owned by the caller, not root.
             command.extend(["--user", self._container_user])
         else:
             command.extend(["--user", "0:0"])
 
-        command.extend([
-            self._image,
-            "tail",
-            "-f",
-            "/dev/null",
-        ])
+        command.append(self._image)
+        if read_only_workspace:
+            command.extend([
+                "python", "-c", "import sys,time; time.sleep(max(0, float(sys.argv[1])-time.time()))",
+                str(deadline),
+            ])
+        else:
+            command.extend(["tail", "-f", "/dev/null"])
 
         completed = _run_process(command=command, timeout_seconds=self._timeout_seconds)
         if completed.exit_code != 0:
@@ -200,6 +228,28 @@ class ContainerSessionBashAdapter:
 
         self._containers[normalized_session] = container_name
         return normalized_session, container_name
+
+    def _assert_task_container(self, container_name: str) -> None:
+        result = _run_process(
+            command=["docker", "inspect", container_name, "--format", "{{json .}}"],
+            timeout_seconds=self._timeout_seconds,
+        )
+        try:
+            config = json.loads(result.stdout)
+            host = config["HostConfig"]
+            mounts = config["Mounts"]
+            repo_mount = next(mount for mount in mounts if mount["Destination"] == self._container_workdir)
+            safe = (
+                result.exit_code == 0 and not repo_mount["RW"] and host["ReadonlyRootfs"]
+                and host["NetworkMode"] == "none" and "ALL" in host["CapDrop"]
+                and "no-new-privileges:true" in host["SecurityOpt"]
+                and all(mount["Destination"] in {self._container_workdir, self.home_dir, "/tmp"} for mount in mounts)
+                and config["Config"]["Cmd"][:2] == ["python", "-c"]
+            )
+        except (ValueError, KeyError, TypeError, StopIteration):
+            safe = False
+        if not safe:
+            raise PermissionError("Existing session lacks the approved-task container profile; use a fresh session")
 
     def _resolve_bind_source(self) -> Path:
         base = self._bind_source_path or self._workspace_root
@@ -275,6 +325,15 @@ class ContainerSessionBashAdapter:
         return tuple(sorted(session_ids))
 
     def close_session(self, *, session_id: str) -> bool:
+        from filelock import FileLock
+
+        identity = _normalize_session_id(session_id)
+        lock_path = self._workspace_root / ".aitobuild/container-locks" / (identity + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(lock_path), timeout=self._timeout_seconds):
+            return self._close_session(session_id=identity)
+
+    def _close_session(self, *, session_id: str) -> bool:
         normalized_session = _normalize_session_id(session_id)
         container_name = self._containers.pop(
             normalized_session,

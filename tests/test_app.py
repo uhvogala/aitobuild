@@ -14,7 +14,7 @@ import pytest
 
 import aitobuild.app as app_module
 from aitobuild.app import create_app
-from aitobuild.developer_isolation import build_developer_task_bundle, default_developer_isolation_policy
+from aitobuild.developer_isolation import IsolationTool, build_developer_task_bundle, default_developer_isolation_policy
 from aitobuild.runtime import FrameworkAvailability, FrameworkBindings, RuntimeBootstrap
 
 
@@ -722,7 +722,7 @@ def test_native_developer_approval_executes_only_the_saved_operation(
             bundle = build_developer_task_bundle(
                 task_id="native-scoped-write", objective="Write a scoped test note",
                 acceptance_criteria=("The note has exact approved content",), constraints=(), context_files=(),
-                policy=replace(default_developer_isolation_policy(), allowed_tools=(app_module.IsolationTool.FILESYSTEM,),
+                policy=replace(default_developer_isolation_policy(), allowed_tools=(IsolationTool.FILESYSTEM,),
                                allowed_paths=("src/approval-probe.txt",), allowed_command_prefixes=()),
             )
             preview = dispatcher.developer_preview_registry.create_or_get(
@@ -893,6 +893,92 @@ def test_app_fails_fast_when_browser_enabled_without_container_session(test_conf
     )
     with pytest.raises(ValueError):
         create_app(invalid_config)
+
+
+def test_explicit_preview_budget_cannot_be_reset_or_bypassed(test_config, monkeypatch: pytest.MonkeyPatch) -> None:
+    agent = _FakeDeveloperAgent()
+    client = _create_app_with_fake_agent(test_config, monkeypatch, agent)
+    headers = _internal_headers(test_config)
+    bundle = build_developer_task_bundle(
+        task_id="explicit-task", objective="Inspect the single scoped file",
+        acceptance_criteria=["No other files changed"], constraints=[], context_files=["src/example.py"],
+        policy=replace(default_developer_isolation_policy(), max_file_changes=1, max_runtime_minutes=1),
+    )
+    preview = client.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "action": "opened", "task_bundle": bundle.to_payload(),
+    })
+    assert preview.status_code == 200, preview.text
+    payload = {"input": "Inspect the scope", "session_id": "explicit-budget", "preview_id": preview.json()["preview_id"]}
+    assert client.post("/internal/developer/agent/run", headers=headers, json=payload).status_code == 409
+    assert agent.calls == []
+    assert client.post("/internal/developer/preview/approve", headers=headers,
+                       json={"preview_id": payload["preview_id"]}).status_code == 200
+    started = client.post("/internal/developer/agent/run", headers=headers, json=payload)
+    assert started.status_code == 200, started.text
+    bypass = client.post("/internal/developer/run", headers=headers, json={
+        "preview_id": payload["preview_id"], "dry_run": False, "commands": [], "file_writes": [],
+    })
+    assert bypass.status_code == 409
+    monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: 1e30)
+    resumed = client.post("/internal/developer/agent/resume", headers=headers, json={
+        "session_id": payload["session_id"], "approved": True,
+        "request_id": started.json()["pending_approval_requests"][0]["request_id"],
+    })
+    assert resumed.status_code == 409
+    assert "expired" in resumed.json()["detail"]
+    assert len(agent.calls) == 1
+    another = client.post("/internal/developer/agent/run", headers=headers, json={**payload, "session_id": "another-budget"})
+    assert another.status_code == 409
+    assert len(agent.calls) == 1
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "timeout", "rejection"])
+def test_approved_task_closes_container_on_terminal_outcomes(test_config, monkeypatch: pytest.MonkeyPatch, outcome: str) -> None:
+    closed: list[str] = []
+
+    class RecordingContainer(app_module.ContainerSessionBashAdapter):
+        def close_session(self, *, session_id: str) -> bool:
+            closed.append(session_id)
+            return True
+
+    class TerminalAgent(_FakeDeveloperAgent):
+        async def run(self, messages: Any, *, session: AgentSession | None = None) -> _FakeRunResult:
+            if outcome == "error":
+                raise RuntimeError("task failed")
+            if outcome == "timeout":
+                raise asyncio.TimeoutError("task timed out")
+            return await super().run(messages, session=session)
+
+    monkeypatch.setattr(app_module, "ContainerSessionBashAdapter", RecordingContainer)
+    config = replace(test_config, developer=replace(test_config.developer, execution_mode="container_session"))
+    agent = TerminalAgent(require_approval=outcome == "rejection")
+    client = _create_app_with_fake_agent(config, monkeypatch, agent)
+    headers = _internal_headers(config)
+    bundle = build_developer_task_bundle(
+        task_id="terminal-task", objective="Inspect the scope", acceptance_criteria=["Report status"],
+        constraints=[], context_files=[],
+    )
+    preview = client.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "task_bundle": bundle.to_payload(),
+    }).json()
+    client.post("/internal/developer/preview/approve", headers=headers, json={"preview_id": preview["preview_id"]})
+    response = client.post("/internal/developer/agent/run", headers=headers, json={
+        "input": "Inspect", "session_id": "terminal-task", "preview_id": preview["preview_id"],
+    })
+    if outcome == "rejection":
+        assert closed == []
+        response = client.post("/internal/developer/agent/resume", headers=headers, json={
+            "session_id": "terminal-task", "approved": False,
+            "request_id": response.json()["pending_approval_requests"][0]["request_id"],
+        })
+    assert response.status_code == {"error": 500, "timeout": 504}.get(outcome, 200), response.text
+    assert closed == ["terminal-task"]
+    if outcome in {"error", "timeout"}:
+        again = client.post("/internal/developer/agent/run", headers=headers, json={
+            "input": "Do not reset the task", "session_id": "another-task", "preview_id": preview["preview_id"],
+        })
+        assert again.status_code == 409
+        assert "aborted" in again.json()["detail"]
 
 
 def test_internal_trigger_architect_scan_route(test_config) -> None:

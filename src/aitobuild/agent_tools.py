@@ -11,7 +11,7 @@ from agent_framework import tool
 from pydantic import Field
 
 from aitobuild.developer_isolation import (
-    DeveloperIsolationPolicy, IsolationTool, default_developer_isolation_policy, is_command_allowed, is_path_allowed,
+    DeveloperIsolationPolicy, DeveloperTaskBudget, IsolationTool, default_developer_isolation_policy, is_command_allowed, is_path_allowed,
 )
 from aitobuild.patching import apply_update_hunks, parse_patch_document
 from aitobuild.policy import (
@@ -48,6 +48,7 @@ class DeveloperToolContext:
     output_dir: Path | None = None
     use_legacy_patch_tool: bool = False
     isolation_policy: DeveloperIsolationPolicy | None = None
+    task_budget: DeveloperTaskBudget | None = None
 
 
 def build_role_tools(*, context: DeveloperToolContext) -> dict[str, tuple[ToolFunc, ...]]:
@@ -61,6 +62,8 @@ def build_developer_tools(*, context: DeveloperToolContext) -> tuple[ToolFunc, .
         raise RuntimeError("MCP adapters enabled but no MCP tool adapter was provided")
 
     policy = context.isolation_policy or default_developer_isolation_policy()
+    if context.task_budget is not None and context.use_legacy_patch_tool:
+        raise ValueError("Budgeted tasks require structured file edits, not the legacy patch adapter")
     active_session_id: str | None = None
 
     def _preview(value: Any, *, max_chars: int = 160) -> str:
@@ -78,12 +81,25 @@ def build_developer_tools(*, context: DeveloperToolContext) -> tuple[ToolFunc, .
     def _resolve_session_id(session_id: str | None) -> str | None:
         nonlocal active_session_id
 
+        if context.task_budget is not None:
+            context.task_budget.remaining_seconds()
         if context.bound_session_id is not None:
             if session_id is not None and session_id.strip() != context.bound_session_id:
                 raise ValueError("Tool session must match this Developer's bound session")
             active_session_id = context.bound_session_id
             if context.container_session_adapter is not None:
-                context.container_session_adapter.create_session(session_id=active_session_id)
+                if context.task_budget is not None and isinstance(context.container_session_adapter, ContainerSessionBashAdapter):
+                    context.container_session_adapter.create_session(
+                        session_id=active_session_id, read_only_workspace=True,
+                        deadline=datetime.now(tz=UTC).timestamp() + context.task_budget.remaining_seconds(),
+                    )
+                    try:
+                        context.task_budget.remaining_seconds()
+                    except TimeoutError:
+                        context.container_session_adapter.close_session(session_id=active_session_id)
+                        raise
+                else:
+                    context.container_session_adapter.create_session(session_id=active_session_id)
             return active_session_id
 
         if session_id is not None and session_id.strip():
@@ -123,6 +139,8 @@ def build_developer_tools(*, context: DeveloperToolContext) -> tuple[ToolFunc, .
         target = (root / path).resolve()
         if not target.is_relative_to(root):
             raise ValueError("File path resolves outside this Developer's workspace")
+        if not is_path_allowed(target.relative_to(root).as_posix(), policy=policy):
+            raise ValueError("File path resolves outside allowed task policy paths")
         return target
 
     @tool(
@@ -336,6 +354,13 @@ def build_developer_tools(*, context: DeveloperToolContext) -> tuple[ToolFunc, .
         if not is_path_allowed(normalized_path, policy=policy):
             raise ValueError(f"path is outside allowed policy paths: {normalized_path}")
 
+        assert_role_action_allowed(AgentRole.DEVELOPER, ActionClass.REPO_WRITE)
+        assert_repo_write_approval(
+            require_human_approval_for_repo_writes=context.require_human_approval_for_repo_writes,
+            approved=approved,
+        )
+        if context.task_budget is not None:
+            context.task_budget.reserve_paths((normalized_path,))
         resolved_session_id = _resolve_session_id(session_id)
         _emit_tool_live(
             "call.start",
@@ -609,9 +634,13 @@ def build_developer_tools(*, context: DeveloperToolContext) -> tuple[ToolFunc, .
         )
 
         try:
-            created_session_id, container_name = context.container_session_adapter.create_session(
-                session_id=session_id,
-            )
+            if context.task_budget is not None and isinstance(context.container_session_adapter, ContainerSessionBashAdapter):
+                created_session_id, container_name = context.container_session_adapter.create_session(
+                    session_id=session_id, read_only_workspace=True,
+                    deadline=datetime.now(tz=UTC).timestamp() + context.task_budget.remaining_seconds(),
+                )
+            else:
+                created_session_id, container_name = context.container_session_adapter.create_session(session_id=session_id)
         except Exception as exc:
             _emit_tool_live(
                 "call.error",

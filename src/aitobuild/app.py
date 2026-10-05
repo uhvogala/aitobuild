@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import AsyncExitStack
 from importlib import import_module
 from dataclasses import replace
@@ -22,7 +23,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
 from aitobuild.config import AppConfig, load_config
 from aitobuild.developer_execution import DeveloperExecutionEngine, PlannedFileWrite
-from aitobuild.developer_isolation import IsolationTool, developer_task_bundle_from_payload
+from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import make_internal_event, normalize_github_webhook, parse_trigger_request
 from aitobuild.proactive import ArchitectScanRunner
@@ -530,12 +531,24 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             or f"preview:{uuid4()}"
         )
 
-        preview = dispatcher.create_developer_preview(
-            dedupe_key=dedupe_key,
-            github_event=github_event_raw.strip(),
-            action=(action_raw or "unknown").strip(),
-            body=body,
-        )
+        if "task_bundle" in payload:
+            raw_bundle = payload["task_bundle"]
+            if not isinstance(raw_bundle, dict) or len(json.dumps(raw_bundle).encode("utf-8")) > MAX_PROMPT_BYTES:
+                raise HTTPException(status_code=400, detail="task_bundle must be an object within the prompt byte limit")
+            try:
+                explicit_bundle = developer_task_bundle_from_payload(raw_bundle)
+            except (ValueError, TypeError) as error:
+                raise HTTPException(status_code=400, detail=f"Invalid task bundle: {error}") from error
+            preview = dispatcher.developer_preview_registry.create_or_get(
+                dedupe_key=dedupe_key, bundle_payload=explicit_bundle.to_payload(), source_payload=body,
+            )
+        else:
+            preview = dispatcher.create_developer_preview(
+                dedupe_key=dedupe_key,
+                github_event=github_event_raw.strip(),
+                action=(action_raw or "unknown").strip(),
+                body=body,
+            )
 
         return {
             "preview_id": preview.preview_id,
@@ -729,6 +742,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             )
 
         dry_run = bool(payload.get("dry_run", True))
+        native_budget_path = developer_state_dir / "budgets" / (sha256(preview_id.encode()).hexdigest() + ".json")
+        if not dry_run and native_budget_path.exists():
+            raise HTTPException(status_code=409, detail="This preview is bound to native task budgets; use native run/resume endpoints")
         approved = bool(payload.get("approved", False))
 
         session_id_raw = payload.get("session_id")
@@ -993,10 +1009,53 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     bound_preview_id = preview_id
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        task_budget = None
+        if task_bundle is not None:
+            if app_config.developer.execution_mode not in {"mock", "container_session"}:
+                raise HTTPException(status_code=409, detail="Approved native tasks require container isolation")
+            if app_config.developer.enable_mcp_adapters or payload.get("use_browser", False) is True:
+                raise HTTPException(status_code=409, detail="Approved tasks do not support MCP adapters or browser execution")
+            try:
+                task_budget = DeveloperTaskBudget(
+                    path=developer_state_dir / "budgets" / (sha256(str(bound_preview_id).encode()).hexdigest() + ".json"),
+                    bundle=task_bundle, create=stored_bundle is None,
+                )
+                task_budget.remaining_seconds()
+            except TimeoutError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            except (ValueError, OSError) as error:
+                raise HTTPException(status_code=409, detail=f"Task budget unavailable: {error}") from error
+
+        def invocation_timeout() -> float:
+            return min(invoke_timeout_seconds, task_budget.remaining_seconds()) if task_budget else invoke_timeout_seconds
+
+        async def close_task_container() -> None:
+            if task_budget is not None and container_session_bash is not None:
+                closed = await asyncio.to_thread(container_session_bash.close_session, session_id=resolved_session_id)
+                if not closed and resolved_session_id in await asyncio.to_thread(container_session_bash.list_session_ids):
+                    raise HTTPException(status_code=500, detail="Approved task container cleanup failed")
+
+        async def fail_task() -> None:
+            try:
+                if task_budget is not None:
+                    task_budget.abort()
+            finally:
+                await close_task_container()
+
+        if task_budget is not None:
+            @function_middleware
+            async def check_task_budget(
+                context: FunctionInvocationContext, call_next: Callable[[], Awaitable[None]],
+            ) -> None:
+                task_budget.remaining_seconds()
+                await call_next()
+
+            run_middleware.append(check_task_budget)
         scoped_tools: tuple[Any, ...] = build_role_tools(
             context=replace(
                 developer_tool_context, bound_session_id=resolved_session_id,
                 isolation_policy=task_bundle.policy if task_bundle is not None else None,
+                task_budget=task_budget,
             )
         )["developer"]
         stored_approvals = session_obj.state.get("aitobuild_pending_approvals", [])
@@ -1028,7 +1087,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             session_obj.state["aitobuild_task_bundle"] = task_bundle.to_payload()
             session_obj.state["aitobuild_preview_id"] = bound_preview_id
             await developer_session_store.set(resolved_session_id, session_obj)
-        browser_allowed = task_bundle is None or IsolationTool.BASH in task_bundle.policy.allowed_tools
+        browser_allowed = task_bundle is None
         if app_config.developer.enable_browser and browser_allowed and payload.get("use_browser", True) is not False:
             if container_session_bash is None or resolved_session_id is None:
                 raise HTTPException(status_code=409, detail="Browser requires a Developer container session")
@@ -1073,7 +1132,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     tools=scoped_tools,
                     middleware=run_middleware,
                 ),
-                timeout=invoke_timeout_seconds,
+                timeout=invocation_timeout(),
             )
             first_pending = _extract_user_input_requests(result)
             record_usage(result)
@@ -1088,6 +1147,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 output_preview=_extract_response_text(result)[:160].replace("\n", "\\n"),
             )
         except asyncio.TimeoutError as exc:
+            await fail_task()
             _emit_developer_agent_live(
                 "invoke.timeout",
                 round=0,
@@ -1101,6 +1161,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 ),
             ) from exc
         except Exception as exc:
+            await fail_task()
             _emit_developer_agent_live("invoke.error", round=0, error=str(exc))
             raise HTTPException(status_code=500, detail=f"Developer agent run failed: {exc}") from exc
 
@@ -1148,7 +1209,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                         tools=scoped_tools,
                         middleware=run_middleware,
                     ),
-                    timeout=invoke_timeout_seconds,
+                    timeout=invocation_timeout(),
                 )
                 round_pending = _extract_user_input_requests(result)
                 record_usage(result)
@@ -1163,6 +1224,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     output_preview=_extract_response_text(result)[:160].replace("\n", "\\n"),
                 )
             except asyncio.TimeoutError as exc:
+                await fail_task()
                 _emit_developer_agent_live(
                     "invoke.timeout",
                     round=approval_rounds,
@@ -1176,6 +1238,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     ),
                 ) from exc
             except Exception as exc:
+                await fail_task()
                 _emit_developer_agent_live(
                     "invoke.error",
                     round=approval_rounds,
@@ -1187,6 +1250,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 ) from exc
 
         pending_requests = _extract_user_input_requests(result)
+        if not pending_requests:
+            await close_task_container()
         response_id = getattr(result, "response_id", None)
         _emit_developer_agent_live(
             "run.finish",

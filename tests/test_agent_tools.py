@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
-from aitobuild.developer_isolation import IsolationTool, default_developer_isolation_policy
+from aitobuild.developer_isolation import (
+    DeveloperTaskBudget, IsolationTool, build_developer_task_bundle, default_developer_isolation_policy,
+)
 from aitobuild.policy import AgentRole
 from aitobuild.tools import MockBashAdapter, MockFilesystemAdapter
 from aitobuild.tools.bash import BashResult
@@ -34,6 +36,61 @@ def test_build_role_tools_includes_developer_toolset(tmp_path: Path) -> None:
     assert "developer_edit_file" in names
     assert "developer_apply_patch" not in names
     assert {"developer_find_files", "developer_search_files"} <= names
+
+
+def test_budgeted_writes_restore_counts_and_reject_before_side_effects(tmp_path: Path) -> None:
+    policy = replace(default_developer_isolation_policy(), max_file_changes=1)
+    bundle = build_developer_task_bundle(
+        task_id="one-file", objective="Edit one file", acceptance_criteria=["Scoped write"],
+        constraints=[], context_files=[], policy=policy,
+    )
+    path = tmp_path / "state/budget.json"
+    context = DeveloperToolContext(
+        bash_adapter=MockBashAdapter(), filesystem_adapter=MockFilesystemAdapter(),
+        workspace_root=tmp_path, require_human_approval_for_repo_writes=True,
+        bound_session_id="budgeted", isolation_policy=policy,
+        task_budget=DeveloperTaskBudget(path=path, bundle=bundle),
+    )
+    tools = build_role_tools(context=context)["developer"]
+    with pytest.raises(PermissionError):
+        tools[2]("src/one.py", "before", approved=False)
+    assert not (tmp_path / ".aitobuild/workspaces/budgeted").exists()
+    tools[2]("src/one.py", "before", approved=True)
+    restored = build_role_tools(context=replace(
+        context, task_budget=DeveloperTaskBudget(path=path, bundle=bundle, create=False),
+    ))["developer"]
+    restored[3]("src/one.py", "before", "after", approved=True)
+    root = tmp_path / ".aitobuild/workspaces/budgeted"
+    assert (root / "src/one.py").read_text() == "after"
+    with pytest.raises(PermissionError, match="file budget"):
+        restored[2]("tests/new/two.py", "blocked", approved=True)
+    assert not (root / "tests").exists()
+
+    calls: list[bool] = []
+
+    class ProfileAdapter(ContainerSessionBashAdapter):
+        def create_session(self, *, session_id: str | None = None, read_only_workspace: bool = False,
+                           deadline: float | None = None) -> tuple[str, str]:
+            assert deadline is not None
+            calls.append(read_only_workspace)
+            return session_id or "budgeted", "container"
+
+    adapter = ProfileAdapter(workspace_root=tmp_path, image="prepared", container_workdir="/workspace",
+                             container_name_prefix="test-profile")
+    profiled = build_role_tools(context=replace(context, container_session_adapter=adapter))["developer"]
+    profiled[4]("budgeted")
+    assert calls == [True, True]
+
+
+def test_symlink_cannot_bypass_blocked_repository_path(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git/config").write_text("unchanged")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/alias").symlink_to(tmp_path / ".git", target_is_directory=True)
+    tools = _developer_tools(tmp_path, legacy_patch=False)
+    with pytest.raises(ValueError, match="policy paths"):
+        tools[2]("src/alias/config", "bypassed")
+    assert (tmp_path / ".git/config").read_text() == "unchanged"
 
 
 def test_patch_tool_schema_example_is_literal_and_executable(tmp_path: Path) -> None:

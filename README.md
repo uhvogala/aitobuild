@@ -27,7 +27,7 @@ human retaining merge authority.
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, capability-audit tests, verified hosted CI baseline | Background tick driver, durable state, tracing, stronger isolation |
 
-Verified locally: **202 tests pass**, Ruff and mypy pass. The original patch-repair
+Verified locally: **212 tests pass**, Ruff and mypy pass. The original patch-repair
 failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
 sessions, managed terminals/processes, native memory/restart and browser tools
 have live integration evidence. Real Grok and Kimi evaluations retain strict
@@ -39,7 +39,8 @@ pytest, Ruff, mypy and the mock fixture simulation, retaining an available
 simulation report for 14 days even on failure. It needs no Azure credentials.
 The [hosted baseline](https://github.com/uhvogala/aitobuild/actions/runs/37308813245)
 passed at `c6edaef`, with 180 tests and the simulation artifact retained. M0 is
-accepted; the additional M1 approval tests are verified locally.
+accepted. M1's constrained native profile has passing Grok/Kimi approved-task
+fixture trials; the broad standalone tool suite is not fully certified.
 
 Future real-repo trials will use
 [uhvogala/aitobuild_example](https://github.com/uhvogala/aitobuild_example), once
@@ -361,6 +362,11 @@ not exposed. Direct commands and managed-shell starts use the task's prefixes,
 which are also shown in tool descriptions. Without `preview_id`, the existing
 standalone prototype remains available and is not an approved task workflow.
 
+For a repository-specific task, `/internal/developer/preview` accepts an optional
+`task_bundle` from `build_developer_task_bundle(...).to_payload()`, alongside the
+usual event fields. It must still be explicitly approved before a native run.
+Run/resume requests cannot replace that bundle or its policy.
+
 `/internal/developer/agent/run` uses the runtime-bound native Developer Agent when available; in descriptor/mock mode it fails with `409` by design.
 
 To bootstrap a meeting from scheduler ticks, first submit a `meeting_requested` internal trigger
@@ -388,18 +394,31 @@ Developer task package with:
 
 Default policy allows edits under `src/` and `tests/` and blocks paths like `.git/` and `.venv/`.
 
-Current checks are prototype guardrails, not complete sandbox enforcement.
-The constrained run endpoint checks command prefixes and file-write counts.
-Preview-bound native runs use the saved bundle's paths, repository tool categories
-and command-prefix checks for direct commands and managed-shell starts. Standalone
-native runs do not enforce an approved bundle. Native file-change counts and
-total task deadlines remain unenforced; shell input and scripts are not parsed
-as independently authorized commands. Durable memory/browser behavior and
-network/resource restrictions do not yet have a complete task-policy contract.
-Shell commands can have side effects beyond their apparent prefix. The declared
-task-wide runtime budget is not enforced as a total wall-clock budget; separate
-command and invoke timeouts exist. Policy parity, approval scope, and resource
-limits must be addressed before unattended execution.
+The accepted M1 profile is preview-bound native execution in a private Docker
+session. It persists a ledger per preview: unique repository paths are reserved
+before writes, repeated edits share a slot, and failed reservations are not
+refunded. One wall-clock deadline starts at binding and includes approval waits
+and restarts. Missing/corrupt ledgers and aborted/expired tasks fail closed;
+another session cannot reset the same preview's budget. Legacy run endpoints
+cannot execute an already native-bound preview.
+
+Commands and interactive shell input operate with a read-only repository/root
+filesystem, no network, dropped capabilities, no privilege escalation, and
+bounded CPU/memory/processes. Writes go through approved scoped file tools.
+The container's PID 1 exits at the task deadline even without the API; completion,
+failure, timeout and rejected approval clean up the task container. Private
+checkouts/home data remain available. Dependencies must already be in the image;
+test/build outputs must use private scratch storage, not repository writes.
+Browser and arbitrary MCP adapters are rejected for this profile. Native memory
+uses the SDK's separate traversal/symlink-checked store and is deadline-guarded,
+not charged against repository file counts.
+
+Standalone native runs and the unbound preview execution prototype do not have
+this contract. Prefix checks are an ergonomics filter, not shell parsing; shell
+commands can read the copied repository and modify private scratch storage.
+This Docker profile is not a hardened hostile-tenant sandbox. Distributed
+coordination, auditing, scratch/disk quotas and broader network/browser policy
+remain required before unattended execution.
 
 ## State and recovery
 

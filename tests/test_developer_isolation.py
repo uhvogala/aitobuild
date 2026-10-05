@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from aitobuild.developer_isolation import (
+    DeveloperTaskBudget,
     developer_task_bundle_from_payload,
     IsolationTool,
     build_developer_task_bundle,
@@ -12,6 +16,41 @@ from aitobuild.developer_isolation import (
     is_command_allowed,
     is_path_allowed,
 )
+
+
+def test_task_budget_persists_unique_files_and_deadline(tmp_path: Path, monkeypatch) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: clock[0])
+    bundle = build_developer_task_bundle(
+        task_id="budget-task", objective="One scoped file", acceptance_criteria=["Tests pass"],
+        constraints=[], context_files=[],
+        policy=replace(default_developer_isolation_policy(), max_file_changes=1, max_runtime_minutes=1),
+    )
+    path = tmp_path / "budget.json"
+    first = DeveloperTaskBudget(path=path, bundle=bundle)
+    first.reserve_paths(("src/one.py",))
+    restored = DeveloperTaskBudget(path=path, bundle=bundle, create=False)
+    restored.reserve_paths(("src/one.py",))
+    before = path.read_bytes()
+    with pytest.raises(PermissionError, match="file budget"):
+        restored.reserve_paths(("src/two.py",))
+    assert path.read_bytes() == before
+    assert json.loads(before)["reserved_paths"] == ["src/one.py"]
+    clock[0] += 61
+    with pytest.raises(TimeoutError, match="expired"):
+        DeveloperTaskBudget(path=path, bundle=bundle).remaining_seconds()
+    with pytest.raises(TimeoutError):
+        restored.reserve_paths(("src/one.py",))
+    path.unlink()
+    with pytest.raises(ValueError, match="missing"):
+        DeveloperTaskBudget(path=path, bundle=bundle, create=False)
+    aborted = DeveloperTaskBudget(path=tmp_path / "aborted.json", bundle=bundle)
+    aborted.abort()
+    aborted.abort()
+    with pytest.raises(TimeoutError, match="aborted"):
+        aborted.reserve_paths(("src/one.py",))
+    with pytest.raises(TimeoutError, match="aborted"):
+        DeveloperTaskBudget(path=tmp_path / "aborted.json", bundle=bundle)
 
 
 def test_build_developer_task_bundle_success() -> None:

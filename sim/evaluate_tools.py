@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from collections import Counter
 from dataclasses import replace
 from datetime import UTC, datetime
+from difflib import unified_diff
 import json
 from pathlib import Path
 import subprocess
@@ -16,7 +18,8 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 
 from aitobuild.app import create_app
-from aitobuild.config import load_config
+from aitobuild.config import AppConfig, load_config
+from aitobuild.developer_isolation import IsolationTool, build_developer_task_bundle, default_developer_isolation_policy
 from sim.run_local_simulation import (
     _rebase_session_bind_path_for_sandbox,
     assert_live_model_config,
@@ -168,7 +171,7 @@ HTTPServer(('127.0.0.1', 8765), Handler).serve_forever()
 
 def run_evaluation(*, env_file: Path, output: Path, browser: bool = True,
                    recovery: bool = False, model: str | None = None,
-                   invoke_timeout: int | None = None) -> int:
+                   invoke_timeout: int | None = None, approved_task: bool = False) -> int:
     load_env_file(env_file)
     base = load_config()
     config = replace(base, runtime=replace(base.runtime, allow_mock_model=False,
@@ -179,6 +182,8 @@ def run_evaluation(*, env_file: Path, output: Path, browser: bool = True,
         state_dir=".aitobuild/evaluation",
     ))
     assert_live_model_config(config)
+    if approved_task:
+        return run_approved_task_evaluation(config=config, output=output)
     root = Path(__file__).resolve().parent
     output = output.resolve()
     cases: list[dict[str, Any]] = []
@@ -442,11 +447,120 @@ def run_evaluation(*, env_file: Path, output: Path, browser: bool = True,
     return 0 if report["succeeded"] else 1
 
 
+def run_approved_task_evaluation(*, config: AppConfig, output: Path) -> int:
+    root = Path(__file__).resolve().parent
+    output = output.resolve()
+    session_id = "approved-" + uuid4().hex[:12]
+    config = replace(config, developer=replace(config.developer, enable_browser=False))
+    source_path = "src/demo_app/math_ops.py"
+    test_path = "tests/test_multiply.py"
+    addition = "\n\ndef multiply(left: int, right: int) -> int:\n    return left * right\n"
+    test_content = (
+        "from demo_app.math_ops import multiply\n\n\n"
+        "def test_multiply() -> None:\n"
+        "    assert multiply(3, 4) == 12\n"
+        "    assert multiply(-2, 5) == -10\n"
+        "    assert multiply(8, 0) == 0\n"
+    )
+    bundle = build_developer_task_bundle(
+        task_id=session_id, objective="Implement and test integer multiply in the disposable fixture",
+        acceptance_criteria=["Preserve add and implement multiply", "Verify positive, negative and zero inputs", "Pytest exits zero"],
+        constraints=["Only the two approved files may change", "No network, browser, MCP or dependency installation"],
+        context_files=[source_path],
+        policy=replace(default_developer_isolation_policy(), allowed_tools=(IsolationTool.FILESYSTEM, IsolationTool.BASH),
+                       allowed_paths=(source_path, test_path), allowed_command_prefixes=("python -B -m pytest",),
+                       max_file_changes=2, max_runtime_minutes=5),
+    )
+    report: dict[str, Any] = {
+        "schema_version": 1, "started_at": datetime.now(UTC).isoformat(),
+        "scope": "M1 approved-task fixture, not full tool-coverage certification",
+        "model": config.runtime.foundry_model, "session_id": session_id, "succeeded": False,
+        "auto_approvals": "Authorized only for this disposable fixture",
+    }
+    with copied_fixture_repo(root / "repo-fixture") as (run_root, repo):
+        baseline = {path.relative_to(repo).as_posix(): path.read_bytes() for path in repo.rglob("*") if path.is_file()}
+        _rebase_session_bind_path_for_sandbox(workspace_root=root.parent, sandbox_repo=repo)
+        config = replace(config, developer=replace(config.developer, session_container_bind_path=(
+            load_config().developer.session_container_bind_path
+        )))
+        report.update(simulation_root=str(run_root), sandbox_repo=str(repo))
+        headers = internal_headers(config)
+        with TestClient(create_app(config)) as client:
+            try:
+                preview = call_checked(client, "POST", "/internal/developer/preview", headers=headers, json={
+                    "github_event": "issues", "action": "opened", "delivery_id": session_id,
+                    "task_bundle": bundle.to_payload(),
+                    "body": {"issue": {"number": 101, "title": "Implement and test multiply in the disposable fixture"}},
+                })
+                call_checked(client, "POST", "/internal/developer/preview/approve", headers=headers,
+                             json={"preview_id": preview["preview_id"]})
+                report["approved_bundle"] = preview["bundle"]
+                begin = perf_counter()
+                response = call_checked(client, "POST", "/internal/developer/agent/run", headers=headers, json={
+                    "session_id": session_id, "preview_id": preview["preview_id"],
+                    "auto_approve_tools": True, "max_approval_rounds": 12, "include_tool_trace": True,
+                    "input": (
+                        f"Read {source_path} with developer_read_file. Use developer_edit_file to append "
+                        f"exactly this function, preserving all existing code:\n{addition}\n"
+                        f"Use developer_write_file to create {test_path} with exactly this content:\n{test_content}\n"
+                        "Then use developer_run_command with exactly: "
+                        "PYTHONPATH=src python -B -m pytest -p no:cacheprovider -q\n"
+                        "The repository mount is read-only for shell commands; use only the file tools for edits. "
+                        "The shell is offline. Do not install dependencies or start/stop sessions. "
+                        "Change only these two files. Execute the tools and finish after the tests pass."
+                    ),
+                })
+                workspace = repo / ".aitobuild/workspaces" / session_id
+                actual = {path.relative_to(workspace).as_posix(): path.read_bytes()
+                          for path in workspace.rglob("*") if path.is_file()}
+                changed = {path for path in set(actual) | set(baseline) if actual.get(path) != baseline.get(path)}
+                report["diffs"] = {path: "".join(unified_diff(
+                    baseline.get(path, b"").decode().splitlines(keepends=True),
+                    actual.get(path, b"").decode().splitlines(keepends=True),
+                    fromfile="a/" + path, tofile="b/" + path,
+                )) for path in sorted(changed)}
+                source_ok = ast.dump(ast.parse(actual.get(source_path, b""))) == ast.dump(ast.parse(
+                    baseline[source_path].decode() + addition,
+                ))
+                tests_ok = ast.dump(ast.parse(actual.get(test_path, b""))) == ast.dump(ast.parse(test_content))
+                budget_paths = list((repo / config.developer.state_dir / "budgets").glob("*.json"))
+                budget = json.loads(budget_paths[0].read_text()) if len(budget_paths) == 1 else {}
+                tests_passed = any(
+                    entry["name"] == "developer_run_command" and entry.get("ok") is True
+                    and isinstance(entry.get("result"), dict) and entry["result"].get("exit_code") == 0
+                    and entry.get("arguments", {}).get("command") == "PYTHONPATH=src python -B -m pytest -p no:cacheprovider -q"
+                    for entry in response.get("tool_trace", [])
+                )
+                report["case"] = grade_case(
+                    name="approved_task", response=response, elapsed_seconds=perf_counter() - begin,
+                    required_tools={"developer_read_file", "developer_edit_file", "developer_write_file", "developer_run_command"},
+                    checks={"source_contract": source_ok, "test_contract": tests_ok,
+                            "only_approved_files_changed": changed == {source_path, test_path},
+                            "persisted_file_budget": set(budget.get("reserved_paths", [])) == {source_path, test_path},
+                            "tests_passed": tests_passed, "task_bound": response.get("preview_id") == preview["preview_id"]},
+                )
+            except Exception as error:
+                report["error"] = str(error)
+            finally:
+                try:
+                    report["cleanup"] = call_checked(client, "POST", "/internal/developer/session/stop-all", headers=headers)
+                except Exception as error:
+                    report["cleanup"] = {"failed_count": 1, "error": str(error)}
+                report["succeeded"] = bool(report.get("case", {}).get("passed") and not report.get("error")
+                                           and report["cleanup"].get("failed_count") == 0
+                                           and report["cleanup"].get("closed_count") == 0)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"[eval] approved_task: {'PASS' if report['succeeded'] else 'FAIL'}; report={output}", flush=True)
+    return 0 if report["succeeded"] else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path, default=Path("sim/.env.simulation.live.example"))
     parser.add_argument("--output", type=Path, default=Path("sim/.run-artifacts/tool-evaluation.json"))
     parser.add_argument("--no-browser", action="store_true", help="Exclude browser tools explicitly.")
+    parser.add_argument("--approved-task", action="store_true", help="Run a strict approved-task fixture with offline read-only shell execution.")
     parser.add_argument("--recovery", action="store_true", help="Inject one expected stale-text edit failure.")
     parser.add_argument("--model", help="Override the deployment name without editing the env file.")
     parser.add_argument("--invoke-timeout", type=int, help="Per-framework-invocation deadline in seconds; defaults to env configuration.")
@@ -455,7 +569,7 @@ def main() -> int:
         parser.error("--invoke-timeout must be >=1")
     return run_evaluation(env_file=args.env_file, output=args.output,
                           browser=not args.no_browser, recovery=args.recovery, model=args.model,
-                          invoke_timeout=args.invoke_timeout)
+                          invoke_timeout=args.invoke_timeout, approved_task=args.approved_task)
 
 
 if __name__ == "__main__":

@@ -126,17 +126,17 @@ These items describe code and local test coverage, not production certification.
 - Ripgrep-backed file discovery and literal/regex content search use allowed private roots, ignore-aware glob filtering and bounded pagination. Focused Grok/Kimi search probes pass with zero errors and unchanged fixture source.
 - Preview command defaults cover common interpreters, package managers, Git, builds, shell scripts and filesystem utilities. Native runs can snapshot an approved preview's task context/policy in a fresh session; scoped repository tools and direct/managed-start commands reuse it after restart, with no caller-supplied policy or session rebinding. Standalone native prototypes remain available; token-prefix matching is not a security boundary.
 - GitHub Actions baseline workflow uses Python 3.14, locked uv dependencies and ripgrep for pytest/Ruff/mypy plus the mock fixture simulation, retaining available reports on failure. Hosted run 37308813245 passed at `c6edaef` with 180 tests and a retained simulation report, accepting M0.
-- Verification on 2026-10-05: 202 local tests pass, `ruff` and `mypy src` pass. Native task-bound approval tests include a mocked model transport; complete policy/budget enforcement and a zero-unexpected-error full live evaluation remain M1 requirements.
+- Verification on 2026-10-05: 212 local tests pass, `ruff` and `mypy src` pass. M1's constrained native profile passes approved two-file Grok/Kimi trials with actual pytest, persisted budgets, zero unexpected errors and automatic cleanup. Full standalone tool coverage is not certified; M2 is next.
 
 ### Current Limits
 
 - `developer.async.webhook` returns a task bundle; no worker consumes it automatically.
-- Task bundles contain generic objectives and aitobuild-specific context paths, not a target repository's issue-derived specification.
+- Webhook-generated bundles still contain generic objectives/service context; explicit preview bundles are supported, but automatic repository-specific issue extraction remains M2 work.
 - GitHub branch/commit/PR operations are not implemented; the adapter records mock issue proposals.
 - Meetings construct workflows without executing them, and proactive scans interpret supplied metadata rather than inspecting a repository.
 - Scheduler ticks require an external caller; application state is in memory and does not survive restart.
-- Native runs without a bound preview remain prototypes. Task-bound repository tools and direct/managed-start commands enforce the saved policy, but file-change/time budgets, interactive shell, memory/browser/network constraints, distributed coordination and durable task/approval audit records remain pending.
-- Docker bind mounts and command-prefix checks do not establish a hardened sandbox; total task budgets remain declarative.
+- Native runs without a bound preview and unbound legacy runs remain prototypes. Approved native tasks persist unique-path reservations and an absolute deadline, fail closed after abort, and use offline read-only repository execution. Browser/arbitrary MCP adapters are excluded; native memory has a separate scoped SDK store. Distributed coordination, durable auditing and scratch/disk quotas remain pending.
+- The constrained Docker profile has resource/capability/network restrictions and expiry/cleanup checks, but is not a hardened hostile-tenant sandbox. Prefix matching is not shell parsing; dependency installation and build outputs cannot write the repository mount.
 - The capability matrix tests check entries, not duplicate implementations; the successful CI baseline does not prove no-duplicate capability enforcement.
 - Docker, MCP, and live-model paths need fresh integration evidence before being considered operational.
 
