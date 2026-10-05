@@ -559,3 +559,60 @@ def test_shared_web_search_and_request_meeting(tmp_path: Path) -> None:
         )
         assert meeting["state"] == "requested"
         assert meeting["requested_by"] == role_name
+
+
+def test_mock_publish_commit_and_draft_pr_respect_allowlist() -> None:
+    from aitobuild.policy import AgentRole
+
+    adapter = MockGitHubAdapter(
+        allowed_repositories=frozenset({"uhvogala/aitobuild_example"}),
+        enforce_allowlist=True,
+    )
+    base = "a" * 40
+    head = adapter.upsert_branch_commit(
+        role=AgentRole.DEVELOPER,
+        repository="uhvogala/aitobuild_example",
+        branch="aitobuild/issue-1-deadbeefdeadbeef",
+        base_sha=base,
+        commit_message="aitobuild: implement #1",
+        files={"src/probe.py": "x = 1\n"},
+        approved=True,
+        require_human_approval_for_repo_writes=True,
+    )
+    assert len(head) == 40
+    pull = adapter.create_or_update_draft_pull_request(
+        role=AgentRole.DEVELOPER,
+        repository="uhvogala/aitobuild_example",
+        title="aitobuild: probe",
+        body="Closes #1",
+        head_branch="aitobuild/issue-1-deadbeefdeadbeef",
+        base_ref="main",
+        issue_number=1,
+        approved=True,
+        require_human_approval_for_repo_writes=True,
+    )
+    assert pull.draft is True and pull.number == 1
+    updated = adapter.create_or_update_draft_pull_request(
+        role=AgentRole.DEVELOPER,
+        repository="uhvogala/aitobuild_example",
+        title="aitobuild: probe",
+        body="Closes #1\nupdated",
+        head_branch="aitobuild/issue-1-deadbeefdeadbeef",
+        base_ref="main",
+        issue_number=1,
+        existing_pull_number=1,
+        approved=True,
+        require_human_approval_for_repo_writes=True,
+    )
+    assert updated.number == 1 and "updated" in updated.body
+    with pytest.raises(PermissionError, match="allowlist"):
+        adapter.upsert_branch_commit(
+            role=AgentRole.DEVELOPER,
+            repository="evil/other",
+            branch="aitobuild/issue-1-deadbeefdeadbeef",
+            base_sha=base,
+            commit_message="nope",
+            files={"a.py": "1"},
+            approved=True,
+            require_human_approval_for_repo_writes=True,
+        )

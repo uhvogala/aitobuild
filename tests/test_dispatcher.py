@@ -994,3 +994,123 @@ def test_preparation_restart_does_not_reset_expired_deadline(approved_delivery, 
     final_budget = json.loads(budget_path.read_text())
     assert final_budget["deadline"] == 0 and final_budget["aborted"]
     assert log_path.read_text() == initial_log
+
+
+def test_publish_verified_delivery_opens_draft_pr_idempotently(
+    implemented_delivery, verification_adapter, monkeypatch,
+) -> None:
+    from aitobuild.tools.github import MockGitHubAdapter
+
+    worker, preview_id, _, _ = implemented_delivery
+    monkeypatch.setattr(
+        delivery_module,
+        "shell_request",
+        lambda *arguments, **kwargs: {
+            "ok": True,
+            "status": "exited",
+            "exit_code": 0,
+            "output": "ok",
+            "next_cursor": 1,
+        },
+    )
+    verified = worker.verify(preview_id, adapter=verification_adapter)
+    assert verified.state == "verified"
+    github = MockGitHubAdapter(
+        allowed_repositories=frozenset({"fixture/widgets"}),
+        enforce_allowlist=True,
+    )
+    published = worker.publish(
+        preview_id,
+        github=github,
+        require_human_approval_for_repo_writes=True,
+    )
+    assert published.state == "published", published.error
+    assert published.publication["draft"] is True
+    assert published.publication["pull_number"] == 1
+    assert published.head_revision == published.publication["head_sha"]
+    assert "Closes #7" in published.publication["body"] or "Closes #" in published.publication["body"]
+    assert len(github.branch_commits) == 1
+    assert github.pull_requests["fixture/widgets"][1].draft is True
+    again = worker.publish(
+        preview_id,
+        github=github,
+        require_human_approval_for_repo_writes=True,
+    )
+    assert again == published
+    assert len(github.branch_commits) == 1
+
+
+def test_publish_rejects_wrong_state_and_drift(
+    implemented_delivery, verification_adapter, monkeypatch,
+) -> None:
+    from aitobuild.tools.github import MockGitHubAdapter
+
+    worker, preview_id, _, _ = implemented_delivery
+    github = MockGitHubAdapter(
+        allowed_repositories=frozenset({"fixture/widgets"}),
+        enforce_allowlist=True,
+    )
+    with pytest.raises(ValueError, match="verified"):
+        worker.publish(
+            preview_id,
+            github=github,
+            require_human_approval_for_repo_writes=True,
+        )
+    monkeypatch.setattr(
+        delivery_module,
+        "shell_request",
+        lambda *a, **k: {"ok": True, "status": "exited", "exit_code": 0, "output": "ok", "next_cursor": 1},
+    )
+    worker.verify(preview_id, adapter=verification_adapter)
+    record = worker.get(preview_id)
+    assert record is not None
+    drifted = Path(record.checkout_path) / "src/probe.py"
+    drifted.write_text("def probe():\n    return False\n")
+    blocked = worker.publish(
+        preview_id,
+        github=github,
+        require_human_approval_for_repo_writes=True,
+    )
+    assert blocked.state == "failed"
+    assert blocked.error and (
+        "publication is blocked" in blocked.error or "Verified checkout changed" in blocked.error
+    )
+
+
+def test_publish_is_single_flight(implemented_delivery, verification_adapter, monkeypatch) -> None:
+    from aitobuild.tools.github import MockGitHubAdapter
+    from dataclasses import replace
+
+    worker, preview_id, _, _ = implemented_delivery
+    monkeypatch.setattr(
+        delivery_module,
+        "shell_request",
+        lambda *a, **k: {"ok": True, "status": "exited", "exit_code": 0, "output": "ok", "next_cursor": 1},
+    )
+    worker.verify(preview_id, adapter=verification_adapter)
+    directory = worker._task_dir(preview_id)
+    record = worker.get(preview_id)
+    assert record is not None
+    stuck = replace(record, state="publishing", publication={
+        "title": "t",
+        "body": "b",
+        "commit_message": "c",
+        "checkout_digest": record.verification["checkout_digest"],
+        "changed_paths": ["src/probe.py"],
+        "base_ref": "main",
+        "base_sha": record.base_revision,
+        "branch": record.branch,
+        "repository": "fixture/widgets",
+        "issue_number": 7,
+    })
+    worker._save(directory, stuck)
+    github = MockGitHubAdapter(
+        allowed_repositories=frozenset({"fixture/widgets"}),
+        enforce_allowlist=True,
+    )
+    with pytest.raises(ValueError, match="concurrent publish|already in progress"):
+        worker.publish(
+            preview_id,
+            github=github,
+            require_human_approval_for_repo_writes=True,
+        )

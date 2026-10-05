@@ -23,6 +23,8 @@ from aitobuild.developer_isolation import (
     DeveloperTaskBudget, DeveloperTaskBundle, developer_task_bundle_from_payload, is_command_allowed, is_path_allowed,
 )
 from aitobuild.developer_preview import DeveloperPreviewRegistry
+from aitobuild.policy import AgentRole
+from aitobuild.tools.github import GitHubAdapter
 from aitobuild.tools.bash import ContainerSessionBashAdapter, _normalize_session_id
 from aitobuild.tools.shell import shell_request
 
@@ -52,6 +54,7 @@ class DeliveryPreparation:
     session_id: str | None = None
     verification_commands: list[str] = field(default_factory=list)
     verification: dict[str, Any] | None = None
+    publication: dict[str, Any] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -174,7 +177,7 @@ class DeveloperDeliveryWorker:
                     raise ValueError("Delivery identity/source differs from the immutable approved task")
                 if record.state == "failed":
                     return record
-                if record.state in {"implementing", "awaiting_tool_approval", "implemented", "verifying", "verified"}:
+                if record.state in {"implementing", "awaiting_tool_approval", "implemented", "verifying", "verified", "publishing", "published"}:
                     return record
             interrupted = record is not None and record.state == "preparing"
             fresh = record is None
@@ -353,6 +356,225 @@ class DeveloperDeliveryWorker:
             self._save(directory, record)
             return record
 
+
+    def publish(
+        self,
+        preview_id: str,
+        *,
+        github: GitHubAdapter,
+        require_human_approval_for_repo_writes: bool,
+    ) -> DeliveryPreparation:
+        """Publish a verified delivery as a draft PR bound to the approved scope."""
+        directory = self._task_dir(preview_id)
+        with self.implementation_lock(preview_id):
+            with FileLock(str(directory) + ".lock", timeout=10):
+                record = self._load(directory)
+            if record is None:
+                raise ValueError("Delivery not found")
+            if record.state == "failed":
+                return record
+            if record.state == "published":
+                return record
+            if record.state == "publishing":
+                raise ValueError("Publication already in progress; concurrent publish is blocked")
+            if record.state != "verified":
+                raise ValueError("Publication requires a verified delivery")
+            preview = self._previews.get(preview_id)
+            if preview is None or not preview.approved or preview.approved_at is None:
+                raise ValueError("Publication requires an existing human approval")
+            if preview.bundle_payload != record.bundle_payload:
+                raise ValueError("Delivery scope differs from the immutable approved task")
+            bundle = developer_task_bundle_from_payload(record.bundle_payload)
+            issue = bundle.issue_context
+            if issue is None or issue.base_revision != record.base_revision:
+                raise ValueError("Publication requires the approved repository issue identity")
+            if not any(
+                source.repository == issue.repository
+                and source.repository_id == issue.repository_id
+                and str(source.path.resolve()) == record.source_path
+                for source in self._sources
+            ):
+                raise ValueError("Publication requires its operator-configured target source")
+            if record.verification is None or record.verification.get("cleanup_succeeded") is not True:
+                raise ValueError("Publication requires successful verification evidence")
+            budget = DeveloperTaskBudget(
+                path=self._state_dir / "budgets" / (sha256(preview_id.encode()).hexdigest() + ".json"),
+                bundle=bundle,
+                create=False,
+            )
+            error: str | None = None
+            try:
+                budget.remaining_seconds()
+                # Bind to approved base + verified tree; reject workspace drift.
+                self._verify_checkout(directory, record, budget, pristine=False)
+                digest = self._checkout_digest(Path(record.checkout_path), budget)
+                if digest != record.verification["checkout_digest"]:
+                    raise ValueError("Verified checkout changed; publication is blocked")
+                changed = set(
+                    self._git(
+                        directory,
+                        budget,
+                        "-C",
+                        record.checkout_path,
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--no-renames",
+                        "--name-only",
+                        "-z",
+                        record.base_revision,
+                        "--",
+                    ).split("\x00")
+                )
+                changed.update(
+                    self._git(
+                        directory,
+                        budget,
+                        "-C",
+                        record.checkout_path,
+                        "ls-files",
+                        "--others",
+                        "-z",
+                    ).split("\x00")
+                )
+                changed.discard("")
+                reservations = set(json.loads(budget.path.read_text())["reserved_paths"])
+                if (
+                    not changed
+                    or not changed <= reservations
+                    or not all(is_path_allowed(path, policy=bundle.policy) for path in changed)
+                ):
+                    raise ValueError(
+                        "Publication changes must be nonempty, within approved paths and reserved file budgets"
+                    )
+                files: dict[str, str | None] = {}
+                checkout = Path(record.checkout_path)
+                for relative in sorted(changed):
+                    target = checkout / relative
+                    if target.exists():
+                        if target.is_symlink() or not target.is_file():
+                            raise ValueError("Publication only supports regular text file changes")
+                        try:
+                            files[relative] = target.read_text(encoding="utf-8")
+                        except UnicodeDecodeError as exc:
+                            raise ValueError(
+                                f"Publication file {relative} must be UTF-8 text"
+                            ) from exc
+                    else:
+                        files[relative] = None
+                title, body, commit_message = self._publication_metadata(bundle)
+                base_ref = issue.base_branch
+                publication = {
+                    "title": title,
+                    "body": body,
+                    "commit_message": commit_message,
+                    "checkout_digest": digest,
+                    "changed_paths": sorted(files),
+                    "base_ref": base_ref,
+                    "base_sha": record.base_revision,
+                    "branch": record.branch,
+                    "repository": issue.repository,
+                    "issue_number": issue.issue_number,
+                }
+                record = replace(
+                    record,
+                    state="publishing",
+                    publication=publication,
+                    error=None,
+                    updated_at=datetime.now(tz=UTC).isoformat(),
+                )
+                self._save(directory, record)
+                head_sha = github.upsert_branch_commit(
+                    role=AgentRole.DEVELOPER,
+                    repository=issue.repository,
+                    branch=record.branch,
+                    base_sha=record.base_revision,
+                    commit_message=commit_message,
+                    files=files,
+                    approved=True,
+                    require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+                )
+                if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+                    raise RuntimeError("GitHub adapter returned an invalid head SHA")
+                existing = None
+                if isinstance(record.publication, dict):
+                    raw_existing = record.publication.get("pull_number")
+                    if isinstance(raw_existing, int):
+                        existing = raw_existing
+                pull = github.create_or_update_draft_pull_request(
+                    role=AgentRole.DEVELOPER,
+                    repository=issue.repository,
+                    title=title,
+                    body=body,
+                    head_branch=record.branch,
+                    base_ref=base_ref,
+                    issue_number=issue.issue_number,
+                    existing_pull_number=existing,
+                    approved=True,
+                    require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+                )
+                if not pull.draft:
+                    raise RuntimeError("Publication must create a draft pull request")
+                publication = {
+                    **publication,
+                    "head_sha": head_sha,
+                    "pull_number": pull.number,
+                    "html_url": pull.html_url,
+                    "draft": True,
+                    "published_at": datetime.now(tz=UTC).isoformat(),
+                }
+                record = replace(
+                    record,
+                    state="published",
+                    head_revision=head_sha,
+                    publication=publication,
+                    error=None,
+                    updated_at=datetime.now(tz=UTC).isoformat(),
+                )
+            except BaseException as failure:
+                error = str(failure) or type(failure).__name__
+                if not isinstance(failure, Exception):
+                    budget.abort()
+                    self._save(
+                        directory,
+                        replace(
+                            record,
+                            state="failed",
+                            error=error,
+                            updated_at=datetime.now(tz=UTC).isoformat(),
+                        ),
+                    )
+                    raise
+            if error is not None:
+                budget.abort()
+                record = replace(
+                    record,
+                    state="failed",
+                    error=error,
+                    updated_at=datetime.now(tz=UTC).isoformat(),
+                )
+            self._save(directory, record)
+            return record
+
+    @staticmethod
+    def _publication_metadata(bundle: DeveloperTaskBundle) -> tuple[str, str, str]:
+        issue = bundle.issue_context
+        if issue is None:
+            raise ValueError("Publication metadata requires issue context")
+        title = f"aitobuild: {issue.title}".strip()
+        if not title:
+            raise ValueError("Publication title derived from issue metadata is empty")
+        criteria = "\n".join(f"- {item}" for item in bundle.acceptance_criteria) or "- (none)"
+        body = (
+            f"Automated draft for #{issue.issue_number}.\n\n"
+            f"## Objective\n{bundle.objective}\n\n"
+            f"## Acceptance criteria\n{criteria}\n\n"
+            f"Closes #{issue.issue_number}\n"
+        )
+        commit_message = f"aitobuild: implement #{issue.issue_number} {issue.title}".strip()
+        return title[:200], body, commit_message[:200]
+
+
     def _run_verification_command(
         self, directory: Path, budget: DeveloperTaskBudget, adapter: ContainerSessionBashAdapter,
         session_id: str, command: str, index: int,
@@ -483,16 +705,16 @@ class DeveloperDeliveryWorker:
         if not isinstance(record.bundle_payload, dict):
             raise ValueError("Invalid persisted delivery scope")
         bundle = developer_task_bundle_from_payload(record.bundle_payload)
-        if record.state not in {"preparing", "prepared", "failed", "implementing", "awaiting_tool_approval", "implemented", "verifying", "verified"} or bundle.issue_context is None:
+        if record.state not in {"preparing", "prepared", "failed", "implementing", "awaiting_tool_approval", "implemented", "verifying", "verified", "publishing", "published"} or bundle.issue_context is None:
             raise ValueError("Invalid persisted delivery preparation state")
         self._validate_verification_commands(record.verification_commands, bundle)
         if record.session_id is not None:
             if not isinstance(record.session_id, str):
                 raise ValueError("Invalid persisted native delivery session")
             _normalize_session_id(record.session_id)
-        if record.state in {"implementing", "awaiting_tool_approval", "implemented", "verifying", "verified"} and record.session_id is None:
+        if record.state in {"implementing", "awaiting_tool_approval", "implemented", "verifying", "verified", "publishing", "published"} and record.session_id is None:
             raise ValueError("Missing persisted native delivery session")
-        if record.state in {"verifying", "verified"}:
+        if record.state in {"verifying", "verified", "publishing", "published"}:
             evidence = record.verification
             if not isinstance(evidence, dict) or not isinstance(evidence.get("session_id"), str):
                 raise ValueError("Invalid persisted verification evidence")
@@ -501,13 +723,13 @@ class DeveloperDeliveryWorker:
                     or not isinstance(evidence.get("checkout_digest"), str)
                     or re.fullmatch(r"[0-9a-f]{64}", evidence["checkout_digest"]) is None):
                 raise ValueError("Invalid persisted verification identity")
-            timestamps = ("started_at", "completed_at") if record.state == "verified" else ("started_at",)
+            timestamps = ("started_at", "completed_at") if record.state in {"verified", "publishing", "published"} else ("started_at",)
             for name in timestamps:
                 timestamp = evidence.get(name)
                 if not isinstance(timestamp, str) or not timestamp:
                     raise ValueError("Invalid persisted verification timestamp")
                 datetime.fromisoformat(timestamp)
-            if record.state == "verified" and (
+            if record.state in {"verified", "publishing", "published"} and (
                 not record.verification_commands or evidence.get("cleanup_succeeded") is not True
                 or len(evidence["commands"]) != len(record.verification_commands)
                 or any(not isinstance(result, dict) or result.get("command") != command
@@ -515,14 +737,44 @@ class DeveloperDeliveryWorker:
                        for command, result in zip(record.verification_commands, evidence["commands"], strict=True))
             ):
                 raise ValueError("Persisted verification lacks successful command/cleanup evidence")
+        if record.state in {"publishing", "published"}:
+            publication = record.publication
+            if not isinstance(publication, dict):
+                raise ValueError("Invalid persisted publication payload")
+            for key in ("title", "body", "commit_message", "checkout_digest", "base_ref", "base_sha", "branch", "repository"):
+                if not isinstance(publication.get(key), str) or not publication[key]:
+                    raise ValueError("Invalid persisted publication field")
+            if publication["base_sha"] != record.base_revision or publication["branch"] != record.branch:
+                raise ValueError("Publication identity differs from the approved delivery")
+            if record.verification is None:
+                raise ValueError("Publication requires persisted verification evidence")
+            if publication["checkout_digest"] != record.verification["checkout_digest"]:
+                raise ValueError("Publication checkout digest differs from verification")
+            if type(publication.get("issue_number")) is not int or publication["issue_number"] <= 0:
+                raise ValueError("Invalid persisted publication issue number")
+            if not isinstance(publication.get("changed_paths"), list) or not publication["changed_paths"]:
+                raise ValueError("Publication must record scoped changed paths")
+            if record.state == "published":
+                published_at = publication.get("published_at")
+                if not isinstance(published_at, str) or not published_at:
+                    raise ValueError("Invalid persisted publication timestamp")
+                datetime.fromisoformat(published_at)
         if bundle.task_id != record.task_id or bundle.issue_context.base_revision != record.base_revision:
             raise ValueError("Persisted delivery preparation differs from the approved identity")
         expected_branch = f"aitobuild/issue-{bundle.issue_context.issue_number}-{sha256(bundle.task_id.encode()).hexdigest()[:16]}"
         if (directory != self._task_dir(record.preview_id) or record.checkout_path != str(directory / "repo")
                 or record.branch != expected_branch):
             raise ValueError("Persisted delivery checkout identity is invalid")
-        if (record.state in {"prepared", "implementing", "awaiting_tool_approval", "implemented", "verifying", "verified"}
+        if (record.state in {"prepared", "implementing", "awaiting_tool_approval", "implemented", "verifying", "verified", "publishing"}
             and record.head_revision != record.base_revision
+                or record.state == "published" and (
+                    not isinstance(record.head_revision, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", record.head_revision) is None
+                    or not isinstance(record.publication, dict)
+                    or record.publication.get("head_sha") != record.head_revision
+                    or record.publication.get("pull_number") is None
+                    or record.publication.get("draft") is not True
+                )
                 or record.state == "failed" and (not isinstance(record.error, str) or not record.error)):
             raise ValueError("Invalid persisted delivery outcome")
         datetime.fromisoformat(record.approved_at)

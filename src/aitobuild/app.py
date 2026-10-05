@@ -765,6 +765,34 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"accepted": record.state == "verified", "delivery": record.to_payload()}
 
+
+    @app.post("/internal/developer/delivery/publish")
+    def publish_developer_delivery(
+        payload: dict[str, Any],
+        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    ) -> dict[str, Any]:
+        _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+        if set(payload) != {"preview_id"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Publication accepts only preview_id; title/body/repository come from the approved delivery",
+            )
+        preview_id = payload.get("preview_id")
+        if not isinstance(preview_id, str) or not preview_id.strip():
+            raise HTTPException(status_code=400, detail="preview_id must be a non-empty string")
+        preview_id = preview_id.strip()
+        try:
+            if delivery_worker.get(preview_id) is None:
+                raise HTTPException(status_code=404, detail="Delivery not found")
+            record = delivery_worker.publish(
+                preview_id,
+                github=github_adapter,
+                require_human_approval_for_repo_writes=app_config.policy.require_human_approval_for_repo_writes,
+            )
+        except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"accepted": record.state == "published", "delivery": record.to_payload()}
+
     @app.get("/internal/developer/delivery/{preview_id}")
     def get_developer_delivery(
         preview_id: str,
