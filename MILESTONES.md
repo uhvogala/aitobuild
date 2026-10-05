@@ -32,7 +32,7 @@ execute task code against the aitobuild service checkout.
 | Area | Evidence | Status |
 | --- | --- | --- |
 | Local setup | Python 3.14+, uv, certificate bootstrap and 16 certificate tests | Implemented |
-| Ingress/governance | Signed webhooks, internal auth, dedupe, previews, role policy | Implemented, in-memory |
+| Ingress/governance | Signed webhooks, internal auth, dedupe, previews, role policy | Local durable previews/issue-task dedupe; other ingress state in memory |
 | Local Developer pipeline | Copied fixture, preview approval, subprocess tests and file write | Verified on 2026-10-05 |
 | Developer model/tool path | Foundry/v1 clients, private tools, terminal/process/browser and file memory | Live Grok/Kimi evaluations; strict zero-error acceptance pending |
 | Persistent Docker sessions | Private checkouts/home volumes, restart memory/history and scoped cleanup | Live integration evidence; prototype isolation only |
@@ -41,7 +41,7 @@ execute task code against the aitobuild service checkout.
 | Architect/meetings | Metadata scan and GroupChatBuilder construction | Execution and review integration missing |
 | Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current local gates: **212 tests pass**; Ruff and mypy pass. Both original patch-repair
+Current local gates: **242 tests pass**; Ruff and mypy pass. Both original patch-repair
 failures are fixed, with ambiguous matching still rejected. Live tool evaluations
 check artifact correctness, tool coverage, context guards and zero unexpected
 errors; provider failures/timeouts are visible failures, not waived successes.
@@ -126,6 +126,24 @@ Exit criteria:
 
 Status: **not implemented end to end**. Depends on M1. This is the supervised MVP.
 
+Preparation slice (2026-10-05): repository `issues` opened/assigned/edited events
+extract target identity, title objective, Markdown acceptance criteria and full
+issue context without service-specific context files. Human approval pins an
+operator-supplied base SHA and the exact scope/policy. Local locked, atomic synced
+preview storage persists approval, stable scope-derived task identity, delivery
+aliases and metadata dispatch markers. Restart, concurrent duplicate delivery,
+immutable scope/base, changed-scope reapproval and malformed-state rejection have
+regressions. Repository issue tasks cannot use the existing execution endpoints
+or legacy harness; the disposable-checkout worker and all publication operations
+remain absent. `dispatched` means metadata was returned, not that work ran.
+Base SHA repository membership must be verified by the future worker.
+
+Local verification: `uv run pytest` (242 tests), `uv run ruff check .`, and
+`uv run mypy src`; mock copied-fixture simulation has `succeeded=true`, actual
+command exit 0 and the generated artifact. No hosted CI or new live-model/GitHub
+trial was run for this slice. The designated live repository remains inactive;
+M2 exit criteria below are not met.
+
 Deliverables:
 - Extract repository, issue, objective, acceptance criteria, base revision, and relevant context from an explicitly supported webhook event/assignment policy.
 - Add a worker that consumes approved tasks rather than merely returning `developer.async.webhook` metadata.
@@ -191,7 +209,7 @@ Exit criteria:
 1. Maintain the green exact-text edit and legacy patch regressions; validate broader live editing tasks without weakening unique-match rejection.
 2. Maintain the green hosted M0 baseline and run CI for new slices.
 3. Preserve the constrained approved-task Grok/Kimi acceptance; never use the framework repository as a target.
-4. Specify the task state machine and GitHub permissions, then implement the smallest issue-to-draft-PR worker for M2.
+4. Extend the durable M2 preparation states with worker/verification/failure recovery and GitHub permissions, then implement the smallest disposable-checkout issue-to-draft-PR worker.
 5. Keep the designated live repository inactive until the worker is ready and a supervised trial is explicitly approved.
 
 Update this snapshot when a milestone's exit checks have actually run. Record

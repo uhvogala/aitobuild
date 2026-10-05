@@ -32,6 +32,18 @@ class DeveloperIsolationPolicy:
 
 
 @dataclass(slots=True, frozen=True)
+class DeveloperIssueContext:
+    repository: str
+    repository_id: int
+    issue_number: int
+    issue_id: int
+    title: str
+    body: str
+    base_branch: str
+    base_revision: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class DeveloperTaskBundle:
     task_id: str
     objective: str
@@ -39,10 +51,13 @@ class DeveloperTaskBundle:
     constraints: tuple[str, ...]
     context_files: tuple[str, ...]
     policy: DeveloperIsolationPolicy
+    issue_context: DeveloperIssueContext | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["policy"]["allowed_tools"] = [tool.value for tool in self.policy.allowed_tools]
+        if self.issue_context is None:
+            payload.pop("issue_context")
         return payload
 
 
@@ -143,6 +158,7 @@ def build_developer_task_bundle(
     constraints: tuple[str, ...] | list[str],
     context_files: tuple[str, ...] | list[str],
     policy: DeveloperIsolationPolicy | None = None,
+    issue_context: DeveloperIssueContext | None = None,
 ) -> DeveloperTaskBundle:
     if not task_id.strip():
         raise ValueError("task_id must be non-empty")
@@ -169,6 +185,7 @@ def build_developer_task_bundle(
         constraints=normalized_constraints,
         context_files=normalized_context,
         policy=bundle_policy,
+        issue_context=issue_context,
     )
 
 
@@ -241,6 +258,28 @@ def developer_task_bundle_from_payload(payload: dict[str, Any]) -> DeveloperTask
         max_runtime_minutes=max_runtime_minutes_raw,
     )
 
+    issue_context = None
+    context_raw = payload.get("issue_context")
+    if context_raw is not None:
+        if not isinstance(context_raw, dict):
+            raise ValueError("issue_context must be an object")
+        for key in ("repository", "title", "body", "base_branch"):
+            if not isinstance(context_raw.get(key), str):
+                raise ValueError(f"issue_context.{key} must be a string")
+        for key in ("repository_id", "issue_number", "issue_id"):
+            value = context_raw.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"issue_context.{key} must be a positive integer")
+        revision = context_raw.get("base_revision")
+        if revision is not None and (not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision)):
+            raise ValueError("issue_context.base_revision must be a resolved lowercase commit SHA")
+        issue_context = DeveloperIssueContext(
+            repository=context_raw["repository"], repository_id=context_raw["repository_id"],
+            issue_number=context_raw["issue_number"], issue_id=context_raw["issue_id"],
+            title=context_raw["title"], body=context_raw["body"], base_branch=context_raw["base_branch"],
+            base_revision=revision,
+        )
+
     return build_developer_task_bundle(
         task_id=task_id_raw,
         objective=objective_raw,
@@ -248,6 +287,7 @@ def developer_task_bundle_from_payload(payload: dict[str, Any]) -> DeveloperTask
         constraints=tuple(constraints_raw),
         context_files=tuple(context_files_raw),
         policy=policy,
+        issue_context=issue_context,
     )
 
 

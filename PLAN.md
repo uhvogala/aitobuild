@@ -110,6 +110,8 @@ These items describe code and local test coverage, not production certification.
 - `meeting.bootstrap` runtime kickoff hook that attempts native `GroupChatBuilder` workflow construction and safely falls back to mock startup when unavailable.
 - Proactive Architect scan workflow output contract with structured findings and issue proposal suggestions.
 - Configurable developer preview requirement before `developer.async.webhook` dispatch with approval gating.
+- Repository issue extraction for explicitly supported opened/assigned/edited events: target identity, issue title/body, Markdown acceptance criteria, and approval-time base SHA. Extracted tasks always require human approval and contain no service-specific context file list.
+- Local locked, atomic synced preview/task storage with immutable approved scope, stable scope-derived task IDs, delivery aliases and restart-safe metadata dispatch markers. Identical issue snapshots deduplicate across delivery IDs and concurrent registry instances; changed scope requires new approval. Repository issue execution remains blocked until a disposable target-checkout worker exists.
 - Operator-visible pending preview queue retrieval for approval workflows.
 - Practical Developer run harness with dry-run/live modes and policy-enforced command/path checks.
 - Configurable Developer execution backend (`mock` or `subprocess`) with CLI command timeout controls.
@@ -126,15 +128,15 @@ These items describe code and local test coverage, not production certification.
 - Ripgrep-backed file discovery and literal/regex content search use allowed private roots, ignore-aware glob filtering and bounded pagination. Focused Grok/Kimi search probes pass with zero errors and unchanged fixture source.
 - Preview command defaults cover common interpreters, package managers, Git, builds, shell scripts and filesystem utilities. Native runs can snapshot an approved preview's task context/policy in a fresh session; scoped repository tools and direct/managed-start commands reuse it after restart, with no caller-supplied policy or session rebinding. Standalone native prototypes remain available; token-prefix matching is not a security boundary.
 - GitHub Actions baseline workflow uses Python 3.14, locked uv dependencies and ripgrep for pytest/Ruff/mypy plus the mock fixture simulation, retaining available reports on failure. Hosted run 37308813245 passed at `c6edaef` with 180 tests and a retained simulation report, accepting M0.
-- Verification on 2026-10-05: 212 local tests pass, `ruff` and `mypy src` pass. M1's constrained native profile passes approved two-file Grok/Kimi trials with actual pytest, persisted budgets, zero unexpected errors and automatic cleanup. Full standalone tool coverage is not certified; M2 is next.
+- Verification on 2026-10-05: 242 local tests pass, `ruff` and `mypy src` pass, and the mock copied-fixture simulation succeeds. Prior M1 constrained two-file Grok/Kimi acceptance is preserved by regressions, not rerun for this slice. M2 issue preparation is implemented locally, but no delivery worker or publication exists. Hosted CI has not run this slice; full standalone tool coverage is not certified.
 
 ### Current Limits
 
 - `developer.async.webhook` returns a task bundle; no worker consumes it automatically.
-- Webhook-generated bundles still contain generic objectives/service context; explicit preview bundles are supported, but automatic repository-specific issue extraction remains M2 work.
+- Supported repository issue events produce target-specific bundles and require approval-time base SHA pinning. No repository lookup or SHA membership verification occurs yet. Legacy fixture payloads without repository context retain prototype routing; unsupported repository webhook events and missing issue criteria are rejected.
 - GitHub branch/commit/PR operations are not implemented; the adapter records mock issue proposals.
 - Meetings construct workflows without executing them, and proactive scans interpret supplied metadata rather than inspecting a repository.
-- Scheduler ticks require an external caller; application state is in memory and does not survive restart.
+- Scheduler ticks require an external caller; meeting/scheduler state and non-repository trigger dedupe remain in memory. Previews, approvals and repository issue task/delivery identities persist locally. `dispatched` records metadata routing, not worker completion; inspect the saved queue after restart. Distributed coordination and full lifecycle auditing remain pending.
 - Native runs without a bound preview and unbound legacy runs remain prototypes. Approved native tasks persist unique-path reservations and an absolute deadline, fail closed after abort, and use offline read-only repository execution. Browser/arbitrary MCP adapters are excluded; native memory has a separate scoped SDK store. Distributed coordination, durable auditing and scratch/disk quotas remain pending.
 - The constrained Docker profile has resource/capability/network restrictions and expiry/cleanup checks, but is not a hardened hostile-tenant sandbox. Prefix matching is not shell parsing; dependency installation and build outputs cannot write the repository mount.
 - The capability matrix tests check entries, not duplicate implementations; the successful CI baseline does not prove no-duplicate capability enforcement.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 import pytest
 
 from aitobuild.config import (
@@ -11,6 +12,18 @@ from aitobuild.config import (
     SchedulerConfig,
     SecurityConfig,
 )
+
+
+@pytest.fixture
+def repository_issue_body() -> dict[str, Any]:
+    return {
+        "repository": {"id": 101, "full_name": "fixture/widgets", "default_branch": "main"},
+        "issue": {
+            "id": 202, "number": 7, "state": "open", "title": "Handle empty widget names",
+            "body": "Reject empty names.\n\n## Acceptance Criteria\n- [ ] Empty names are rejected.\n- Existing names still work.\n\n## Notes\n- Keep the API stable.",
+        },
+        "assignee": {"login": "fixture-developer"},
+    }
 
 
 @pytest.fixture

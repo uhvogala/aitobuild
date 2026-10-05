@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from aitobuild.events import EventOrigin, EventType, make_internal_event
-from aitobuild.triggers import DispatchResult, InMemoryDedupeStore, TriggerEngine
+from aitobuild.triggers import DispatchResult, Dispatcher, InMemoryDedupeStore, TriggerEngine
 
 
-class _TestDispatcher:
+class _TestDispatcher(Dispatcher):
     def route(self, _event):
         return DispatchResult(accepted=True, route="ok")
 

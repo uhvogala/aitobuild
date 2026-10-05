@@ -24,6 +24,7 @@ from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
 from aitobuild.config import AppConfig, load_config
 from aitobuild.developer_execution import DeveloperExecutionEngine, PlannedFileWrite
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
+from aitobuild.developer_preview import DeveloperPreviewRegistry
 from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import make_internal_event, normalize_github_webhook, parse_trigger_request
 from aitobuild.proactive import ArchitectScanRunner
@@ -227,14 +228,15 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         raise ValueError("Developer browser requires container_session mode")
 
     app = FastAPI(title="aitobuild")
+    workspace_root = Path.cwd()
+    developer_state_dir = (workspace_root / app_config.developer.state_dir).resolve()
     trigger_engine = TriggerEngine(dedupe_store=InMemoryDedupeStore())
     dispatcher = DispatcherAgent(
         require_developer_preview=app_config.developer.require_preview_before_dispatch,
+        developer_preview_registry=DeveloperPreviewRegistry(developer_state_dir / "previews.json"),
     )
     scheduler = scheduler_from_config(app_config.scheduler)
     architect_scan_runner = ArchitectScanRunner()
-    workspace_root = Path.cwd()
-    developer_state_dir = (workspace_root / app_config.developer.state_dir).resolve()
     developer_session_store = FileSessionStore(developer_state_dir / "sessions")
     developer_sessions: dict[str, Any] = {}
     active_developer_runs: set[str] = set()
@@ -532,28 +534,36 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         )
 
         if "task_bundle" in payload:
+            if "repository" in body:
+                raise HTTPException(status_code=400, detail="Repository issue previews must use extracted issue scope")
             raw_bundle = payload["task_bundle"]
             if not isinstance(raw_bundle, dict) or len(json.dumps(raw_bundle).encode("utf-8")) > MAX_PROMPT_BYTES:
                 raise HTTPException(status_code=400, detail="task_bundle must be an object within the prompt byte limit")
             try:
                 explicit_bundle = developer_task_bundle_from_payload(raw_bundle)
+                if explicit_bundle.issue_context is not None:
+                    raise ValueError("Repository issue previews must use extracted issue scope")
+                preview = dispatcher.developer_preview_registry.create_or_get(
+                    dedupe_key=dedupe_key, bundle_payload=explicit_bundle.to_payload(), source_payload=body,
+                )
             except (ValueError, TypeError) as error:
                 raise HTTPException(status_code=400, detail=f"Invalid task bundle: {error}") from error
-            preview = dispatcher.developer_preview_registry.create_or_get(
-                dedupe_key=dedupe_key, bundle_payload=explicit_bundle.to_payload(), source_payload=body,
-            )
         else:
-            preview = dispatcher.create_developer_preview(
-                dedupe_key=dedupe_key,
-                github_event=github_event_raw.strip(),
-                action=(action_raw or "unknown").strip(),
-                body=body,
-            )
+            try:
+                preview = dispatcher.create_developer_preview(
+                    dedupe_key=dedupe_key,
+                    github_event=github_event_raw.strip(),
+                    action=(action_raw or "unknown").strip(),
+                    body=body,
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
 
         return {
             "preview_id": preview.preview_id,
             "dedupe_key": preview.dedupe_key,
             "approved": preview.approved,
+            "task_state": preview.state,
             "bundle": preview.bundle_payload,
         }
 
@@ -568,7 +578,13 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         if not isinstance(preview_id_raw, str) or not preview_id_raw.strip():
             raise HTTPException(status_code=400, detail="preview_id must be a non-empty string")
 
-        approved = dispatcher.approve_developer_preview(preview_id_raw.strip())
+        base_revision = payload.get("base_revision")
+        if base_revision is not None and (not isinstance(base_revision, str) or not base_revision):
+            raise HTTPException(status_code=400, detail="base_revision must be a non-empty commit SHA")
+        try:
+            approved = dispatcher.approve_developer_preview(preview_id_raw.strip(), base_revision=base_revision)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         if approved is None:
             raise HTTPException(status_code=404, detail="preview_id not found")
 
@@ -576,6 +592,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "preview_id": approved.preview_id,
             "dedupe_key": approved.dedupe_key,
             "approved": approved.approved,
+            "task_state": approved.state,
+            "bundle": approved.bundle_payload,
             "approved_at": approved.approved_at.isoformat() if approved.approved_at else None,
         }
 
@@ -599,8 +617,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     "preview_id": preview.preview_id,
                     "dedupe_key": preview.dedupe_key,
                     "approved": preview.approved,
+                    "task_state": preview.state,
                     "created_at": preview.created_at.isoformat(),
                     "approved_at": preview.approved_at.isoformat() if preview.approved_at else None,
+                    "dispatched_at": preview.dispatched_at.isoformat() if preview.dispatched_at else None,
                     "bundle": preview.bundle_payload,
                     "source": preview.source_payload,
                 }
@@ -717,6 +737,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             bundle = developer_task_bundle_from_payload(preview.bundle_payload)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"Invalid preview bundle payload: {exc}") from exc
+
+        if bundle.issue_context is not None:
+            raise HTTPException(status_code=409, detail="Repository issue execution requires the disposable-checkout delivery worker; it is not implemented")
 
         commands_raw = payload.get("commands", [])
         if not isinstance(commands_raw, list) or not all(isinstance(item, str) for item in commands_raw):
@@ -1011,6 +1034,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(error)) from error
         task_budget = None
         if task_bundle is not None:
+            if task_bundle.issue_context is not None:
+                raise HTTPException(status_code=409, detail="Repository issue execution requires the disposable-checkout delivery worker; it is not implemented")
             if app_config.developer.execution_mode not in {"mock", "container_session"}:
                 raise HTTPException(status_code=409, detail="Approved native tasks require container isolation")
             if app_config.developer.enable_mcp_adapters or payload.get("use_browser", False) is True:

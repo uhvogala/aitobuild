@@ -39,6 +39,8 @@ class TriggerEngine:
         self._dedupe_store = dedupe_store
 
     def dispatch(self, event: InternalEvent, *, dispatcher: "Dispatcher") -> DispatchResult:
+        if dispatcher.uses_durable_dedupe(event):
+            return dispatcher.route(event)
         dedupe_key = event.envelope.dedupe_key
         if self._dedupe_store.seen(dedupe_key):
             return DispatchResult(accepted=False, route="dedupe", reason="duplicate event")
@@ -47,5 +49,8 @@ class TriggerEngine:
 
 
 class Dispatcher:
+    def uses_durable_dedupe(self, event: InternalEvent) -> bool:
+        return False
+
     def route(self, event: InternalEvent) -> DispatchResult:  # pragma: no cover - interface
         raise NotImplementedError

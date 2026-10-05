@@ -63,6 +63,12 @@ class DeveloperExecutionEngine:
         require_human_approval_for_repo_writes: bool,
         session_id: str | None = None,
     ) -> DeveloperExecutionResult:
+        if bundle.issue_context is not None:
+            return DeveloperExecutionResult(
+                accepted=False,
+                reason="Repository issue execution requires the disposable-checkout delivery worker",
+                command_outcomes=(), file_write_outcomes=(),
+            )
         command_outcomes: list[CommandOutcome] = []
         write_outcomes: list[FileWriteOutcome] = []
         accepted = True

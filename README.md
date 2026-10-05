@@ -20,14 +20,14 @@ human retaining merge authority.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Ingress and routing | Signed webhooks, authenticated internal APIs, deduplication, deterministic dispatch | Durable task worker and repository-specific task extraction |
+| Ingress and routing | Signed webhooks, authenticated internal APIs, deterministic dispatch, repository issue extraction and durable approved-task deduplication | Disposable-checkout delivery worker |
 | Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
 | Native model runtime | Foundry binding, Developer invocation and persisted manual approvals | Reproducible live-model acceptance run and consistent task-policy enforcement |
 | GitHub integration | Webhook input and mock issue-proposal adapter | Real issue, branch, commit, and PR operations |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
-| Operations | Tick endpoint, policy checks, capability-audit tests, verified hosted CI baseline | Background tick driver, durable state, tracing, stronger isolation |
+| Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **212 tests pass**, Ruff and mypy pass. The original patch-repair
+Verified locally: **242 tests pass**, Ruff and mypy pass. The original patch-repair
 failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
 sessions, managed terminals/processes, native memory/restart and browser tools
 have live integration evidence. Real Grok and Kimi evaluations retain strict
@@ -241,8 +241,9 @@ These route responses do not launch a Developer worker or open a PR.
 Architect scan findings currently derive from supplied counters/flags, not
 an autonomous repository inspection.
 
-When `AITOBUILD_REQUIRE_DEVELOPER_PREVIEW=true`, webhook dispatch returns
-`developer.preview_required` until a matching preview is approved.
+When `AITOBUILD_REQUIRE_DEVELOPER_PREVIEW=true`, legacy fixture webhook dispatch
+returns `developer.preview_required` until a matching preview is approved.
+Repository issue tasks always require approval, regardless of that flag.
 
 Preview flow:
 
@@ -253,6 +254,45 @@ Preview flow:
 4. Deliver the webhook with the preview's matching delivery ID or dedupe key;
 	dispatcher then routes to `developer.async.webhook`. An already accepted
 	delivery is deduplicated; the simulator uses a second delivery ID for its preview/replay pair.
+
+### Durable repository issue preparation
+
+The first M2 slice supports GitHub `issues` events with `opened`, `assigned`, or
+`edited` actions. Assignment creates a reviewable preview, not authorization to
+execute; `assigned` must include an assignee login. Other repository webhook
+events, closed issues, and PRs are rejected. Payloads must provide repository
+`id`, `full_name`, and `default_branch`, plus issue `id`, `number`, `state`,
+`title`, and `body`. The title becomes the objective; the full issue body is
+retained as target context. The body must contain a Markdown `Acceptance Criteria`
+heading with bullet, checkbox, or numbered list items. Missing criteria are
+rejected rather than replaced with a generic objective. Service source files
+are not added as target context. The existing default isolation policy is part
+of the scope shown for human review; arbitrary scope overrides are not supported
+for extracted repository issue previews in this slice.
+
+Webhooks do not supply a base commit SHA. Approve the preview through
+`POST /internal/developer/preview/approve` with `preview_id` and `base_revision`,
+a resolved 40-character target commit SHA supplied by the operator. The service
+validates SHA syntax and pins it in the approved bundle; target repository
+membership/checkout verification must be implemented by the future worker.
+The approved issue context, criteria, constraints, and policy cannot be replaced.
+Changed issue scope with a new delivery creates a new pending task; changing
+scope under an existing delivery or replacing an approved base is rejected.
+
+Previews, approvals, stable scope-derived task IDs, delivery aliases, and dispatch
+markers are saved under `AITOBUILD_DEVELOPER_STATE_DIR` (default
+`.aitobuild/developer/previews.json`) using local file locks and atomic synced
+saves. Identical issue snapshots share one preview across delivery IDs. A pending
+delivery can be replayed after approval, including after restart; an already
+dispatched task returns `dedupe` without creating another task. Inspect the queue
+with `pending_only=false` to recover `approved` or `dispatched` records. These
+states describe metadata routing, not worker execution or completion.
+
+Repository issue bundles are blocked by both Developer execution endpoints and
+the legacy execution harness until a disposable target-checkout worker exists.
+This slice performs no clone, target command, branch, commit, or PR operation.
+The designated future live repository remains inactive. Other trigger dedupe,
+meetings, and scheduler state remain in memory; this is not distributed storage.
 
 Developer practical run flow:
 

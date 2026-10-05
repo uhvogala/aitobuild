@@ -28,6 +28,67 @@ def _internal_headers(test_config) -> dict[str, str]:
     return {"X-Internal-Token": token}
 
 
+def test_repository_issue_api_recovers_approval_and_delivery_after_restart(test_config, repository_issue_body) -> None:
+    headers = _internal_headers(test_config)
+    repository_issue_body["action"] = "opened"
+    body = json.dumps(repository_issue_body).encode()
+    webhook_headers = {
+        "X-GitHub-Event": "issues", "X-GitHub-Delivery": "durable-issue-1",
+        "X-Hub-Signature-256": _signature(test_config.webhook_secret, body),
+    }
+    first = TestClient(create_app(test_config))
+    pending = first.post("/webhook", content=body, headers=webhook_headers)
+    assert pending.json()["route"] == "developer.preview_required"
+    preview_id = pending.json()["metadata"]["preview_id"]
+    restarted = TestClient(create_app(test_config))
+    queue = restarted.get("/internal/developer/previews", headers=headers).json()
+    assert queue["items"][0]["preview_id"] == preview_id
+    approval_payload = {"preview_id": preview_id}
+    assert restarted.post("/internal/developer/preview/approve", headers=headers, json=approval_payload).status_code == 400
+    approval_payload["base_revision"] = "a" * 40
+    approval = restarted.post("/internal/developer/preview/approve", headers=headers, json=approval_payload)
+    assert approval.status_code == 200, approval.text
+    duplicate_preview = restarted.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "action": "opened", "delivery_id": "durable-issue-2", "body": repository_issue_body,
+    })
+    assert duplicate_preview.json()["preview_id"] == preview_id
+    assert duplicate_preview.json()["task_state"] == "approved"
+    restarted = TestClient(create_app(test_config))
+    dispatched = restarted.post("/webhook", content=body, headers=webhook_headers)
+    assert dispatched.json()["accepted"] is True
+    assert dispatched.json()["metadata"]["developer_task_bundle"] == approval.json()["bundle"]
+    restarted = TestClient(create_app(test_config))
+    for delivery in ("durable-issue-1", "durable-issue-2", "durable-issue-3"):
+        webhook_headers["X-GitHub-Delivery"] = delivery
+        duplicate = restarted.post("/webhook", content=body, headers=webhook_headers)
+        assert duplicate.json()["route"] == "dedupe"
+        assert duplicate.json()["metadata"]["preview_id"] == preview_id
+    queue = restarted.get("/internal/developer/previews?pending_only=false", headers=headers).json()
+    assert queue["count"] == 1
+    assert queue["items"][0]["task_state"] == "dispatched"
+
+
+def test_repository_issue_execution_cannot_use_service_checkout(test_config, repository_issue_body, monkeypatch) -> None:
+    agent = _FakeDeveloperAgent()
+    client = _create_app_with_fake_agent(test_config, monkeypatch, agent)
+    headers = _internal_headers(test_config)
+    preview = client.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "action": "opened", "body": repository_issue_body,
+    }).json()
+    approval = client.post("/internal/developer/preview/approve", headers=headers, json={
+        "preview_id": preview["preview_id"], "base_revision": "a" * 40,
+    })
+    assert approval.status_code == 200
+    for route in ("/internal/developer/run", "/internal/developer/agent/run"):
+        response = client.post(route, headers=headers, json={
+            "preview_id": preview["preview_id"], "input": "Implement the issue", "dry_run": False,
+            "approved": True, "commands": ["pytest"], "file_writes": [{"path": "src/must-not-write.txt", "content": "bad"}],
+        })
+        assert response.status_code == 409, response.text
+        assert "disposable-checkout delivery worker" in response.json()["detail"]
+    assert agent.calls == []
+
+
 _FakeSession = AgentSession
 
 

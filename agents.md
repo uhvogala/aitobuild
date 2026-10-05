@@ -36,7 +36,8 @@ Current foundation scope:
 Important limits:
 - Dispatch returns task metadata; it does not yet drive a GitHub branch/PR worker.
 - GitHub writes are mock-only; meetings are constructed, not executed.
-- Scheduler ticks require a caller; application state is in memory.
+- Scheduler ticks require a caller; meeting/scheduler state and non-repository trigger dedupe remain in memory. Previews, approved scope/base, repository issue identity/delivery aliases and metadata dispatch markers persist locally under the Developer state directory.
+- Repository issues opened/assigned/edited require explicit human approval and an operator-supplied base SHA. Criteria must be listed under a Markdown Acceptance Criteria heading. Changed scope requires a new approved task; duplicate delivery/restart cannot replace approval. Repository issue execution is blocked until the disposable target-checkout worker exists; no publication operations are implemented.
 - Preview-bound native tasks persist policy, unique-path pre-write reservations and a shared absolute deadline. Use the constrained Docker profile: read-only repo/root, offline commands and interactive input, dropped capabilities, CPU/memory/PID limits, expiry and terminal-outcome cleanup. Browser/arbitrary MCP adapters and legacy execution of native-bound previews are rejected. Standalone/unbound execution remains a prototype; do not call this a hardened hostile-tenant sandbox.
 - Native pending approvals and sessions persist locally; distributed coordination, durable task/approval auditing, and PM/Architect tool wiring remain pending.
 
@@ -64,9 +65,12 @@ installs ripgrep, runs these gates and the mock fixture simulation, and retains
 available reports on failure. Hosted run 37308813245 passed at `c6edaef` with
 180 tests and a retained simulation artifact; M0 is accepted.
 
-Verification snapshot (2026-10-05): 212 local tests pass; Ruff and mypy pass.
+Verification snapshot (2026-10-05): 242 local tests pass; Ruff, mypy and the mock
+copied-fixture simulation pass. The M2 extraction/durable preparation slice has
+restart/concurrency/immutable-scope regressions, but no delivery worker, target
+checkout or publication. Hosted CI has not run this slice.
 M1 constrained native Grok/Kimi approved-task fixtures pass with actual tests,
-persisted budgets, zero unexpected errors and automatic cleanup. M2 is next;
+persisted budgets, zero unexpected errors and automatic cleanup. M2 delivery is next;
 the designated live GitHub repository remains inactive.
 Live Grok/Kimi tool evaluation remains stricter than tool coverage: require
 artifact correctness, completion, successful cleanup and zero unexpected errors.

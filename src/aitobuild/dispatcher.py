@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from hashlib import sha256
+import json
+import re
 from typing import Any
 
-from aitobuild.developer_isolation import build_developer_task_bundle
+from aitobuild.developer_isolation import DeveloperIssueContext, build_developer_task_bundle
 from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry
 from aitobuild.escalation import EscalationCategory, EscalationRouter, EscalationSeverity
-from aitobuild.events import EventOrigin, EventType, InternalEvent
+from aitobuild.events import EventOrigin, EventType, InternalEvent, make_internal_event
 from aitobuild.meetings import (
     MeetingDeadlineExceededError,
     MeetingRegistry,
@@ -58,8 +61,11 @@ class DispatcherAgent(Dispatcher):
         body = payload.get("body")
         body_dict: dict[str, Any] = body if isinstance(body, dict) else {}
 
+        if "repository" in body_dict:
+            return self._route_repository_issue(event, github_event, action, body_dict)
+
         issue_number = _extract_issue_or_pr_number(body_dict)
-        task_id = f"WEBHOOK-{event.envelope.correlation_id.upper()}"
+        task_id = f"WEBHOOK-{sha256(event.envelope.dedupe_key.encode()).hexdigest()}"
         objective = (
             f"Handle GitHub webhook '{github_event}' action '{action}'"
             if issue_number is None
@@ -92,16 +98,20 @@ class DispatcherAgent(Dispatcher):
                 reason=str(exc),
             )
 
+        bundle_payload = bundle.to_payload()
         if self.require_developer_preview:
-            preview = self.developer_preview_registry.create_or_get(
-                dedupe_key=event.envelope.dedupe_key,
-                bundle_payload=bundle.to_payload(),
-                source_payload={
-                    "github_event": github_event,
-                    "action": action,
-                    "body": body_dict,
-                },
-            )
+            try:
+                preview = self.developer_preview_registry.create_or_get(
+                    dedupe_key=event.envelope.dedupe_key,
+                    bundle_payload=bundle_payload,
+                    source_payload={
+                        "github_event": github_event,
+                        "action": action,
+                        "body": body_dict,
+                    },
+                )
+            except ValueError as exc:
+                return DispatchResult(accepted=False, route="developer.invalid", reason=str(exc))
             if not preview.approved:
                 return DispatchResult(
                     accepted=False,
@@ -114,12 +124,13 @@ class DispatcherAgent(Dispatcher):
                         "action": action,
                     },
                 )
+            bundle_payload = preview.bundle_payload
 
         return DispatchResult(
             accepted=True,
             route="developer.async.webhook",
             metadata={
-                "developer_task_bundle": bundle.to_payload(),
+                "developer_task_bundle": bundle_payload,
                 "github_event": github_event,
                 "action": action,
             },
@@ -133,37 +144,85 @@ class DispatcherAgent(Dispatcher):
         action: str,
         body: dict[str, Any],
     ) -> DeveloperPreview:
+        if "repository" in body:
+            return self._create_repository_issue_preview(dedupe_key, github_event, action, body)
         payload: dict[str, Any] = {
             "github_event": github_event,
             "action": action,
             "body": body,
         }
 
-        bundle = build_developer_task_bundle(
-            task_id=f"PREVIEW-{dedupe_key.upper().replace(':', '-')}"[:80],
-            objective=f"Preview developer task for webhook '{github_event}' action '{action}'",
-            acceptance_criteria=(
-                "Confirm bundle scope is sufficient and safe.",
-                "Confirm acceptance criteria are implementation-ready.",
-            ),
-            constraints=(
-                "Use isolation policy defaults unless explicit override is approved.",
-            ),
-            context_files=(
-                "src/aitobuild/dispatcher.py",
-                "src/aitobuild/developer_isolation.py",
-                "tests/test_dispatcher.py",
-            ),
+        event = make_internal_event(
+            origin=EventOrigin.GITHUB_WEBHOOK, event_type=EventType.WEBHOOK_EVENT_RECEIVED,
+            payload=payload, dedupe_key=dedupe_key,
         )
-
+        result = self._route_developer_webhook(event)
+        if result.metadata is None:
+            raise ValueError(result.reason or "Unable to create developer preview")
         return self.developer_preview_registry.create_or_get(
             dedupe_key=dedupe_key,
-            bundle_payload=bundle.to_payload(),
+            bundle_payload=result.metadata["developer_task_bundle"],
             source_payload=payload,
         )
 
-    def approve_developer_preview(self, preview_id: str) -> DeveloperPreview | None:
-        return self.developer_preview_registry.approve(preview_id)
+    def approve_developer_preview(
+        self, preview_id: str, *, base_revision: str | None = None,
+    ) -> DeveloperPreview | None:
+        return self.developer_preview_registry.approve(preview_id, base_revision=base_revision)
+
+    def uses_durable_dedupe(self, event: InternalEvent) -> bool:
+        body = event.payload.get("body")
+        return (
+            event.envelope.origin is EventOrigin.GITHUB_WEBHOOK
+            and event.envelope.event_type is EventType.WEBHOOK_EVENT_RECEIVED
+            and isinstance(body, dict) and "repository" in body
+        )
+
+    def _route_repository_issue(
+        self, event: InternalEvent, github_event: str, action: str, body: dict[str, Any],
+    ) -> DispatchResult:
+        if github_event != "issues" or action not in {"opened", "assigned", "edited"}:
+            return DispatchResult(accepted=False, route="developer.unsupported", reason="Only issues opened/assigned/edited are supported for repository tasks")
+        try:
+            preview = self._create_repository_issue_preview(
+                event.envelope.dedupe_key, github_event, action, body,
+            )
+        except ValueError as exc:
+            return DispatchResult(accepted=False, route="developer.invalid", reason=str(exc))
+        metadata = {
+            "preview_id": preview.preview_id, "task_id": preview.bundle_payload["task_id"],
+            "task_state": preview.state, "developer_task_bundle": preview.bundle_payload,
+            "github_event": github_event, "action": action,
+        }
+        if not preview.approved:
+            return DispatchResult(accepted=False, route="developer.preview_required", reason="Repository issue tasks require approval and a resolved base commit", metadata=metadata)
+        dispatched = self.developer_preview_registry.claim_dispatch(preview.preview_id)
+        metadata["task_state"] = "dispatched"
+        if dispatched is None:
+            return DispatchResult(accepted=False, route="dedupe", reason="Approved issue task already dispatched", metadata=metadata)
+        return DispatchResult(accepted=True, route="developer.async.webhook", metadata=metadata)
+
+    def _create_repository_issue_preview(
+        self, dedupe_key: str, github_event: str, action: str, body: dict[str, Any],
+    ) -> DeveloperPreview:
+        if github_event != "issues" or action not in {"opened", "assigned", "edited"}:
+            raise ValueError("Only issues opened/assigned/edited are supported for repository tasks")
+        context, criteria = _extract_repository_issue(body, action=action)
+        bundle = build_developer_task_bundle(
+            task_id="pending", objective=context.title, acceptance_criteria=criteria,
+            constraints=(
+                "Execute only in a disposable checkout of the approved target repository and base commit.",
+                "Require successful verification before publication; preserve failure artifacts.",
+                "Publish draft PRs only; never merge the task PR.",
+            ),
+            context_files=(), issue_context=context,
+        )
+        task_key = "ISSUE-" + sha256(json.dumps(bundle.to_payload(), sort_keys=True).encode()).hexdigest()
+        bundle = replace(bundle, task_id=task_key)
+        return self.developer_preview_registry.create_or_get(
+            dedupe_key=dedupe_key, task_key=task_key, bundle_payload=bundle.to_payload(),
+            source_payload={"github_event": github_event, "action": action, "body": body},
+        )
 
     def list_developer_previews(self, *, pending_only: bool, limit: int) -> tuple[DeveloperPreview, ...]:
         return self.developer_preview_registry.list_previews(pending_only=pending_only, limit=limit)
@@ -234,3 +293,43 @@ def _extract_issue_or_pr_number(body: dict[str, Any]) -> int | None:
         return body["number"]
 
     return None
+
+
+def _extract_repository_issue(
+    body: dict[str, Any], *, action: str,
+) -> tuple[DeveloperIssueContext, tuple[str, ...]]:
+    repository, issue = body.get("repository"), body.get("issue")
+    if not isinstance(repository, dict) or not isinstance(issue, dict) or "pull_request" in issue:
+        raise ValueError("Repository task requires a GitHub issue, not a pull request")
+    full_name = repository.get("full_name")
+    if not isinstance(full_name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", full_name):
+        raise ValueError("repository.full_name must be owner/repository")
+    for data, key in ((repository, "id"), (issue, "id"), (issue, "number")):
+        value = data.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"Repository and issue {key} must be positive integers")
+    branch, title, description = repository.get("default_branch"), issue.get("title"), issue.get("body")
+    if not isinstance(branch, str) or not branch.strip() or not isinstance(title, str) or not title.strip():
+        raise ValueError("Repository default branch and issue title are required")
+    if issue.get("state") != "open" or not isinstance(description, str):
+        raise ValueError("Repository task requires an open issue with a body")
+    if action == "assigned":
+        assignee = body.get("assignee")
+        if not isinstance(assignee, dict) or not isinstance(assignee.get("login"), str) or not assignee["login"].strip():
+            raise ValueError("Assigned issue event requires an assignee login")
+    criteria: list[str] = []
+    in_criteria = False
+    for line in description.splitlines():
+        heading = re.fullmatch(r"#{1,6}\s+(.+?)\s*#*", line.strip())
+        if heading:
+            in_criteria = heading[1].strip().rstrip(":").casefold() == "acceptance criteria"
+        elif in_criteria:
+            item = re.fullmatch(r"\s*(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+)(\S.*)", line)
+            if item:
+                criteria.append(item[1].strip())
+    if not criteria:
+        raise ValueError("Issue body requires an Acceptance Criteria heading with list items")
+    return DeveloperIssueContext(
+        repository=full_name.lower(), repository_id=repository["id"], issue_number=issue["number"],
+        issue_id=issue["id"], title=title.strip(), body=description, base_branch=branch.strip(),
+    ), tuple(criteria)
