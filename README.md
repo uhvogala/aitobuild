@@ -25,13 +25,19 @@ human retaining merge authority.
 | Native model runtime | Foundry binding and Developer agent invocation | Reproducible live-model acceptance run and resumable approvals |
 | GitHub integration | Webhook input and mock issue-proposal adapter | Real issue, branch, commit, and PR operations |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
-| Operations | Tick endpoint, policy checks, capability-audit tests | Background tick driver, durable state, CI, tracing, stronger isolation |
+| Operations | Tick endpoint, policy checks, capability-audit tests, CI baseline workflow | Background tick driver, durable state, verified hosted CI run, tracing, stronger isolation |
 
 Verified locally: **180 tests pass**, Ruff and mypy pass. The original patch-repair
 failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
 sessions, managed terminals/processes, native memory/restart and browser tools
 have live integration evidence. Real Grok and Kimi evaluations retain strict
 failure reports; neither is yet certified as a zero-error full-suite baseline.
+
+The [CI workflow](.github/workflows/ci.yml) is configured for pushes, pull requests
+and manual runs on Python 3.14 with locked uv dependencies and ripgrep. It runs
+pytest, Ruff, mypy and the mock fixture simulation, retaining an available
+simulation report for 14 days even on failure. It needs no Azure credentials.
+The first hosted run remains unverified; M0 is not yet accepted.
 
 See [agent tool evaluation](sim/README.md#agent-tool-evaluation) for model comparison,
 token/cache usage and artifact checks. Large tool outputs are saved to private

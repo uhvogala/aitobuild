@@ -29,7 +29,7 @@ mock simulation. Full backlog autonomy is a later goal, not the current state.
 | MCP shell/filesystem | Native stdio transport adapter, configurable names | Optional; compatibility validation pending |
 | GitHub output | Mock issue-proposal adapter only | Branch/commit/PR delivery missing |
 | Architect/meetings | Metadata scan and GroupChatBuilder construction | Execution and review integration missing |
-| Operations | Manual tick API and capability matrix tests | CI, durable worker/state and tracing missing |
+| Operations | Manual tick API, capability matrix tests and CI baseline workflow | Hosted CI run unverified; durable worker/state and tracing missing |
 
 Current gates: **180 tests pass**; Ruff and mypy pass. Both original patch-repair
 failures are fixed, with ambiguous matching still rejected. Live tool evaluations
@@ -44,7 +44,7 @@ local pipeline, not GitHub delivery or production isolation.
 ## Restart Checklist
 
 1. Read this document, then use the [README quick start](README.md#quick-start).
-2. Run `uv sync` and the three quality gates. M0 still requires CI enforcement of the green local baseline.
+2. Run `uv sync --locked` and the three quality gates. Verify the first hosted CI run before accepting M0.
 3. Clear inherited Foundry endpoint/API-key settings and run the [local simulation](sim/README.md#local-baseline).
 4. Require the preview/replay routes, `accepted=true`, zero command exit codes, `generated_file_exists=true`, and `succeeded=true` in the report.
 5. For API-only testing, configure both secrets, start Uvicorn on loopback, and check health plus authenticated Developer readiness. Mock readiness is expected to be false.
@@ -52,8 +52,10 @@ local pipeline, not GitHub delivery or production isolation.
 
 ## M0: Reproducible Baseline
 
-Status: **in progress**. Local tests and quality gates are green; CI enforcement
-remains pending. M1/M2 are not accepted on local evidence alone.
+Status: **in progress**. Local tests and quality gates are green. The
+[CI workflow](.github/workflows/ci.yml) implements the locked Python 3.14 gates
+and mock fixture simulation with report retention; its first hosted run remains
+unverified. M1/M2 are not accepted on local evidence alone.
 
 Deliverables:
 - Maintain the repaired patch behavior while preserving rejection of ambiguous or unsafe patches.

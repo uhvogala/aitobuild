@@ -57,6 +57,10 @@ Quality gates (from repository root):
 - `uv run ruff check .`
 - `uv run mypy src`
 
+The GitHub Actions baseline workflow uses Python 3.14 and `uv sync --locked`,
+installs ripgrep, runs these gates and the mock fixture simulation, and retains
+available reports on failure. Hosted verification remains pending.
+
 Verification snapshot (2026-10-05): 180 tests pass; Ruff and mypy pass.
 Live Grok/Kimi tool evaluation remains stricter than tool coverage: require
 artifact correctness, completion, successful cleanup and zero unexpected errors.

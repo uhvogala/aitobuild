@@ -125,6 +125,7 @@ These items describe code and local test coverage, not production certification.
 - Targeted edits use structured exact-text replacement with unique-match rejection; legacy free-form patch parsing is opt-in. Focused same-task Grok/Kimi editing probes pass with zero tool errors and independent pytest verification.
 - Ripgrep-backed file discovery and literal/regex content search use allowed private roots, ignore-aware glob filtering and bounded pagination. Focused Grok/Kimi search probes pass with zero errors and unchanged fixture source.
 - Preview command defaults cover common interpreters, package managers, Git, builds, shell scripts and filesystem utilities. Explicit task-specific policies remain supported; token-prefix matching is not a security boundary and does not govern native-agent command tools.
+- GitHub Actions baseline workflow uses Python 3.14, locked uv dependencies and ripgrep for pytest/Ruff/mypy plus the mock fixture simulation, retaining available reports on failure. Local workflow commands and syntax are verified; the first hosted run remains pending.
 - Verification on 2026-10-05: 180 tests pass, `ruff` and `mypy src` pass. CI enforcement and a zero-unexpected-error full live evaluation remain milestone acceptance requirements.
 
 ### Current Limits
@@ -136,7 +137,7 @@ These items describe code and local test coverage, not production certification.
 - Scheduler ticks require an external caller; application state is in memory and does not survive restart.
 - The native agent endpoint is separate from preview-based execution and lacks equivalent bundle command enforcement and durable approval/session replay.
 - Docker bind mounts and command-prefix checks do not establish a hardened sandbox; total task budgets remain declarative.
-- No checked-in CI workflow exists. The capability matrix tests check entries, not duplicate implementations.
+- The CI workflow has not yet been verified on GitHub. The capability matrix tests check entries, not duplicate implementations.
 - Docker, MCP, and live-model paths need fresh integration evidence before being considered operational.
 
 ### Pending Items
@@ -154,7 +155,7 @@ These items describe code and local test coverage, not production certification.
 
 ### Next Execution Order
 
-1. Restore a green baseline and enforce quality gates in CI (M0).
+1. Verify the first hosted baseline CI run (M0).
 2. Validate one constrained, live Developer task in a disposable repository (M1).
 3. Connect an approved GitHub issue to a worker, task branch, verified commit, and draft PR (M2).
 4. Add Architect review and bounded, executed blocker-resolution meetings (M3).

@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  baseline:
+    name: Python 3.14 baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+        with:
+          version: "0.12.12"
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install ripgrep
+        run: sudo -n apt-get update && sudo -n apt-get install -y --no-install-recommends ripgrep
+      - name: Sync locked dependencies
+        run: uv sync --locked
+      - name: Test
+        run: uv run --locked pytest
+      - name: Lint
+        run: uv run --locked ruff check .
+      - name: Typecheck
+        run: uv run --locked mypy src
+      - name: Run mock fixture simulation
+        run: >-
+          env -u AITOBUILD_FOUNDRY_ENDPOINT -u AITOBUILD_FOUNDRY_API_KEY
+          uv run --locked python sim/run_local_simulation.py
+          --output sim/simulation-report.json
+      - name: Retain simulation report
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: simulation-report
+          path: sim/simulation-report.json
+          if-no-files-found: warn
+          retention-days: 14
