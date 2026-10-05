@@ -563,19 +563,22 @@ def test_shared_web_search_and_request_meeting(tmp_path: Path) -> None:
 
 def test_mock_publish_commit_and_draft_pr_respect_allowlist() -> None:
     from aitobuild.policy import AgentRole
+    from aitobuild.tools.github import GitHubBlobChange, _git_blob_sha
 
     adapter = MockGitHubAdapter(
         allowed_repositories=frozenset({"uhvogala/aitobuild_example"}),
         enforce_allowlist=True,
     )
     base = "a" * 40
+    content = b"x = 1\n"
+    change = GitHubBlobChange(mode="100644", content=content, blob_sha=_git_blob_sha(content))
     head = adapter.upsert_branch_commit(
         role=AgentRole.DEVELOPER,
         repository="uhvogala/aitobuild_example",
         branch="aitobuild/issue-1-deadbeefdeadbeef",
         base_sha=base,
         commit_message="aitobuild: implement #1",
-        files={"src/probe.py": "x = 1\n"},
+        files={"src/probe.py": change},
         approved=True,
         require_human_approval_for_repo_writes=True,
     )
@@ -605,6 +608,17 @@ def test_mock_publish_commit_and_draft_pr_respect_allowlist() -> None:
         require_human_approval_for_repo_writes=True,
     )
     assert updated.number == 1 and "updated" in updated.body
+    with pytest.raises(ValueError, match="aitobuild/"):
+        adapter.upsert_branch_commit(
+            role=AgentRole.DEVELOPER,
+            repository="uhvogala/aitobuild_example",
+            branch="feature/not-scoped",
+            base_sha=base,
+            commit_message="nope",
+            files={"a.py": change},
+            approved=True,
+            require_human_approval_for_repo_writes=True,
+        )
     with pytest.raises(PermissionError, match="allowlist"):
         adapter.upsert_branch_commit(
             role=AgentRole.DEVELOPER,
@@ -612,7 +626,7 @@ def test_mock_publish_commit_and_draft_pr_respect_allowlist() -> None:
             branch="aitobuild/issue-1-deadbeefdeadbeef",
             base_sha=base,
             commit_message="nope",
-            files={"a.py": "1"},
+            files={"a.py": change},
             approved=True,
             require_human_approval_for_repo_writes=True,
         )

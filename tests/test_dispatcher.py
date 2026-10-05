@@ -1019,10 +1019,17 @@ def test_publish_verified_delivery_opens_draft_pr_idempotently(
         allowed_repositories=frozenset({"fixture/widgets"}),
         enforce_allowlist=True,
     )
+    with pytest.raises(ValueError, match="mock publication is refused"):
+        worker.publish(
+            preview_id,
+            github=github,
+            require_human_approval_for_repo_writes=True,
+        )
     published = worker.publish(
         preview_id,
         github=github,
         require_human_approval_for_repo_writes=True,
+        allow_mock_publication=True,
     )
     assert published.state == "published", published.error
     assert published.publication["draft"] is True
@@ -1035,6 +1042,7 @@ def test_publish_verified_delivery_opens_draft_pr_idempotently(
         preview_id,
         github=github,
         require_human_approval_for_repo_writes=True,
+        allow_mock_publication=True,
     )
     assert again == published
     assert len(github.branch_commits) == 1
@@ -1055,6 +1063,7 @@ def test_publish_rejects_wrong_state_and_drift(
             preview_id,
             github=github,
             require_human_approval_for_repo_writes=True,
+            allow_mock_publication=True,
         )
     monkeypatch.setattr(
         delivery_module,
@@ -1070,6 +1079,7 @@ def test_publish_rejects_wrong_state_and_drift(
         preview_id,
         github=github,
         require_human_approval_for_repo_writes=True,
+        allow_mock_publication=True,
     )
     assert blocked.state == "failed"
     assert blocked.error and (
@@ -1077,7 +1087,9 @@ def test_publish_rejects_wrong_state_and_drift(
     )
 
 
-def test_publish_is_single_flight(implemented_delivery, verification_adapter, monkeypatch) -> None:
+def test_publish_resumes_interrupted_publishing_and_reuses_pull(
+    implemented_delivery, verification_adapter, monkeypatch,
+) -> None:
     from aitobuild.tools.github import MockGitHubAdapter
     from dataclasses import replace
 
@@ -1088,29 +1100,39 @@ def test_publish_is_single_flight(implemented_delivery, verification_adapter, mo
         lambda *a, **k: {"ok": True, "status": "exited", "exit_code": 0, "output": "ok", "next_cursor": 1},
     )
     worker.verify(preview_id, adapter=verification_adapter)
-    directory = worker._task_dir(preview_id)
-    record = worker.get(preview_id)
-    assert record is not None
-    stuck = replace(record, state="publishing", publication={
-        "title": "t",
-        "body": "b",
-        "commit_message": "c",
-        "checkout_digest": record.verification["checkout_digest"],
-        "changed_paths": ["src/probe.py"],
-        "base_ref": "main",
-        "base_sha": record.base_revision,
-        "branch": record.branch,
-        "repository": "fixture/widgets",
-        "issue_number": 7,
-    })
-    worker._save(directory, stuck)
     github = MockGitHubAdapter(
         allowed_repositories=frozenset({"fixture/widgets"}),
         enforce_allowlist=True,
     )
-    with pytest.raises(ValueError, match="concurrent publish|already in progress"):
-        worker.publish(
-            preview_id,
-            github=github,
-            require_human_approval_for_repo_writes=True,
-        )
+    # First publish succeeds.
+    published = worker.publish(
+        preview_id,
+        github=github,
+        require_human_approval_for_repo_writes=True,
+        allow_mock_publication=True,
+    )
+    assert published.state == "published"
+    pull_number = published.publication["pull_number"]
+    # Simulate interrupted publishing after PR create (orphan-avoidance resume).
+    directory = worker._task_dir(preview_id)
+    interrupted = replace(
+        published,
+        state="publishing",
+        head_revision=published.base_revision,
+        publication={
+            key: value
+            for key, value in published.publication.items()
+            if key != "published_at"
+        },
+    )
+    worker._save(directory, interrupted)
+    resumed = worker.publish(
+        preview_id,
+        github=github,
+        require_human_approval_for_repo_writes=True,
+        allow_mock_publication=True,
+    )
+    assert resumed.state == "published"
+    assert resumed.publication["pull_number"] == pull_number
+    assert len(github.pull_requests["fixture/widgets"]) == 1
+    assert "Verification" in resumed.publication["body"]

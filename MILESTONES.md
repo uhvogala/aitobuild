@@ -169,8 +169,17 @@ mutation, expiry, concurrent invocation, interrupted recovery and malformed
 evidence guards pass. Verified duplicate requests recheck integrity without
 re-execution. Actual Docker probes demonstrate verified exit 0 and terminal exit 5
 failure despite the Developer's own tests passing, with artifacts and cleanup.
-`verified` is command-plan evidence, not publication approval. GitHub publication
-remains pending; M2 is not accepted end to end.
+`verified` is command-plan evidence, not publication approval.
+
+GitHub publish slice (2026-10-05): authenticated publish accepts only preview
+identity. Verified checkouts bind to an approved base SHA plus a content-addressed
+tree fingerprint (blob SHAs and file modes). Publication is single-flight with
+resume from interrupted `publishing`, persists `pull_number`/`head_sha` before the
+terminal state, and create-or-updates the same draft PR under an `aitobuild/`
+branch prefix. Live `gh` adapters get a request timeout; durable mock
+`published` is refused on the HTTP path. PR bodies include verification evidence.
+M2 is not accepted end to end until a designated live trial meets the exit
+criteria below.
 
 Local verification: `AITOBUILD_RUN_DELIVERY_DOCKER_TEST=1 uv run pytest` (325 tests;
 ordinary gate 323 passed/two skipped), `uv run ruff check .`, and

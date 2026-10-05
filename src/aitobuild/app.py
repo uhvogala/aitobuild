@@ -45,6 +45,7 @@ from aitobuild.tools import (
     MockFilesystemAdapter,
     SubprocessBashAdapter,
     build_github_adapter,
+    MockGitHubAdapter,
     build_web_search_adapter,
 )
 from aitobuild.triggers import InMemoryDedupeStore, TriggerEngine
@@ -784,10 +785,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         try:
             if delivery_worker.get(preview_id) is None:
                 raise HTTPException(status_code=404, detail="Delivery not found")
+            if isinstance(github_adapter, MockGitHubAdapter):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Publication requires a live GitHub adapter (gh_cli); mock publication is refused",
+                )
             record = delivery_worker.publish(
                 preview_id,
                 github=github_adapter,
                 require_human_approval_for_repo_writes=app_config.policy.require_human_approval_for_repo_writes,
+                allow_mock_publication=False,
             )
         except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error

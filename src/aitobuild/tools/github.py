@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from hashlib import sha256
+from hashlib import sha1, sha256
 import json
 import re
-from subprocess import CalledProcessError, run
+from subprocess import CalledProcessError, TimeoutExpired, run
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
@@ -120,6 +121,23 @@ class GitHubPullRequestReview:
         }
 
 
+
+@dataclass(slots=True, frozen=True)
+class GitHubBlobChange:
+    """One scoped file change published as a Git blob (bytes + mode + git blob SHA)."""
+
+    mode: Literal["100644", "100755"]
+    content: bytes
+    blob_sha: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "content_base64": base64.b64encode(self.content).decode("ascii"),
+            "blob_sha": self.blob_sha,
+        }
+
+
 class GitHubAdapter(Protocol):
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue: ...
 
@@ -199,7 +217,7 @@ class GitHubAdapter(Protocol):
         branch: str,
         base_sha: str,
         commit_message: str,
-        files: Mapping[str, str | None],
+        files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
     ) -> str: ...
@@ -411,7 +429,7 @@ class MockGitHubAdapter:
         branch: str,
         base_sha: str,
         commit_message: str,
-        files: Mapping[str, str | None],
+        files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
     ) -> str:
@@ -424,12 +442,17 @@ class MockGitHubAdapter:
         _validate_publish_commit_inputs(
             branch=branch, base_sha=base_sha, commit_message=commit_message, files=files
         )
+        encoded_files = {
+            path: None if change is None else change.to_dict()
+            for path, change in sorted(files.items())
+        }
         payload = {
             "repository": repo,
             "branch": branch.strip(),
             "base_sha": base_sha.lower(),
             "commit_message": commit_message.strip(),
-            "files": {path: files[path] for path in sorted(files)},
+            "files": encoded_files,
+            "tree_fingerprint": _tree_fingerprint(files),
         }
         head_sha = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:40]
         self.branch_commits.append({**payload, "head_sha": head_sha})
@@ -473,6 +496,14 @@ class MockGitHubAdapter:
             current = repo_prs.get(existing_pull_number)
             if current is None:
                 raise ValueError(f"Pull request #{existing_pull_number} was not found")
+            if current.head_ref != cleaned_head:
+                raise ValueError(
+                    f"Pull request #{existing_pull_number} head ref does not match the delivery branch"
+                )
+            if not current.draft:
+                raise ValueError(
+                    f"Pull request #{existing_pull_number} is not a draft; refusing update"
+                )
             updated = GitHubPullRequest(
                 number=existing_pull_number,
                 title=cleaned_title,
@@ -576,7 +607,10 @@ class GhCliGitHubAdapter:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=60,
             )
+        except TimeoutExpired as exc:
+            raise RuntimeError(f"gh api timed out for {method} {endpoint}") from exc
         except CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             raise RuntimeError(f"gh api failed for {method} {endpoint}: {detail}") from exc
@@ -759,7 +793,7 @@ class GhCliGitHubAdapter:
         branch: str,
         base_sha: str,
         commit_message: str,
-        files: Mapping[str, str | None],
+        files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
     ) -> str:
@@ -780,19 +814,27 @@ class GhCliGitHubAdapter:
             raise RuntimeError("Base commit is missing a tree SHA")
         tree_entries: list[dict[str, Any]] = []
         for path_name in sorted(files):
-            content = files[path_name]
-            if content is None:
+            change = files[path_name]
+            if change is None:
                 tree_entries.append({"path": path_name, "mode": "100644", "type": "blob", "sha": None})
                 continue
             blob = self._api(
                 f"repos/{repo}/git/blobs",
                 method="POST",
-                payload={"content": content, "encoding": "utf-8"},
+                payload={
+                    "content": base64.b64encode(change.content).decode("ascii"),
+                    "encoding": "base64",
+                },
             )
             if not isinstance(blob, dict) or not isinstance(blob.get("sha"), str):
                 raise RuntimeError(f"Failed to create blob for {path_name}")
+            if blob["sha"] != change.blob_sha:
+                raise RuntimeError(
+                    f"GitHub blob SHA mismatch for {path_name}: "
+                    f"expected {change.blob_sha}, got {blob['sha']}"
+                )
             tree_entries.append(
-                {"path": path_name, "mode": "100644", "type": "blob", "sha": blob["sha"]}
+                {"path": path_name, "mode": change.mode, "type": "blob", "sha": blob["sha"]}
             )
         tree = self._api(
             f"repos/{repo}/git/trees",
@@ -812,6 +854,8 @@ class GhCliGitHubAdapter:
         )
         if not isinstance(commit, dict) or not isinstance(commit.get("sha"), str):
             raise RuntimeError("Failed to create GitHub commit")
+        if not isinstance(commit.get("tree"), dict) or commit["tree"].get("sha") != tree["sha"]:
+            raise RuntimeError("Published commit tree SHA does not match the uploaded tree")
         head_sha = commit["sha"]
         try:
             self._api(
@@ -860,6 +904,15 @@ class GhCliGitHubAdapter:
         ):
             raise ValueError("existing_pull_number must be a positive integer when provided")
         if existing_pull_number is not None:
+            current = self.get_pull_request(repository=repo, pull_number=existing_pull_number)
+            if current.head_ref != cleaned_head:
+                raise ValueError(
+                    f"Pull request #{existing_pull_number} head ref does not match the delivery branch"
+                )
+            if not current.draft:
+                raise ValueError(
+                    f"Pull request #{existing_pull_number} is not a draft; refusing update"
+                )
             raw = self._api(
                 f"repos/{repo}/pulls/{existing_pull_number}",
                 method="PATCH",
@@ -902,38 +955,62 @@ class GhCliGitHubAdapter:
 
 
 
+def _git_blob_sha(content: bytes) -> str:
+    return sha1(b"blob %d\x00" % len(content) + content).hexdigest()
+
+
+def _tree_fingerprint(files: Mapping[str, GitHubBlobChange | None]) -> str:
+    entries = []
+    for path_name in sorted(files):
+        change = files[path_name]
+        if change is None:
+            entries.append({"path": path_name, "deleted": True})
+        else:
+            entries.append({"path": path_name, "mode": change.mode, "blob_sha": change.blob_sha})
+    return sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()
+
+
 def _validate_publish_commit_inputs(
     *,
     branch: str,
     base_sha: str,
     commit_message: str,
-    files: Mapping[str, str | None],
+    files: Mapping[str, GitHubBlobChange | None],
 ) -> None:
     cleaned_branch = branch.strip() if isinstance(branch, str) else ""
     if (
         not cleaned_branch
-        or cleaned_branch.startswith("/")
+        or not cleaned_branch.startswith("aitobuild/")
         or cleaned_branch.endswith("/")
         or ".." in cleaned_branch
         or re.fullmatch(r"[A-Za-z0-9._/-]+", cleaned_branch) is None
     ):
-        raise ValueError("branch must be a safe non-empty git ref name")
+        raise ValueError("branch must be an aitobuild/ task ref name")
     if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
         raise ValueError("base_sha must be a resolved lowercase commit SHA")
     if not isinstance(commit_message, str) or not commit_message.strip():
         raise ValueError("commit_message must be non-empty")
     if not isinstance(files, Mapping) or not files:
         raise ValueError("publish commit requires a non-empty scoped file map")
-    for path, content in files.items():
+    for path_name, change in files.items():
         if (
-            not isinstance(path, str)
-            or not path.strip()
-            or path.startswith("/")
-            or any(part == ".." for part in path.split("/"))
+            not isinstance(path_name, str)
+            or not path_name.strip()
+            or path_name.startswith("/")
+            or any(part == ".." for part in path_name.split("/"))
         ):
             raise ValueError("publish file paths must be relative and scoped")
-        if content is not None and not isinstance(content, str):
-            raise ValueError("publish file contents must be UTF-8 text or null for deletion")
+        if change is None:
+            continue
+        if not isinstance(change, GitHubBlobChange):
+            raise ValueError("publish file changes must be GitHubBlobChange values")
+        if change.mode not in {"100644", "100755"}:
+            raise ValueError("publish file mode must be 100644 or 100755")
+        if not isinstance(change.content, (bytes, bytearray)):
+            raise ValueError("publish file contents must be raw bytes")
+        if change.blob_sha != _git_blob_sha(bytes(change.content)):
+            raise ValueError(f"publish blob SHA mismatch for {path_name}")
+
 
 
 def build_github_adapter(

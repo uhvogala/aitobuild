@@ -11,6 +11,7 @@ from aitobuild.tools.bash import (
 from aitobuild.tools.filesystem import FilesystemAdapter, MockFilesystemAdapter
 from aitobuild.tools.github import (
     GhCliGitHubAdapter,
+    GitHubBlobChange,
     GitHubIssue,
     GitHubIssueProposal,
     GitHubPullRequest,
@@ -34,6 +35,7 @@ __all__ = [
     "DuckDuckGoLiteSearchAdapter",
     "FilesystemAdapter",
     "GhCliGitHubAdapter",
+    "GitHubBlobChange",
     "GitHubIssue",
     "GitHubIssueProposal",
     "GitHubPullRequest",
