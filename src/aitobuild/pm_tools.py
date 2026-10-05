@@ -28,7 +28,9 @@ class PlanDraftStore:
     Operator approval freezes an immutable content snapshot. Mutations after
     approval (or while awaiting approval) invalidate the prior approval, matching
     the Developer preview renew-on-scope-change pattern. Issue creation must use
-    the approved snapshot, never the mutable draft fields alone.
+    the approved snapshot, never the mutable draft fields alone. Successful
+    ``pm_create_issue`` consumes the approval (like issue-write) so the same
+    approved plan cannot create issues repeatedly without a new operator approve.
     """
 
     drafts: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -44,7 +46,11 @@ class PlanDraftStore:
         }
 
     def _invalidate_approval(self, record: dict[str, Any]) -> None:
-        if record.get("approval_state") in {"approved", "awaiting_human_approval"}:
+        if record.get("approval_state") in {
+            "approved",
+            "awaiting_human_approval",
+            "consumed",
+        }:
             record["approval_state"] = "draft"
             record["approval_request_id"] = None
             record.pop("approved_snapshot", None)
@@ -154,6 +160,29 @@ class PlanDraftStore:
             raise PermissionError(
                 "approved plan is missing an immutable content snapshot; renew approval"
             )
+        return deepcopy(snapshot)
+
+    def consume_approved(self, draft_id: str) -> dict[str, Any]:
+        """Consume an approved plan and return the frozen snapshot for issue creation.
+
+        Aligns with ``IssueWriteApprovalStore.consume_approved``: a successful create
+        path must call this so the same approved plan cannot create issues repeatedly
+        without a new operator approve. Callers must execute using the returned
+        snapshot only (including ``repository``); agent-supplied overrides are ignored.
+        """
+        record = self._require(draft_id)
+        if record.get("approval_state") != "approved":
+            raise PermissionError(
+                "plan draft is not operator-approved for issue creation; "
+                "approve via POST /internal/pm/plan/approve"
+            )
+        snapshot = record.get("approved_snapshot")
+        if not isinstance(snapshot, dict):
+            raise PermissionError(
+                "approved plan is missing an immutable content snapshot; renew approval"
+            )
+        record["approval_state"] = "consumed"
+        record["updated_at"] = datetime.now(tz=UTC).isoformat()
         return deepcopy(snapshot)
 
     def list_drafts(self, *, pending_only: bool = False, limit: int = 50) -> list[dict[str, Any]]:
@@ -389,7 +418,9 @@ def build_pm_tools(
         description=(
             "Create a GitHub issue from an operator-approved plan draft (preferred) or an explicit "
             "proposal when approval gating is disabled. Agent-supplied approved flags are ignored; "
-            "when gating is on, the draft must already be approved in the plan store."
+            "when gating is on, the draft must already be approved in the plan store. Create uses "
+            "the frozen snapshot only (including repository) and consumes the approval so the same "
+            "approved plan cannot create issues repeatedly without a new operator approve."
         ),
     )
     def pm_create_issue(
@@ -415,15 +446,15 @@ def build_pm_tools(
         del approved  # Agent-supplied approval is never authoritative.
         if draft_id is not None:
             if require_human_approval_for_repo_writes:
-                # Content-bound: create only from the immutable approved snapshot.
-                snapshot = drafts.get_approved_snapshot(draft_id)
+                # Content-bound + one-shot: consume frozen snapshot; ignore agent repository.
+                snapshot = drafts.consume_approved(draft_id)
                 issue_title = str(snapshot["title"])
                 issue_body = _issue_body(
                     summary=str(snapshot["summary"]),
                     acceptance_criteria=list(snapshot["acceptance_criteria"]),
                 )
                 issue_labels = tuple(snapshot.get("labels") or ())
-                issue_repo = _repo(repository or snapshot.get("repository"))
+                issue_repo = _repo(snapshot.get("repository"))
             else:
                 draft = drafts.get(draft_id)
                 issue_title = str(draft["title"])

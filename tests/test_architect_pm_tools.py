@@ -231,6 +231,7 @@ def test_pm_plan_approval_requires_operator_store_not_agent_flag(tmp_path: Path)
     assert created["created"] is True
     assert created["issue"]["number"] == 1
     assert "Acceptance Criteria" in created["issue"]["body"]
+    assert plan_store.get(draft_id)["approval_state"] == "consumed"
 
 
 def test_pm_update_and_link_require_operator_issue_write_approval(tmp_path: Path) -> None:
@@ -339,6 +340,114 @@ def test_pm_draft_edit_after_approve_invalidates_and_create_uses_snapshot(tmp_pa
     assert created["issue"]["title"] == "Approved title"
     assert "Tampered" not in created["issue"]["body"]
     assert "Approved summary" in created["issue"]["body"]
+    assert plan_store.get(draft_id)["approval_state"] == "consumed"
+
+
+def test_pm_create_issue_ignores_agent_repository_override(tmp_path: Path) -> None:
+    """After approve, create must use snapshot.repository only — ignore agent repository."""
+    github = MockGitHubAdapter()
+    plan_store = PlanDraftStore()
+    tools = _tool_map(
+        build_role_tools(context=_context(tmp_path, github=github, plan_store=plan_store))["pm"]
+    )
+    draft = tools["pm_draft_plan"](
+        "Repo-bound plan",
+        "Must land in the approved repository.",
+        acceptance_criteria=["Created in approved repo"],
+        labels=["pm"],
+        repository="uhvogala/aitobuild_example",
+    )
+    draft_id = draft["draft_id"]
+    pending = tools["pm_request_plan_approval"](draft_id)
+    plan_store.mark_approved(
+        draft_id=draft_id,
+        approval_request_id=pending["approval_request_id"],
+    )
+    assert plan_store.get(draft_id)["approved_snapshot"]["repository"] == (
+        "uhvogala/aitobuild_example"
+    )
+
+    created = tools["pm_create_issue"](draft_id, repository="evil/other-repo")
+    assert created["created"] is True
+    issue = created["issue"]
+    assert issue["repository"] == "uhvogala/aitobuild_example"
+    assert "evil/other-repo" not in issue["html_url"]
+    assert "uhvogala/aitobuild_example" in issue["html_url"]
+    assert "evil/other-repo" not in github.issues
+    assert 1 in github.issues["uhvogala/aitobuild_example"]
+
+
+def test_pm_create_issue_consumes_plan_approval(tmp_path: Path) -> None:
+    """Successful create consumes approval; replay without a new operator approve fails."""
+    github = MockGitHubAdapter()
+    plan_store = PlanDraftStore()
+    tools = _tool_map(
+        build_role_tools(context=_context(tmp_path, github=github, plan_store=plan_store))["pm"]
+    )
+    draft = tools["pm_draft_plan"](
+        "One-shot plan",
+        "Create once.",
+        acceptance_criteria=["Only one issue"],
+    )
+    draft_id = draft["draft_id"]
+    pending = tools["pm_request_plan_approval"](draft_id)
+    plan_store.mark_approved(
+        draft_id=draft_id,
+        approval_request_id=pending["approval_request_id"],
+    )
+
+    first = tools["pm_create_issue"](draft_id)
+    assert first["created"] is True
+    assert first["issue"]["number"] == 1
+    assert plan_store.get(draft_id)["approval_state"] == "consumed"
+
+    with pytest.raises(PermissionError, match="operator-approved"):
+        tools["pm_create_issue"](draft_id)
+
+    # Renew: re-request + operator approve allows another create.
+    tools["pm_draft_plan"](
+        "One-shot plan",
+        "Create once.",
+        acceptance_criteria=["Only one issue"],
+        draft_id=draft_id,
+    )
+    pending2 = tools["pm_request_plan_approval"](draft_id)
+    plan_store.mark_approved(
+        draft_id=draft_id,
+        approval_request_id=pending2["approval_request_id"],
+    )
+    second = tools["pm_create_issue"](draft_id)
+    assert second["created"] is True
+    assert second["issue"]["number"] == 2
+    assert plan_store.get(draft_id)["approval_state"] == "consumed"
+
+
+def test_pm_issue_write_approval_is_consumed_and_not_replayable(tmp_path: Path) -> None:
+    """Issue-write approvals are one-shot after execute (pattern plan create must match)."""
+    github = MockGitHubAdapter()
+    write_store = IssueWriteApprovalStore()
+    github.seed_issue(
+        repository="uhvogala/aitobuild_example",
+        issue=GitHubIssue(
+            number=11, title="Epic", body="Parent", state="open", labels=("backlog",)
+        ),
+    )
+    tools = _tool_map(
+        build_role_tools(context=_context(tmp_path, github=github, issue_write_store=write_store))[
+            "pm"
+        ]
+    )
+    pending = tools["pm_update_issue"](11, body="Approved once")
+    write_store.mark_approved(approval_request_id=pending["approval_request_id"])
+    updated = tools["pm_update_issue"](
+        11, body="Approved once", approval_request_id=pending["approval_request_id"]
+    )
+    assert updated["updated"] is True
+    assert write_store.requests[pending["approval_request_id"]]["approval_state"] == "consumed"
+    with pytest.raises(PermissionError, match="human-approved"):
+        tools["pm_update_issue"](
+            11, body="Replay", approval_request_id=pending["approval_request_id"]
+        )
 
 
 def test_pm_issue_write_execute_uses_stored_approved_payload(tmp_path: Path) -> None:
