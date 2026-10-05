@@ -1139,11 +1139,11 @@ def test_publish_resumes_interrupted_publishing_and_reuses_pull(
 
 
 
-def test_publish_resumes_failed_with_head_sha_without_pull(
-    implemented_delivery, verification_adapter, monkeypatch,
+def test_publish_resumes_after_real_adapter_failure_without_aborting_budget(
+    implemented_delivery, verification_adapter, monkeypatch, tmp_path,
 ) -> None:
+    """Failed create after commit must keep the budget alive so retry can finish."""
     from aitobuild.tools.github import MockGitHubAdapter
-    from dataclasses import replace
 
     worker, preview_id, _, _ = implemented_delivery
     monkeypatch.setattr(
@@ -1156,31 +1156,35 @@ def test_publish_resumes_failed_with_head_sha_without_pull(
         allowed_repositories=frozenset({"fixture/widgets"}),
         enforce_allowlist=True,
     )
-    published = worker.publish(
+    real_create = MockGitHubAdapter.create_or_update_draft_pull_request
+    calls = {"n": 0}
+
+    def fail_once(self, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated draft PR adapter failure")
+        return real_create(self, **kwargs)
+
+    monkeypatch.setattr(
+        MockGitHubAdapter, "create_or_update_draft_pull_request", fail_once,
+    )
+    failed = worker.publish(
         preview_id,
         github=github,
         require_human_approval_for_repo_writes=True,
         allow_mock_publication=True,
     )
-    assert published.state == "published"
-    pull_number = published.publication["pull_number"]
-    head_sha = published.publication["head_sha"]
-    # Failed after commit, before pull_number persist; orphan PR still exists on the head branch.
-    directory = worker._task_dir(preview_id)
-    failed = replace(
-        published,
-        state="failed",
-        error="simulated create-before-persist failure",
-        head_revision=published.base_revision,
-        publication={
-            key: value
-            for key, value in published.publication.items()
-            if key not in {"published_at", "pull_number", "html_url", "draft"}
-        },
-    )
+    assert failed.state == "failed", failed.error
+    assert "simulated draft PR adapter failure" in (failed.error or "")
+    assert isinstance(failed.publication, dict)
     assert "pull_number" not in failed.publication
-    assert failed.publication["head_sha"] == head_sha
-    worker._save(directory, failed)
+    head_sha = failed.publication["head_sha"]
+    assert isinstance(head_sha, str) and len(head_sha) == 40
+    assert len(github.branch_commits) == 1
+    assert github.pull_requests.get("fixture/widgets", {}) == {}
+    budget = json.loads(next((tmp_path / "state" / "budgets").glob("*.json")).read_text())
+    assert budget.get("aborted", False) is False
+
     resumed = worker.publish(
         preview_id,
         github=github,
@@ -1188,18 +1192,20 @@ def test_publish_resumes_failed_with_head_sha_without_pull(
         allow_mock_publication=True,
     )
     assert resumed.state == "published", resumed.error
-    assert resumed.publication["pull_number"] == pull_number
     assert resumed.publication["head_sha"] == head_sha
+    assert resumed.publication["pull_number"] == 1
     assert len(github.branch_commits) == 1
     assert len(github.pull_requests["fixture/widgets"]) == 1
+    assert calls["n"] == 2
+    final_budget = json.loads(next((tmp_path / "state" / "budgets").glob("*.json")).read_text())
+    assert final_budget.get("aborted", False) is False
 
 
-def test_publish_create_or_update_reuses_open_draft_by_head_without_persisted_number(
-    implemented_delivery, verification_adapter, monkeypatch,
+def test_publish_create_or_update_reuses_open_draft_after_create_before_persist_failure(
+    implemented_delivery, verification_adapter, monkeypatch, tmp_path,
 ) -> None:
-    """Create-before-persist: adapter finds the open draft by head branch."""
+    """Adapter creates the draft, then fails before identity persist; retry re-binds by head."""
     from aitobuild.tools.github import MockGitHubAdapter
-    from dataclasses import replace
 
     worker, preview_id, _, _ = implemented_delivery
     monkeypatch.setattr(
@@ -1212,35 +1218,45 @@ def test_publish_create_or_update_reuses_open_draft_by_head_without_persisted_nu
         allowed_repositories=frozenset({"fixture/widgets"}),
         enforce_allowlist=True,
     )
-    published = worker.publish(
+    real_create = MockGitHubAdapter.create_or_update_draft_pull_request
+    calls = {"n": 0}
+
+    def create_then_fail(self, **kwargs):
+        calls["n"] += 1
+        pull = real_create(self, **kwargs)
+        if calls["n"] == 1:
+            raise RuntimeError("simulated failure after draft PR create")
+        return pull
+
+    monkeypatch.setattr(
+        MockGitHubAdapter, "create_or_update_draft_pull_request", create_then_fail,
+    )
+    failed = worker.publish(
         preview_id,
         github=github,
         require_human_approval_for_repo_writes=True,
         allow_mock_publication=True,
     )
-    pull_number = published.publication["pull_number"]
-    directory = worker._task_dir(preview_id)
-    # publishing with head_sha but no pull_number (crash window after create).
-    interrupted = replace(
-        published,
-        state="publishing",
-        head_revision=published.base_revision,
-        publication={
-            key: value
-            for key, value in published.publication.items()
-            if key not in {"published_at", "pull_number", "html_url", "draft"}
-        },
-    )
-    worker._save(directory, interrupted)
+    assert failed.state == "failed"
+    assert "after draft PR create" in (failed.error or "")
+    assert "pull_number" not in failed.publication
+    assert failed.publication["head_sha"]
+    assert len(github.pull_requests["fixture/widgets"]) == 1
+    orphan = next(iter(github.pull_requests["fixture/widgets"].values()))
+    assert orphan.draft is True
+    budget = json.loads(next((tmp_path / "state" / "budgets").glob("*.json")).read_text())
+    assert budget.get("aborted", False) is False
+
     resumed = worker.publish(
         preview_id,
         github=github,
         require_human_approval_for_repo_writes=True,
         allow_mock_publication=True,
     )
-    assert resumed.state == "published"
-    assert resumed.publication["pull_number"] == pull_number
+    assert resumed.state == "published", resumed.error
+    assert resumed.publication["pull_number"] == orphan.number
     assert len(github.pull_requests["fixture/widgets"]) == 1
+    assert calls["n"] == 2
 
 
 def test_architect_review_published_draft_from_publication_only(

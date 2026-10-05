@@ -576,7 +576,11 @@ class DeveloperDeliveryWorker:
             except BaseException as failure:
                 error = str(failure) or type(failure).__name__
                 if not isinstance(failure, Exception):
-                    budget.abort()
+                    publication_now = (
+                        record.publication if isinstance(record.publication, dict) else None
+                    )
+                    if not _publication_is_resumable(publication_now):
+                        budget.abort()
                     self._save(
                         directory,
                         replace(
@@ -586,7 +590,13 @@ class DeveloperDeliveryWorker:
                     )
                     raise
             if error is not None:
-                budget.abort()
+                publication_now = (
+                    record.publication if isinstance(record.publication, dict) else None
+                )
+                # Keep the task budget alive when publish already persisted enough
+                # identity (head_sha / pull_number) to resume without a new approval.
+                if not _publication_is_resumable(publication_now):
+                    budget.abort()
                 record = replace(
                     record, state="failed", error=error,
                     updated_at=datetime.now(tz=UTC).isoformat(),
