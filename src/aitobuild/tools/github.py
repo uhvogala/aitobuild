@@ -200,6 +200,7 @@ class GitHubAdapter(Protocol):
         pull_number: int,
         event: Literal["APPROVE", "REQUEST_CHANGES", "COMMENT"],
         body: str,
+        commit_id: str | None = None,
     ) -> GitHubPullRequestReview: ...
 
     def create_issue_proposal(
@@ -424,14 +425,21 @@ class MockGitHubAdapter:
         pull_number: int,
         event: Literal["APPROVE", "REQUEST_CHANGES", "COMMENT"],
         body: str,
+        commit_id: str | None = None,
     ) -> GitHubPullRequestReview:
         assert_role_action_allowed(role, ActionClass.PR_REVIEW)
         repository = self._resolve_repository(repository)
-        self.get_pull_request(repository=repository, pull_number=pull_number)
+        pull = self.get_pull_request(repository=repository, pull_number=pull_number)
         if event not in {"APPROVE", "REQUEST_CHANGES", "COMMENT"}:
             raise ValueError("event must be APPROVE, REQUEST_CHANGES, or COMMENT")
         if not body.strip():
             raise ValueError("review body must be non-empty")
+        if commit_id is not None:
+            cleaned_commit = commit_id.strip().lower()
+            if re.fullmatch(r"[0-9a-f]{40}", cleaned_commit) is None:
+                raise ValueError("commit_id must be a 40-char lowercase hex SHA")
+            if pull.head_sha and pull.head_sha.lower() != cleaned_commit:
+                raise ValueError("commit_id does not match the pull request head SHA")
         review = GitHubPullRequestReview(
             pull_number=pull_number,
             event=event,
@@ -788,6 +796,7 @@ class GhCliGitHubAdapter:
         pull_number: int,
         event: Literal["APPROVE", "REQUEST_CHANGES", "COMMENT"],
         body: str,
+        commit_id: str | None = None,
     ) -> GitHubPullRequestReview:
         assert_role_action_allowed(role, ActionClass.PR_REVIEW)
         if event not in {"APPROVE", "REQUEST_CHANGES", "COMMENT"}:
@@ -795,10 +804,16 @@ class GhCliGitHubAdapter:
         if not body.strip():
             raise ValueError("review body must be non-empty")
         repo = self._resolve_repository(repository)
+        payload: dict[str, Any] = {"event": event, "body": body.strip()}
+        if commit_id is not None:
+            cleaned_commit = commit_id.strip().lower()
+            if re.fullmatch(r"[0-9a-f]{40}", cleaned_commit) is None:
+                raise ValueError("commit_id must be a 40-char lowercase hex SHA")
+            payload["commit_id"] = cleaned_commit
         raw = self._api(
             f"repos/{repo}/pulls/{pull_number}/reviews",
             method="POST",
-            payload={"event": event, "body": body.strip()},
+            payload=payload,
         )
         return GitHubPullRequestReview(
             pull_number=pull_number,

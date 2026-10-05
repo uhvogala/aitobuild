@@ -65,7 +65,6 @@ class DeveloperToolContext:
     plan_draft_store: PlanDraftStore | None = None
     issue_write_store: IssueWriteApprovalStore | None = None
     default_repository: str | None = None
-    allow_pr_approve: bool = False
     delivery_worker: DeveloperDeliveryWorker | None = None
 
 
@@ -91,8 +90,6 @@ def build_role_tools(*, context: DeveloperToolContext) -> dict[str, tuple[ToolFu
                 else None
             ),
             prepared_workspace=context.prepared_workspace,
-            default_repository=context.default_repository,
-            allow_pr_approve=context.allow_pr_approve,
             delivery_worker=context.delivery_worker,
         ),
         AgentRole.PM.value: build_pm_tools(

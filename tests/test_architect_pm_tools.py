@@ -16,7 +16,6 @@ from aitobuild.tools.filesystem import MockFilesystemAdapter
 from aitobuild.tools.github import (
     GhCliGitHubAdapter,
     GitHubIssue,
-    GitHubPullRequest,
     MockGitHubAdapter,
     build_github_adapter,
 )
@@ -33,7 +32,6 @@ def _context(
     github: MockGitHubAdapter | None = None,
     plan_store: PlanDraftStore | None = None,
     issue_write_store: IssueWriteApprovalStore | None = None,
-    allow_pr_approve: bool = False,
     require_human_approval_for_repo_writes: bool = True,
 ) -> DeveloperToolContext:
     return DeveloperToolContext(
@@ -56,7 +54,6 @@ def _context(
         plan_draft_store=plan_store or PlanDraftStore(),
         issue_write_store=issue_write_store or IssueWriteApprovalStore(),
         default_repository="uhvogala/aitobuild_example",
-        allow_pr_approve=allow_pr_approve,
     )
 
 
@@ -72,8 +69,6 @@ def test_build_role_tools_includes_architect_and_pm(tmp_path: Path) -> None:
         "architect_run_command",
         "architect_start_session",
         "architect_stop_session",
-        "architect_get_pr",
-        "architect_submit_pr_review",
         "architect_get_published_pr",
         "architect_submit_published_pr_review",
         "architect_memory_query",
@@ -105,59 +100,15 @@ def test_architect_stays_read_only_for_repo_writes() -> None:
     assert_role_action_allowed(AgentRole.ARCHITECT, ActionClass.PR_REVIEW)
 
 
-def test_architect_pr_review_and_memory_roundtrip(tmp_path: Path) -> None:
-    github = MockGitHubAdapter()
-    github.seed_pull_request(
-        repository="uhvogala/aitobuild_example",
-        pull_request=GitHubPullRequest(
-            number=12,
-            title="Add feature",
-            body="Implements issue #7",
-            state="open",
-            head_ref="feat/x",
-            base_ref="main",
-            changed_files=("src/example.py",),
-            repository="uhvogala/aitobuild_example",
-        ),
-    )
-    tools = _tool_map(build_role_tools(context=_context(tmp_path, github=github))["architect"])
-    pr = tools["architect_get_pr"](12)
-    assert pr["number"] == 12
-    assert pr["changed_files"] == ["src/example.py"]
-    review = tools["architect_submit_pr_review"](12, "REQUEST_CHANGES", "Please extract a helper.")
-    assert review["event"] == "REQUEST_CHANGES"
-    assert len(github.reviews) == 1
+def test_architect_memory_roundtrip_and_no_freeform_pr_tools(tmp_path: Path) -> None:
+    tools = _tool_map(build_role_tools(context=_context(tmp_path))["architect"])
+    assert "architect_get_pr" not in tools
+    assert "architect_submit_pr_review" not in tools
     recorded = tools["architect_memory_record"](
         "helper-extraction", "Extract shared validation helper."
     )
     matches = tools["architect_memory_query"]("validation helper")
     assert recorded["memory_id"] in {item["memory_id"] for item in matches["matches"]}
-
-
-def test_architect_approve_gated_by_config(tmp_path: Path) -> None:
-    github = MockGitHubAdapter()
-    github.seed_pull_request(
-        repository="uhvogala/aitobuild_example",
-        pull_request=GitHubPullRequest(
-            number=3,
-            title="PR",
-            body="body",
-            state="open",
-            head_ref="feat",
-            base_ref="main",
-            repository="uhvogala/aitobuild_example",
-        ),
-    )
-    blocked = _tool_map(build_role_tools(context=_context(tmp_path, github=github))["architect"])
-    with pytest.raises(PermissionError, match="APPROVE reviews are disabled"):
-        blocked["architect_submit_pr_review"](3, "APPROVE", "LGTM")
-    allowed = _tool_map(
-        build_role_tools(context=_context(tmp_path, github=github, allow_pr_approve=True))[
-            "architect"
-        ]
-    )
-    review = allowed["architect_submit_pr_review"](3, "APPROVE", "LGTM")
-    assert review["event"] == "APPROVE"
 
 
 def test_architect_run_command_rejects_mutations(tmp_path: Path) -> None:

@@ -1170,17 +1170,21 @@ def test_architect_review_published_draft_from_publication_only(
     reviewed = worker.submit_architect_review(
         preview_id,
         github=github,
-        event="REQUEST_CHANGES",
+        event="COMMENT",
         body="Please extract a helper before merge.",
     )
     assert reviewed.architect_review is not None
-    assert reviewed.architect_review["event"] == "REQUEST_CHANGES"
+    assert reviewed.architect_review["event"] == "COMMENT"
     assert reviewed.architect_review["body"].startswith(ARCHITECT_REVIEW_BODY_PREFIX)
     assert reviewed.architect_review["head_sha"] == published.publication["head_sha"]
     assert len(github.reviews) == 1
     again = worker.get_published_pull_request(preview_id, github=github)
-    assert again["architect_review"]["event"] == "REQUEST_CHANGES"
-    with pytest.raises(ValueError, match="COMMENT or REQUEST_CHANGES"):
+    assert again["architect_review"]["event"] == "COMMENT"
+    with pytest.raises(ValueError, match="distinct Architect reviewer|COMMENT only"):
+        worker.submit_architect_review(
+            preview_id, github=github, event="REQUEST_CHANGES", body="Needs changes.",
+        )
+    with pytest.raises(ValueError, match="allows only COMMENT"):
         worker.submit_architect_review(
             preview_id, github=github, event="APPROVE", body="LGTM",
         )
@@ -1229,7 +1233,7 @@ def test_architect_review_refuses_when_publication_head_moved(
     )
     fetched = worker.get_published_pull_request(preview_id, github=github)
     assert fetched["head_matches_publication"] is False
-    with pytest.raises(ValueError, match="head SHA moved"):
+    with pytest.raises(ValueError, match="head SHA no longer matches|head SHA changed"):
         worker.submit_architect_review(
             preview_id, github=github, event="COMMENT", body="Looks fine overall.",
         )
