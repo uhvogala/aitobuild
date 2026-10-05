@@ -11,9 +11,10 @@ from types import ModuleType
 from typing import Any, Callable
 
 from agent_framework import (
-    CompactionProvider, ContextWindowCompactionStrategy, FileHistoryProvider, FileMemoryProvider,
+    CompactionProvider, ContextWindowCompactionStrategy, FileHistoryProvider,
     FileSystemAgentFileStore,
 )
+from aitobuild.foundry_compat import FoundryCompatibleFileMemoryProvider
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from openai import AsyncOpenAI
 
@@ -235,7 +236,7 @@ def _build_role_agent_handles(
                 options = {
                     "context_providers": [
                         FileHistoryProvider(developer_state_dir / "history", skip_excluded=True),
-                        FileMemoryProvider(
+                        FoundryCompatibleFileMemoryProvider(
                             FileSystemAgentFileStore(developer_state_dir / "memory"),
                         ),
                         CompactionProvider(
