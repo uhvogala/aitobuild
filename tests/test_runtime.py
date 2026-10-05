@@ -202,6 +202,56 @@ def test_native_memory_persists_without_sharing_between_developers(tmp_path: Pat
     asyncio.run(check())
 
 
+
+def test_inline_json_schema_refs_expands_defs() -> None:
+    from aitobuild.foundry_compat import inline_json_schema_refs
+
+    schema = {
+        "$defs": {
+            "Item": {
+                "type": "object",
+                "properties": {"n": {"type": "integer"}},
+                "required": ["n"],
+            }
+        },
+        "type": "object",
+        "properties": {"items": {"type": "array", "items": {"$ref": "#/$defs/Item"}}},
+        "required": ["items"],
+    }
+    inlined = inline_json_schema_refs(schema)
+    assert "$defs" not in inlined
+    assert "$ref" not in str(inlined)
+    assert inlined["properties"]["items"]["items"]["properties"]["n"]["type"] == "integer"
+
+
+def test_foundry_compatible_file_memory_inlines_replace_lines_schema(tmp_path: Path) -> None:
+    from aitobuild.foundry_compat import FoundryCompatibleFileMemoryProvider
+
+    async def check() -> None:
+        provider = FoundryCompatibleFileMemoryProvider(FileSystemAgentFileStore(tmp_path / "memory"))
+        context = SessionContext(session_id="dev-one", input_messages=[])
+        await provider.before_run(
+            agent=None,
+            session=AgentSession(session_id="dev-one"),
+            context=context,
+            state={},
+        )
+        by_name = {item.name: item for item in context.tools}
+        assert "file_memory_replace_lines" in by_name
+        schema = by_name["file_memory_replace_lines"].parameters()
+        assert "$defs" not in schema
+        assert "$ref" not in str(schema)
+        assert schema["properties"]["edits"]["items"]["type"] == "object"
+        await by_name["file_memory_write"](file_name="note.md", content="line1\nline2\n")
+        result = await by_name["file_memory_replace_lines"](
+            file_name="note.md",
+            edits=[{"line_number": 1, "new_line": "updated\n"}],
+        )
+        assert "Replaced" in str(result) or "1" in str(result)
+
+    asyncio.run(check())
+
+
 def test_native_session_store_restores_state_after_restart(tmp_path: Path) -> None:
     async def check() -> None:
         session = AgentSession(session_id="dev-one")
