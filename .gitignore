@@ -2,8 +2,7 @@
 .devcontainer/certs/host/
 .devcontainer/certs/*.crt
 .devcontainer/certs/*.pem
-sim/.env.simulation.local
-sim/.env.simulation.live.local
+sim/.env.simulation*.local
 sim/simulation-report.json
 sim/.run-artifacts/
 sim/aitobuild-sim-*/

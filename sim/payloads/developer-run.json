@@ -2,7 +2,7 @@
   "dry_run": false,
   "approved": true,
   "commands": [
-    "python -m pip install --upgrade --force-reinstall pytest --target /tmp/aitobuild-sim-site --break-system-packages && PYTHONPATH=/tmp/aitobuild-sim-site python -m pytest -q -p no:cacheprovider"
+    "python -m pytest -q -p no:cacheprovider"
   ],
   "file_writes": [
     {

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import tempfile
 from contextlib import contextmanager
 from hashlib import sha256
@@ -350,6 +351,22 @@ def run_simulation(
             "generated_file_exists": (repo_root / "src/demo_app/generated_note.txt").exists(),
         }
 
+        summary["succeeded"] = bool(
+            developer_run_first.get("accepted")
+            and summary["generated_file_exists"]
+            and (developer_run_second is None or developer_run_second.get("accepted"))
+            and (agent_run_result is None or agent_run_result.get("completed"))
+            and (
+                not use_session
+                or (
+                    session_stopped is not None
+                    and session_stopped.get("closed")
+                    and session_cleanup is not None
+                    and session_cleanup.get("failed_count") == 0
+                )
+            )
+        )
+
         if output_file is None:
             output_target = run_root / "simulation-report.json"
         else:
@@ -363,6 +380,10 @@ def run_simulation(
         print(json.dumps(summary, indent=2))
         print(f"\nSimulation report written to: {output_target}")
 
+    if not summary["succeeded"]:
+        print("Simulation failed; inspect execution, approval, and cleanup outcomes in the report.",
+              file=sys.stderr)
+        return 1
     return 0
 
 

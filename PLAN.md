@@ -1,8 +1,8 @@
-Here is the comprehensive design document for your automated agentic software development framework, synthesizing all the architectural decisions, topologies, and technologies we've established.
-
----
-
 # System Design Document: Agentic Product Team Framework
+
+This document describes the target architecture, not a fully implemented system.
+The implementation snapshot in section 7 distinguishes available capabilities
+from remaining work. Operational milestones are tracked in [MILESTONES.md](MILESTONES.md).
 
 ## 1. Executive Summary
 This document outlines the architecture for an autonomous, agent-driven software development framework. The system simulates a human product team (Product Manager, Architect, Developer) using Large Language Models operating within the **Microsoft Agent Framework (Python)**. 
@@ -20,13 +20,17 @@ To prevent the chaotic, spaghetti-code outputs typical of naive autonomous codin
 * **Execution Environment:** Ephemeral, sandboxed Docker containers running MCP Bash and Filesystem servers.
 
 ### 2.2 Global Routing: The Dispatcher Pattern
-The system is event-driven. Rather than a monolithic loop, a lightweight `DispatcherAgent` handles incoming events.
-* **Input:** GitHub Webhooks (FastAPI/Flask endpoint).
+The system is event-driven. The current implementation uses a deterministic Python dispatcher, not an LLM-based `DispatcherAgent`.
+* **Input:** GitHub Webhooks and authenticated internal triggers through FastAPI.
 * **Logic:** The Dispatcher parses the raw JSON payload, identifies the event type (e.g., "Issue Opened", "Test Failed", "PR Comment"), and invokes the appropriate Agent's isolated asynchronous workflow.
 
 ## 3. The Agent Roster (Entities & Scopes)
 
 Each agent is an isolated instance of the `Agent` class with specific instructions and constrained tool access (via MCP Plugins).
+
+This roster is the target design. Today, role specifications exist for all
+three roles, but runtime tool wiring is implemented only for the Developer.
+MCP shell/filesystem transport is optional; GitHub operations remain mock-only.
 
 * **Product Manager (PM) Agent:**
     * *Scope:* Translates high-level Epics into atomic GitHub Issues with clear acceptance criteria.
@@ -68,7 +72,7 @@ The following illustrates a complete, end-to-end feature lifecycle:
 1.  **Trigger:** A human (or PM Agent) opens a new GitHub Epic: "Add Stripe Subscription Billing."
 2.  **Dispatch:** Webhook fires. The `DispatcherAgent` routes the payload to the PM Agent.
 3.  **Planning Sync (Meeting):** The PM Agent recognizes the complexity and calls `request_meeting(agenda="Stripe Integration Planning", participants=["Architect", "Dev"])`.
-4.  **Architectural Scaffold:** In the meeting, the Architect establishes the module boundaries. The meeting terminates by the Architect pushing interface definitions (`IStripeService.ts`) to a new branch and generating 3 separate implementation issues via the GitHub MCP.
+4.  **Architectural Scaffold:** The Architect proposes module boundaries without writing implementation files. The PM creates approved implementation issues, and the Developer implements any required interface definitions on a task branch. Architect repository-write access remains disallowed by the current role policy.
 5.  **Execution (Async):** The Dispatcher routes Issue #1 to the Developer Agent. The Developer uses the Filesystem and Bash MCP tools to write the implementation and run unit tests.
 6.  **Code Review (Async -> Sync):** The Developer opens a PR. The Dispatcher routes this to the Architect Agent. The Architect uses a Bash MCP tool to run `npm run lint` and `npm test` against the PR branch. 
     * *If Pass:* Architect approves via GitHub MCP. PR is merged.
@@ -83,9 +87,11 @@ The following illustrates a complete, end-to-end feature lifecycle:
 * **Phase 4: The Sync Engine.** Implement `GroupChatBuilder` for code review disputes (Architect + Dev) with strict termination conditions.
 * **Phase 5: Full Autonomy.** Introduce the PM Agent and allow the system to ingest raw text prompts and manage its own backlog end-to-end.
 
-## 7. Foundation Implementation Status (2026-04-10)
+## 7. Implementation Snapshot (2026-10-05)
 
-### Completed Items
+### Implemented Building Blocks
+
+These items describe code and local test coverage, not production certification.
 
 - Unified trigger model with webhook and internal event normalization.
 - FastAPI ingress endpoints: `/health`, `/webhook`, `/internal/triggers`, `/internal/scheduler/tick`.
@@ -111,23 +117,44 @@ The following illustrates a complete, end-to-end feature lifecycle:
 - Agent Framework role-tool wiring using `Agent(..., tools=[...])` for Developer command/file/session operations.
 - MCP-backed Developer command/filesystem adapters with explicit fail-fast behavior (no local fallback in MCP mode).
 - Developer Agent diagnostics endpoint (`/internal/runtime/developer-agent`) for runtime readiness, tool inventory, and session support visibility.
-- Developer Agent run endpoint (`/internal/developer/agent/run`) with optional session creation and approval replay support.
+- Developer Agent run endpoint (`/internal/developer/agent/run`) with optional session creation and in-call auto-approval replay. Manual HTTP approval replay and persistent native session continuation are not implemented.
 - Capability audit matrix for reuse/wrap/custom decisions.
-- Quality gates passing: `pytest`, `ruff`, and `mypy`.
+- Host certificate export and pre-feature dev container trust bootstrap, with generated certificates excluded from Git.
+- Local subprocess simulation repaired to use uv-installed pytest, with explicit success reporting and nonzero failure exits.
+- Verification on 2026-10-05: `ruff` and `mypy src` pass; `pytest` reports 104 passed and two failures in patch-repair tests. The 16 certificate regression tests and three smoke tests pass. A clean test baseline remains a prerequisite for a working-system milestone.
+
+### Current Limits
+
+- `developer.async.webhook` returns a task bundle; no worker consumes it automatically.
+- Task bundles contain generic objectives and aitobuild-specific context paths, not a target repository's issue-derived specification.
+- GitHub branch/commit/PR operations are not implemented; the adapter records mock issue proposals.
+- Meetings construct workflows without executing them, and proactive scans interpret supplied metadata rather than inspecting a repository.
+- Scheduler ticks require an external caller; application state is in memory and does not survive restart.
+- The native agent endpoint is separate from preview-based execution and lacks equivalent bundle command enforcement and durable approval/session replay.
+- Docker bind mounts and command-prefix checks do not establish a hardened sandbox; total task budgets remain declarative.
+- No checked-in CI workflow exists. The capability matrix tests check entries, not duplicate implementations.
+- Docker, MCP, and live-model paths need fresh integration evidence before being considered operational.
 
 ### Pending Items
 
-- Strengthen native Agent Framework binding coverage with additional provider-specific constructor support and richer runtime diagnostics.
+- Validate the pinned Agent Framework/Foundry path with real tool calls, approval handling, and visible binding failures before adding provider support.
 - Extend `GroupChatBuilder` kickoff from workflow construction to managed execution/session lifecycle controls.
 - Validate MCP server/tool-name compatibility and approval semantics across target environments.
 - Add end-to-end Developer async loop from approved preview to branch/PR workflow lifecycle (branch creation, commit, PR open/update).
 - Add CI-enforced no-duplicate capability audit checks for `reuse_native` items.
 - Add structured audit/trace logging for ingress, dispatch decisions, meeting transitions, and escalation events.
 - Formalize `approval_required` as an explicit workflow transition state across adapters and dispatcher decisions.
-- Define executable sandbox policy contract module for later container orchestration phase.
+- Enforce the existing isolation contract consistently across preview runs, native agent tools, and container execution.
+- Persist task, dedupe, approval, and session state and define retry/recovery behavior.
+- Restore the two failing patch-repair tests without weakening strict patch acceptance checks.
 
 ### Next Execution Order
 
-1. Developer async loop: connect approved preview execution to branch/PR lifecycle.
-2. Governance: enforce capability-audit overlap checks in CI.
-3. Observability: add structured audit/trace logging across trigger, meeting, and escalation lifecycle.
+1. Restore a green baseline and enforce quality gates in CI (M0).
+2. Validate one constrained, live Developer task in a disposable repository (M1).
+3. Connect an approved GitHub issue to a worker, task branch, verified commit, and draft PR (M2).
+4. Add Architect review and bounded, executed blocker-resolution meetings (M3).
+5. Add durable recovery, scheduling, audit traces, and operational controls (M4).
+6. Introduce PM backlog planning for a supervised product-team pilot (M5).
+
+See [MILESTONES.md](MILESTONES.md) for dependencies, acceptance criteria, and the immediate work queue.

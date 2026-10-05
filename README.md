@@ -1,14 +1,79 @@
 # aitobuild
 
-Phase 1 foundation for the agent framework project.
+An agentic product-team framework with Product Manager, Architect, and Developer
+roles, built on Microsoft Agent Framework and FastAPI.
+
+Current stage: foundation plus a local Developer execution prototype. This is
+not yet an autonomous issue-to-PR service. The next delivery target is one
+approved issue producing a tested draft PR in a disposable repository, with a
+human retaining merge authority.
+
+## Start here
+
+- [MILESTONES.md](MILESTONES.md): current progress, ordered milestones, and exit criteria.
+- [PLAN.md](PLAN.md): target architecture and implementation gaps.
+- [sim/README.md](sim/README.md): local simulation and optional Docker/live-model setup.
+- [.devcontainer/certs/README.md](.devcontainer/certs/README.md): host certificate setup.
+- [agents.md](agents.md): repository conventions for contributors and coding agents.
+
+## Current status (2026-10-05)
+
+| Area | Implemented | Remaining |
+| --- | --- | --- |
+| Ingress and routing | Signed webhooks, authenticated internal APIs, deduplication, deterministic dispatch | Durable task worker and repository-specific task extraction |
+| Developer execution | Preview approval, command/file runs, patch tools, Docker sessions | Complete issue-to-branch-to-PR delivery |
+| Native model runtime | Foundry binding and Developer agent invocation | Reproducible live-model acceptance run and resumable approvals |
+| GitHub integration | Webhook input and mock issue-proposal adapter | Real issue, branch, commit, and PR operations |
+| Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
+| Operations | Tick endpoint, policy checks, capability-audit tests | Background tick driver, durable state, CI, tracing, stronger isolation |
+
+Verified locally: subprocess fixture simulation succeeds; Ruff and mypy pass.
+Pytest reports **104 passed, 2 failed**. Both failures are existing patch-repair
+tests in [tests/test_agent_tools.py](tests/test_agent_tools.py), tracked as the
+first milestone blocker. Docker sessions, MCP servers, and live Foundry calls
+have not been revalidated in this review.
 
 ## Quick start
+
+Prerequisites: Python 3.14 or newer and `uv`. Run from the repository root.
+The dev container also needs Python 3 on the host for certificate export.
 
 ```bash
 uv sync
 ```
 
 The `dev` dependency group is enabled by default, so tools like `pytest`, `ruff`, and `mypy` are installed automatically on sync.
+
+Start a local API with model fallback and simulated command execution:
+
+```bash
+export AITOBUILD_WEBHOOK_SECRET="local-webhook-secret"
+export AITOBUILD_INTERNAL_API_TOKEN="local-internal-token"
+export AITOBUILD_REQUIRE_INTERNAL_AUTH="true"
+export AITOBUILD_REQUIRE_APPROVAL_FOR_REPO_WRITES="true"
+export AITOBUILD_REQUIRE_DEVELOPER_PREVIEW="true"
+export AITOBUILD_ALLOW_MOCK_MODEL="true"
+export AITOBUILD_DEVELOPER_EXECUTION_MODE="mock"
+unset AITOBUILD_FOUNDRY_ENDPOINT AITOBUILD_FOUNDRY_API_KEY
+uv run uvicorn aitobuild.server:app --host 127.0.0.1 --port 8000 --reload
+```
+
+In another terminal:
+
+```bash
+curl --fail http://127.0.0.1:8000/health
+curl --fail -H 'X-Internal-Token: local-internal-token' \
+	http://127.0.0.1:8000/internal/runtime/developer-agent
+```
+
+Expect health status `ok`, runtime mode `mock`, and `ready_for_run=false`.
+The readiness endpoint checks native handle availability, not provider
+connectivity or successful tool execution. Interactive API schemas are at
+`http://127.0.0.1:8000/docs`.
+
+These credentials are local examples only. Do not expose this prototype to
+untrusted callers. Mock mode simulates commands but does **not** disable file
+writes; use dry runs or the copied-fixture simulation for execution experiments.
 
 ## Local simulation (no GitHub, no real repo)
 
@@ -18,8 +83,15 @@ temporary copied fixture repository.
 Run:
 
 ```bash
-uv run python sim/run_local_simulation.py
+env -u AITOBUILD_FOUNDRY_ENDPOINT -u AITOBUILD_FOUNDRY_API_KEY \
+	uv run python sim/run_local_simulation.py --output sim/simulation-report.json
 ```
+
+Expected: initial route `developer.preview_required`, replay route
+`developer.async.webhook`, execution `accepted=true`, command exit code `0`,
+`generated_file_exists=true`, and `succeeded=true`. The harness exits nonzero
+for failed execution, incomplete agent approval, or failed session cleanup.
+The default command uses the pytest installed by `uv sync`; it does not bootstrap pip.
 
 Optional:
 
@@ -35,7 +107,7 @@ The simulation kit includes:
 - `sim/payloads/` sample request payloads.
 - `sim/run_local_simulation.py` as the end-to-end harness.
 
-For details, see `sim/README.md`.
+For details, see [sim/README.md](sim/README.md).
 
 ## Useful commands
 
@@ -60,7 +132,12 @@ uv run uvicorn aitobuild.server:app --reload
 
 ```bash
 export AITOBUILD_WEBHOOK_SECRET="replace-me"
+export AITOBUILD_INTERNAL_API_TOKEN="replace-me-internal-token"
 ```
+
+Both are required with the default internal-auth setting. Disabling internal
+auth removes the token requirement, but is only appropriate for isolated tests.
+The server does not automatically load simulation env files; the harness does.
 
 Optional runtime flags:
 
@@ -86,6 +163,7 @@ export AITOBUILD_DEVELOPER_COMMAND_TIMEOUT_SECONDS="120"
 export AITOBUILD_DEVELOPER_SESSION_CONTAINER_IMAGE="python:3.14-slim"
 export AITOBUILD_DEVELOPER_SESSION_CONTAINER_WORKDIR="/workspace"
 export AITOBUILD_DEVELOPER_SESSION_CONTAINER_PREFIX="aitobuild-dev"
+export AITOBUILD_DEVELOPER_SESSION_RUN_AS_CURRENT_USER="true"
 # Optional host-visible path for Docker bind mount source in container_session mode.
 # Leave unset to use the current process workspace path.
 export AITOBUILD_DEVELOPER_SESSION_CONTAINER_BIND_PATH=""
@@ -109,10 +187,15 @@ export AITOBUILD_DEVELOPER_MCP_FILESYSTEM_WRITE_TOOL_NAME="write_file"
 - `GET /internal/developer/previews`
 - `POST /internal/developer/session/start`
 - `POST /internal/developer/session/stop`
+- `POST /internal/developer/session/stop-all`
 - `POST /internal/developer/run`
 - `GET /internal/runtime/developer-agent`
 - `POST /internal/developer/agent/run`
 - `GET /internal/escalations`
+
+All `/internal/*` endpoints require `X-Internal-Token` by default. Webhooks
+require `X-GitHub-Event`, `X-GitHub-Delivery`, and an HMAC-SHA256
+`X-Hub-Signature-256` computed over the exact request body.
 
 Example internal trigger payload:
 
@@ -129,6 +212,10 @@ structured findings and issue proposal suggestions.
 `developer.async.webhook` responses include `metadata.developer_task_bundle`
 for isolated software delivery execution.
 
+These route responses do not launch a Developer worker or open a PR.
+Architect scan findings currently derive from supplied counters/flags, not
+an autonomous repository inspection.
+
 When `AITOBUILD_REQUIRE_DEVELOPER_PREVIEW=true`, webhook dispatch returns
 `developer.preview_required` until a matching preview is approved.
 
@@ -138,7 +225,9 @@ Preview flow:
 	`github_event`, optional `action`, optional `delivery_id`, and optional `body`.
 2. Approve via `POST /internal/developer/preview/approve` with `preview_id`.
 3. Inspect pending queue via `GET /internal/developer/previews` (defaults to `pending_only=true`).
-4. Re-deliver the webhook; dispatcher then routes to `developer.async.webhook`.
+4. Deliver the webhook with the preview's matching delivery ID or dedupe key;
+	dispatcher then routes to `developer.async.webhook`. An already accepted
+	delivery is deduplicated; the simulator uses a second delivery ID for its preview/replay pair.
 
 Developer practical run flow:
 
@@ -153,9 +242,16 @@ Developer practical run flow:
 
 `/internal/developer/run` enforces the bundle's isolation policy for command prefixes and file paths.
 
+The execution root is the API process working directory, captured at startup.
+Start the process in a disposable target checkout for real commands and writes;
+there is not yet a per-request repository checkout manager. Preview approval
+and `approved=true` for live file writes are separate checks. Commands run before
+the requested file writes, so a passing command does not validate those later
+writes; run verification again after applying changes.
+
 Execution backends:
 
-- `mock`: deterministic simulated command execution (safe default)
+- `mock`: deterministic simulated commands; file reads/writes still use the real workspace
 - `subprocess`: runs commands in the same runtime environment as the API process
 - `container_session`: runs commands in a persistent Docker container per session
 
@@ -169,10 +265,19 @@ Container-session flow:
 
 This keeps one container alive for the whole Developer task session rather than launching one per command.
 
+The default `python:3.14-slim` session image is not a prepared test/MCP toolchain.
+Supply an image with the required tools and CA trust before running session
+simulation. Docker sessions bind-mount the workspace writable and are not a
+security boundary for untrusted code.
+
 MCP adapter mode:
 
 - Set `AITOBUILD_DEVELOPER_ENABLE_MCP_ADAPTERS=true` to route Developer command/filesystem tools through MCP stdio clients inside the session container.
 - This is fail-fast by design: if MCP dependencies, tool bindings, or session requirements are missing, startup or tool invocation errors immediately.
+- Session images must include Node.js/`npx`; the adapters launch shell/filesystem
+	servers through `docker exec ... npx -y`. Server packages, schemas, paths, and
+	tool names still need integration validation; MCP is optional, not required
+	for the verified local baseline.
 
 Agent Framework tool wiring:
 
@@ -190,7 +295,11 @@ Developer Agent runtime flow:
 	- `create_session` (optional bool)
 	- `auto_approve_tools` (optional bool, default `false`)
 	- `max_approval_rounds` (optional int, default `3`)
-3. If approvals are not auto-approved, inspect `pending_approval_requests` in the response and replay with another call.
+3. Inspect `pending_approval_requests`, `completed`, and
+	`approval_round_limit_reached`. The endpoint can replay approvals within one
+	call when `auto_approve_tools=true`, but does not accept manual approval
+	responses or persist native sessions for reliable continuation across calls.
+	Do not assume that submitting the returned `session_id` resumes pending work.
 
 `/internal/developer/agent/run` uses the runtime-bound native Developer Agent when available; in descriptor/mock mode it fails with `409` by design.
 
@@ -199,6 +308,10 @@ and pass the returned `meeting_id` in `POST /internal/scheduler/tick` with `manu
 Both internal endpoints require `X-Internal-Token` when internal auth is enabled.
 Successful `meeting.bootstrap` dispatches include `metadata.meeting_kickoff` with
 `workflow_built` (native GroupChatBuilder path) or `mock_started` (fallback path).
+
+`workflow_built` means constructed, not executed or resolved. The scheduler
+only advances when `/internal/scheduler/tick` is called; no background scheduler
+loop runs just because `AITOBUILD_SCHEDULER_ENABLED=true`.
 
 If a meeting deadline has passed when a `meeting_due` event arrives, the dispatcher emits
 `escalation.route` and sends a structured escalation event to shared sinks.
@@ -211,9 +324,26 @@ Developer task package with:
 - objective and acceptance criteria
 - workspace-relative context files only
 - allowed tools and path/command limits
-- bounded runtime and file-change caps
+- declared runtime and file-change budgets
 
 Default policy allows edits under `src/` and `tests/` and blocks paths like `.git/` and `.venv/`.
+
+Current checks are prototype guardrails, not complete sandbox enforcement.
+The constrained run endpoint checks command prefixes and file-write counts;
+native agent commands do not apply the same bundle command-prefix checks.
+Shell commands can have side effects beyond their apparent prefix. The declared
+task-wide runtime budget is not enforced as a total wall-clock budget; separate
+command and invoke timeouts exist. Policy parity, approval scope, and resource
+limits must be addressed before unattended execution.
+
+## State and recovery
+
+Deduplication, previews, meetings, escalation events, and session mappings are
+in memory. Restarting the server loses that application state, and reload mode
+can invalidate previews. Docker containers may outlive the API process; use
+`/internal/developer/session/stop-all` to clean up containers discovered under
+the configured name prefix. Native agent session persistence and recovery are
+not implemented.
 
 ## Repository hygiene
 
