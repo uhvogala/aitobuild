@@ -18,8 +18,18 @@ spec.loader.exec_module(exporter)
 
 
 @pytest.fixture
-def certificate() -> bytes:
-    return ssl.create_default_context().get_ca_certs(binary_form=True)[0]
+def certificate(tmp_path: Path) -> bytes:
+    certificate_path = tmp_path / "test-ca.der"
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(tmp_path / "test-ca.key"), "-out", str(certificate_path),
+            "-outform", "DER", "-days", "1", "-subj", "/CN=aitobuild-test-ca",
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return certificate_path.read_bytes()
 
 
 def test_pem_bundles_and_der_are_supported(certificate: bytes) -> None:
