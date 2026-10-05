@@ -15,6 +15,8 @@ class AgentRole(StrEnum):
 class ActionClass(StrEnum):
     READ_ONLY = "read_only"
     REPO_WRITE = "repo_write"
+    ISSUE_WRITE = "issue_write"
+    PR_REVIEW = "pr_review"
 
 
 @dataclass(slots=True, frozen=True)
@@ -26,11 +28,11 @@ class RolePolicy:
 ROLE_POLICY_MATRIX: dict[AgentRole, RolePolicy] = {
     AgentRole.PM: RolePolicy(
         role=AgentRole.PM,
-        allowed_actions=(ActionClass.READ_ONLY, ActionClass.REPO_WRITE),
+        allowed_actions=(ActionClass.READ_ONLY, ActionClass.ISSUE_WRITE),
     ),
     AgentRole.ARCHITECT: RolePolicy(
         role=AgentRole.ARCHITECT,
-        allowed_actions=(ActionClass.READ_ONLY,),
+        allowed_actions=(ActionClass.READ_ONLY, ActionClass.PR_REVIEW),
     ),
     AgentRole.DEVELOPER: RolePolicy(
         role=AgentRole.DEVELOPER,

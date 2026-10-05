@@ -32,7 +32,9 @@ from aitobuild.events import make_internal_event, normalize_github_webhook, pars
 from aitobuild.proactive import ArchitectScanRunner
 from aitobuild.runtime import bootstrap_runtime, kickoff_meeting_bootstrap
 from aitobuild.scheduler import scheduler_from_config
+from aitobuild.pm_tools import IssueWriteApprovalStore, PlanDraftStore
 from aitobuild.tools import (
+    ArchitectMemoryStore,
     BashAdapter,
     ContainerSessionBashAdapter,
     FilesystemAdapter,
@@ -42,6 +44,8 @@ from aitobuild.tools import (
     MockBashAdapter,
     MockFilesystemAdapter,
     SubprocessBashAdapter,
+    build_github_adapter,
+    build_web_search_adapter,
 )
 from aitobuild.triggers import InMemoryDedupeStore, TriggerEngine
 from aitobuild.tools.mcp_adapters import build_browser_tool
@@ -296,6 +300,15 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             workspace_root=workspace_root,
         )
 
+    github_adapter = build_github_adapter(
+        mode=app_config.github.adapter,
+        default_repository=app_config.github.default_repository,
+        allowed_repositories=app_config.github.allowed_repositories,
+    )
+    web_search_adapter = build_web_search_adapter(mode=app_config.web_search.adapter)
+    architect_memory = ArchitectMemoryStore(developer_state_dir / "architect_memory.jsonl")
+    plan_draft_store = PlanDraftStore()
+    issue_write_store = IssueWriteApprovalStore()
     developer_tool_context = DeveloperToolContext(
             bash_adapter=bash_adapter,
             filesystem_adapter=filesystem_adapter,
@@ -306,6 +319,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             enable_mcp_adapters=app_config.developer.enable_mcp_adapters,
             enable_agent_live_logs=app_config.developer.enable_agent_live_logs,
             output_dir=developer_state_dir / "outputs",
+            github_adapter=github_adapter,
+            meeting_registry=dispatcher.meeting_registry,
+            web_search_adapter=web_search_adapter,
+            architect_memory=architect_memory,
+            plan_draft_store=plan_draft_store,
+            issue_write_store=issue_write_store,
+            default_repository=app_config.github.default_repository,
+            allow_pr_approve=app_config.policy.architect_allow_pr_approve,
         )
     role_tools = build_role_tools(context=developer_tool_context)
 
@@ -606,6 +627,70 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "bundle": approved.bundle_payload,
             "approved_at": approved.approved_at.isoformat() if approved.approved_at else None,
         }
+
+    @app.get("/internal/pm/plans")
+    def list_pm_plans(
+        pending_only: bool = Query(default=False),
+        limit: int = Query(default=50, ge=1, le=500),
+        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    ) -> dict[str, Any]:
+        _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+        drafts = plan_draft_store.list_drafts(pending_only=pending_only, limit=limit)
+        return {"plans": drafts, "plan_count": len(drafts)}
+
+    @app.post("/internal/pm/plan/approve")
+    def approve_pm_plan(
+        payload: dict[str, Any],
+        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    ) -> dict[str, Any]:
+        _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+        draft_id_raw = payload.get("draft_id")
+        if not isinstance(draft_id_raw, str) or not draft_id_raw.strip():
+            raise HTTPException(status_code=400, detail="draft_id must be a non-empty string")
+        approval_request_id = payload.get("approval_request_id")
+        if approval_request_id is not None and (
+            not isinstance(approval_request_id, str) or not approval_request_id.strip()
+        ):
+            raise HTTPException(status_code=400, detail="approval_request_id must be a non-empty string")
+        try:
+            approved = plan_draft_store.mark_approved(
+                draft_id=draft_id_raw.strip(),
+                approval_request_id=(
+                    approval_request_id.strip() if isinstance(approval_request_id, str) else None
+                ),
+            )
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except PermissionError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"approved": True, "plan": approved}
+
+    @app.get("/internal/pm/issue-writes")
+    def list_pm_issue_writes(
+        pending_only: bool = Query(default=True),
+        limit: int = Query(default=50, ge=1, le=500),
+        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    ) -> dict[str, Any]:
+        _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+        requests = issue_write_store.list_requests(pending_only=pending_only, limit=limit)
+        return {"issue_writes": requests, "issue_write_count": len(requests)}
+
+    @app.post("/internal/pm/issue-write/approve")
+    def approve_pm_issue_write(
+        payload: dict[str, Any],
+        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    ) -> dict[str, Any]:
+        _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+        request_id_raw = payload.get("approval_request_id")
+        if not isinstance(request_id_raw, str) or not request_id_raw.strip():
+            raise HTTPException(status_code=400, detail="approval_request_id must be a non-empty string")
+        try:
+            approved = issue_write_store.mark_approved(approval_request_id=request_id_raw.strip())
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except PermissionError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"approved": True, "issue_write": approved}
 
     @app.get("/internal/developer/previews")
     def list_developer_previews(

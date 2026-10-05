@@ -20,14 +20,20 @@ from aitobuild.policy import (
     assert_repo_write_approval,
     assert_role_action_allowed,
 )
+from aitobuild.architect_tools import ARCHITECT_SESSION_PREFIX, build_architect_tools
+from aitobuild.meetings import MeetingRegistry
+from aitobuild.pm_tools import IssueWriteApprovalStore, PlanDraftStore, build_pm_tools
 from aitobuild.tools import (
     ContainerSessionBashAdapter,
     FilesystemAdapter,
     MCPDeveloperToolAdapter,
 )
+from aitobuild.tools.architect_memory import ArchitectMemoryStore
 from aitobuild.tools.bash import BashAdapter, prepare_developer_workspace
+from aitobuild.tools.github import GitHubAdapter
 from aitobuild.tools.shell import build_shell_tools, shell_request
 from aitobuild.tools.search import search_workspace
+from aitobuild.tools.web_search import WebSearchAdapter
 from aitobuild.tool_outputs import build_output_reader
 
 
@@ -50,11 +56,51 @@ class DeveloperToolContext:
     isolation_policy: DeveloperIsolationPolicy | None = None
     task_budget: DeveloperTaskBudget | None = None
     prepared_workspace: Path | None = None
+    github_adapter: GitHubAdapter | None = None
+    meeting_registry: MeetingRegistry | None = None
+    web_search_adapter: WebSearchAdapter | None = None
+    architect_memory: ArchitectMemoryStore | None = None
+    architect_isolation_policy: DeveloperIsolationPolicy | None = None
+    plan_draft_store: PlanDraftStore | None = None
+    issue_write_store: IssueWriteApprovalStore | None = None
+    default_repository: str | None = None
+    allow_pr_approve: bool = False
 
 
 def build_role_tools(*, context: DeveloperToolContext) -> dict[str, tuple[ToolFunc, ...]]:
     return {
         AgentRole.DEVELOPER.value: build_developer_tools(context=context),
+        AgentRole.ARCHITECT.value: build_architect_tools(
+            bash_adapter=context.bash_adapter,
+            filesystem_adapter=context.filesystem_adapter,
+            workspace_root=context.workspace_root,
+            github_adapter=context.github_adapter,
+            meeting_registry=context.meeting_registry,
+            web_search_adapter=context.web_search_adapter,
+            memory_store=context.architect_memory,
+            container_session_adapter=context.container_session_adapter,
+            mcp_tool_adapter=context.mcp_tool_adapter,
+            isolation_policy=context.architect_isolation_policy,
+            # Never bind Architect to a Developer session id.
+            bound_session_id=(
+                context.bound_session_id
+                if context.bound_session_id
+                and context.bound_session_id.startswith(ARCHITECT_SESSION_PREFIX)
+                else None
+            ),
+            prepared_workspace=context.prepared_workspace,
+            default_repository=context.default_repository,
+            allow_pr_approve=context.allow_pr_approve,
+        ),
+        AgentRole.PM.value: build_pm_tools(
+            github_adapter=context.github_adapter,
+            meeting_registry=context.meeting_registry,
+            web_search_adapter=context.web_search_adapter,
+            plan_store=context.plan_draft_store,
+            issue_write_store=context.issue_write_store,
+            require_human_approval_for_repo_writes=context.require_human_approval_for_repo_writes,
+            default_repository=context.default_repository,
+        ),
     }
 
 

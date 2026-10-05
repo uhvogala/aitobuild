@@ -31,6 +31,19 @@ class SchedulerConfig:
 @dataclass(slots=True, frozen=True)
 class PolicyConfig:
     require_human_approval_for_repo_writes: bool
+    architect_allow_pr_approve: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class GitHubConfig:
+    adapter: str = "mock"
+    default_repository: str | None = None
+    allowed_repositories: tuple[str, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class WebSearchConfig:
+    adapter: str = "mock"
 
 
 @dataclass(slots=True, frozen=True)
@@ -77,6 +90,8 @@ class AppConfig:
     policy: PolicyConfig
     security: SecurityConfig
     developer: DeveloperConfig
+    github: GitHubConfig
+    web_search: WebSearchConfig
 
 
 DEFAULT_SCAN_CRON = "0 8 * * *"
@@ -134,6 +149,33 @@ def _parse_repository_sources(raw: str) -> tuple[RepositorySourceConfig, ...]:
     return tuple(sources)
 
 
+def _parse_github_allowed_repos(raw: str | None) -> tuple[str, ...]:
+    if raw is None or not raw.strip():
+        return ()
+    repos: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        repo = part.strip().lower()
+        if not repo:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", repo):
+            raise ValueError(
+                "AITOBUILD_GITHUB_ALLOWED_REPOS entries must be owner/name "
+                "(letters, digits, underscore, hyphen, dot)"
+            )
+        if repo not in seen:
+            seen.add(repo)
+            repos.append(repo)
+    return tuple(repos)
+
+
+def _normalize_repository_name(repository: str) -> str:
+    cleaned = repository.strip().lower()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", cleaned):
+        raise ValueError("repository must be owner/name")
+    return cleaned
+
+
 def load_config() -> AppConfig:
     webhook_secret = _require_non_empty("AITOBUILD_WEBHOOK_SECRET", getenv("AITOBUILD_WEBHOOK_SECRET"))
 
@@ -158,7 +200,24 @@ def load_config() -> AppConfig:
         require_human_approval_for_repo_writes=_as_bool(
             getenv("AITOBUILD_REQUIRE_APPROVAL_FOR_REPO_WRITES"),
             default=True,
-        )
+        ),
+        architect_allow_pr_approve=_as_bool(
+            getenv("AITOBUILD_ARCHITECT_ALLOW_PR_APPROVE"),
+            default=False,
+        ),
+    )
+
+    github_default_repository = getenv("AITOBUILD_GITHUB_DEFAULT_REPOSITORY")
+    default_repository = (
+        _normalize_repository_name(github_default_repository)
+        if github_default_repository and github_default_repository.strip()
+        else None
+    )
+    # Placeholder; allowlist is finalized after developer repository_sources are known.
+    github_adapter_mode = (getenv("AITOBUILD_GITHUB_ADAPTER", "mock") or "mock").strip() or "mock"
+    github_allowed_from_env = _parse_github_allowed_repos(getenv("AITOBUILD_GITHUB_ALLOWED_REPOS"))
+    web_search = WebSearchConfig(
+        adapter=(getenv("AITOBUILD_WEB_SEARCH_ADAPTER", "mock") or "mock").strip() or "mock",
     )
 
     require_internal_auth = _as_bool(getenv("AITOBUILD_REQUIRE_INTERNAL_AUTH"), default=True)
@@ -248,6 +307,31 @@ def load_config() -> AppConfig:
             "AITOBUILD_SCHEDULER_QUIET_START_HOUR and AITOBUILD_SCHEDULER_QUIET_END_HOUR must both be set"
         )
 
+    allowed_repositories: list[str] = list(github_allowed_from_env)
+    seen_repos = set(allowed_repositories)
+    if default_repository is not None and default_repository not in seen_repos:
+        allowed_repositories.append(default_repository)
+        seen_repos.add(default_repository)
+    for source in developer.repository_sources:
+        if source.repository not in seen_repos:
+            allowed_repositories.append(source.repository)
+            seen_repos.add(source.repository)
+
+    github = GitHubConfig(
+        adapter=github_adapter_mode,
+        default_repository=default_repository,
+        allowed_repositories=tuple(allowed_repositories),
+    )
+
+    if github.adapter not in {"mock", "gh", "gh_cli", "cli"}:
+        raise ValueError("AITOBUILD_GITHUB_ADAPTER must be mock or gh_cli")
+    if github.adapter in {"gh", "gh_cli", "cli"} and not github.allowed_repositories:
+        raise ValueError(
+            "AITOBUILD_GITHUB_ALLOWED_REPOS (or default/repository sources) is required for gh_cli"
+        )
+    if web_search.adapter not in {"mock", "duckduckgo", "ddg", "live"}:
+        raise ValueError("AITOBUILD_WEB_SEARCH_ADAPTER must be mock or duckduckgo")
+
     return AppConfig(
         webhook_secret=webhook_secret,
         runtime=runtime,
@@ -255,4 +339,6 @@ def load_config() -> AppConfig:
         policy=policy,
         security=security,
         developer=developer,
+        github=github,
+        web_search=web_search,
     )
