@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
+from uuid import uuid4
 
 from agent_framework import tool
 from pydantic import Field
@@ -28,8 +29,56 @@ from aitobuild.tools.web_search import WebSearchAdapter
 
 ToolFunc = Callable[..., Any]
 
+ARCHITECT_SESSION_PREFIX = "architect-"
+_ARCHITECT_SHELL_META_CHARS = set(";|&`$<>\n\r")
+_ARCHITECT_BANNED_TOKEN_FRAGMENTS = (
+    " rm ",
+    " mv ",
+    " cp ",
+    " tee ",
+    " npm install",
+    " pip install",
+    " uv add",
+    " uv pip",
+    "&&rm ",
+    ";rm ",
+    " chmod ",
+    " chown ",
+    " curl ",
+    " wget ",
+    " dd ",
+    " mkfs",
+    " shutdown",
+    " reboot",
+)
+
+
+def _assert_architect_session_id(session_id: str) -> str:
+    cleaned = session_id.strip()
+    if not cleaned:
+        raise ValueError("session_id must be non-empty")
+    if not cleaned.startswith(ARCHITECT_SESSION_PREFIX):
+        raise PermissionError(
+            "Architect may only manage sessions prefixed with "
+            f"'{ARCHITECT_SESSION_PREFIX}' (cannot attach/stop Developer sessions)"
+        )
+    return cleaned
+
+
+def _harden_architect_command(command: str) -> None:
+    if any(ch in command for ch in _ARCHITECT_SHELL_META_CHARS):
+        raise PermissionError(
+            "Architect run_command rejects shell metacharacters (;|&`$<> and newlines)"
+        )
+    if "$(" in command or "${" in command:
+        raise PermissionError("Architect run_command rejects shell expansions")
+    lowered = f" {command.lower()} "
+    if any(token in lowered for token in _ARCHITECT_BANNED_TOKEN_FRAGMENTS):
+        raise PermissionError("Architect run_command rejects mutating or dangerous operations")
+
 
 def build_architect_tools(
+
     *,
     bash_adapter: BashAdapter,
     filesystem_adapter: FilesystemAdapter,
@@ -44,24 +93,27 @@ def build_architect_tools(
     bound_session_id: str | None = None,
     prepared_workspace: Path | None = None,
     default_repository: str | None = None,
+    allow_pr_approve: bool = False,
 ) -> tuple[ToolFunc, ...]:
     policy = isolation_policy or default_architect_isolation_policy()
     github = github_adapter or MockGitHubAdapter()
     memory = memory_store
     active_session_id: str | None = None
     role = AgentRole.ARCHITECT
+    if bound_session_id is not None:
+        bound_session_id = _assert_architect_session_id(bound_session_id)
 
     def _resolve_session_id(session_id: str | None) -> str | None:
         nonlocal active_session_id
         if bound_session_id is not None:
-            if session_id is not None and session_id.strip() != bound_session_id:
+            if session_id is not None and _assert_architect_session_id(session_id) != bound_session_id:
                 raise ValueError("Tool session must match this Architect's bound session")
             active_session_id = bound_session_id
             if container_session_adapter is not None:
                 container_session_adapter.create_session(session_id=active_session_id)
             return active_session_id
         if session_id is not None and session_id.strip():
-            active_session_id = session_id.strip()
+            active_session_id = _assert_architect_session_id(session_id)
             return active_session_id
         if container_session_adapter is None:
             return None
@@ -70,13 +122,19 @@ def build_architect_tools(
         list_session_ids = getattr(container_session_adapter, "list_session_ids", None)
         if callable(list_session_ids):
             try:
-                existing = list_session_ids()
+                existing = [
+                    str(item)
+                    for item in list_session_ids()
+                    if str(item).startswith(ARCHITECT_SESSION_PREFIX)
+                ]
             except Exception:
-                existing = ()
+                existing = []
             if len(existing) == 1:
-                active_session_id = str(existing[0])
+                active_session_id = existing[0]
                 return active_session_id
-        created_session_id, _ = container_session_adapter.create_session()
+        created_session_id, _ = container_session_adapter.create_session(
+            session_id=f"{ARCHITECT_SESSION_PREFIX}{uuid4().hex[:10]}"
+        )
         active_session_id = created_session_id
         return active_session_id
 
@@ -131,11 +189,7 @@ def build_architect_tools(
         assert_role_action_allowed(role, ActionClass.READ_ONLY)
         if not is_command_allowed(command, policy=policy):
             raise PermissionError("Command is outside allowed Architect analysis prefixes")
-        # Reject obvious mutating shell tokens even when the prefix matches.
-        lowered = f" {command.lower()} "
-        banned_tokens = (" rm ", " mv ", " cp ", " tee ", "npm install", "pip install", "uv add", "&&rm ", ";rm ")
-        if any(token in lowered for token in banned_tokens) or ">" in command:
-            raise PermissionError("Architect run_command rejects mutating shell operations")
+        _harden_architect_command(command)
         resolved_session_id = _resolve_session_id(session_id)
         if mcp_tool_adapter is not None:
             if resolved_session_id is None:
@@ -284,14 +338,25 @@ def build_architect_tools(
         description="Start or reuse a persistent read-only container session for Architect analysis.",
     )
     def architect_start_session(
-        session_id: Annotated[str | None, Field(description="Optional desired session id.")] = None,
+        session_id: Annotated[str | None, Field(description="Optional desired Architect session id.")] = None,
     ) -> dict[str, str]:
         nonlocal active_session_id
         if container_session_adapter is None:
             raise ValueError("container_session mode is not enabled")
         if bound_session_id is not None:
-            session_id = _resolve_session_id(session_id)
-        created_session_id, container_name = container_session_adapter.create_session(session_id=session_id)
+            resolved = _resolve_session_id(session_id)
+            created_session_id, container_name = container_session_adapter.create_session(
+                session_id=resolved
+            )
+        else:
+            desired = (
+                _assert_architect_session_id(session_id)
+                if session_id and session_id.strip()
+                else f"{ARCHITECT_SESSION_PREFIX}{uuid4().hex[:10]}"
+            )
+            created_session_id, container_name = container_session_adapter.create_session(
+                session_id=desired
+            )
         active_session_id = created_session_id
         return {"session_id": created_session_id, "container_name": container_name}
 
@@ -301,11 +366,12 @@ def build_architect_tools(
         description="Stop and clean up a persistent Architect container session.",
     )
     def architect_stop_session(
-        session_id: Annotated[str, Field(description="Session id to stop.")],
+        session_id: Annotated[str, Field(description="Architect session id to stop.")],
     ) -> dict[str, Any]:
         nonlocal active_session_id
         if container_session_adapter is None:
             raise ValueError("container_session mode is not enabled")
+        session_id = _assert_architect_session_id(session_id)
         if bound_session_id is not None and session_id != bound_session_id:
             raise ValueError("Cannot stop another Architect session")
         closed = container_session_adapter.close_session(session_id=session_id)
@@ -346,6 +412,11 @@ def build_architect_tools(
         body: Annotated[str, Field(description="Review commentary for the Developer/human.")],
         repository: Annotated[str | None, Field(description="owner/name repository.")] = None,
     ) -> dict[str, Any]:
+        if event == "APPROVE" and not allow_pr_approve:
+            raise PermissionError(
+                "Architect APPROVE reviews are disabled; set AITOBUILD_ARCHITECT_ALLOW_PR_APPROVE=true "
+                "to enable, or use COMMENT / REQUEST_CHANGES"
+            )
         review = github.submit_pr_review(
             role=role,
             repository=_repo(repository),

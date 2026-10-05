@@ -1,17 +1,25 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
+from aitobuild.architect_tools import ARCHITECT_SESSION_PREFIX, build_architect_tools
 from aitobuild.meetings import MeetingRegistry
-from aitobuild.pm_tools import PlanDraftStore
+from aitobuild.pm_tools import IssueWriteApprovalStore, PlanDraftStore
 from aitobuild.policy import ActionClass, AgentRole, assert_role_action_allowed
 from aitobuild.tools.architect_memory import ArchitectMemoryStore
 from aitobuild.tools.bash import MockBashAdapter
 from aitobuild.tools.filesystem import MockFilesystemAdapter
-from aitobuild.tools.github import GitHubIssue, GitHubPullRequest, MockGitHubAdapter
+from aitobuild.tools.github import (
+    GhCliGitHubAdapter,
+    GitHubIssue,
+    GitHubPullRequest,
+    MockGitHubAdapter,
+    build_github_adapter,
+)
 from aitobuild.tools.web_search import MockWebSearchAdapter, WebSearchResult
 
 
@@ -19,12 +27,20 @@ def _tool_map(tools: tuple) -> dict[str, object]:
     return {tool.name: tool for tool in tools}
 
 
-def _context(tmp_path: Path, *, github: MockGitHubAdapter | None = None) -> DeveloperToolContext:
+def _context(
+    tmp_path: Path,
+    *,
+    github: MockGitHubAdapter | None = None,
+    plan_store: PlanDraftStore | None = None,
+    issue_write_store: IssueWriteApprovalStore | None = None,
+    allow_pr_approve: bool = False,
+    require_human_approval_for_repo_writes: bool = True,
+) -> DeveloperToolContext:
     return DeveloperToolContext(
         bash_adapter=MockBashAdapter(),
         filesystem_adapter=MockFilesystemAdapter(),
         workspace_root=tmp_path,
-        require_human_approval_for_repo_writes=True,
+        require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
         github_adapter=github or MockGitHubAdapter(),
         meeting_registry=MeetingRegistry(),
         web_search_adapter=MockWebSearchAdapter(
@@ -37,8 +53,10 @@ def _context(tmp_path: Path, *, github: MockGitHubAdapter | None = None) -> Deve
             ]
         ),
         architect_memory=ArchitectMemoryStore(tmp_path / "architect_memory.jsonl"),
-        plan_draft_store=PlanDraftStore(),
+        plan_draft_store=plan_store or PlanDraftStore(),
+        issue_write_store=issue_write_store or IssueWriteApprovalStore(),
         default_repository="uhvogala/aitobuild_example",
+        allow_pr_approve=allow_pr_approve,
     )
 
 
@@ -112,12 +130,60 @@ def test_architect_pr_review_and_memory_roundtrip(tmp_path: Path) -> None:
     assert recorded["memory_id"] in {item["memory_id"] for item in matches["matches"]}
 
 
+def test_architect_approve_gated_by_config(tmp_path: Path) -> None:
+    github = MockGitHubAdapter()
+    github.seed_pull_request(
+        repository="uhvogala/aitobuild_example",
+        pull_request=GitHubPullRequest(
+            number=3,
+            title="PR",
+            body="body",
+            state="open",
+            head_ref="feat",
+            base_ref="main",
+            repository="uhvogala/aitobuild_example",
+        ),
+    )
+    blocked = _tool_map(build_role_tools(context=_context(tmp_path, github=github))["architect"])
+    with pytest.raises(PermissionError, match="APPROVE reviews are disabled"):
+        blocked["architect_submit_pr_review"](3, "APPROVE", "LGTM")
+    allowed = _tool_map(
+        build_role_tools(context=_context(tmp_path, github=github, allow_pr_approve=True))["architect"]
+    )
+    review = allowed["architect_submit_pr_review"](3, "APPROVE", "LGTM")
+    assert review["event"] == "APPROVE"
+
+
 def test_architect_run_command_rejects_mutations(tmp_path: Path) -> None:
     tools = _tool_map(build_role_tools(context=_context(tmp_path))["architect"])
-    with pytest.raises(PermissionError, match="mutating|outside allowed"):
+    with pytest.raises(PermissionError, match="mutating|metacharacter|outside allowed|dangerous|expansion"):
         tools["architect_run_command"]("echo hi > src/out.txt")
+    with pytest.raises(PermissionError, match="metacharacter|dangerous|expansion"):
+        tools["architect_run_command"]("pytest -q; rm -rf /")
+    with pytest.raises(PermissionError, match="metacharacter|expansion"):
+        tools["architect_run_command"]("pytest $(echo bad)")
     result = tools["architect_run_command"]("pytest -q")
     assert result["exit_code"] == 0
+
+
+def test_architect_cannot_stop_developer_session(tmp_path: Path) -> None:
+    adapter = MagicMock()
+    adapter.create_session.return_value = ("architect-abc", "container")
+    adapter.close_session.return_value = True
+    tools = _tool_map(
+        build_architect_tools(
+            bash_adapter=MockBashAdapter(),
+            filesystem_adapter=MockFilesystemAdapter(),
+            workspace_root=tmp_path,
+            container_session_adapter=adapter,
+        )
+    )
+    started = tools["architect_start_session"]()
+    assert started["session_id"].startswith(ARCHITECT_SESSION_PREFIX)
+    with pytest.raises(PermissionError, match="architect-"):
+        tools["architect_stop_session"]("developer-sess-1")
+    with pytest.raises(PermissionError, match="architect-"):
+        tools["architect_start_session"]("dev-hijack")
 
 
 def test_architect_read_file_roundtrip(tmp_path: Path) -> None:
@@ -132,24 +198,36 @@ def test_architect_read_file_roundtrip(tmp_path: Path) -> None:
     ) or "src/mod.py" in str(found)
 
 
-def test_pm_plan_approval_gate_and_issue_create(tmp_path: Path) -> None:
+def test_pm_plan_approval_requires_operator_store_not_agent_flag(tmp_path: Path) -> None:
     github = MockGitHubAdapter()
-    tools = _tool_map(build_role_tools(context=_context(tmp_path, github=github))["pm"])
+    plan_store = PlanDraftStore()
+    tools = _tool_map(
+        build_role_tools(context=_context(tmp_path, github=github, plan_store=plan_store))["pm"]
+    )
     draft = tools["pm_draft_plan"]("Handle empty names", "Reject empty widget names.")
     draft_id = draft["draft_id"]
     tools["pm_set_acceptance_criteria"](draft_id, ["Empty names are rejected."])
     pending = tools["pm_request_plan_approval"](draft_id)
     assert pending["approval_state"] == "awaiting_human_approval"
-    with pytest.raises(PermissionError):
-        tools["pm_create_issue"](False, draft_id, pending["approval_request_id"])
-    created = tools["pm_create_issue"](True, draft_id, pending["approval_request_id"])
+
+    # Agent-supplied approved=true must not create the issue.
+    with pytest.raises(PermissionError, match="operator-approved"):
+        tools["pm_create_issue"](draft_id, approved=True)
+
+    # Operator path marks the store approved (mirrors /internal/pm/plan/approve).
+    plan_store.mark_approved(
+        draft_id=draft_id,
+        approval_request_id=pending["approval_request_id"],
+    )
+    created = tools["pm_create_issue"](draft_id)
     assert created["created"] is True
     assert created["issue"]["number"] == 1
     assert "Acceptance Criteria" in created["issue"]["body"]
 
 
-def test_pm_backlog_update_and_link(tmp_path: Path) -> None:
+def test_pm_update_and_link_require_operator_issue_write_approval(tmp_path: Path) -> None:
     github = MockGitHubAdapter()
+    write_store = IssueWriteApprovalStore()
     github.seed_issue(
         repository="uhvogala/aitobuild_example",
         issue=GitHubIssue(number=3, title="Epic", body="Parent", state="open", labels=("backlog",)),
@@ -158,16 +236,89 @@ def test_pm_backlog_update_and_link(tmp_path: Path) -> None:
         repository="uhvogala/aitobuild_example",
         issue=GitHubIssue(number=4, title="Child", body="Task", state="open", labels=("backlog",)),
     )
-    tools = _tool_map(build_role_tools(context=_context(tmp_path, github=github))["pm"])
+    tools = _tool_map(
+        build_role_tools(
+            context=_context(tmp_path, github=github, issue_write_store=write_store)
+        )["pm"]
+    )
     backlog = tools["pm_list_backlog"](labels=["backlog"])
     assert backlog["issue_count"] == 2
     issue = tools["pm_get_issue"](3)
     assert issue["title"] == "Epic"
-    updated = tools["pm_update_issue"](3, True, None, "Updated body", None, None, None)
+
+    pending_update = tools["pm_update_issue"](3, body="Updated body")
+    assert pending_update["updated"] is False
+    assert pending_update["approval_state"] == "awaiting_human_approval"
+    # Agent approved flag / unapproved request id must not bypass the store.
+    with pytest.raises(PermissionError, match="human-approved"):
+        tools["pm_update_issue"](
+            3,
+            body="Updated body",
+            approval_request_id=pending_update["approval_request_id"],
+            approved=True,
+        )
+    write_store.mark_approved(approval_request_id=pending_update["approval_request_id"])
+    updated = tools["pm_update_issue"](
+        3, body="Updated body", approval_request_id=pending_update["approval_request_id"]
+    )
+    assert updated["updated"] is True
     assert updated["issue"]["body"] == "Updated body"
-    linked = tools["pm_link_issues"](3, 4, "blocks", True)
+
+    pending_link = tools["pm_link_issues"](3, 4, "blocks")
+    assert pending_link["linked"] is False
+    write_store.mark_approved(approval_request_id=pending_link["approval_request_id"])
+    linked = tools["pm_link_issues"](
+        3, 4, "blocks", approval_request_id=pending_link["approval_request_id"]
+    )
     assert linked["relationship"] == "blocks"
     assert github.links
+
+
+def test_ghcli_adapter_enforces_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = GhCliGitHubAdapter(
+        default_repository="uhvogala/aitobuild",
+        allowed_repositories=("uhvogala/aitobuild",),
+    )
+    calls: list[tuple[str, str]] = []
+
+    def fake_api(endpoint: str, *, method: str = "GET", payload: dict | None = None):
+        calls.append((method, endpoint))
+        if method == "GET" and endpoint.endswith("/issues/1"):
+            return {
+                "number": 1,
+                "title": "t",
+                "body": "b",
+                "state": "open",
+                "labels": [],
+                "html_url": "https://github.com/uhvogala/aitobuild/issues/1",
+            }
+        return {"number": 2, "title": "n", "body": "b", "state": "open", "labels": [], "html_url": "x"}
+
+    monkeypatch.setattr(adapter, "_api", fake_api)
+    issue = adapter.get_issue(repository="uhvogala/aitobuild", issue_number=1)
+    assert issue.number == 1
+    with pytest.raises(PermissionError, match="allowlist"):
+        adapter.get_issue(repository="evil/other", issue_number=1)
+    with pytest.raises(ValueError, match="allowlist"):
+        GhCliGitHubAdapter(allowed_repositories=())
+
+
+def test_build_github_adapter_gh_cli_requires_allowlist() -> None:
+    with pytest.raises(ValueError, match="allowlist"):
+        build_github_adapter(mode="gh_cli", allowed_repositories=())
+    adapter = build_github_adapter(
+        mode="gh_cli",
+        default_repository="uhvogala/aitobuild",
+        allowed_repositories=("uhvogala/aitobuild",),
+    )
+    assert isinstance(adapter, GhCliGitHubAdapter)
+    mock = build_github_adapter(
+        mode="mock",
+        allowed_repositories=("uhvogala/aitobuild",),
+    )
+    assert isinstance(mock, MockGitHubAdapter)
+    with pytest.raises(PermissionError, match="allowlist"):
+        mock.get_issue(repository="evil/other", issue_number=1)
 
 
 def test_shared_web_search_and_request_meeting(tmp_path: Path) -> None:

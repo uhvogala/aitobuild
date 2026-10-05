@@ -16,6 +16,33 @@ from aitobuild.policy import (
 )
 
 
+def normalize_repository_name(repository: str) -> str:
+    cleaned = repository.strip().lower()
+    if not cleaned or "/" not in cleaned:
+        raise ValueError("repository must be owner/name")
+    owner, _, name = cleaned.partition("/")
+    if not owner or not name or "/" in name:
+        raise ValueError("repository must be owner/name")
+    return f"{owner}/{name}"
+
+
+def assert_repository_allowed(
+    repository: str,
+    *,
+    allowed_repositories: frozenset[str] | None,
+    enforce_allowlist: bool,
+) -> str:
+    resolved = normalize_repository_name(repository)
+    if not enforce_allowlist:
+        return resolved
+    allowed = allowed_repositories or frozenset()
+    if resolved not in allowed:
+        raise PermissionError(
+            f"Repository {resolved} is outside AITOBUILD_GITHUB_ALLOWED_REPOS allowlist"
+        )
+    return resolved
+
+
 @dataclass(slots=True, frozen=True)
 class GitHubIssueProposal:
     title: str
@@ -171,18 +198,30 @@ class MockGitHubAdapter:
     pull_requests: dict[str, dict[int, GitHubPullRequest]] = field(default_factory=dict)
     reviews: list[GitHubPullRequestReview] = field(default_factory=list)
     links: list[dict[str, Any]] = field(default_factory=list)
+    allowed_repositories: frozenset[str] | None = None
+    enforce_allowlist: bool = False
     _next_issue: int = 1
     _next_pr: int = 1
 
+    def _resolve_repository(self, repository: str) -> str:
+        return assert_repository_allowed(
+            repository,
+            allowed_repositories=self.allowed_repositories,
+            enforce_allowlist=self.enforce_allowlist,
+        )
+
     def seed_issue(self, *, repository: str, issue: GitHubIssue) -> None:
+        repository = normalize_repository_name(repository)
         self.issues.setdefault(repository, {})[issue.number] = issue
         self._next_issue = max(self._next_issue, issue.number + 1)
 
     def seed_pull_request(self, *, repository: str, pull_request: GitHubPullRequest) -> None:
+        repository = normalize_repository_name(repository)
         self.pull_requests.setdefault(repository, {})[pull_request.number] = pull_request
         self._next_pr = max(self._next_pr, pull_request.number + 1)
 
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue:
+        repository = self._resolve_repository(repository)
         try:
             return self.issues[repository][issue_number]
         except KeyError as exc:
@@ -196,6 +235,7 @@ class MockGitHubAdapter:
         labels: tuple[str, ...] = (),
         limit: int = 30,
     ) -> tuple[GitHubIssue, ...]:
+        repository = self._resolve_repository(repository)
         items = list(self.issues.get(repository, {}).values())
         if state != "all":
             items = [item for item in items if item.state == state]
@@ -221,6 +261,7 @@ class MockGitHubAdapter:
             require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
             approved=approved,
         )
+        repository = self._resolve_repository(repository)
         number = self._next_issue
         self._next_issue += 1
         issue = GitHubIssue(
@@ -253,6 +294,7 @@ class MockGitHubAdapter:
             require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
             approved=approved,
         )
+        repository = self._resolve_repository(repository)
         current = self.get_issue(repository=repository, issue_number=issue_number)
         updated = GitHubIssue(
             number=current.number,
@@ -282,6 +324,7 @@ class MockGitHubAdapter:
             require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
             approved=approved,
         )
+        repository = self._resolve_repository(repository)
         self.get_issue(repository=repository, issue_number=issue_number)
         self.get_issue(repository=repository, issue_number=related_issue_number)
         record = {
@@ -294,6 +337,7 @@ class MockGitHubAdapter:
         return record
 
     def get_pull_request(self, *, repository: str, pull_number: int) -> GitHubPullRequest:
+        repository = self._resolve_repository(repository)
         try:
             return self.pull_requests[repository][pull_number]
         except KeyError as exc:
@@ -309,6 +353,7 @@ class MockGitHubAdapter:
         body: str,
     ) -> GitHubPullRequestReview:
         assert_role_action_allowed(role, ActionClass.PR_REVIEW)
+        repository = self._resolve_repository(repository)
         self.get_pull_request(repository=repository, pull_number=pull_number)
         if event not in {"APPROVE", "REQUEST_CHANGES", "COMMENT"}:
             raise ValueError("event must be APPROVE, REQUEST_CHANGES, or COMMENT")
@@ -343,15 +388,39 @@ class MockGitHubAdapter:
 class GhCliGitHubAdapter:
     """Least-privilege GitHub adapter backed by the authenticated `gh` CLI."""
 
-    def __init__(self, *, default_repository: str | None = None) -> None:
-        self.default_repository = default_repository
+    def __init__(
+        self,
+        *,
+        default_repository: str | None = None,
+        allowed_repositories: tuple[str, ...] | frozenset[str] | None = None,
+        enforce_allowlist: bool = True,
+    ) -> None:
+        self.default_repository = (
+            normalize_repository_name(default_repository) if default_repository else None
+        )
+        allowed = frozenset(
+            normalize_repository_name(item) for item in (allowed_repositories or ())
+        )
+        if self.default_repository is not None:
+            allowed = allowed | {self.default_repository}
+        self.allowed_repositories = allowed
+        self.enforce_allowlist = enforce_allowlist
+        if self.enforce_allowlist and not self.allowed_repositories:
+            raise ValueError(
+                "GhCliGitHubAdapter requires a non-empty repository allowlist "
+                "(AITOBUILD_GITHUB_ALLOWED_REPOS and/or default repository)"
+            )
         self.proposals: list[GitHubIssueProposal] = []
 
     def _resolve_repository(self, repository: str | None) -> str:
         resolved = (repository or self.default_repository or "").strip()
-        if not resolved or "/" not in resolved:
+        if not resolved:
             raise ValueError("repository must be owner/name")
-        return resolved
+        return assert_repository_allowed(
+            resolved,
+            allowed_repositories=self.allowed_repositories,
+            enforce_allowlist=self.enforce_allowlist,
+        )
 
     def _api(
         self,
@@ -568,12 +637,23 @@ def build_github_adapter(
     *,
     mode: str = "mock",
     default_repository: str | None = None,
+    allowed_repositories: tuple[str, ...] | None = None,
 ) -> MockGitHubAdapter | GhCliGitHubAdapter:
     normalized = mode.strip().lower()
+    allowed = tuple(allowed_repositories or ())
     if normalized in {"", "mock"}:
-        return MockGitHubAdapter()
+        return MockGitHubAdapter(
+            allowed_repositories=frozenset(normalize_repository_name(item) for item in allowed)
+            if allowed
+            else None,
+            enforce_allowlist=bool(allowed),
+        )
     if normalized in {"gh", "gh_cli", "cli"}:
-        return GhCliGitHubAdapter(default_repository=default_repository)
+        return GhCliGitHubAdapter(
+            default_repository=default_repository,
+            allowed_repositories=allowed,
+            enforce_allowlist=True,
+        )
     raise ValueError("AITOBUILD_GITHUB_ADAPTER must be mock or gh_cli")
 
 

@@ -198,6 +198,14 @@ export AITOBUILD_DEVELOPER_ENABLE_AGENT_LIVE_LOGS="false"
 export AITOBUILD_DEVELOPER_MCP_SHELL_TOOL_NAME="execute_command"
 export AITOBUILD_DEVELOPER_MCP_FILESYSTEM_READ_TOOL_NAME="read_file"
 export AITOBUILD_DEVELOPER_MCP_FILESYSTEM_WRITE_TOOL_NAME="write_file"
+# GitHub adapters for Architect/PM tools (default mock).
+export AITOBUILD_GITHUB_ADAPTER="mock"
+export AITOBUILD_GITHUB_DEFAULT_REPOSITORY="uhvogala/aitobuild"
+# Comma-separated owner/name allowlist required for gh_cli (also auto-includes default + developer repository sources).
+export AITOBUILD_GITHUB_ALLOWED_REPOS="uhvogala/aitobuild"
+export AITOBUILD_WEB_SEARCH_ADAPTER="mock"
+# Architect APPROVE PR reviews are off by default (COMMENT / REQUEST_CHANGES still allowed).
+export AITOBUILD_ARCHITECT_ALLOW_PR_APPROVE="false"
 ```
 
 For Azure OpenAI v1, set `AITOBUILD_FOUNDRY_ENDPOINT` to the resource URL ending
@@ -214,6 +222,10 @@ API key from an ignored local environment file. Runtime mode is `openai`.
 - `POST /internal/developer/preview`
 - `POST /internal/developer/preview/approve`
 - `GET /internal/developer/previews`
+- `GET /internal/pm/plans`
+- `POST /internal/pm/plan/approve`
+- `GET /internal/pm/issue-writes`
+- `POST /internal/pm/issue-write/approve`
 - `POST /internal/developer/delivery/prepare`
 - `GET /internal/developer/delivery/{preview_id}`
 - `POST /internal/developer/session/start`
