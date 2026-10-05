@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
+import json
 import os
 from pathlib import Path
+import re
+import shutil
+import tempfile
 from subprocess import CalledProcessError, CompletedProcess, TimeoutExpired, run
 from typing import Protocol
 from uuid import uuid4
@@ -44,7 +49,10 @@ class SubprocessBashAdapter:
         try:
             completed: CompletedProcess[str] = run(
                 command,
-                cwd=self._workspace_root,
+                cwd=(
+                    prepare_developer_workspace(self._workspace_root, session_id)
+                    if session_id else self._workspace_root
+                ),
                 shell=True,
                 check=False,
                 capture_output=True,
@@ -91,8 +99,9 @@ class ContainerSessionBashAdapter:
         bind_source_path: str | None = None,
         run_as_current_user: bool = True,
         timeout_seconds: int = 120,
+        data_volume_name: str | None = None,
     ) -> None:
-        self._workspace_root = workspace_root
+        self._workspace_root = workspace_root.resolve()
         self._image = image
         self._container_workdir = container_workdir
         self._container_name_prefix = container_name_prefix
@@ -100,6 +109,14 @@ class ContainerSessionBashAdapter:
         self._run_as_current_user = run_as_current_user
         self._timeout_seconds = timeout_seconds
         self._containers: dict[str, str] = {}
+        workspace_key = str(self._bind_source_path or self._workspace_root.resolve())
+        workspace_hash = sha256(workspace_key.encode()).hexdigest()[:16]
+        self._workspace_hash = workspace_hash
+        self._container_name_prefix = f"{container_name_prefix}-{workspace_hash}"
+        self.data_volume_name = data_volume_name or f"{container_name_prefix}-data-{workspace_hash}"
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", self.data_volume_name):
+            raise ValueError("Developer data volume must be a named Docker volume, not a path")
+        self.home_dir = "/home/developer"
 
         container_user: str | None = None
         if self._run_as_current_user and hasattr(os, "getuid") and hasattr(os, "getgid"):
@@ -111,6 +128,7 @@ class ContainerSessionBashAdapter:
         if not raw_session:
             raise ValueError("session_id must be non-empty")
         normalized_session = _normalize_session_id(raw_session)
+        self._prepare_workspace(normalized_session)
 
         existing = self._containers.get(normalized_session)
         if existing is not None:
@@ -136,22 +154,36 @@ class ContainerSessionBashAdapter:
                 timeout_seconds=self._timeout_seconds,
             )
 
-        mount_source = self._bind_source_path or self._workspace_root
+        relative_workspace = self.get_workspace_root(normalized_session).relative_to(self._workspace_root)
+        mount_source = self._resolve_bind_source() / relative_workspace
+        self._prepare_data_volume(normalized_session)
         command = [
             "docker",
             "run",
             "-d",
-            "--rm",
             "--name",
             container_name,
             "-w",
             self._container_workdir,
             "-v",
             f"{mount_source}:{self._container_workdir}",
+            "--mount",
+            f"type=volume,source={self.data_volume_name},target={self.home_dir},"
+            f"volume-subpath={self.data_volume_subpath(normalized_session)}",
+            "-e",
+            f"HOME={self.home_dir}",
+            "-e",
+            f"UV_CACHE_DIR={self.home_dir}/.cache/uv",
+            "-e",
+            f"NPM_CONFIG_PREFIX={self.home_dir}/.local",
+            "-e",
+            f"PATH={self.home_dir}/.local/bin:/usr/local/bin:/usr/bin:/bin",
         ]
         if self._container_user is not None:
             # Keep writes on bind-mounted workspace owned by the caller, not root.
-            command.extend(["--user", self._container_user, "-e", "HOME=/tmp"])
+            command.extend(["--user", self._container_user])
+        else:
+            command.extend(["--user", "0:0"])
 
         command.extend([
             self._image,
@@ -168,6 +200,61 @@ class ContainerSessionBashAdapter:
 
         self._containers[normalized_session] = container_name
         return normalized_session, container_name
+
+    def _resolve_bind_source(self) -> Path:
+        base = self._bind_source_path or self._workspace_root
+        if base != self._workspace_root or not Path("/.dockerenv").exists():
+            return base
+        inspected = _run_process(
+            command=["docker", "inspect", os.uname().nodename, "--format", "{{json .Mounts}}"],
+            timeout_seconds=self._timeout_seconds,
+        )
+        if inspected.exit_code != 0:
+            return base
+        try:
+            mounts = json.loads(inspected.stdout)
+            matching = [
+                mount for mount in mounts
+                if self._workspace_root.is_relative_to(mount["Destination"])
+            ]
+            if matching:
+                mount = max(matching, key=lambda item: len(item["Destination"]))
+                return Path(mount["Source"]) / self._workspace_root.relative_to(mount["Destination"])
+        except (ValueError, TypeError, KeyError):
+            pass
+        return base
+
+    def get_workspace_root(self, session_id: str) -> Path:
+        return self._workspace_root / ".aitobuild" / "workspaces" / _normalize_session_id(session_id)
+
+    def data_volume_subpath(self, session_id: str) -> str:
+        return f"{self._workspace_hash}/{_normalize_session_id(session_id)}"
+
+    def _prepare_workspace(self, session_id: str) -> None:
+        prepare_developer_workspace(self._workspace_root, session_id)
+
+    def _prepare_data_volume(self, session_id: str) -> None:
+        created = _run_process(
+            command=["docker", "volume", "create", self.data_volume_name],
+            timeout_seconds=self._timeout_seconds,
+        )
+        if created.exit_code != 0:
+            raise RuntimeError(f"Failed to create Developer data volume: {created.stderr}")
+        owned = _run_process(
+                command=[
+                    "docker", "run", "--rm", "--user", "0",
+                    "--mount", f"type=volume,source={self.data_volume_name},target=/aitobuild-data",
+                    "--entrypoint", "python", self._image, "-c",
+                    "import os,sys; from pathlib import Path; "
+                    "home=Path('/aitobuild-data')/sys.argv[1]; "
+                    "home.mkdir(parents=True,exist_ok=True,mode=0o700); "
+                    "owner=sys.argv[2].split(':'); os.chown(home,int(owner[0]),int(owner[1]))",
+                    self.data_volume_subpath(session_id), self._container_user or "0:0",
+                ],
+                timeout_seconds=self._timeout_seconds,
+            )
+        if owned.exit_code != 0:
+            raise RuntimeError(f"Failed to prepare Developer home ownership: {owned.stderr}")
 
     def get_container_name(self, *, session_id: str) -> str | None:
         normalized_session = _normalize_session_id(session_id)
@@ -206,7 +293,11 @@ class ContainerSessionBashAdapter:
                 timeout_seconds=self._timeout_seconds,
             )
             if stopped.exit_code == 0 or _is_container_not_found(stopped):
-                return True
+                removed = _run_process(
+                    command=["docker", "rm", "-f", container_name],
+                    timeout_seconds=self._timeout_seconds,
+                )
+                return removed.exit_code == 0 or _is_container_not_found(removed)
 
         all_container_names = set(
             _list_container_names(timeout_seconds=self._timeout_seconds, include_all=True)
@@ -232,7 +323,7 @@ class ContainerSessionBashAdapter:
             _, container_name = self.create_session(session_id=normalized_session)
 
         completed = _run_process(
-            command=["docker", "exec", container_name, "sh", "-lc", command],
+            command=["docker", "exec", container_name, "sh", "-c", command],
             timeout_seconds=self._timeout_seconds,
         )
 
@@ -244,14 +335,54 @@ class ContainerSessionBashAdapter:
         )
 
 
+def prepare_developer_workspace(workspace_root: Path, session_id: str) -> Path:
+    workspace_root = workspace_root.resolve()
+    target = workspace_root / ".aitobuild" / "workspaces" / _normalize_session_id(session_id)
+    if target.is_dir():
+        return target
+    if (workspace_root / ".git").is_file():
+        raise ValueError("Developer workspace seed must be a standalone checkout, not a Git worktree")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix="seed-", dir=target.parent))
+    generated = shutil.ignore_patterns(
+        ".aitobuild", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache",
+        ".mypy_cache", "node_modules", "secrets", "aitobuild-sim-*", ".run-artifacts",
+        "simulation-report.json",
+    )
+
+    def ignored(directory: str, names: list[str]) -> set[str]:
+        excluded = set(generated(directory, names))
+        excluded.update(
+            name for name in names if name.startswith(".env")
+            and name not in {".env.simulation", ".env.simulation.session"}
+            and not name.endswith(".example")
+        )
+        if Path(directory) == workspace_root / ".devcontainer" / "certs":
+            excluded.update(
+                name for name in names if name == "host"
+                or Path(name).suffix.lower() in {".crt", ".pem", ".cer", ".key"}
+            )
+        return excluded
+
+    try:
+        shutil.copytree(
+            workspace_root, temporary / "repo", symlinks=True,
+            ignore=ignored,
+        )
+        (temporary / "repo").rename(target)
+    finally:
+        shutil.rmtree(temporary)
+    return target
+
+
 def _normalize_session_id(session_id: str) -> str:
-    cleaned = session_id.strip().lower().replace("_", "-")
-    allowed = "abcdefghijklmnopqrstuvwxyz0123456789-"
-    normalized = "".join(char for char in cleaned if char in allowed)
-    normalized = normalized.strip("-")
-    if not normalized:
-        raise ValueError("session_id must contain alphanumeric characters")
-    return normalized[:48]
+    normalized = session_id.strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", normalized):
+        raise ValueError(
+            "session_id must be 1..48 lowercase letters/digits/hyphens, starting with a letter or digit; "
+            "use a unique ID such as dev-one. IDs are never silently normalized or truncated."
+        )
+    return normalized
 
 
 def _run_process(*, command: list[str], timeout_seconds: int) -> BashResult:

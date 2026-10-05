@@ -7,6 +7,9 @@ COPY .devcontainer/import-certs.sh /tmp/aitobuild-bootstrap/.devcontainer/import
 
 RUN WORKSPACE_FOLDER=/tmp/aitobuild-bootstrap \
     bash /tmp/aitobuild-bootstrap/.devcontainer/import-certs.sh \
-    && rm -rf /tmp/aitobuild-bootstrap
+    && rm -rf /tmp/aitobuild-bootstrap \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ripgrep \
+    && rm -rf /var/lib/apt/lists/*
 
 USER vscode

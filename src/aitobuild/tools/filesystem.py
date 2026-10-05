@@ -34,7 +34,8 @@ class FilesystemAdapter(Protocol):
 class MockFilesystemAdapter:
     def read_text(self, *, role: AgentRole, path: Path, session_id: str | None = None) -> str:
         assert_role_action_allowed(role, ActionClass.READ_ONLY)
-        return path.read_text(encoding="utf-8")
+        with path.open(encoding="utf-8", newline="") as stream:
+            return stream.read()
 
     def write_text(
         self,

@@ -21,21 +21,26 @@ human retaining merge authority.
 | Area | Implemented | Remaining |
 | --- | --- | --- |
 | Ingress and routing | Signed webhooks, authenticated internal APIs, deduplication, deterministic dispatch | Durable task worker and repository-specific task extraction |
-| Developer execution | Preview approval, command/file runs, patch tools, Docker sessions | Complete issue-to-branch-to-PR delivery |
+| Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
 | Native model runtime | Foundry binding and Developer agent invocation | Reproducible live-model acceptance run and resumable approvals |
 | GitHub integration | Webhook input and mock issue-proposal adapter | Real issue, branch, commit, and PR operations |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, capability-audit tests | Background tick driver, durable state, CI, tracing, stronger isolation |
 
-Verified locally: subprocess fixture simulation succeeds; Ruff and mypy pass.
-Pytest reports **104 passed, 2 failed**. Both failures are existing patch-repair
-tests in [tests/test_agent_tools.py](tests/test_agent_tools.py), tracked as the
-first milestone blocker. Docker sessions, MCP servers, and live Foundry calls
-have not been revalidated in this review.
+Verified locally: **180 tests pass**, Ruff and mypy pass. The original patch-repair
+failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
+sessions, managed terminals/processes, native memory/restart and browser tools
+have live integration evidence. Real Grok and Kimi evaluations retain strict
+failure reports; neither is yet certified as a zero-error full-suite baseline.
+
+See [agent tool evaluation](sim/README.md#agent-tool-evaluation) for model comparison,
+token/cache usage and artifact checks. Large tool outputs are saved to private
+files with bounded previews and paged retrieval; oversized API prompts are rejected.
 
 ## Quick start
 
-Prerequisites: Python 3.14 or newer and `uv`. Run from the repository root.
+Prerequisites: Python 3.14 or newer, `uv`, and ripgrep (`rg`, 14+). Both checked-in
+container images install ripgrep. Run from the repository root.
 The dev container also needs Python 3 on the host for certificate export.
 
 ```bash
@@ -123,7 +128,7 @@ uv run uvicorn aitobuild.server:app --reload
 - Unified trigger pipeline for webhook and internal events.
 - FastAPI ingress with GitHub webhook signature verification.
 - Trigger deduplication and deterministic dispatcher routing.
-- Agent Framework runtime bootstrap with Foundry-first and mock fallback modes.
+- Agent Framework runtime bootstrap with Foundry project, Azure OpenAI v1 and explicit mock fallback modes.
 - Scheduler scaffolding for proactive architect scans and meeting bootstrap events.
 - Shared escalation route and sink for consistent human/system escalation outputs.
 - Developer isolation bundle contract for scoped software delivery tasks.
@@ -160,7 +165,7 @@ export AITOBUILD_INTERNAL_API_TOKEN="replace-me-internal-token"
 export AITOBUILD_REQUIRE_DEVELOPER_PREVIEW="false"
 export AITOBUILD_DEVELOPER_EXECUTION_MODE="mock"
 export AITOBUILD_DEVELOPER_COMMAND_TIMEOUT_SECONDS="120"
-export AITOBUILD_DEVELOPER_SESSION_CONTAINER_IMAGE="python:3.14-slim"
+export AITOBUILD_DEVELOPER_SESSION_CONTAINER_IMAGE="aitobuild-developer:local"
 export AITOBUILD_DEVELOPER_SESSION_CONTAINER_WORKDIR="/workspace"
 export AITOBUILD_DEVELOPER_SESSION_CONTAINER_PREFIX="aitobuild-dev"
 export AITOBUILD_DEVELOPER_SESSION_RUN_AS_CURRENT_USER="true"
@@ -175,6 +180,11 @@ export AITOBUILD_DEVELOPER_MCP_SHELL_TOOL_NAME="execute_command"
 export AITOBUILD_DEVELOPER_MCP_FILESYSTEM_READ_TOOL_NAME="read_file"
 export AITOBUILD_DEVELOPER_MCP_FILESYSTEM_WRITE_TOOL_NAME="write_file"
 ```
+
+For Azure OpenAI v1, set `AITOBUILD_FOUNDRY_ENDPOINT` to the resource URL ending
+in `/openai/v1` and `AITOBUILD_FOUNDRY_MODEL` to the deployment name. This uses
+the native chat-completions client with refreshable Entra auth, or an optional
+API key from an ignored local environment file. Runtime mode is `openai`.
 
 ## API endpoints
 
@@ -242,9 +252,20 @@ Developer practical run flow:
 
 `/internal/developer/run` enforces the bundle's isolation policy for command prefixes and file paths.
 
-The execution root is the API process working directory, captured at startup.
-Start the process in a disposable target checkout for real commands and writes;
-there is not yet a per-request repository checkout manager. Preview approval
+The default command policy covers normal development workflows: Python/uv,
+Node package managers, Git, common build/compiler tools, shell scripts,
+filesystem inspection/manipulation, downloads and archives. Task-specific
+`allowed_command_prefixes` can still narrow this list. Matching uses complete
+command tokens and accepts leading environment assignments; it does not parse
+heredoc bodies or authorize every command inside a script. Permitting a tool
+does not install it. Interpreters and shells can execute arbitrary code, so this
+is an ergonomics policy, not a sandbox. Preview approval and existing file-write
+checks remain unchanged; unscoped subprocess runs still use the API environment.
+
+The seed repository is the API process working directory, captured at startup.
+Session-bound runs copy it once into `.aitobuild/workspaces/<session-id>`; different
+Developers have separate checkouts and private home-volume subdirectories.
+Unscoped subprocess execution still uses the API working directory. Preview approval
 and `approved=true` for live file writes are separate checks. Commands run before
 the requested file writes, so a passing command does not validate those later
 writes; run verification again after applying changes.
@@ -265,9 +286,9 @@ Container-session flow:
 
 This keeps one container alive for the whole Developer task session rather than launching one per command.
 
-The default `python:3.14-slim` session image is not a prepared test/MCP toolchain.
-Supply an image with the required tools and CA trust before running session
-simulation. Docker sessions bind-mount the workspace writable and are not a
+Build [.devcontainer/Dockerfile.developer](.devcontainer/Dockerfile.developer) as
+`aitobuild-developer:local` for the prepared test/browser/terminal toolchain.
+Docker sessions bind-mount a private checkout writable and are not a
 security boundary for untrusted code.
 
 MCP adapter mode:
@@ -281,10 +302,13 @@ MCP adapter mode:
 
 Agent Framework tool wiring:
 
-- Runtime now provides role-specific tools to agents using `Agent(..., tools=[...])`.
+- Developer tools are bound per native `Agent.run(..., tools=[...])` to prevent cross-session access and duplicate registration.
 - Tool functions are compatible with the `@tool(...)` pattern from the Agent Framework sample `02_add_tools.py` when `agent_framework.tool` is available.
-- Current Developer tools include command execution, file read/write, context-matched patch apply, and session start/stop operations.
-- `developer_apply_patch` accepts either the custom patch format (`*** Update File:` body with optional `*** Begin/End Patch` wrapper) or unified diff update format (`---`/`+++` with `@@` hunks).
+- Targeted edits use `developer_edit_file(path, old_text, new_text)`. The non-empty old text must match exactly once; insertion repeats a unique existing anchor in the replacement. Stale or ambiguous matches leave the file unchanged. No diff syntax, line-prefix repair or newline normalization is involved.
+- The legacy `developer_apply_patch` parser remains opt-in through `DeveloperToolContext.use_legacy_patch_tool` for compatibility; it is not advertised to models by default. Use `developer_write_file` for new files or an explicitly requested full-file replacement.
+- A focused Grok/Kimi read-edit-test probe passed for both models with zero tool errors and independent pytest verification. This is editing evidence, not full-suite acceptance.
+- `developer_find_files` discovers paths with glob filters; `developer_search_files` searches literal text or Rust regex and returns paths, line numbers and byte columns. Both use ripgrep, respect allowed roots and ignore files, and support bounded pages with `next_offset`. Hidden/ignored files are opt-in; content searches skip files over 1 MiB and return bounded line previews. Read selected files before exact-text edits.
+- Shell `rg` is available in the prepared image and allowed by preview command policy. Restart existing Developer containers to pick up image changes; private checkouts and home data persist. The workspace dev-container package change takes effect on rebuild.
 
 Developer Agent runtime flow:
 
@@ -298,8 +322,8 @@ Developer Agent runtime flow:
 3. Inspect `pending_approval_requests`, `completed`, and
 	`approval_round_limit_reached`. The endpoint can replay approvals within one
 	call when `auto_approve_tools=true`, but does not accept manual approval
-	responses or persist native sessions for reliable continuation across calls.
-	Do not assume that submitting the returned `session_id` resumes pending work.
+	responses. Native sessions/history persist by identity, but manual continuation
+	of a pending approval is not implemented.
 
 `/internal/developer/agent/run` uses the runtime-bound native Developer Agent when available; in descriptor/mock mode it fails with `409` by design.
 

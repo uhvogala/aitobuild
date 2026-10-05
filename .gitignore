@@ -1,4 +1,5 @@
 .venv/
+.aitobuild/
 .devcontainer/certs/host/
 .devcontainer/certs/*.crt
 .devcontainer/certs/*.pem

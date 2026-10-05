@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import pytest
 
 from aitobuild.config import (
@@ -13,7 +14,7 @@ from aitobuild.config import (
 
 
 @pytest.fixture
-def test_config() -> AppConfig:
+def test_config(tmp_path: Path) -> AppConfig:
     return AppConfig(
         webhook_secret="test-secret",
         runtime=RuntimeConfig(
@@ -51,5 +52,6 @@ def test_config() -> AppConfig:
             mcp_shell_tool_name="execute_command",
             mcp_filesystem_read_tool_name="read_file",
             mcp_filesystem_write_tool_name="write_file",
+            state_dir=str(tmp_path / "developer-state"),
         ),
     )

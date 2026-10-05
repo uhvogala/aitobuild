@@ -52,6 +52,9 @@ class DeveloperConfig:
     mcp_shell_tool_name: str
     mcp_filesystem_read_tool_name: str
     mcp_filesystem_write_tool_name: str
+    state_dir: str = ".aitobuild/developer"
+    session_data_volume: str | None = None
+    enable_browser: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -133,7 +136,7 @@ def load_config() -> AppConfig:
         ),
         execution_mode=getenv("AITOBUILD_DEVELOPER_EXECUTION_MODE", "mock").strip().lower(),
         command_timeout_seconds=int(getenv("AITOBUILD_DEVELOPER_COMMAND_TIMEOUT_SECONDS", "120")),
-        session_container_image=getenv("AITOBUILD_DEVELOPER_SESSION_CONTAINER_IMAGE", "python:3.14-slim")
+        session_container_image=getenv("AITOBUILD_DEVELOPER_SESSION_CONTAINER_IMAGE", "aitobuild-developer:local")
         .strip(),
         session_container_workdir=getenv("AITOBUILD_DEVELOPER_SESSION_CONTAINER_WORKDIR", "/workspace")
         .strip(),
@@ -162,6 +165,9 @@ def load_config() -> AppConfig:
         mcp_filesystem_write_tool_name=getenv(
             "AITOBUILD_DEVELOPER_MCP_FILESYSTEM_WRITE_TOOL_NAME", "write_file"
         ).strip(),
+        state_dir=getenv("AITOBUILD_DEVELOPER_STATE_DIR", ".aitobuild/developer").strip(),
+        session_data_volume=getenv("AITOBUILD_DEVELOPER_SESSION_DATA_VOLUME", "").strip() or None,
+        enable_browser=_as_bool(getenv("AITOBUILD_DEVELOPER_ENABLE_BROWSER"), default=False),
     )
 
     if developer.execution_mode not in {"mock", "subprocess", "container_session"}:
@@ -186,6 +192,10 @@ def load_config() -> AppConfig:
         raise ValueError("AITOBUILD_DEVELOPER_MCP_FILESYSTEM_READ_TOOL_NAME must be non-empty")
     if not developer.mcp_filesystem_write_tool_name:
         raise ValueError("AITOBUILD_DEVELOPER_MCP_FILESYSTEM_WRITE_TOOL_NAME must be non-empty")
+    if not developer.state_dir:
+        raise ValueError("AITOBUILD_DEVELOPER_STATE_DIR must be non-empty")
+    if developer.enable_browser and developer.execution_mode != "container_session":
+        raise ValueError("AITOBUILD_DEVELOPER_ENABLE_BROWSER requires container_session mode")
 
     if scheduler.max_concurrent_proactive_jobs < 1:
         raise ValueError("AITOBUILD_MAX_PROACTIVE_JOBS must be >= 1")

@@ -348,6 +348,7 @@ def _repair_missing_plus_in_addition_block(
     old_lines: list[str] = []
     new_lines: list[str] = []
     repaired = False
+    removed_lines = {value for kind, value in line_kinds if kind == "-"}
 
     for index, (kind, value) in enumerate(line_kinds):
         if kind == "-":
@@ -361,7 +362,7 @@ def _repair_missing_plus_in_addition_block(
         # Context line that doesn't exist in current file and is surrounded by
         # additions is likely a missed '+' prefix from model output.
         if (
-            value not in current_lines
+            (value not in current_lines or value in removed_lines)
             and _has_addition_marker_around(line_kinds=line_kinds, index=index, direction=-1)
             and _has_addition_marker_around(line_kinds=line_kinds, index=index, direction=1)
         ):
@@ -423,11 +424,11 @@ def _common_suffix_length(left: tuple[str, ...], right: tuple[str, ...]) -> int:
 def _build_missing_plus_hint(*, lines: list[str], hunk: PatchHunk) -> str | None:
     # Common model near-miss: bare custom hunks insert multiline code blocks
     # where only blank separators are prefixed with '+'.
-    if len(hunk.new_lines) <= len(hunk.old_lines):
-        return None
-
-    missing_nonblank_old_lines = [line for line in hunk.old_lines if line.strip() and line not in lines]
-    if not missing_nonblank_old_lines:
+    missing_context = any(
+        kind == " " and value.strip() and value not in lines
+        for kind, value in hunk.line_kinds
+    )
+    if not missing_context:
         return None
 
     return (

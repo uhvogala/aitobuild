@@ -46,6 +46,26 @@ def phase1_capability_matrix() -> tuple[CapabilityAuditItem, ...]:
             decision=CapabilityDecision.CUSTOM_BUILD,
             rationale="Project-specific idempotency behavior for retries and scheduler events.",
         ),
+        CapabilityAuditItem(
+            capability="developer_durable_memory",
+            decision=CapabilityDecision.REUSE_NATIVE,
+            rationale="Use FileMemoryProvider with session-scoped native file storage.",
+        ),
+        CapabilityAuditItem(
+            capability="developer_session_persistence",
+            decision=CapabilityDecision.WRAP_NATIVE,
+            rationale="Use FileSessionStore and FileHistoryProvider for native Developer sessions.",
+        ),
+        CapabilityAuditItem(
+            capability="developer_browser",
+            decision=CapabilityDecision.WRAP_NATIVE,
+            rationale="Use MCPStdioTool with Microsoft Playwright MCP in the private Developer container.",
+        ),
+        CapabilityAuditItem(
+            capability="developer_workspace_provisioning",
+            decision=CapabilityDecision.CUSTOM_BUILD,
+            rationale="Project-specific seed-once checkouts and per-Developer Docker volume subdirectories.",
+        ),
     )
 
 

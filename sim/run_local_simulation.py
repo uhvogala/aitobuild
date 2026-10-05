@@ -159,9 +159,9 @@ def run_simulation(
         runtime_status = call_checked(client, "GET", "/internal/runtime/developer-agent", headers=headers)
         emit_live("runtime status", enabled=live_output, payload=runtime_status)
         if live_model:
-            if runtime_status.get("runtime_mode") != "foundry":
+            if runtime_status.get("runtime_mode") not in {"foundry", "openai"}:
                 raise RuntimeError(
-                    "Live-model mode expected runtime_mode=foundry; check model provider setup"
+                    "Live-model mode expected a live foundry/openai runtime; check model provider setup"
                 )
             if not bool(runtime_status.get("ready_for_run")):
                 raise RuntimeError(
@@ -331,9 +331,13 @@ def run_simulation(
                     }
                     emit_live("session cleanup failed", enabled=live_output, payload=session_cleanup)
 
+        developer_workspace = (
+            Path(session_started["workspace"]) if session_started is not None else repo_root
+        )
         summary = {
             "simulation_root": str(run_root),
             "sandbox_repo": str(repo_root),
+            "developer_workspace": str(developer_workspace),
             "runtime_status": runtime_status,
             "live_model_mode": live_model,
             "webhook_initial": webhook_initial,
@@ -348,7 +352,7 @@ def run_simulation(
             "session_stopped": session_stopped,
             "session_cleanup": session_cleanup,
             "developer_agent_run": agent_run_result,
-            "generated_file_exists": (repo_root / "src/demo_app/generated_note.txt").exists(),
+            "generated_file_exists": (developer_workspace / "src/demo_app/generated_note.txt").exists(),
         }
 
         summary["succeeded"] = bool(
@@ -412,7 +416,7 @@ def main() -> int:
     parser.add_argument(
         "--live-model",
         action="store_true",
-        help="Require real model runtime (foundry mode, no mock fallback) and run developer agent.",
+        help="Require real model runtime (foundry/openai, no mock fallback) and run developer agent.",
     )
     parser.add_argument(
         "--agent-prompt",

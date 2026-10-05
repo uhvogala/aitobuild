@@ -1,0 +1,7 @@
+**
+!.devcontainer/
+!.devcontainer/**
+!src/
+!src/aitobuild/
+!src/aitobuild/tools/
+!src/aitobuild/tools/shell_runtime.py

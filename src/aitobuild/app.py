@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from importlib import import_module
+from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from hmac import compare_digest, new
@@ -11,9 +13,10 @@ from inspect import isawaitable
 from json import dumps, loads
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
+from agent_framework import AgentSession, FileSessionStore, FunctionInvocationContext, function_middleware
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 
 from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
@@ -37,6 +40,9 @@ from aitobuild.tools import (
     SubprocessBashAdapter,
 )
 from aitobuild.triggers import InMemoryDedupeStore, TriggerEngine
+from aitobuild.tools.mcp_adapters import build_browser_tool
+from aitobuild.tools.bash import _normalize_session_id
+from aitobuild.tool_outputs import MAX_PROMPT_BYTES, build_output_guard
 
 
 def _is_valid_signature(*, secret: str, payload: bytes, provided: str | None) -> bool:
@@ -184,14 +190,23 @@ def _augment_prompt_with_tool_guidance(*, prompt: str, tools: tuple[Any, ...]) -
     return f"{guidance}\n\nTask:\n{prompt}"
 
 
-async def _invoke_agent_run(*, agent_handle: Any, message: Any, session: Any | None) -> Any:
+async def _invoke_agent_run(
+    *, agent_handle: Any, message: Any, session: Any | None,
+    tools: tuple[Any, ...] | None = None,
+    middleware: list[Any] | None = None,
+) -> Any:
     run_method = getattr(agent_handle, "run", None)
     if not callable(run_method):
         raise RuntimeError("Developer agent does not provide callable run(...)")
 
     if session is not None:
         try:
-            outcome = run_method(message, session=session, options={"store": True})
+            kwargs: dict[str, Any] = {"session": session, "options": {"store": False}}
+            if tools is not None:
+                kwargs["tools"] = tools
+            if middleware is not None:
+                kwargs["middleware"] = middleware
+            outcome = run_method(message, **kwargs)
         except TypeError:
             try:
                 outcome = run_method(message, session=session)
@@ -207,6 +222,8 @@ async def _invoke_agent_run(*, agent_handle: Any, message: Any, session: Any | N
 
 def create_app(config: AppConfig | None = None) -> FastAPI:
     app_config = config or load_config()
+    if app_config.developer.enable_browser and app_config.developer.execution_mode != "container_session":
+        raise ValueError("Developer browser requires container_session mode")
 
     app = FastAPI(title="aitobuild")
     trigger_engine = TriggerEngine(dedupe_store=InMemoryDedupeStore())
@@ -216,6 +233,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     scheduler = scheduler_from_config(app_config.scheduler)
     architect_scan_runner = ArchitectScanRunner()
     workspace_root = Path.cwd()
+    developer_state_dir = (workspace_root / app_config.developer.state_dir).resolve()
+    developer_session_store = FileSessionStore(developer_state_dir / "sessions")
+    developer_sessions: dict[str, Any] = {}
+    active_developer_runs: set[str] = set()
     filesystem_adapter: FilesystemAdapter = MockFilesystemAdapter()
 
     bash_adapter: BashAdapter
@@ -234,6 +255,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             bind_source_path=app_config.developer.session_container_bind_path,
             run_as_current_user=app_config.developer.session_container_run_as_current_user,
             timeout_seconds=app_config.developer.command_timeout_seconds,
+            data_volume_name=app_config.developer.session_data_volume,
         )
         bash_adapter = container_session_bash
     else:
@@ -261,8 +283,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             workspace_root=workspace_root,
         )
 
-    role_tools = build_role_tools(
-        context=DeveloperToolContext(
+    developer_tool_context = DeveloperToolContext(
             bash_adapter=bash_adapter,
             filesystem_adapter=filesystem_adapter,
             workspace_root=workspace_root,
@@ -271,12 +292,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             mcp_tool_adapter=mcp_tool_adapter,
             enable_mcp_adapters=app_config.developer.enable_mcp_adapters,
             enable_agent_live_logs=app_config.developer.enable_agent_live_logs,
+            output_dir=developer_state_dir / "outputs",
         )
-    )
+    role_tools = build_role_tools(context=developer_tool_context)
 
     runtime = bootstrap_runtime(
         app_config.runtime,
         role_tools=role_tools,
+        developer_state_dir=developer_state_dir,
     )
 
     developer_execution = DeveloperExecutionEngine(
@@ -600,6 +623,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "session_id": session_id,
             "container_name": container_name,
             "execution_mode": app_config.developer.execution_mode,
+            "data_volume": container_session_bash.data_volume_name,
+            "workspace": str(container_session_bash.get_workspace_root(session_id)),
         }
 
     @app.post("/internal/developer/session/stop")
@@ -721,7 +746,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             bundle=bundle,
             commands=commands,
             file_writes=tuple(planned_writes),
-            workspace_root=workspace_root,
+            workspace_root=(
+                container_session_bash.get_workspace_root(session_id)
+                if container_session_bash is not None and session_id else workspace_root
+            ),
             dry_run=dry_run,
             approved=approved,
             require_human_approval_for_repo_writes=app_config.policy.require_human_approval_for_repo_writes,
@@ -768,7 +796,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
         configured_tools = runtime.role_tools.get("developer", ())
         tool_names = [
-            getattr(tool_func, "__name__", type(tool_func).__name__)
+            _tool_name(tool_func)
             for tool_func in configured_tools
         ]
 
@@ -779,12 +807,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "supports_sessions": bool(supports_sessions),
             "tool_count": len(configured_tools),
             "tool_names": tool_names,
+            "persistent_memory": bool(can_run),
+            "state_directory": str(developer_state_dir),
+            "data_volume": container_session_bash.data_volume_name if container_session_bash else None,
+            "browser_enabled": app_config.developer.enable_browser,
         }
 
-    @app.post("/internal/developer/agent/run")
-    async def run_developer_agent(
+    async def _run_developer_agent(
         payload: dict[str, Any],
-        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        x_internal_token: str | None,
+        tool_stack: AsyncExitStack,
     ) -> dict[str, Any]:
         _assert_internal_auth(config=app_config, provided_token=x_internal_token)
 
@@ -805,9 +837,13 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         input_raw = payload.get("input")
         if not isinstance(input_raw, str) or not input_raw.strip():
             raise HTTPException(status_code=400, detail="input must be a non-empty string")
+        if len(input_raw.encode("utf-8")) > MAX_PROMPT_BYTES:
+            raise HTTPException(status_code=413, detail=(
+                f"input exceeds {MAX_PROMPT_BYTES} UTF-8 bytes; put large content in workspace files "
+                "and ask the Developer to read only the relevant section"
+            ))
         user_prompt = input_raw.strip()
-        configured_tools = runtime.role_tools.get("developer", ())
-        prompt = _augment_prompt_with_tool_guidance(prompt=user_prompt, tools=configured_tools)
+        prompt = user_prompt
 
         auto_approve_tools = bool(payload.get("auto_approve_tools", False))
         max_approval_rounds_raw = payload.get("max_approval_rounds", 3)
@@ -817,13 +853,64 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="max_approval_rounds must be within 1..20")
         max_approval_rounds = max_approval_rounds_raw
         invoke_timeout_seconds = app_config.developer.agent_invoke_timeout_seconds
+        include_tool_trace = payload.get("include_tool_trace", False) is True
+        tool_trace: list[dict[str, Any]] = []
+        usage: dict[str, int] = {}
+
+        @function_middleware
+        async def trace_tool(
+            context: FunctionInvocationContext, call_next: Callable[[], Awaitable[None]],
+        ) -> None:
+            started = perf_counter()
+            entry: dict[str, Any] = {
+                "name": context.function.name,
+                "arguments": dict(context.arguments),
+            }
+            try:
+                await call_next()
+                result_contents = context.result
+                if getattr(result_contents, "type", None) == "function_approval_request":
+                    return
+                if isinstance(result_contents, list):
+                    if any(getattr(item, "type", None) == "function_approval_request" for item in result_contents):
+                        return
+                    text = "\n".join(getattr(item, "text", "") or "" for item in result_contents)
+                else:
+                    text = str(result_contents)
+                try:
+                    structured = loads(text)
+                except ValueError:
+                    structured = None
+                entry["ok"] = not (isinstance(structured, dict) and (
+                    structured.get("ok") is False or structured.get("isError") is True
+                ))
+                entry["result"] = structured if isinstance(structured, dict) else text[:6000]
+            except Exception as error:
+                entry.update(ok=False, error=str(error)[:2000])
+                raise
+            finally:
+                if "ok" in entry:
+                    entry["duration_ms"] = int((perf_counter() - started) * 1000)
+                    tool_trace.append(entry)
+
+        run_middleware = [trace_tool] if include_tool_trace else []
+
+        def record_usage(response: Any) -> None:
+            for key, value in (getattr(response, "usage_details", None) or {}).items():
+                if isinstance(value, int):
+                    usage[key] = usage.get(key, 0) + value
 
         session_id_raw = payload.get("session_id")
         if session_id_raw is not None and not isinstance(session_id_raw, str):
             raise HTTPException(status_code=400, detail="session_id must be a string when provided")
         session_id = session_id_raw.strip() if isinstance(session_id_raw, str) else None
 
-        create_session_requested = bool(payload.get("create_session", False)) or bool(session_id)
+        create_session_requested = True
+        if session_id:
+            try:
+                _normalize_session_id(session_id)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
         _emit_developer_agent_live(
             "run.start",
             prompt_chars=len(prompt),
@@ -833,14 +920,21 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             create_session_requested=create_session_requested,
             provided_session_id=session_id,
         )
-        session_obj: Any | None = None
+        session_obj: Any | None = developer_sessions.get(session_id) if session_id else None
         resolved_session_id: str | None = None
         if create_session_requested:
             try:
-                session_obj, resolved_session_id = _create_agent_session(
-                    developer_handle,
-                    session_id=session_id,
-                )
+                if session_obj is None and session_id:
+                    session_obj = await developer_session_store.get(session_id)
+                if session_obj is None:
+                    session_obj, resolved_session_id = _create_agent_session(
+                        developer_handle,
+                        session_id=session_id,
+                    )
+                else:
+                    resolved_session_id = session_obj.session_id
+                if resolved_session_id:
+                    developer_sessions[resolved_session_id] = session_obj
                 _emit_developer_agent_live(
                     "session.ready",
                     resolved_session_id=resolved_session_id,
@@ -848,6 +942,30 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             except Exception as exc:
                 _emit_developer_agent_live("session.error", error=str(exc))
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        scoped_tools: tuple[Any, ...] = build_role_tools(
+            context=replace(developer_tool_context, bound_session_id=resolved_session_id)
+        )["developer"]
+        if resolved_session_id is None:
+            raise HTTPException(status_code=409, detail="Developer run requires a session identity")
+        run_middleware.append(build_output_guard(developer_state_dir / "outputs" / resolved_session_id))
+        if resolved_session_id in active_developer_runs:
+            raise HTTPException(status_code=409, detail="This Developer session already has an active run")
+        active_developer_runs.add(resolved_session_id)
+        tool_stack.callback(active_developer_runs.discard, resolved_session_id)
+        if app_config.developer.enable_browser and payload.get("use_browser", True) is not False:
+            if container_session_bash is None or resolved_session_id is None:
+                raise HTTPException(status_code=409, detail="Browser requires a Developer container session")
+            await asyncio.to_thread(
+                container_session_bash.create_session, session_id=resolved_session_id
+            )
+            browser_tool = build_browser_tool(
+                container_session_adapter=container_session_bash,
+                session_id=resolved_session_id,
+                request_timeout_seconds=app_config.developer.command_timeout_seconds,
+            )
+            await tool_stack.enter_async_context(browser_tool)
+            scoped_tools = (*scoped_tools, browser_tool)
 
         try:
             invoke_started = perf_counter()
@@ -863,10 +981,15 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     agent_handle=developer_handle,
                     message=prompt,
                     session=session_obj,
+                    tools=scoped_tools,
+                    middleware=run_middleware,
                 ),
                 timeout=invoke_timeout_seconds,
             )
             first_pending = _extract_user_input_requests(result)
+            record_usage(result)
+            if isinstance(session_obj, AgentSession) and resolved_session_id:
+                await developer_session_store.set(resolved_session_id, session_obj)
             _emit_developer_agent_live(
                 "invoke.end",
                 round=0,
@@ -934,10 +1057,15 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                         agent_handle=developer_handle,
                         message=approval_replay_message,
                         session=session_obj,
+                        tools=scoped_tools,
+                        middleware=run_middleware,
                     ),
                     timeout=invoke_timeout_seconds,
                 )
                 round_pending = _extract_user_input_requests(result)
+                record_usage(result)
+                if isinstance(session_obj, AgentSession) and resolved_session_id:
+                    await developer_session_store.set(resolved_session_id, session_obj)
                 _emit_developer_agent_live(
                     "invoke.end",
                     round=approval_rounds,
@@ -1001,7 +1129,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 for request in pending_requests
             ],
             "completed": len(pending_requests) == 0,
+            **({"tool_trace": tool_trace, "usage": usage} if include_tool_trace else {}),
         }
+
+    @app.post("/internal/developer/agent/run")
+    async def run_developer_agent(
+        payload: dict[str, Any],
+        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    ) -> dict[str, Any]:
+        async with AsyncExitStack() as tool_stack:
+            return await _run_developer_agent(payload, x_internal_token, tool_stack)
 
     @app.get("/internal/escalations")
     def list_escalations(

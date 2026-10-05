@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from importlib import import_module
 from importlib.util import find_spec
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
 
-from azure.identity import DefaultAzureCredential
+from agent_framework import (
+    CompactionProvider, ContextWindowCompactionStrategy, FileHistoryProvider, FileMemoryProvider,
+    FileSystemAgentFileStore,
+)
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from openai import AsyncOpenAI
 
 from aitobuild.agents import AgentSpec, default_agent_specs
 from aitobuild.config import RuntimeConfig
@@ -27,6 +34,7 @@ class FrameworkBindings:
     foundry_chat_client_class: type[Any] | None = None
     agent_class: type[Any] | None = None
     group_chat_builder_class: type[Any] | None = None
+    openai_chat_completion_client_class: type[Any] | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -74,6 +82,9 @@ def detect_framework_bindings() -> FrameworkBindings:
         foundry_chat_client_class=foundry_chat_client_class,
         agent_class=agent_class,
         group_chat_builder_class=group_chat_builder_class,
+        openai_chat_completion_client_class=_try_get_class(
+            "agent_framework.openai", "OpenAIChatCompletionClient"
+        ),
     )
 
 
@@ -91,6 +102,7 @@ def bootstrap_runtime(
     config: RuntimeConfig,
     *,
     role_tools: dict[str, tuple[Callable[..., Any], ...]] | None = None,
+    developer_state_dir: Path | None = None,
 ) -> RuntimeBootstrap:
     bindings = detect_framework_bindings()
     availability = FrameworkAvailability(
@@ -98,6 +110,21 @@ def bootstrap_runtime(
         agent=bindings.agent_class is not None,
         group_chat_builder=bindings.group_chat_builder_class is not None,
     )
+
+    if config.foundry_endpoint and config.foundry_endpoint.rstrip("/").endswith("/openai/v1"):
+        client = _construct_openai_client(bindings=bindings, config=config)
+        return RuntimeBootstrap(
+            mode="openai",
+            availability=availability,
+            bindings=bindings,
+            client=client,
+            role_agents=_build_role_agent_handles(
+                default_agent_specs(), client=client, agent_class=bindings.agent_class,
+                role_tools=role_tools, developer_state_dir=developer_state_dir,
+            ),
+            meeting_workflows={},
+            role_tools=role_tools or {},
+        )
 
     if availability.foundry_chat_client and config.foundry_endpoint:
         try:
@@ -116,6 +143,7 @@ def bootstrap_runtime(
                     client=client,
                     agent_class=bindings.agent_class,
                     role_tools=role_tools,
+                    developer_state_dir=developer_state_dir,
                 ),
                 meeting_workflows={},
                 role_tools=role_tools or {},
@@ -144,6 +172,27 @@ def bootstrap_runtime(
     )
 
 
+def _construct_openai_client(*, bindings: FrameworkBindings, config: RuntimeConfig) -> Any:
+    client_class = bindings.openai_chat_completion_client_class
+    if client_class is None:
+        raise RuntimeError("OpenAIChatCompletionClient unavailable; run uv sync")
+    token_provider = get_bearer_token_provider(
+        DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
+    )
+
+    async def async_token_provider() -> str:
+        return await asyncio.to_thread(token_provider)
+
+    api_key = config.foundry_api_key or async_token_provider
+    return client_class(
+        model=config.foundry_model,
+        function_invocation_configuration={"include_detailed_errors": True},
+        async_client=AsyncOpenAI(
+            base_url=config.foundry_endpoint, api_key=api_key, max_retries=1,
+        ),
+    )
+
+
 def _construct_foundry_client(*, bindings: FrameworkBindings, config: RuntimeConfig) -> Any:
     endpoint = config.foundry_endpoint
     if endpoint is None:
@@ -164,6 +213,7 @@ def _construct_foundry_client(*, bindings: FrameworkBindings, config: RuntimeCon
         project_endpoint=endpoint,
         model=config.foundry_model,
         credential=DefaultAzureCredential(),
+        function_invocation_configuration={"include_detailed_errors": True},
     )
 
 
@@ -173,33 +223,43 @@ def _build_role_agent_handles(
     client: Any,
     agent_class: type[Any] | None,
     role_tools: dict[str, tuple[Callable[..., Any], ...]] | None,
+    developer_state_dir: Path | None = None,
 ) -> dict[str, Any]:
     handles: dict[str, Any] = {}
     tools_by_role = role_tools or {}
     for spec in specs:
         tools = list(tools_by_role.get(spec.role.value, ()))
         if agent_class is not None:
-            if tools:
-                try:
-                    handles[spec.role.value] = agent_class(
-                        client=client,
-                        name=spec.name,
-                        instructions=spec.instructions,
-                        tools=tools,
-                    )
-                    continue
-                except Exception:
-                    pass
-
+            options: dict[str, Any] = {}
+            if spec.role.value == "developer" and developer_state_dir is not None:
+                options = {
+                    "context_providers": [
+                        FileHistoryProvider(developer_state_dir / "history", skip_excluded=True),
+                        FileMemoryProvider(
+                            FileSystemAgentFileStore(developer_state_dir / "memory"),
+                        ),
+                        CompactionProvider(
+                            history_source_id="file_history",
+                            before_strategy=ContextWindowCompactionStrategy(
+                                max_context_window_tokens=32000, max_output_tokens=4096,
+                                keep_last_tool_call_groups=4, preserve_first_user_group=True,
+                            ),
+                        ),
+                    ],
+                    "default_options": {"store": False, "max_tokens": 4096},
+                    "require_per_service_call_history_persistence": True,
+                }
             try:
                 handles[spec.role.value] = agent_class(
                     client=client,
                     name=spec.name,
                     instructions=spec.instructions,
+                    tools=[] if spec.role.value == "developer" else tools,
+                    **options,
                 )
                 continue
-            except Exception:
-                pass
+            except Exception as error:
+                raise RuntimeError(f"Failed to bind {spec.role.value} agent with its tools") from error
 
         handles[spec.role.value] = {
             "name": spec.name,

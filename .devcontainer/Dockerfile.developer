@@ -1,0 +1,26 @@
+FROM mcr.microsoft.com/devcontainers/python:3-3.14-trixie
+
+USER root
+
+COPY --from=ghcr.io/astral-sh/uv:0.12.12 /uv /uvx /usr/local/bin/
+COPY .devcontainer/certs/ /tmp/aitobuild-bootstrap/.devcontainer/certs/
+COPY .devcontainer/import-certs.sh /tmp/aitobuild-bootstrap/.devcontainer/import-certs.sh
+
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+
+RUN WORKSPACE_FOLDER=/tmp/aitobuild-bootstrap \
+    bash /tmp/aitobuild-bootstrap/.devcontainer/import-certs.sh \
+    && rm -rf /tmp/aitobuild-bootstrap \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends git curl nodejs npm chromium tmux ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && uv --system-certs pip install --system pytest==9.0.3 ruff==0.15.10 mypy==1.20.0 psutil==7.2.2 \
+    && npm install --global @playwright/mcp@0.0.83
+
+COPY src/aitobuild/tools/shell_runtime.py /opt/aitobuild/shell_runtime.py
+
+WORKDIR /workspace
+USER vscode

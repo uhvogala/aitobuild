@@ -105,7 +105,7 @@ These items describe code and local test coverage, not production certification.
 - Shared escalation route and sink model with pluggable destinations.
 - Internal endpoint authentication with `X-Internal-Token`.
 - Mock-first adapters and policy guardrails for role/action restrictions.
-- Runtime bootstrap with Foundry-first and mock fallback mode.
+- Runtime bootstrap with Foundry project and Azure OpenAI v1 chat-completions clients; live evaluations disable mock fallback.
 - Runtime binding abstraction for Agent Framework classes with optional concrete `Agent` instantiation.
 - `meeting.bootstrap` runtime kickoff hook that attempts native `GroupChatBuilder` workflow construction and safely falls back to mock startup when unavailable.
 - Proactive Architect scan workflow output contract with structured findings and issue proposal suggestions.
@@ -114,14 +114,18 @@ These items describe code and local test coverage, not production certification.
 - Practical Developer run harness with dry-run/live modes and policy-enforced command/path checks.
 - Configurable Developer execution backend (`mock` or `subprocess`) with CLI command timeout controls.
 - Persistent container-session execution mode for Developer runs (single container per session with start/stop lifecycle).
-- Agent Framework role-tool wiring using `Agent(..., tools=[...])` for Developer command/file/session operations.
+- Session-bound Developer tool wiring using native per-run tools for files, terminal jobs, processes and optional browser MCP.
 - MCP-backed Developer command/filesystem adapters with explicit fail-fast behavior (no local fallback in MCP mode).
 - Developer Agent diagnostics endpoint (`/internal/runtime/developer-agent`) for runtime readiness, tool inventory, and session support visibility.
-- Developer Agent run endpoint (`/internal/developer/agent/run`) with optional session creation and in-call auto-approval replay. Manual HTTP approval replay and persistent native session continuation are not implemented.
+- Developer Agent run endpoint (`/internal/developer/agent/run`) with persistent native sessions/history/memory, same-session concurrency protection and in-call auto-approval replay. Manual HTTP approval replay remains pending.
 - Capability audit matrix for reuse/wrap/custom decisions.
 - Host certificate export and pre-feature dev container trust bootstrap, with generated certificates excluded from Git.
 - Local subprocess simulation repaired to use uv-installed pytest, with explicit success reporting and nonzero failure exits.
-- Verification on 2026-10-05: `ruff` and `mypy src` pass; `pytest` reports 104 passed and two failures in patch-repair tests. The 16 certificate regression tests and three smoke tests pass. A clean test baseline remains a prerequisite for a working-system milestone.
+- Agent-driven fixture evaluations record tool coverage, artifact correctness, errors, latency and token/cache usage for deployed Grok/Kimi models. Oversized tool results spill to private files with paged retrieval; oversized prompts are rejected before invocation.
+- Targeted edits use structured exact-text replacement with unique-match rejection; legacy free-form patch parsing is opt-in. Focused same-task Grok/Kimi editing probes pass with zero tool errors and independent pytest verification.
+- Ripgrep-backed file discovery and literal/regex content search use allowed private roots, ignore-aware glob filtering and bounded pagination. Focused Grok/Kimi search probes pass with zero errors and unchanged fixture source.
+- Preview command defaults cover common interpreters, package managers, Git, builds, shell scripts and filesystem utilities. Explicit task-specific policies remain supported; token-prefix matching is not a security boundary and does not govern native-agent command tools.
+- Verification on 2026-10-05: 180 tests pass, `ruff` and `mypy src` pass. CI enforcement and a zero-unexpected-error full live evaluation remain milestone acceptance requirements.
 
 ### Current Limits
 
@@ -146,7 +150,7 @@ These items describe code and local test coverage, not production certification.
 - Formalize `approval_required` as an explicit workflow transition state across adapters and dispatcher decisions.
 - Enforce the existing isolation contract consistently across preview runs, native agent tools, and container execution.
 - Persist task, dedupe, approval, and session state and define retry/recovery behavior.
-- Restore the two failing patch-repair tests without weakening strict patch acceptance checks.
+- Retain exact-edit and legacy patch regressions without weakening unique-match rejection; extend real-model editing acceptance beyond the focused fixture probe.
 
 ### Next Execution Order
 

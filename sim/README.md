@@ -75,9 +75,13 @@ Sandbox directories are retained for inspection, not deleted automatically.
 ## Docker Sessions
 
 Prerequisites: Docker daemon access, a host-visible bind mount path, and a
-session image containing Python and pytest. The checked-in session configuration
-selects `python:3.14-slim`, which does **not** include pytest. Prepare an image
-with its toolchain and CA trust before attempting the session acceptance check.
+session image containing Python and pytest. Build the checked-in prepared image:
+
+```bash
+docker build -f .devcontainer/Dockerfile.developer -t aitobuild-developer:local .
+```
+
+This includes Python tooling, ripgrep, tmux, psutil, Node.js and Chromium/Playwright MCP.
 Use `uv` for installing Python tools in that image; do not depend on host `.venv`
 packages being available inside the session container. Dev container CA trust
 is not automatically inherited by a separate session image.
@@ -111,8 +115,8 @@ fixture and trusted prompts; native command policies and manual approval/session
 continuation still have gaps. `--auto-approve-agent-tools` grants tool approvals
 without per-call human review and is not suitable for untrusted tasks.
 
-1. Use [sim/.env.simulation.live.example](.env.simulation.live.example) for an ignored local env file; set the real Foundry project endpoint/model, disable mock fallback, and select your prepared session image.
-2. Authenticate with Entra credentials (for example, `az login` directly in your terminal). Keep `AITOBUILD_FOUNDRY_API_KEY` unset; the configured runtime uses `DefaultAzureCredential`.
+1. Use [sim/.env.simulation.live.example](.env.simulation.live.example) for an ignored local env file; set a Foundry project or Azure `/openai/v1` endpoint, deployment name, and prepared image. Disable mock fallback.
+2. Authenticate with Entra credentials (for example, `az login` directly in your terminal). Project endpoints require Entra; v1 endpoints also permit an API key stored only in an ignored local env file.
 3. Meet the Docker prerequisites above, then run:
 
 ```bash
@@ -157,14 +161,73 @@ If `developer_agent_run.output_text` says `Let me try to start a session first`,
 the model is asking to call the `developer_start_session` tool before continuing.
 If `approval_round_limit_reached=true`, increase `--agent-max-approval-rounds`
 for a fresh run and inspect the retained sandbox before retrying. The current
-HTTP API recreates a native session on each call and cannot reliably replay
-manual approval decisions or resume pending work from a returned `session_id`.
+HTTP API persists native sessions, history and memory by `session_id`, and prevents
+concurrent agent runs with the same identity. Manual HTTP approval replay is still pending.
 An incomplete agent run now makes the simulation fail rather than appearing successful.
 
-Require `runtime_mode=foundry`, `ready_for_run=true`,
+Require `runtime_mode=foundry` or `openai`, `ready_for_run=true`,
 `developer_agent_run.completed=true`, no pending approvals, and actual
 post-edit test evidence. Readiness alone does not prove provider connectivity
 or correct model behavior.
+
+## Agent Tool Evaluation
+
+[evaluate_tools.py](evaluate_tools.py) reuses the copied-fixture simulation and
+native Developer API. It makes billable model calls and auto-approves tools only
+inside disposable Developer workspaces. It does not validate GitHub delivery.
+
+```bash
+uv run python -m sim.evaluate_tools --model grok-4.6 \
+  --output sim/.run-artifacts/grok-tool-evaluation.json
+uv run python -m sim.evaluate_tools --model Kimi-K2.7-Code \
+  --invoke-timeout 360 --output sim/.run-artifacts/kimi-tool-evaluation.json
+```
+
+The default env file is the live example with the deployed Azure v1 endpoint.
+Use `--env-file` for ignored local overrides. Use `--no-browser` to explicitly
+exclude browser coverage; `--recovery` injects exactly one expected stale-text edit error.
+Normal runs require zero unexpected tool errors, even if a retry later succeeds.
+
+Eight stages cover file editing and independent pytest verification, detached
+terminals/input/process signals, all seven native memory tools, app restart,
+large-output paging, all 14 browser tools, Developer isolation and session stop.
+Reports include tool traces, required/missing coverage, artifact checks, errors,
+approval rounds, elapsed time and provider token/cache usage. Repeated tool calls
+include legitimate reads and lifecycle operations, not just retries. Provider
+timeouts/rate limits and incomplete approvals fail the stage without being
+misrepresented as successful tool execution. Reports are saved after each stage.
+
+The 2026-10-05 Kimi run passed 6/8 stages with 83% recorded tool coverage and
+successful cleanup. Its recovered context-free patch and native-memory timeout
+failed strict acceptance. Timeout responses currently omit partial traces/usage;
+coverage and token totals can therefore undercount that stage. Earlier Grok
+reports used an older harness and are not a controlled model comparison.
+
+The default editing contract is now `developer_edit_file(path, old_text, new_text)`:
+an exact unique replacement, not model-generated patch syntax. The legacy parser
+is opt-in only. A focused same-task Grok/Kimi probe on 2026-10-05 passed both models
+on their first edit attempt with zero tool errors, independent fixture pytest
+verification and successful cleanup. The full suite has not been rerun with
+this contract; historical patch failures remain in their original reports.
+
+The file stage now also requires `developer_find_files` and `developer_search_files`,
+checking the discovered path and definition line rather than model self-report.
+Focused Grok/Kimi Docker-backed search probes both passed with zero tool errors,
+unchanged source files and successful cleanup. Discovery honors ignore/hidden
+settings before glob filtering; content search is literal by default with opt-in
+Rust regex and case-insensitive matching. Pages have at most 100 entries, a bounded
+byte budget and `next_offset`; line previews are limited to 400 UTF-8 bytes.
+Content search skips files over 1 MiB. Queries have a 15-second budget and stay
+within the Developer's policy-allowed private checkout; this is not hardened isolation.
+
+Results over 6,000 UTF-8 bytes, oversized errors and tool media are saved in session-private files;
+only a bounded preview/output ID reaches the model. `developer_read_output`
+retrieves up to 4,000 bytes per page (2,000 default). Command logs remain in the
+private persistent home. Prompts over 32,000 UTF-8 bytes return HTTP 413 before
+model invocation. Native `FileHistoryProvider`, `FileSessionStore`, file memory
+and history-aware compaction retain task state; chat completions still sends
+relevant history, with provider-side prefix caching where available. These
+limits are conservative context guards, not a hardened sandbox or secret store.
 
 ## MCP Status
 

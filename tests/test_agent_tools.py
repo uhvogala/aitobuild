@@ -11,21 +11,119 @@ from aitobuild.tools.bash import BashResult
 from aitobuild.tools.bash import ContainerSessionBashAdapter
 
 
-def _developer_tools(tmp_path: Path):
+def _developer_tools(tmp_path: Path, *, legacy_patch: bool = True, include_search: bool = False):
     context = DeveloperToolContext(
         bash_adapter=MockBashAdapter(),
         filesystem_adapter=MockFilesystemAdapter(),
         workspace_root=tmp_path,
         require_human_approval_for_repo_writes=False,
         container_session_adapter=None,
+        use_legacy_patch_tool=legacy_patch,
     )
     role_tools = build_role_tools(context=context)
-    return role_tools["developer"]
+    tools = role_tools["developer"]
+    return tools if include_search else tools[:6]
 
 
 def test_build_role_tools_includes_developer_toolset(tmp_path: Path) -> None:
-    tools = _developer_tools(tmp_path)
-    assert len(tools) == 6
+    tools = _developer_tools(tmp_path, legacy_patch=False, include_search=True)
+    assert len(tools) == 8
+    names = {tool.name for tool in tools}
+    assert "developer_edit_file" in names
+    assert "developer_apply_patch" not in names
+    assert {"developer_find_files", "developer_search_files"} <= names
+
+
+def test_patch_tool_schema_example_is_literal_and_executable(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    target = tmp_path / "src/example.py"
+    target.write_text("old = 1\n")
+    apply_patch = _developer_tools(tmp_path)[3]
+    example = apply_patch.description.split("Example patch argument inserting after one unique line:\n", 1)[1]
+    assert apply_patch(patch=example)["applied"]
+    assert target.read_text() == "old = 1\nnew = 2\n"
+
+
+@pytest.mark.parametrize("original, old_text, new_text, expected", [
+    ("old = 1\n", "old = 1\n", "old = 1\nnew = 2\n", "old = 1\nnew = 2\n"),
+    ("keep\nremove\nend", "remove\n", "", "keep\nend"),
+    ("alpha\r\nbeta\r\n", "beta", "gamma", "alpha\r\ngamma\r\n"),
+    ("alpha\nlast", "last", "changed", "alpha\nchanged"),
+    ("@@\n+literal\n", "+literal", "-literal", "@@\n-literal\n"),
+])
+def test_structured_edit_preserves_surrounding_text(
+    tmp_path: Path, original: str, old_text: str, new_text: str, expected: str,
+) -> None:
+    (tmp_path / "src").mkdir()
+    target = tmp_path / "src/example.txt"
+    target.write_bytes(original.encode())
+    edit = _developer_tools(tmp_path, legacy_patch=False)[3]
+    assert edit.name == "developer_edit_file"
+    assert edit(path="src/example.txt", old_text=old_text, new_text=new_text)["replacement_count"] == 1
+    assert target.read_bytes() == expected.encode()
+
+
+@pytest.mark.parametrize("original, old_text", [
+    ("alpha\nbeta\n", "stale"),
+    ("alpha\nalpha\n", "alpha"),
+    ("aaa", "aa"),
+    ("alpha", ""),
+])
+def test_structured_edit_rejects_invalid_anchors_without_writing(
+    tmp_path: Path, original: str, old_text: str,
+) -> None:
+    (tmp_path / "src").mkdir()
+    target = tmp_path / "src/example.txt"
+    target.write_text(original)
+    edit = _developer_tools(tmp_path, legacy_patch=False)[3]
+    with pytest.raises(ValueError):
+        edit(path="src/example.txt", old_text=old_text, new_text="changed")
+    assert target.read_text() == original
+
+
+@pytest.mark.parametrize("path", ["/src/example.txt", "../example.txt", "secrets/example.txt"])
+def test_structured_edit_rejects_unscoped_paths(tmp_path: Path, path: str) -> None:
+    edit = _developer_tools(tmp_path, legacy_patch=False)[3]
+    with pytest.raises(ValueError, match="workspace-relative|traverse|outside"):
+        edit(path=path, old_text="old", new_text="new")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_structured_edit_uses_mcp_backend_without_bypassing_approval(tmp_path: Path, approved: bool) -> None:
+    class MemoryMCPAdapter:
+        def __init__(self) -> None:
+            self.content = "old = 1\r\n"
+            self.reads = 0
+            self.writes = 0
+
+        def read_file(self, *, session_id: str, path: str) -> str:
+            assert (session_id, path) == ("dev-one", "src/example.txt")
+            self.reads += 1
+            return self.content
+
+        def write_file(self, *, session_id: str, path: str, content: str) -> None:
+            assert (session_id, path) == ("dev-one", "src/example.txt")
+            self.writes += 1
+            self.content = content
+
+    adapter = MemoryMCPAdapter()
+    context = DeveloperToolContext(
+        bash_adapter=MockBashAdapter(), filesystem_adapter=MockFilesystemAdapter(),
+        workspace_root=tmp_path, require_human_approval_for_repo_writes=True,
+        enable_mcp_adapters=True, mcp_tool_adapter=adapter,  # type: ignore[arg-type]
+        bound_session_id="dev-one",
+    )
+    edit = build_role_tools(context=context)["developer"][3]
+    if approved:
+        assert edit("src/example.txt", "old = 1", "old = 2", approved=True)["applied"]
+        assert adapter.content == "old = 2\r\n"
+        assert (adapter.reads, adapter.writes) == (1, 1)
+    else:
+        with pytest.raises(PermissionError, match="approval"):
+            edit("src/example.txt", "old = 1", "old = 2", approved=False)
+        assert adapter.content == "old = 1\r\n"
+        assert (adapter.reads, adapter.writes) == (0, 0)
 
 
 def test_developer_tool_read_write_roundtrip(tmp_path: Path) -> None:
@@ -116,7 +214,7 @@ def test_developer_tools_auto_create_and_reuse_container_session(tmp_path: Path)
         container_session_adapter=container_adapter,  # type: ignore[arg-type]
     )
 
-    run_command, _read_file, _write_file, _apply_patch, start_session, _stop_session = build_role_tools(
+    run_command, _read_file, _write_file, _apply_patch, start_session, _stop_session, *_search_tools = build_role_tools(
         context=context
     )["developer"]
 
@@ -170,7 +268,7 @@ def test_developer_tools_reuse_existing_single_container_session(tmp_path: Path)
         container_session_adapter=container_adapter,  # type: ignore[arg-type]
     )
 
-    run_command, _read_file, _write_file, _apply_patch, _start_session, _stop_session = build_role_tools(
+    run_command, _read_file, _write_file, _apply_patch, _start_session, _stop_session, *_search_tools = build_role_tools(
         context=context
     )["developer"]
 
@@ -179,6 +277,52 @@ def test_developer_tools_reuse_existing_single_container_session(tmp_path: Path)
     assert result["exit_code"] == 0
     assert container_adapter.created == []
     assert bash_adapter.session_ids == ["existing-session"]
+
+
+@pytest.mark.parametrize("container_mode", [False, True])
+def test_bound_developer_tools_use_private_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, container_mode: bool,
+) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "note.txt").write_text("seed", encoding="utf-8")
+    adapter = ContainerSessionBashAdapter(
+        workspace_root=tmp_path, image="python:3.14-slim",
+        container_workdir="/workspace", container_name_prefix="aitobuild-test",
+    )
+    adapter._prepare_workspace("dev-one")
+    adapter._prepare_workspace("dev-two")
+    monkeypatch.setattr(
+        adapter, "create_session", lambda *, session_id: (session_id, f"container-{session_id}")
+    )
+    toolsets = [
+        build_role_tools(context=DeveloperToolContext(
+            bash_adapter=MockBashAdapter(), filesystem_adapter=MockFilesystemAdapter(),
+            workspace_root=tmp_path, require_human_approval_for_repo_writes=True,
+            container_session_adapter=adapter if container_mode else None, bound_session_id=session_id,
+        ))["developer"]
+        for session_id in ("dev-one", "dev-two")
+    ]
+    first, second = toolsets
+    first[2]("src/note.txt", "first developer", approved=True)
+    second[2]("src/note.txt", "second developer", approved=True)
+    first[3]("src/note.txt", "first developer", "edited first developer")
+    assert first[1]("src/note.txt") == "edited first developer"
+    assert second[1]("src/note.txt") == "second developer"
+    assert (tmp_path / "src" / "note.txt").read_text() == "seed"
+    with pytest.raises(ValueError, match="bound session"):
+        first[2]("src/note.txt", "wrong", session_id="dev-two")
+    with pytest.raises(ValueError, match="bound session"):
+        first[3]("src/note.txt", "second developer", "wrong", session_id="dev-two")
+    if not container_mode:
+        assert first[6](glob="**/note.txt")["results"] == [{"path": "src/note.txt"}]
+        found = first[7](pattern="edited first developer")
+        assert found["results"][0]["path"] == "src/note.txt"
+        assert second[7](pattern="edited first developer")["results"] == []
+        with pytest.raises(ValueError, match="bound session"):
+            first[6](session_id="dev-two")
+    if container_mode:
+        with pytest.raises(ValueError, match="another Developer"):
+            first[5]("dev-two")
 
 
 def test_developer_apply_patch_updates_file(tmp_path: Path) -> None:
@@ -301,6 +445,21 @@ def test_developer_apply_patch_surfaces_missing_plus_hint_when_not_repairable(
         apply_patch(malformed_patch, approved=True)
 
     assert "every inserted line must start with '+'" in str(exc_info.value)
+
+
+def test_developer_apply_patch_rejects_ambiguous_repaired_context(tmp_path: Path) -> None:
+    _run_command, read_file, write_file, apply_patch, _start_session, _stop_session = _developer_tools(
+        tmp_path
+    )
+    original = "alpha\nbeta\nalpha\nbeta\n"
+    write_file("src/example.txt", original, approved=True)
+    patch = "\n".join([
+        "*** Update File: src/example.txt", "@@", "alpha", "-beta", "+gamma",
+        "missing-plus", "+extra",
+    ])
+    with pytest.raises(ValueError):
+        apply_patch(patch, approved=True)
+    assert read_file("src/example.txt") == original
 
 
 def test_developer_apply_patch_accepts_unified_diff_format(tmp_path: Path) -> None:

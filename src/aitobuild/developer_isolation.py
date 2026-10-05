@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from enum import StrEnum
+import re
+import shlex
 from typing import Any
 
 
@@ -44,12 +46,17 @@ def default_developer_isolation_policy() -> DeveloperIsolationPolicy:
         allowed_paths=("src/", "tests/", "README.md", "pyproject.toml"),
         blocked_paths=(".git/", ".venv/", "secrets/"),
         allowed_command_prefixes=(
-            "uv run",
-            "pytest",
-            "ruff",
-            "mypy",
-            "python -m pytest",
-            "python -m pip",
+            "uv", "python", "python3", "pytest", "ruff", "mypy", "coverage",
+            "node", "npm", "npx", "pnpm", "yarn", "corepack", "bun", "deno",
+            "tsc", "eslint", "prettier",
+            "git", "make", "cmake", "ninja", "gcc", "g++", "cc", "c++", "clang", "clang++",
+            "go", "cargo", "rustc", "rustfmt", "dotnet", "java", "javac",
+            "mvn", "gradle", "./mvnw", "./gradlew", "ruby", "bundle", "rake", "php", "composer",
+            "bash", "sh", "env", "timeout", "set", "export", "source", ".", "test", "[", "true", "false",
+            "pwd", "ls", "tree", "find", "rg", "grep", "cat", "head", "tail", "wc",
+            "sort", "uniq", "cut", "tr", "sed", "awk", "xargs", "diff", "file", "stat", "du",
+            "which", "printf", "echo", "mkdir", "cp", "mv", "touch", "tee", "ln",
+            "curl", "wget", "jq", "tar", "zip", "unzip", "gzip", "gunzip", "bzip2", "xz",
         ),
         max_file_changes=12,
         max_runtime_minutes=30,
@@ -185,10 +192,32 @@ def is_path_allowed(path: str, *, policy: DeveloperIsolationPolicy) -> bool:
 
 
 def is_command_allowed(command: str, *, policy: DeveloperIsolationPolicy) -> bool:
-    normalized = command.strip()
-    if not normalized:
+    prefixes: list[list[str]] = []
+    for prefix in policy.allowed_command_prefixes:
+        try:
+            prefix_parts = shlex.split(prefix)
+        except ValueError:
+            continue
+        if prefix_parts:
+            prefixes.append(prefix_parts)
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    command_parts: list[str] = []
+    try:
+        for token in lexer:
+            if not command_parts and "=" in token:
+                name = token.partition("=")[0]
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is not None:
+                    continue
+            command_parts.append(token)
+            if command_parts in prefixes:
+                return True
+            if not any(parts[:len(command_parts)] == command_parts for parts in prefixes):
+                return False
+    except ValueError:
         return False
-    return any(normalized.startswith(prefix) for prefix in policy.allowed_command_prefixes)
+    return False
 
 
 def _normalize_context_file(path: str) -> str:

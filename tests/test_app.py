@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import asyncio
 import hmac
 import json
 from hashlib import sha256
 from types import SimpleNamespace
 from typing import Any
 
+from agent_framework import AgentSession, FileSessionStore
 from fastapi.testclient import TestClient
 import pytest
 
@@ -25,9 +27,7 @@ def _internal_headers(test_config) -> dict[str, str]:
     return {"X-Internal-Token": token}
 
 
-class _FakeSession:
-    def __init__(self, *, session_id: str) -> None:
-        self.session_id = session_id
+_FakeSession = AgentSession
 
 
 class _FakeApprovalRequest:
@@ -61,6 +61,8 @@ class _FakeDeveloperAgent:
 
     async def run(self, messages: Any, *, session: _FakeSession | None = None) -> _FakeRunResult:
         self.calls.append((messages, session.session_id if session is not None else None))
+        if session is not None:
+            session.state["turn_count"] = session.state.get("turn_count", 0) + 1
 
         if not isinstance(messages, str):
             return _FakeRunResult(text="command executed", user_input_requests=[], response_id="resp-2")
@@ -101,6 +103,16 @@ def test_health_endpoint(test_config) -> None:
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+@pytest.mark.parametrize("prompt", ["x" * 32001, "\u4e2d" * 11000], ids=["ascii", "multibyte"])
+def test_oversized_agent_prompt_is_rejected_before_model_call(test_config, monkeypatch, prompt: str) -> None:
+    agent = _FakeDeveloperAgent()
+    client = _create_app_with_fake_agent(test_config, monkeypatch, agent)
+    response = client.post("/internal/developer/agent/run", headers=_internal_headers(test_config),
+                           json={"input": prompt})
+    assert response.status_code == 413
+    assert agent.calls == []
 
 
 def test_webhook_signature_validation(test_config) -> None:
@@ -278,7 +290,11 @@ def test_preview_listing_defaults_to_pending_only(test_config) -> None:
     assert second_id in ids
 
 
-def test_developer_run_dry_run_success_for_approved_preview(test_config) -> None:
+@pytest.mark.parametrize("command", [
+    "uv run pytest", "uv sync", "npm run build", "git diff --stat",
+    "bash scripts/check.sh", "PYTHONPATH=src pytest -q",
+])
+def test_developer_run_dry_run_success_for_approved_preview(test_config, command: str) -> None:
     client = TestClient(create_app(test_config))
     headers = _internal_headers(test_config)
 
@@ -308,7 +324,7 @@ def test_developer_run_dry_run_success_for_approved_preview(test_config) -> None
         json={
             "preview_id": preview_id,
             "dry_run": True,
-            "commands": ["uv run pytest"],
+            "commands": [command],
             "file_writes": [{"path": "tests/sandbox-output.txt", "content": "dry-run"}],
         },
     )
@@ -316,7 +332,7 @@ def test_developer_run_dry_run_success_for_approved_preview(test_config) -> None
     body = run_response.json()
     assert body["accepted"] is True
     assert body["dry_run"] is True
-    assert body["command_outcomes"][0]["command"] == "uv run pytest"
+    assert body["command_outcomes"][0]["command"] == command
     assert body["command_outcomes"][0]["executed"] is False
     assert body["file_write_outcomes"][0]["path"] == "tests/sandbox-output.txt"
     assert body["file_write_outcomes"][0]["executed"] is False
@@ -532,7 +548,7 @@ def test_developer_agent_run_executes_with_auto_approvals(test_config, monkeypat
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     body = response.json()
     assert body["completed"] is True
     assert body["pending_approval_count"] == 0
@@ -555,6 +571,32 @@ def test_app_fails_fast_when_mcp_enabled_without_container_session(test_config) 
     )
 
     with pytest.raises(RuntimeError):
+        create_app(invalid_config)
+
+
+def test_developer_agent_session_survives_app_restart(test_config, monkeypatch: pytest.MonkeyPatch) -> None:
+    first = _create_app_with_fake_agent(test_config, monkeypatch, _FakeDeveloperAgent())
+    response = first.post(
+        "/internal/developer/agent/run", headers=_internal_headers(test_config),
+        json={"input": "First turn", "session_id": "dev-one"},
+    )
+    assert response.status_code == 200, response.text
+    restarted = _create_app_with_fake_agent(test_config, monkeypatch, _FakeDeveloperAgent())
+    response = restarted.post(
+        "/internal/developer/agent/run", headers=_internal_headers(test_config),
+        json={"input": "Second turn", "session_id": "dev-one"},
+    )
+    assert response.status_code == 200
+    restored = asyncio.run(FileSessionStore(test_config.developer.state_dir + "/sessions").get("dev-one"))
+    assert restored is not None
+    assert restored.state["turn_count"] == 2
+
+
+def test_app_fails_fast_when_browser_enabled_without_container_session(test_config) -> None:
+    invalid_config = replace(
+        test_config, developer=replace(test_config.developer, enable_browser=True),
+    )
+    with pytest.raises(ValueError):
         create_app(invalid_config)
 
 

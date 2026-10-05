@@ -24,17 +24,17 @@ mock simulation. Full backlog autonomy is a later goal, not the current state.
 | Local setup | Python 3.14+, uv, certificate bootstrap and 16 certificate tests | Implemented |
 | Ingress/governance | Signed webhooks, internal auth, dedupe, previews, role policy | Implemented, in-memory |
 | Local Developer pipeline | Copied fixture, preview approval, subprocess tests and file write | Verified on 2026-10-05 |
-| Developer model/tool path | Foundry binding, six Developer tools, native run endpoint | Implemented; live validation pending |
-| Persistent Docker sessions | Start/run/stop and prefix-based cleanup | Implemented; fresh integration validation pending |
+| Developer model/tool path | Foundry/v1 clients, private tools, terminal/process/browser and file memory | Live Grok/Kimi evaluations; strict zero-error acceptance pending |
+| Persistent Docker sessions | Private checkouts/home volumes, restart memory/history and scoped cleanup | Live integration evidence; prototype isolation only |
 | MCP shell/filesystem | Native stdio transport adapter, configurable names | Optional; compatibility validation pending |
 | GitHub output | Mock issue-proposal adapter only | Branch/commit/PR delivery missing |
 | Architect/meetings | Metadata scan and GroupChatBuilder construction | Execution and review integration missing |
 | Operations | Manual tick API and capability matrix tests | CI, durable worker/state and tracing missing |
 
-Current gates: **104 tests pass, 2 fail**; Ruff and mypy pass. The failures are
-`test_developer_apply_patch_recovers_missing_plus_inside_addition_block` and
-`test_developer_apply_patch_surfaces_missing_plus_hint_when_not_repairable` in
-[tests/test_agent_tools.py](tests/test_agent_tools.py). They predate this refresh.
+Current gates: **180 tests pass**; Ruff and mypy pass. Both original patch-repair
+failures are fixed, with ambiguous matching still rejected. Live tool evaluations
+check artifact correctness, tool coverage, context guards and zero unexpected
+errors; provider failures/timeouts are visible failures, not waived successes.
 
 The simulation's obsolete pip bootstrap has been replaced with the pytest from
 the uv-managed environment. It now records `succeeded` and exits nonzero for
@@ -44,7 +44,7 @@ local pipeline, not GitHub delivery or production isolation.
 ## Restart Checklist
 
 1. Read this document, then use the [README quick start](README.md#quick-start).
-2. Run `uv sync` and the three quality gates. Do not consider M0 complete while the known failures remain.
+2. Run `uv sync` and the three quality gates. M0 still requires CI enforcement of the green local baseline.
 3. Clear inherited Foundry endpoint/API-key settings and run the [local simulation](sim/README.md#local-baseline).
 4. Require the preview/replay routes, `accepted=true`, zero command exit codes, `generated_file_exists=true`, and `succeeded=true` in the report.
 5. For API-only testing, configure both secrets, start Uvicorn on loopback, and check health plus authenticated Developer readiness. Mock readiness is expected to be false.
@@ -52,11 +52,11 @@ local pipeline, not GitHub delivery or production isolation.
 
 ## M0: Reproducible Baseline
 
-Status: **in progress**. Local setup and subprocess simulation work; two tests
-still fail and no CI workflow is checked in. This blocks acceptance of M1/M2.
+Status: **in progress**. Local tests and quality gates are green; CI enforcement
+remains pending. M1/M2 are not accepted on local evidence alone.
 
 Deliverables:
-- Repair the two patch-repair failures while preserving rejection of ambiguous or unsafe patches.
+- Maintain the repaired patch behavior while preserving rejection of ambiguous or unsafe patches.
 - Run tests, Ruff, and mypy in CI using Python 3.14 and the uv lockfile.
 - Include the fixture simulation and retain its report as a diagnostic artifact.
 - Keep contributor/setup docs accurate and pin reproducible dependencies.
@@ -68,8 +68,9 @@ Exit criteria:
 
 ## M1: Constrained Live Developer Task
 
-Status: **partial implementation, not accepted**. Depends on M0. Runtime/tool
-code exists, but Docker/MCP/live Foundry paths need reproducible evidence.
+Status: **partial implementation, not accepted**. Depends on M0. Prepared Docker,
+native model and optional browser paths have live evidence. Consistent policy
+enforcement, manual approval continuation and zero-error acceptance remain pending.
 
 Deliverables:
 - Prepare a session image with its test toolchain and CA trust; validate bind paths and non-root ownership.
@@ -151,9 +152,9 @@ Exit criteria:
 
 ## Immediate Work Queue
 
-1. Fix and investigate the two patch-repair tests; do not weaken them to make CI green.
+1. Maintain the green exact-text edit and legacy patch regressions; validate broader live editing tasks without weakening unique-match rejection.
 2. Add CI for the verified local path and record the green M0 baseline.
-3. Prepare/test the Developer session image and Foundry connection using the fixture, never the framework repository as a target.
+3. Extend live Developer fixture acceptance beyond the passing focused Grok/Kimi editing probe; never use the framework repository as a target.
 4. Close native-agent policy and approval/session gaps before claiming M1 complete.
 5. Specify the task state machine and GitHub permissions, then implement the smallest issue-to-draft-PR worker for M2.
 

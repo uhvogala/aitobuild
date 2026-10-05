@@ -8,6 +8,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
+from agent_framework import MCPStdioTool
 from aitobuild.policy import ActionClass, AgentRole, assert_repo_write_approval, assert_role_action_allowed
 from aitobuild.tools.bash import BashAdapter, BashResult, ContainerSessionBashAdapter
 from aitobuild.tools.filesystem import FilesystemAdapter
@@ -64,7 +65,7 @@ class MCPDeveloperToolAdapter:
             server_command="@modelcontextprotocol/server-filesystem",
             server_args=[self._filesystem_workdir],
             tool_name=self._filesystem_read_tool_name,
-            kwargs={"path": path},
+            kwargs={"path": f"{self._filesystem_workdir}/{path}"},
         )
 
         parsed = _parse_result_payload(result)
@@ -79,7 +80,7 @@ class MCPDeveloperToolAdapter:
             server_command="@modelcontextprotocol/server-filesystem",
             server_args=[self._filesystem_workdir],
             tool_name=self._filesystem_write_tool_name,
-            kwargs={"path": path, "content": content},
+            kwargs={"path": f"{self._filesystem_workdir}/{path}", "content": content},
         )
 
     def _call_mcp_tool(
@@ -169,7 +170,8 @@ class MCPFilesystemAdapter(FilesystemAdapter):
         if session_id is None or not session_id.strip():
             raise ValueError("session_id is required for MCP filesystem read")
 
-        relative_path = _workspace_relative_path(path=path, workspace_root=self._workspace_root)
+        root = self._mcp_adapter._container_session_adapter.get_workspace_root(session_id)
+        relative_path = _workspace_relative_path(path=path, workspace_root=root)
         return self._mcp_adapter.read_file(session_id=session_id.strip(), path=relative_path)
 
     def write_text(
@@ -190,7 +192,8 @@ class MCPFilesystemAdapter(FilesystemAdapter):
         if session_id is None or not session_id.strip():
             raise ValueError("session_id is required for MCP filesystem write")
 
-        relative_path = _workspace_relative_path(path=path, workspace_root=self._workspace_root)
+        root = self._mcp_adapter._container_session_adapter.get_workspace_root(session_id)
+        relative_path = _workspace_relative_path(path=path, workspace_root=root)
         self._mcp_adapter.write_file(
             session_id=session_id.strip(),
             path=relative_path,
@@ -206,6 +209,34 @@ def _workspace_relative_path(*, path: Path, workspace_root: Path) -> str:
     except ValueError as exc:
         raise ValueError("path is outside workspace root") from exc
     return str(relative).replace("\\", "/")
+
+
+def build_browser_tool(
+    *, container_session_adapter: ContainerSessionBashAdapter,
+    session_id: str, request_timeout_seconds: int,
+) -> MCPStdioTool:
+    container_name = container_session_adapter.get_container_name(session_id=session_id)
+    if container_name is None:
+        raise ValueError("Browser tools require an active Developer container session")
+    return MCPStdioTool(
+        name="developer-browser",
+        command="docker",
+        args=[
+            "exec", "-i", container_name, "playwright-mcp", "--headless",
+            "--executable-path", "/usr/bin/chromium", "--no-sandbox", "--no-webmcp",
+            "--user-data-dir", f"{container_session_adapter.home_dir}/.aitobuild/browser",
+            "--output-dir", f"{container_session_adapter.home_dir}/.aitobuild/browser-output",
+        ],
+        load_prompts=False,
+        approval_mode="always_require",
+        allowed_tools=(
+            "browser_navigate", "browser_navigate_back", "browser_snapshot", "browser_click",
+            "browser_type", "browser_press_key", "browser_select_option", "browser_tabs",
+            "browser_close", "browser_take_screenshot", "browser_resize", "browser_wait_for",
+            "browser_console_messages", "browser_network_requests",
+        ),
+        request_timeout=request_timeout_seconds,
+    )
 
 
 def _run_async(awaitable: Any) -> Any:

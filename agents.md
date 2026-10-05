@@ -57,16 +57,21 @@ Quality gates (from repository root):
 - `uv run ruff check .`
 - `uv run mypy src`
 
-Verification snapshot (2026-10-05): 104 tests pass and two existing patch-repair
-tests fail; Ruff and mypy pass. Treat fixing that baseline as M0 work, not as a
-reason to remove or relax tests. Refresh the milestone snapshot when reverified.
+Verification snapshot (2026-10-05): 180 tests pass; Ruff and mypy pass.
+Live Grok/Kimi tool evaluation remains stricter than tool coverage: require
+artifact correctness, completion, successful cleanup and zero unexpected errors.
 
 Local workflow:
 - Run `uv sync` with Python 3.14+.
 - Use `uv run python sim/run_local_simulation.py --output sim/simulation-report.json`
 	for copied-fixture execution; clear Foundry endpoint/API-key settings for a mock-only run.
 - Require `succeeded=true` and zero command exit codes; do not infer success from HTTP status alone.
-- Real subprocess and non-MCP file operations act on the API process working directory.
+- Session-bound operations use private copied checkouts; unscoped subprocess runs use the API working directory.
+- Use `uv run python -m sim.evaluate_tools --model <deployment>` for live tool evaluations.
+- Models use `developer_edit_file(path, old_text, new_text)` for exact unique-span edits. Legacy patch parsing is opt-in, not a model-facing default; do not repair ambiguous matches or bypass stale edits with whole-file writes.
+- Ripgrep is installed in both images. Use `developer_find_files` for glob discovery and `developer_search_files` for bounded literal/regex content search; prefer narrow paths/globs and reuse `next_offset` only when more results are needed.
+- Preview command defaults cover normal multi-language development and shell workflows; explicit task allowlists remain configurable. Token-prefix checks are an ergonomics filter, not shell isolation, and are separate from native-agent command permissions.
+- Large tool results are spilled to session-private outputs with bounded paging; API prompts over 32,000 UTF-8 bytes are rejected.
 - Keep generated host certificates, reports, sandbox copies, and local credential files out of Git.
 
 ## Dependency Management (uv)
