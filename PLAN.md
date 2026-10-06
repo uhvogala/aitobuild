@@ -5,7 +5,10 @@ The implementation snapshot in section 7 distinguishes available capabilities
 from remaining work. Operational milestones are tracked in [MILESTONES.md](MILESTONES.md).
 
 ## 1. Executive Summary
-This document outlines the architecture for an autonomous, agent-driven software development framework. The system simulates a human product team (Product Manager, Architect, Developer) using Large Language Models operating within the **Microsoft Agent Framework (Python)**. 
+This document outlines a supervised, configurable product-team framework using
+the **Microsoft Agent Framework (Python)**. PM, Architect and Developer are
+initial role templates, not fixed team instances or mandatory workflow stages.
+Humans approve scope and retain merge authority.
 
 To prevent the chaotic, spaghetti-code outputs typical of naive autonomous coding systems, this framework enforces strict role separation and boundaries using two distinct communication paradigms:
 1.  **Asynchronous (GitHub):** The immutable source of truth and state machine.
@@ -22,11 +25,38 @@ To prevent the chaotic, spaghetti-code outputs typical of naive autonomous codin
 ### 2.2 Global Routing: The Dispatcher Pattern
 The system is event-driven. The current implementation uses a deterministic Python dispatcher, not an LLM-based `DispatcherAgent`.
 * **Input:** GitHub Webhooks and authenticated internal triggers through FastAPI.
-* **Logic:** The Dispatcher parses the raw JSON payload, identifies the event type (e.g., "Issue Opened", "Test Failed", "PR Comment"), and invokes the appropriate Agent's isolated asynchronous workflow.
+* **Current behavior:** Dispatch validates and returns task metadata; it does not start an automatic contribution workflow.
+* **Target behavior:** Resolve a versioned configured event route, team and workflow; record a validated assignment before invoking managed execution. PM-led, rule-based and human-selected delegation are selectable strategies, not fixed routing branches.
+
+### 2.3 Configurable Organization and Workflows
+
+Role templates remain permission ceilings; named agent instances are separate
+identities with prompts, optional model-profile references and capacity settings.
+Teams configure members and an optional coordinator. Routes select native workflow
+definitions and eligible delegates. No `skills` labels are part of this schema;
+optional attached skill files are a separate future feature.
+
+Start with JSON organization definitions containing native declarative workflow
+documents. Reuse Agent Framework `WorkflowFactory`/`WorkflowBuilder`, handoffs and
+checkpoints rather than inventing a workflow language. An application-owned
+registry will bind approved service operations; config cannot grant permissions,
+skip verification or expose arbitrary HTTP/MCP/file loading. Native graph/action
+admission must be validated before anything is connected to live execution.
+
+Definitions and execution state have separate storage contracts. Immutable,
+content-addressed definition revisions let new runs adopt updates while existing
+runs pin their approved snapshot. A file-backed definition store comes first;
+a database backend can later implement the same contract. Assignment ownership,
+scope approvals, budget ledgers, side-effect receipts and emergency revocation
+remain enforced independently of workflow configuration.
 
 ## 3. The Agent Roster (Entities & Scopes)
 
 Each agent is an isolated instance of the `Agent` class with specific instructions and constrained tool access (via MCP Plugins).
+
+Configured instance IDs, prompts and model profiles distinguish agents sharing a
+role. Team membership, coordinator and eligible delegates are configuration,
+not role-derived globals. The roles below are reusable templates.
 
 This roster is the target design. Today, role specifications exist for all
 three roles and native toolsets are wired for the Developer, Architect and PM.
@@ -47,7 +77,12 @@ allowlisted `gh_cli` adapter.
 ## 4. Communication & State Management
 
 ### 4.1 Asynchronous Layer (The Default State)
-Agents work in isolation. When the Dispatcher assigns an issue to the Developer Agent, it enters a solitary loop: reading the issue, writing files, and running bash commands. Context is kept minimal and focused solely on the task. The state of the project is entirely managed by the GitHub Kanban board and Git tree.
+Routes choose configured teams and workflows. A coordinator (often a PM), an
+explicit rule or a human proposes a structured assignment to an eligible agent.
+The service validates and records task/revision/ownership/scope before execution;
+a conversational handoff alone does not authorize writes. GitHub holds product
+issues and contribution artifacts; local run/approval/budget/checkpoint state
+tracks execution separately and will need durable backend support.
 
 ### 4.2 Synchronous Layer (The Meeting Engine)
 When isolated agents hit a blocker (e.g., failing tests, ambiguous requirements, or architectural disputes), they trigger the Synchronous Layer using the `request_meeting(agenda, participants)` tool.
@@ -69,25 +104,28 @@ Meetings are strictly bounded to prevent infinite token loops. A meeting termina
 
 ## 5. System Lifecycle & Workflow Example
 
-The following illustrates a complete, end-to-end feature lifecycle:
+The following is one possible configured recipe, not a mandatory pipeline or
+hardcoded organization chart. Its delivery, review and meeting integration is
+not yet operationally complete:
 
 1.  **Trigger:** A human (or PM Agent) opens a new GitHub Epic: "Add Stripe Subscription Billing."
 2.  **Dispatch:** Webhook fires. The `DispatcherAgent` routes the payload to the PM Agent.
 3.  **Planning Sync (Meeting):** The PM Agent recognizes the complexity and calls `request_meeting(agenda="Stripe Integration Planning", participants=["Architect", "Dev"])`.
 4.  **Architectural Scaffold:** The Architect proposes module boundaries without writing implementation files. The PM creates approved implementation issues, and the Developer implements any required interface definitions on a task branch. Architect repository-write access remains disallowed by the current role policy.
-5.  **Execution (Async):** The Dispatcher routes Issue #1 to the Developer Agent. The Developer uses the Filesystem and Bash MCP tools to write the implementation and run unit tests.
+5.  **Execution (Async):** Configured delegation selects an eligible implementer for Issue #1. The approved workflow binds isolated preparation, implementation, independent verification and draft publication operations.
 6.  **Code Review (Async -> Sync):** The Developer opens a PR. The Dispatcher routes this to the Architect Agent. The Architect uses a Bash MCP tool to run `npm run lint` and `npm test` against the PR branch. 
-    * *If Pass:* Architect approves via GitHub MCP. PR is merged.
-    * *If Fail:* Architect leaves inline comments. If the Developer fails to fix the issues after 2 attempts, the Orchestrator forces a 1:1 "Code Review Sync" meeting to resolve the dispute.
+    * *If Pass:* A head-pinned review is recorded; human approval and merge authority remain separate. Current published-delivery reviews are COMMENT-only.
+    * *If Fail:* The configured workflow requests a scoped correction or escalates to a bounded meeting/human. Retry limits and meeting participants are configured, not a fixed two-attempt/1:1 rule; changed scope still requires approval.
 7.  **Completion:** Once all issues linked to the Epic are closed, the PM agent asynchronously updates the main Epic and pings the human overseer.
 
 ## 6. Implementation Phasing
 
 * **Phase 1: Foundation.** Set up the Python FastAPI webhook server, the `DispatcherAgent`, and integrate the Microsoft Agent Framework.
-* **Phase 2: Tooling.** Configure the off-the-shelf MCP Servers (GitHub, Bash, Filesystem) and wrap them as standard plugins for the agents.
-* **Phase 3: The Async Loop.** Implement the Developer workflow (Issue assignment -> File modification -> PR generation) without the Architect.
-* **Phase 4: The Sync Engine.** Implement `GroupChatBuilder` for code review disputes (Architect + Dev) with strict termination conditions.
-* **Phase 5: Full Autonomy.** Introduce the PM Agent and allow the system to ingest raw text prompts and manage its own backlog end-to-end.
+* **Phase 2: Definitions.** Versioned organization/workflow configuration, file-backed immutable revisions and a DB-ready storage contract. No `skills` labels.
+* **Phase 3: Factories and Delegation.** Configurable agent identities/model/tool profiles, validated native operation bindings and persisted coordinator/rule/human assignments.
+* **Phase 4: Managed Workflows.** Native orchestration/checkpoints connecting approved delivery operations, pinned revisions, bounded recovery and independent verification. Validate the first issue-to-draft recipe, not a hardcoded universal loop.
+* **Phase 5: Review and Coordination.** Configured review/fix/meeting recipes and managed scheduling with durable state and escalation.
+* **Phase 6: Supervised Pilot.** Broaden PM backlog/planning and proactive proposals after delivery/recovery gates pass; evaluate before expanding autonomy.
 
 ## 7. Implementation Snapshot (2026-10-06)
 
@@ -95,6 +133,7 @@ The following illustrates a complete, end-to-end feature lifecycle:
 
 These items describe code and local test coverage, not production certification.
 
+- Organization definition library: strict schema version 1 JSON with stable agent/team/workflow/route IDs, prompts, optional model-profile references, capacity declarations and coordinator/rule/human delegation configuration; no skills or permission grants. File-backed `DefinitionStore` saves canonical SHA-256-addressed immutable snapshots with locked atomic/fsynced writes and integrity checks. Example native declarative document loads with pinned SDK 1.20; no live activation or full graph admission is implemented.
 - Unified trigger model with webhook and internal event normalization.
 - FastAPI ingress endpoints: `/health`, `/webhook`, `/internal/triggers`, `/internal/scheduler/tick`.
 - FastAPI internal developer preview endpoints: `/internal/developer/preview` and `/internal/developer/preview/approve`.
@@ -136,12 +175,14 @@ These items describe code and local test coverage, not production certification.
 - Verification on 2026-10-05: 325 tests pass with both real Docker probes enabled (323 plus two skips normally); `ruff`, `mypy src` and the mock copied-fixture simulation pass. Native SDK approval replay regressions use mocked transport. Actual independent Docker pytest success/failure both preserve evidence and clean up; Developer tests passing alone cannot certify a delivery. Prior M1 Grok/Kimi acceptance is preserved by regressions, not rerun. M2 extraction, preparation, native implementation and independent verification are connected; the supervised example-repository Grok trial below now provides live evidence for this slice. GitHub task-result publication and hosted CI for the slice remain pending; full standalone tool coverage is not certified.
 - Integrated baseline verification on 2026-10-06 at `740b385`: **347 passed, two optional Docker probes skipped**, Ruff passes, and mypy passes for 37 source files. Focused role/delivery/policy tests: 105 passed/two skipped. This gate run did not repeat live models, real Docker probes or hosted CI, and passing regressions do not waive the reproduced publication findings below.
 - Publication-fix verification on 2026-10-06: **364 passed, two optional Docker probes skipped**, `uv run ruff check .`, `uv run mypy src` (37 source files) and whitespace checks pass. Regressions cover content/mode/removal after capture, missing PR/head receipts, uncertain ref creation, remote drift/denied lookup, expiry and terminal failed-budget replay. No live publication/model trial or hosted CI was repeated.
+- Configurable-definition foundation verification on 2026-10-06: **396 passed, two optional Docker probes skipped**, Ruff, mypy (38 source files) and whitespace checks pass. Definition tests cover multiple instances per role, native example compatibility, configurable delegation, invalid versions/fields/references, immutable/canonical revisions, reload, concurrency, tampering and interrupted-save recovery. No automatic routing/runtime activation or external trials were added.
 
 ### Current Limits
 
+- Organization definitions/store are not wired into runtime bootstrap or dispatch. Profile resolution, native action/reference admission, persisted assignments, managed runner and active-run revision pinning are next; stored revisions are not approvals. The existing runtime still has one handle per role. Capacity is declared, not enforced. Native document shape validation is not graph validation or a security admission gate.
 - `developer.async.webhook` returns a task bundle; no worker consumes it automatically.
 - Supported repository issue events produce target-specific bundles and require approval-time base SHA pinning. Checkout preparation validates membership in the explicitly configured local seed/base branch, not live GitHub repository identity or remote freshness. No automatic remote lookup/fetch occurs. Legacy fixture payloads without repository context retain prototype routing; unsupported repository webhook events and missing issue criteria are rejected.
-- GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions. Live acceptance remains pending. The CLI is not installed in the current service container. No live task-result publication has been tested.
+- GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions at `88720aa`. Live acceptance remains pending. The operator installed checksum-verified `gh` 2.102.0 locally for the fresh trial and verified `uhvogala` on github.com; this is not a default image dependency. No live task-result publication has been tested.
 - PM draft/write-approval stores remain in memory; restart loses those records. Architect/PM tool binding is implemented, but managed role run/resume and automatic published-target review orchestration are not wired into the HTTP workflow. Published-PR reads expose metadata and filenames, not a reviewable diff or target file content.
 - Meetings construct workflows without executing them, and proactive scans interpret supplied metadata rather than inspecting a repository.
 - Scheduler ticks require an external caller; meeting/scheduler state and non-repository trigger dedupe remain in memory. Previews, approvals and repository issue task/delivery identities persist locally. `dispatched` records metadata routing, not worker completion; inspect the saved queue after restart. Distributed coordination and full lifecycle auditing remain pending.
@@ -166,9 +207,19 @@ These items describe code and local test coverage, not production certification.
 - **P2, remote side-effect recovery, fixed locally:** missing PR numbers now reconcile the same repository/head/base open draft; missing head receipts reconcile only an exact tree, approved base parent and commit message. Unknown or mismatched refs are not overwritten. Interrupted `publishing` uses the original valid budget; terminal `failed` returns its retained receipt without restoring or replaying an aborted budget. Regressions include uncertain ref success, local receipt-save failure, ready/closed PR refusal, drift and expiry. See [GitHub adapter](src/aitobuild/tools/github.py) and [publication regressions](tests/test_dispatcher.py).
 - Next supervised trial should cover a fresh approved issue through implementation, verification, draft publication and head-bound COMMENT review, after `gh` authentication/hosting/allowlist are checked. The previous trial explicitly prohibited task-result publication and its deadline must not be renewed; require new explicit approval. No self-merge. Full M2/M3 acceptance remains open.
 
+### Supervised Publication Attempt (2026-10-06)
+
+- Human explicitly approved a fresh multiply issue, one task branch/commit and one draft PR after independent verification; no merge, Architect review or service push. Created [issue #2](https://github.com/uhvogala/aitobuild_example/issues/2) at the unchanged baseline `f54d7dd42960d208d04fa1058ec333401c73eef5`. Both previous tasks/budgets were left untouched. GitHub CLI hosting, owner identity, repository ID, push permission and single-repository allowlist were checked first; credentials stayed inside the operator process.
+- New preview `dp-804107c6-bbc7-4836-ac66-89411433405b` used separate state/session and constrained Grok execution. About 54.6 seconds, 13 approval rounds and 14 tool calls. Exactly the two approved files changed, existing `add` stayed unchanged, and Developer plus independent verification each passed **5 tests**, integer exit **0**, with successful cleanup and unchanged deadline/reservations.
+- **Incorrect supervisor gate stopped publication:** the first `developer_edit_file` added a trailing newline to `old_text` absent from the baseline and read-tool result. Exact matching correctly rejected it without writing; the model reread, fixed the span and completed verified work. The supervisor incorrectly applied the tool-usability evaluation's zero-error criterion to a contribution. Operator clarification: recoverable mistakes are allowed during actual work; acceptance depends on the final outcome, not a flawless trace. Keep errors visible and exact matching unchanged. This was neither duplicate execution nor a reproduced publication defect.
+- Raw [report](sim/.run-artifacts/example-publication-20261006/report.json), [evidence review](sim/.run-artifacts/example-publication-20261006/review.json) and [supervisor abort receipt](sim/.run-artifacts/example-publication-20261006/supervisor-abort.json) are retained. The service's successful `verified` receipt is preserved, but the rejected trial's original budget is now aborted, with identical deadline and reserved paths. No task container remained; trusted seed and remote `master` were unchanged and the repository has no PR. No model/verifier replay or budget reset occurred.
+- Harness finding: a bare grading assertion gave an empty error string, and supervisor-level rejection initially left the verified budget active. The ignored one-off harness now records failed check names and aborts genuinely rejected unpublished budgets; saved-evidence review labels the separate abort receipt without rewriting the raw report. Delivery grading now allows recovered tool errors while requiring completion, correct scoped artifacts, successful final tests/independent verification, cleanup, approval and a valid unchanged budget. Focused checks accept recovered errors and reject incomplete work, invalid artifacts, failed verification and aborted budgets. The previous abort is not undone; future execution needs fresh approved identity. Publication/restart acceptance and M2 remain open.
+
 ### Pending Items
 
-- Trial finding: the GitHub MCP connection targets an enterprise host, while the example repo is on github.com; authenticated repository lookup there returned 404. Explicitly configure hosting/API endpoint and verify identity before publication. Operator bootstrap used github.com access, with credentials kept inside the process.
+- Trial finding: the GitHub MCP connection targets an enterprise host, while the example repo is on github.com; authenticated repository lookup there returned 404. The publication-trial CLI explicitly checked github.com identity and target configuration, with credentials kept inside the process. Repeat host/identity checks for every future trial; the MCP host mismatch remains.
+- Tool-usability finding: preserve EOF termination exactly when constructing `old_text`. Measure this in focused tool evaluations; it is not a delivery blocker when the agent recovers and verifies its work. Do not weaken unique exact-span rejection or reuse the aborted publication trial.
+- Keep tool-usability evaluation separate from contribution acceptance. Zero unexpected errors is an evaluation criterion, not a production gate; unresolved failures, policy violations, missing approval, failed final verification/cleanup and aborted or expired budgets still block delivery.
 - Trial finding: repository issue extraction supplies broad default paths/commands even when criteria specify exact files. Add operator-owned policy narrowing before immutable approval, and validated scope-aware approval handling. Do not replace approved policy afterward or simply auto-approve every tool to reduce the 12-round overhead.
 - Trial harness: validate all presented read/discovery/search/write/command approvals and schema-aware evidence grading before another run. Preserve raw failures and missing-field reporting errors; any new task attempt needs explicit approval and separate durable identity/state, never a reset aborted budget.
 - Validate the pinned Agent Framework/Foundry path with real tool calls, approval handling, and visible binding failures before adding provider support.

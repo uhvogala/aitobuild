@@ -6,7 +6,9 @@ roles, built on Microsoft Agent Framework and FastAPI.
 Current stage: foundation plus a local Developer execution prototype. This is
 not yet an autonomous issue-to-PR service. The next delivery target is one
 approved issue producing a tested draft PR in a disposable repository, with a
-human retaining merge authority.
+human retaining merge authority. Before adding that managed workflow, the current
+focus is configurable organization definitions, agent factories and delegation
+rather than a fixed team structure or hardcoded lifecycle.
 
 ## Start here
 
@@ -16,20 +18,21 @@ human retaining merge authority.
 - [.devcontainer/certs/README.md](.devcontainer/certs/README.md): host certificate setup.
 - [agents.md](agents.md): repository conventions for contributors and coding agents.
 
-## Current status (2026-10-05)
+## Current status (2026-10-06)
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Ingress and routing | Signed webhooks, internal auth, repository issue extraction, durable approvals, target implementation and independent verification | Gated publication |
+| Organization definitions | Versioned JSON, configurable instances/teams/routes/delegation, immutable file-backed revisions | Factories, native graph admission, recorded assignments and managed execution |
+| Ingress and routing | Signed webhooks, internal auth, issue extraction and durable scope approval/dedupe | Configurable assignment routing and automatic task consumption |
 | Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
-| Native model runtime | Foundry binding, Developer invocation and persisted manual approvals | Reproducible live-model acceptance run and consistent task-policy enforcement |
-| GitHub integration | Webhook input and mock issue-proposal adapter | Real issue, branch, commit, and PR operations |
+| Native model runtime | Foundry binding, approved Developer invocation, persistent manual approvals and constrained Grok/Kimi trials | Configurable agent factories and managed PM/Architect execution |
+| GitHub integration | Operator-gated issue writes, verified draft publication and head-pinned COMMENT reviews through allowlisted gh CLI | Live publication acceptance and meaningful source/diff review |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **325 tests pass** with both opt-in prepared-target Docker
-probes enabled; the ordinary gate has 323 passes and two Docker skips. Ruff and
-mypy pass. Docker probes cover independent pytest success/failure and cleanup.
+Verified locally: **396 tests pass**, with two optional prepared-target Docker
+probes skipped; Ruff and mypy (38 source files) pass. The prior 325-test baseline
+included both real Docker probes for independent pytest success/failure and cleanup.
 The original patch-repair
 failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
 sessions, managed terminals/processes, native memory/restart and browser tools
@@ -57,6 +60,37 @@ token/cache usage and artifact checks. Large tool outputs are saved to private
 files with bounded previews and paged retrieval; oversized API prompts are rejected.
 
 ## Quick start
+
+### Organization definition foundation
+
+[config/organization.example.json](config/organization.example.json) describes
+named agents (multiple instances per role), prompts, teams/coordinator, native
+declarative workflow documents and event routes with coordinator/rule/human
+delegation. `model_profile` is an optional operator-profile reference, not inline
+credentials; profile resolution is a later runtime slice. Capacity is currently
+declared only. There are no `skills` labels or configurable permission grants.
+
+Validate and persist an immutable revision through the library API:
+
+```python
+from pathlib import Path
+from aitobuild.organization import FileDefinitionStore, load_organization_definition
+
+definition = load_organization_definition(Path("config/organization.example.json"))
+store = FileDefinitionStore(Path("/tmp/aitobuild-definitions"))
+snapshot = store.save(definition)
+restored = store.get(snapshot.organization_id, snapshot.revision)
+```
+
+Use a trusted service-owned storage directory. Changed definitions create new
+revisions; callers must select a revision explicitly. Storage does not activate
+or approve it. The example workflow is a harmless definition probe, not a delivery
+recipe. Definitions are not yet connected to runtime/dispatch: full native graph
+validation, configurable factories, recorded delegation and managed run/revision
+pinning follow in [MILESTONES.md](MILESTONES.md). Existing execution safeguards
+and endpoints are unchanged.
+
+### API setup
 
 Prerequisites: Python 3.14 or newer, `uv`, and ripgrep (`rg`, 14+). Both checked-in
 container images install ripgrep. Run from the repository root.

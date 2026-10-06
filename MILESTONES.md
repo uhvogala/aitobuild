@@ -6,11 +6,16 @@ Statuses below are evidence-based, not completion estimates or promised dates.
 
 ## Direction
 
-Build a supervised product team, starting with one reliable Developer workflow:
-an approved GitHub issue becomes a tested draft PR in an isolated task checkout.
-Humans approve scope and retain merge authority. Add Architect review and
-bounded meetings next, then PM planning and proactive work after delivery and
-recovery are dependable. Reuse native Microsoft Agent Framework capabilities
+Build a supervised product-team framework with configurable agent instances,
+teams, workflows and delegation. Role templates define permission ceilings, not
+a fixed organization chart. First establish versioned file-backed definitions,
+then configurable factories and recorded assignments, before implementing a
+managed workflow runner. Its first delivery recipe is an approved GitHub issue
+becoming a tested draft PR in an isolated task checkout. PM-led, rule-based or
+human-selected delegation is configurable; PM assignment does not require the
+later full backlog-planning milestone. Humans approve scope and retain merge
+authority. Add review, bounded meetings and proactive recipes without hardcoding
+one universal lifecycle. Reuse native Microsoft Agent Framework capabilities
 before adding orchestration logic; validate against the pinned SDK, not an
 assumed API. MCP is an optional integration path, not a prerequisite for the MVP.
 
@@ -32,6 +37,7 @@ execute task code against the aitobuild service checkout.
 
 | Area | Evidence | Status |
 | --- | --- | --- |
+| Organization definitions | Strict versioned JSON, agent/team/workflow/route references, selectable delegation and immutable file-backed revisions | Definition foundation; runtime, assignment and native graph admission integration pending |
 | Local setup | Python 3.14+, uv, certificate bootstrap and 16 certificate tests | Implemented |
 | Ingress/governance | Signed webhooks, internal auth, dedupe, previews, role policy | Local durable previews/issue-task dedupe; other ingress state in memory |
 | Local Developer pipeline | Copied fixture, preview approval, subprocess tests and file write | Verified on 2026-10-05 |
@@ -42,8 +48,9 @@ execute task code against the aitobuild service checkout.
 | Architect/PM/meetings | Wired role tools, operator-gated PM writes, head-bound COMMENT review, GroupChatBuilder construction | Managed role execution, reviewable target diff, durable PM state and meeting execution pending |
 | Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current local gates after publication fixes: **364 passed, two optional Docker probes skipped**;
-Ruff and mypy (37 source files) pass. The prior 325-test Docker-enabled baseline
+Current local gates with the definition foundation: **396 passed, two optional Docker probes skipped**;
+Ruff and mypy (38 source files) pass. Publication-fix gates previously passed
+with 364 tests. The prior 325-test Docker-enabled baseline
 and supervised example-issue implementation/verification remain historical evidence,
 not live publication acceptance. Both original patch-repair
 failures are fixed, with ambiguous matching still rejected. Live tool evaluations
@@ -58,11 +65,52 @@ local pipeline, not GitHub delivery or production isolation.
 ## Restart Checklist
 
 1. Read this document, then use the [README quick start](README.md#quick-start).
-2. Run `uv sync --locked` and the three quality gates. M0 and the constrained native M1 profile are accepted; continue with M2.
+2. Run `uv sync --locked` and the three quality gates. M0 and the constrained native M1 profile are accepted; continue with the configurable M2 foundation below.
 3. Clear inherited Foundry endpoint/API-key settings and run the [local simulation](sim/README.md#local-baseline).
 4. Require the preview/replay routes, `accepted=true`, zero command exit codes, `generated_file_exists=true`, and `succeeded=true` in the report.
 5. For API-only testing, configure both secrets, start Uvicorn on loopback, and check health plus authenticated Developer readiness. Mock readiness is expected to be false.
-6. Work through M0, then M1 and M2 in order. Keep all live execution in disposable target repositories.
+6. Follow the immediate work queue; preserve accepted M0/M1 gates. Keep all live execution in disposable target repositories.
+
+## M2 Foundation: Configurable Organization and Workflow Definitions
+
+Status: **definition/storage slice implemented; execution integration pending**.
+This foundation precedes automatic issue consumption, not existing operator
+delivery endpoints. Agent roles remain fixed initially; instance IDs, prompts,
+optional model profiles, team membership/coordinator, event routes and delegation
+strategy are configurable. No nominal `skills` metadata is accepted.
+
+Deliverables and acceptance sequence:
+1. Strict versioned JSON definitions and a storage interface with a file-backed
+	implementation. Content-addressed immutable snapshots survive reload; changed
+	definitions create distinct revisions. Unknown fields, ambiguous routes and
+	invalid membership/references fail closed. **Implemented**; example native
+	workflow loads with the pinned SDK. The example is a probe, not delivery.
+2. Configurable agent factories and operator-owned model/tool-profile registries;
+	resolve profile references and bind native actions against an allowlisted
+	operation registry. Validate full native graphs and agent/function references
+	before activation. Config cannot extend role policy or grant arbitrary code,
+	HTTP/MCP access or file imports. **Next**.
+3. Structured delegation records for coordinator/rule/human strategies: task,
+	organization revision, team, eligible selected agent, rationale, scope and
+	ownership. Reject unknown/ineligible agents and capacity/approval violations.
+	Assignment is not a GitHub assignee write. **Pending**.
+4. Managed native workflows with persisted run/assignment/checkpoint references,
+	approvals, cancellation and budgets. New runs pin approved revisions; later
+	config changes cannot silently alter active runs or reset failed budgets.
+	Definitions stay separate from execution state; DB storage can later implement
+	the same definition contract. **Pending**.
+
+Local validation (2026-10-06): `uv run pytest` reports 396 passes/two optional
+Docker skips; `uv run ruff check .` and `uv run mypy src` pass (38 source files).
+Definition tests cover native example compatibility, version/field/reference
+rejection, delegation modes, reload, canonical/concurrent saves, immutable
+revisions, corruption/address rejection and interrupted-save recovery. No live
+models, GitHub writes, real Docker probes or hosted CI were repeated.
+
+The configuration loader/store are library APIs only. They do not activate
+routing, enforce capacity, execute delegation, register model profiles or replace
+the current hardcoded runtime. Runtime pinning is an acceptance criterion for the
+managed-run slice, not a claim about current endpoints.
 
 ## M0: Reproducible Baseline
 
@@ -201,9 +249,23 @@ zero unexpected tool errors and successful cleanup. It did not publish a task
 result. New publication/review paths have no live acceptance evidence; M2 exit
 criteria below are not met.
 
+Fresh publication attempt (2026-10-06, service fixes at `88720aa`): explicitly
+approved issue #2 used new Grok task/state at the unchanged baseline. Scoped
+artifacts and both five-test sessions passed with cleanup, but one model-added
+EOF newline caused an exact-span rejection that the model corrected. The
+supervisor incorrectly used a tool-evaluation zero-error gate and stopped
+publication despite recovered, verified work. Delivery grading now accepts
+recovered mistakes; final correctness, scope, verification, cleanup and valid
+approval/budgets remain mandatory. The verified receipt is retained and the
+rejected trial budget is aborted without changing its deadline/reservations.
+GitHub hosting/auth/allowlist preflight passed; `gh` 2.102.0 is installed locally,
+not in the default image. See [trial findings](PLAN.md#supervised-publication-attempt-2026-10-06).
+No PR exists; publication/restart live acceptance remains pending. Any new attempt
+requires fresh approval/identity, not a replay or relaxed edit matching.
+
 Deliverables:
 - Extract repository, issue, objective, acceptance criteria, base revision, and relevant context from an explicitly supported webhook event/assignment policy.
-- Add a worker that consumes approved tasks rather than merely returning `developer.async.webhook` metadata.
+- Add a managed native workflow runner that consumes approved configured assignments rather than merely returning `developer.async.webhook` metadata; delivery stages bind existing preparation, implementation, verification and publication operations.
 - Create a disposable checkout/task branch; never execute against the service's own checkout by accident.
 - Implement least-privilege GitHub operations for branch creation, verified commits, and draft PR creation/update.
 - Persist task identity, approval, delivery dedupe, base/head revisions, and worker transitions so retries cannot create duplicate branches or PRs.
@@ -272,11 +334,11 @@ Exit criteria:
 
 ## Immediate Work Queue
 
-1. Maintain the green exact-text edit and legacy patch regressions; validate broader live editing tasks without weakening unique-match rejection.
-2. Maintain the green hosted M0 baseline and run CI for new slices.
-3. Preserve the constrained approved-task Grok/Kimi acceptance; never use the framework repository as a target.
-4. Preserve the locally fixed publication snapshot/reconciliation regressions; live acceptance remains pending.
-5. Next delivery slice: a fresh approved issue through implementation, verification and draft publication in the designated test repository. Check GitHub hosting/authentication/allowlist, validate the supervisor and obtain explicit publication approval; do not renew old trial budgets. Head-bound COMMENT review may be staged separately, with actual target source/diff inspection before claiming semantic review.
+1. Preserve the configurable definition/storage regressions and existing M0/M1, exact-span and publication safeguards. Run CI for new slices; never target the service checkout.
+2. Next implementation slice: configurable agent factories, profile resolution and native action/graph admission. Keep existing runtime APIs compatible; no workflow activation before validation.
+3. Add validated persisted coordinator/rule/human assignments, then a native managed runner that pins configuration revisions and connects existing approved delivery stages without a hardcoded team structure.
+4. Validate a configured approved issue-to-draft recipe in copied fixtures, including revision changes, restarts, duplicate assignment and recovery within original budgets.
+5. Stage a freshly approved live draft trial using outcome-based contribution grading. Recheck GitHub hosting/authentication/allowlist; do not replay the previously aborted task. Recovered tool errors are diagnostics, not contribution blockers. Stage head-bound COMMENT review only with actual source/diff inspection before claiming semantic review.
 
 Update this snapshot when a milestone's exit checks have actually run. Record
 the date, commands, observed result, and any unvalidated external dependencies;

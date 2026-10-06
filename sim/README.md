@@ -254,6 +254,14 @@ Use `--env-file` for ignored local overrides. Use `--no-browser` to explicitly
 exclude browser coverage; `--recovery` injects exactly one expected stale-text edit error.
 Normal runs require zero unexpected tool errors, even if a retry later succeeds.
 
+That criterion measures tool usability in this evaluation harness, not delivery
+acceptance for actual contributions. During real work, agents may make mistakes,
+reread, correct an edit or fix a failing test. Recovered errors remain diagnostic
+evidence but do not block a completed contribution with correct scoped artifacts,
+passing final tests and independent verification, successful cleanup, required
+approval and valid budgets. Unresolved failures and policy violations still block;
+aborted/expired tasks are never replayed by resetting their budgets.
+
 Eight stages cover file editing and independent pytest verification, detached
 terminals/input/process signals, all seven native memory tools, app restart,
 large-output paging, all 14 browser tools, Developer isolation and session stop.

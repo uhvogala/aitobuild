@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "product",
+  "agents": [
+    {"id": "planner", "role": "pm", "instructions": "Triage issues and propose scoped assignments to eligible team members."},
+    {"id": "developer_one", "role": "developer", "instructions": "Implement approved tasks and verify the final scoped result."},
+    {"id": "developer_two", "role": "developer", "instructions": "Implement approved tasks and verify the final scoped result."}
+  ],
+  "teams": [
+    {"id": "product", "members": ["planner", "developer_one", "developer_two"], "coordinator": "planner"}
+  ],
+  "workflows": [
+    {
+      "id": "definition_probe",
+      "document": {
+        "name": "definition_probe",
+        "actions": [{"kind": "SendActivity", "activity": {"text": "Organization definition loaded."}}]
+      }
+    }
+  ],
+  "routes": [
+    {
+      "id": "issue_intake",
+      "events": ["github.issue.ready"],
+      "team": "product",
+      "workflow": "definition_probe",
+      "delegation": {"strategy": "coordinator", "eligible_agents": ["developer_one", "developer_two"]}
+    }
+  ]
+}

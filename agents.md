@@ -16,6 +16,12 @@ Project:
 - Current phase: foundation plus local Developer execution prototype; not yet issue-to-PR automation
 - Purpose: agentic product-team framework with PM, Architect, and Developer roles
 
+Organization/workflow direction:
+- Role templates may remain fixed initially; agent IDs/prompts/model profiles, teams/coordinators, native workflows and delegation must be configurable. Do not introduce a hardcoded contribution loop or fixed team structure.
+- Strict JSON definitions and file-backed immutable revisions live in `src/aitobuild/organization.py`, with `config/organization.example.json` as a native-workflow probe. Storage is not approval or activation; runtime factories, graph admission, persisted assignments and managed revision-pinned runs are pending.
+- Foundation gates (2026-10-06): 396 tests pass/two optional Docker skips; Ruff and mypy (38 source files) pass. No new live model/GitHub/Docker/hosted CI trial. Preserve existing operator endpoints and safety ceilings while integrating configuration.
+- Omit nominal `skills` labels. Optional skill-file attachment is a separate future feature. Configuration cannot widen role/tool permissions, bypass scope/approval/verification or reset budgets. Prefer native Agent Framework orchestration behind validated application-owned bindings; definitions and run state use separate storage contracts so DB-backed definitions can follow.
+
 Project orientation:
 - [README.md](README.md): setup, current capabilities, and operational limitations
 - [PLAN.md](PLAN.md): target architecture and implementation snapshot
@@ -90,8 +96,23 @@ persisted budgets, zero unexpected errors and automatic cleanup. M2 delivery is 
 the designated repository has an approved baseline and trial issue #1. The previous
 trial prohibited result publication; new publication trials need explicit approval
 and must not reset its expired or aborted budgets.
+Fresh publication attempt (2026-10-06, `88720aa`) used approved issue #2 and new
+Grok state; both five-test sessions and cleanup passed, but a model-added EOF
+newline caused one exact-span error. Strict acceptance stopped before publication.
+That stop incorrectly applied tool-evaluation criteria to a contribution: the
+model recovered and verified its work. Its verified receipt remains; the supervisor aborted its original budget without
+resetting deadline/reservations. No PR or merge occurred. CLI hosting/auth/allowlist
+preflight passed with locally installed `gh` 2.102.0. Preserve reports and require
+fresh task approval; never normalize spans or reset aborted budgets.
 Live Grok/Kimi tool evaluation remains stricter than tool coverage: require
 artifact correctness, completion, successful cleanup and zero unexpected errors.
+This zero-error criterion applies only to tool development/usability evaluations,
+not actual contributions. Agents may recover from tool errors while working.
+Delivery acceptance requires completed correct scoped artifacts, passing final
+tests and independent verification, successful cleanup, required approval and
+valid budgets. Retain recovered errors as diagnostics; unresolved failures and
+policy violations still block. Do not abort an otherwise qualified delivery
+solely because its trace contains a recovered error.
 
 Local workflow:
 - Run `uv sync` with Python 3.14+.
