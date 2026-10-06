@@ -1,6 +1,6 @@
 # Delivery Milestones
 
-Last verified: 2026-10-05. This is the execution roadmap; [PLAN.md](PLAN.md)
+Last verified: 2026-10-06. This is the execution roadmap; [PLAN.md](PLAN.md)
 describes the target architecture and [README.md](README.md) documents setup.
 Statuses below are evidence-based, not completion estimates or promised dates.
 
@@ -38,11 +38,14 @@ execute task code against the aitobuild service checkout.
 | Developer model/tool path | Foundry/v1 clients, private tools, terminal/process/browser and file memory | Live Grok/Kimi evaluations; strict zero-error acceptance pending |
 | Persistent Docker sessions | Private checkouts/home volumes, restart memory/history and scoped cleanup | Live integration evidence; prototype isolation only |
 | MCP shell/filesystem | Native stdio transport adapter, configurable names | Optional; compatibility validation pending |
-| GitHub output | Mock issue-proposal adapter only | Branch/commit/PR delivery missing |
-| Architect/meetings | Metadata scan and GroupChatBuilder construction | Execution and review integration missing |
+| GitHub output | Allowlisted gh CLI branch/commit/draft publication, immutable snapshot capture and exact remote reconciliation | Locally regression-verified prototype; live acceptance pending |
+| Architect/PM/meetings | Wired role tools, operator-gated PM writes, head-bound COMMENT review, GroupChatBuilder construction | Managed role execution, reviewable target diff, durable PM state and meeting execution pending |
 | Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current local gates: **325 tests pass** with real Docker probes enabled; Ruff and mypy pass. Both original patch-repair
+Current local gates after publication fixes: **364 passed, two optional Docker probes skipped**;
+Ruff and mypy (37 source files) pass. The prior 325-test Docker-enabled baseline
+and supervised example-issue implementation/verification remain historical evidence,
+not live publication acceptance. Both original patch-repair
 failures are fixed, with ambiguous matching still rejected. Live tool evaluations
 check artifact correctness, tool coverage, context guards and zero unexpected
 errors; provider failures/timeouts are visible failures, not waived successes.
@@ -125,7 +128,10 @@ Exit criteria:
 
 ## M2: Approved Issue to Draft PR
 
-Status: **not implemented end to end**. Depends on M1. This is the supervised MVP.
+Status: **operator-driven slices implemented; not accepted end to end**. Depends
+on M1. Automatic task consumption and live publication acceptance remain pending.
+The 2026-10-06 review reproduced snapshot/recovery defects now fixed with local
+regressions; live acceptance remains open. See [PLAN.md](PLAN.md#merged-pr-review-2026-10-06).
 
 Preparation slice (2026-10-05): repository `issues` opened/assigned/edited events
 extract target identity, title objective, Markdown acceptance criteria and full
@@ -147,7 +153,8 @@ and restart return one pristine prepared checkout; interrupted/modified/expired
 preparation fails closed instead of replaying side effects. Timeout cleanup,
 failure artifacts and configuration/auth regressions pass. This is host Git
 metadata preparation from trusted local seeds, not target code execution or a
-hardened hostile-repository sandbox. All publication operations remain blocked/unimplemented.
+hardened hostile-repository sandbox. The publication prototype is described below;
+its live acceptance requires a fresh approved trial.
 
 Native implementation slice (2026-10-05): approved native issue runs now bind the
 prepared checkout directly to file tools and constrained offline Docker commands.
@@ -176,17 +183,23 @@ identity. Verified checkouts bind to an approved base SHA plus a content-address
 tree fingerprint (blob SHAs and file modes). Publication is single-flight with
 resume from interrupted `publishing`, persists `pull_number`/`head_sha` before the
 terminal state, and create-or-updates the same draft PR under an `aitobuild/`
-branch prefix. Live `gh` adapters get a request timeout; durable mock
+branch prefix. The 2026-10-06 fixes capture upload bytes/modes in the digest walk
+and reconcile missing head/PR receipts against exact remote state without ref
+overwrites. Failed/aborted tasks remain terminal; interrupted `publishing` may
+resume only within the original deadline. Final PR identity/head/deadline checks
+must pass; failures retain remote receipts. Live `gh` adapters get a request timeout; durable mock
 `published` is refused on the HTTP path. PR bodies include verification evidence.
 M2 is not accepted end to end until a designated live trial meets the exit
 criteria below.
 
-Local verification: `AITOBUILD_RUN_DELIVERY_DOCKER_TEST=1 uv run pytest` (325 tests;
-ordinary gate 323 passed/two skipped), `uv run ruff check .`, and
-`uv run mypy src`; mock copied-fixture simulation has `succeeded=true`, actual
-command exit 0 and the generated artifact. No hosted CI or new live-model/GitHub
-trial was run for this slice. The designated live repository remains inactive;
-M2 exit criteria below are not met.
+Local verification after publication fixes: `uv run pytest` (364 passed/two optional Docker
+skips), `uv run ruff check .`, and `uv run mypy src` pass. The prior Docker-enabled
+325-test run and mock copied-fixture simulation are retained baseline evidence.
+The 2026-10-05 supervised Grok example-issue trial reached independent verification:
+five tests passed in both sessions, two scoped files, unchanged budget/deadline,
+zero unexpected tool errors and successful cleanup. It did not publish a task
+result. New publication/review paths have no live acceptance evidence; M2 exit
+criteria below are not met.
 
 Deliverables:
 - Extract repository, issue, objective, acceptance criteria, base revision, and relevant context from an explicitly supported webhook event/assignment policy.
@@ -262,8 +275,8 @@ Exit criteria:
 1. Maintain the green exact-text edit and legacy patch regressions; validate broader live editing tasks without weakening unique-match rejection.
 2. Maintain the green hosted M0 baseline and run CI for new slices.
 3. Preserve the constrained approved-task Grok/Kimi acceptance; never use the framework repository as a target.
-4. Add least-privilege approved commit/draft-PR publication with durable dedupe; recheck independent verification and the exact target snapshot before side effects.
-5. Start staged supervised trials in the designated test repository when a concrete slice is ready, with approved scope and applicable safeguards; do not wait for full M2 delivery.
+4. Preserve the locally fixed publication snapshot/reconciliation regressions; live acceptance remains pending.
+5. Next delivery slice: a fresh approved issue through implementation, verification and draft publication in the designated test repository. Check GitHub hosting/authentication/allowlist, validate the supervisor and obtain explicit publication approval; do not renew old trial budgets. Head-bound COMMENT review may be staged separately, with actual target source/diff inspection before claiming semantic review.
 
 Update this snapshot when a milestone's exit checks have actually run. Record
 the date, commands, observed result, and any unvalidated external dependencies;

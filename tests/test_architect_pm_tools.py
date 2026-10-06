@@ -482,6 +482,101 @@ def test_ghcli_adapter_enforces_allowlist(monkeypatch: pytest.MonkeyPatch) -> No
         GhCliGitHubAdapter(allowed_repositories=())
 
 
+@pytest.mark.parametrize("draft,state", [(True, "open"), (False, "open"), (True, "closed")])
+def test_ghcli_recovers_existing_task_pr_without_local_number(monkeypatch, draft, state) -> None:
+    from aitobuild.policy import AgentRole
+
+    adapter = GhCliGitHubAdapter(allowed_repositories=("fixture/widgets",))
+    raw = {"number": 8, "title": "Trial", "body": "Original", "state": state, "draft": draft,
+           "head": {"ref": "aitobuild/issue-7-task", "sha": "b" * 40,
+                    "repo": {"full_name": "fixture/widgets"}}, "base": {"ref": "main"}}
+    calls = []
+
+    def api(endpoint, *, method="GET", payload=None):
+        calls.append((method, endpoint))
+        if method == "POST":
+            raise AssertionError("Recovery must not create a second PR")
+        if "/pulls?" in endpoint:
+            return [raw]
+        if endpoint.endswith("/files?per_page=100"):
+            return []
+        return {**raw, **(payload or {})}
+
+    monkeypatch.setattr(adapter, "_api", api)
+    arguments = dict(role=AgentRole.DEVELOPER, repository="fixture/widgets", title="Trial",
+                     body="Updated", head_branch="aitobuild/issue-7-task", base_ref="main",
+                     issue_number=7, approved=True, require_human_approval_for_repo_writes=True)
+    if draft and state == "open":
+        pull = adapter.create_or_update_draft_pull_request(**arguments)
+        assert pull.number == 8 and pull.body == "Updated"
+        assert any(method == "PATCH" for method, _ in calls)
+    else:
+        with pytest.raises(ValueError, match="open draft"):
+            adapter.create_or_update_draft_pull_request(**arguments)
+        assert all(method == "GET" for method, _ in calls)
+
+
+@pytest.mark.parametrize("remote", ["matching", "wrong_tree", "wrong_parent", "wrong_message",
+                                    "missing", "uncertain_ref", "forbidden"])
+def test_ghcli_recovers_only_the_exact_remote_commit(monkeypatch, remote) -> None:
+    from aitobuild.policy import AgentRole
+    from aitobuild.tools.github import GitHubBlobChange, _git_blob_sha
+
+    adapter = GhCliGitHubAdapter(allowed_repositories=("fixture/widgets",))
+    base, old_head, new_head, tree = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+    content = b"value = 1\n"
+    calls = []
+    ref_created = False
+
+    def api(endpoint, *, method="GET", payload=None):
+        nonlocal ref_created
+        calls.append((method, endpoint))
+        if endpoint.endswith("/git/commits/" + base):
+            return {"tree": {"sha": "e" * 40}}
+        if "/git/ref/heads/" in endpoint:
+            if remote == "forbidden":
+                raise RuntimeError("gh: Forbidden (HTTP 403)")
+            if remote == "missing" or remote == "uncertain_ref" and not ref_created:
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            return {"object": {"sha": old_head}}
+        if endpoint.endswith("/git/commits/" + old_head):
+            return {"tree": {"sha": "e" * 40 if remote == "wrong_tree" else tree},
+                    "parents": [{"sha": "f" * 40 if remote == "wrong_parent" else base,
+                                 "url": "https://api.github.com/example"}],
+                    "message": "Different" if remote == "wrong_message" else "Trial"}
+        if endpoint.endswith("/git/blobs"):
+            return {"sha": _git_blob_sha(content)}
+        if endpoint.endswith("/git/trees"):
+            return {"sha": tree}
+        if endpoint.endswith("/git/commits"):
+            return {"sha": new_head, "tree": {"sha": tree}}
+        if endpoint.endswith("/git/refs"):
+            if remote == "uncertain_ref":
+                ref_created = True
+                raise RuntimeError("Lost transport after remote ref creation")
+            return {"object": {"sha": new_head}}
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(adapter, "_api", api)
+    arguments = dict(role=AgentRole.DEVELOPER, repository="fixture/widgets",
+                     branch="aitobuild/issue-7-task", base_sha=base, commit_message="Trial",
+                     files={"src/probe.py": GitHubBlobChange(mode="100644", content=content,
+                                                           blob_sha=_git_blob_sha(content))},
+                     approved=True, require_human_approval_for_repo_writes=True)
+    if remote == "forbidden":
+        with pytest.raises(RuntimeError, match="HTTP 403"):
+            adapter.upsert_branch_commit(**arguments)
+    elif remote in {"wrong_tree", "wrong_parent", "wrong_message"}:
+        with pytest.raises(ValueError, match="approved publication"):
+            adapter.upsert_branch_commit(**arguments)
+    else:
+        assert adapter.upsert_branch_commit(**arguments) == (new_head if remote == "missing" else old_head)
+    creates = [(method, endpoint) for method, endpoint in calls
+               if endpoint.endswith(("/git/commits", "/git/refs"))]
+    assert bool(creates) is (remote in {"missing", "uncertain_ref"})
+    assert all(method != "PATCH" for method, _ in calls)
+
+
 def test_build_github_adapter_gh_cli_requires_allowlist() -> None:
     with pytest.raises(ValueError, match="allowlist"):
         build_github_adapter(mode="gh_cli", allowed_repositories=())

@@ -29,8 +29,10 @@ The system is event-driven. The current implementation uses a deterministic Pyth
 Each agent is an isolated instance of the `Agent` class with specific instructions and constrained tool access (via MCP Plugins).
 
 This roster is the target design. Today, role specifications exist for all
-three roles, but runtime tool wiring is implemented only for the Developer.
-MCP shell/filesystem transport is optional; GitHub operations remain mock-only.
+three roles and native toolsets are wired for the Developer, Architect and PM.
+Only Developer execution has managed HTTP run/resume endpoints. MCP
+shell/filesystem transport is optional; GitHub defaults to mock with an optional
+allowlisted `gh_cli` adapter.
 
 * **Product Manager (PM) Agent:**
     * *Scope:* Translates high-level Epics into atomic GitHub Issues with clear acceptance criteria.
@@ -87,7 +89,7 @@ The following illustrates a complete, end-to-end feature lifecycle:
 * **Phase 4: The Sync Engine.** Implement `GroupChatBuilder` for code review disputes (Architect + Dev) with strict termination conditions.
 * **Phase 5: Full Autonomy.** Introduce the PM Agent and allow the system to ingest raw text prompts and manage its own backlog end-to-end.
 
-## 7. Implementation Snapshot (2026-10-05)
+## 7. Implementation Snapshot (2026-10-06)
 
 ### Implemented Building Blocks
 
@@ -112,7 +114,9 @@ These items describe code and local test coverage, not production certification.
 - Configurable developer preview requirement before `developer.async.webhook` dispatch with approval gating.
 - Repository issue extraction for explicitly supported opened/assigned/edited events: target identity, issue title/body, Markdown acceptance criteria, and approval-time base SHA. Extracted tasks always require human approval and contain no service-specific context file list.
 - Local locked, atomic synced preview/task storage with immutable approved scope, stable scope-derived task IDs, delivery aliases and restart-safe metadata dispatch markers. Identical issue snapshots deduplicate across delivery IDs and concurrent registry instances; changed scope requires new approval.
-- Operator-triggered checkout-preparation worker and authenticated prepare/verify/status endpoints. Explicit trusted local seed configuration matches repository name/ID; the worker checks approved base membership, rejects service/linked worktrees, creates a private independent clone/task branch, and persists state and artifacts. Native issue runs bind tools to that checkout with a durable session identity. Independent verification runs a pinned operator command plan in a fresh constrained Docker session, persists exit/output/cleanup evidence bound to a whole-checkout fingerprint, and blocks mutation or failed/interrupted replay. Preparation, implementation and verification share the original deadline and reservations. Publication remains pending.
+- Operator-triggered checkout-preparation worker and authenticated prepare/verify/status endpoints. Explicit trusted local seed configuration matches repository name/ID; the worker checks approved base membership, rejects service/linked worktrees, creates a private independent clone/task branch, and persists state and artifacts. Native issue runs bind tools to that checkout with a durable session identity. Independent verification runs a pinned operator command plan in a fresh constrained Docker session, persists exit/output/cleanup evidence bound to a whole-checkout fingerprint, and blocks mutation or failed/interrupted replay. Preparation, implementation and verification share the original deadline and reservations.
+- Architect and PM native toolsets are wired into runtime bootstrap. Architect tools provide source analysis, discovery/search, durable decision memory and published-delivery review. PM tools provide backlog reads, plan drafts, criteria and operator-approved issue creation/update/linking with immutable one-shot approval snapshots. GitHub defaults to mock; the optional `gh_cli` adapter enforces a repository allowlist. Web search and meeting request tools are shared across roles.
+- Authenticated `POST /internal/developer/delivery/publish` accepts only preview identity, derives metadata from the approved issue and records `publishing`/`published` plus remote branch/commit/draft-PR identity. Publication captures immutable bytes/modes during the verified-digest walk. Interrupted `publishing` can reconcile the exact remote tree/base/message and same task-branch draft PR without overwriting refs; failed/aborted tasks remain terminal. Published-delivery Architect tools resolve PR/head from saved publication, pin review `commit_id` and permit COMMENT only. Live evidence is still required before acceptance.
 - Operator-visible pending preview queue retrieval for approval workflows.
 - Practical Developer run harness with dry-run/live modes and policy-enforced command/path checks.
 - Configurable Developer execution backend (`mock` or `subprocess`) with CLI command timeout controls.
@@ -129,13 +133,16 @@ These items describe code and local test coverage, not production certification.
 - Ripgrep-backed file discovery and literal/regex content search use allowed private roots, ignore-aware glob filtering and bounded pagination. Focused Grok/Kimi search probes pass with zero errors and unchanged fixture source.
 - Preview command defaults cover common interpreters, package managers, Git, builds, shell scripts and filesystem utilities. Native runs can snapshot an approved preview's task context/policy in a fresh session; scoped repository tools and direct/managed-start commands reuse it after restart, with no caller-supplied policy or session rebinding. Standalone native prototypes remain available; token-prefix matching is not a security boundary.
 - GitHub Actions baseline workflow uses Python 3.14, locked uv dependencies and ripgrep for pytest/Ruff/mypy plus the mock fixture simulation, retaining available reports on failure. Hosted run 37308813245 passed at `c6edaef` with 180 tests and a retained simulation report, accepting M0.
-- Verification on 2026-10-05: 325 tests pass with both real Docker probes enabled (323 plus two skips normally); `ruff`, `mypy src` and the mock copied-fixture simulation pass. Native SDK approval replay uses mocked transport. Actual independent Docker pytest success/failure both preserve evidence and clean up; Developer tests passing alone cannot certify a delivery. Prior M1 Grok/Kimi acceptance is preserved by regressions, not rerun. M2 extraction, preparation, native implementation and independent verification are connected; GitHub publication remains pending. Hosted CI and new live GitHub/model trials have not run this slice; full standalone tool coverage is not certified.
+- Verification on 2026-10-05: 325 tests pass with both real Docker probes enabled (323 plus two skips normally); `ruff`, `mypy src` and the mock copied-fixture simulation pass. Native SDK approval replay regressions use mocked transport. Actual independent Docker pytest success/failure both preserve evidence and clean up; Developer tests passing alone cannot certify a delivery. Prior M1 Grok/Kimi acceptance is preserved by regressions, not rerun. M2 extraction, preparation, native implementation and independent verification are connected; the supervised example-repository Grok trial below now provides live evidence for this slice. GitHub task-result publication and hosted CI for the slice remain pending; full standalone tool coverage is not certified.
+- Integrated baseline verification on 2026-10-06 at `740b385`: **347 passed, two optional Docker probes skipped**, Ruff passes, and mypy passes for 37 source files. Focused role/delivery/policy tests: 105 passed/two skipped. This gate run did not repeat live models, real Docker probes or hosted CI, and passing regressions do not waive the reproduced publication findings below.
+- Publication-fix verification on 2026-10-06: **364 passed, two optional Docker probes skipped**, `uv run ruff check .`, `uv run mypy src` (37 source files) and whitespace checks pass. Regressions cover content/mode/removal after capture, missing PR/head receipts, uncertain ref creation, remote drift/denied lookup, expiry and terminal failed-budget replay. No live publication/model trial or hosted CI was repeated.
 
 ### Current Limits
 
 - `developer.async.webhook` returns a task bundle; no worker consumes it automatically.
 - Supported repository issue events produce target-specific bundles and require approval-time base SHA pinning. Checkout preparation validates membership in the explicitly configured local seed/base branch, not live GitHub repository identity or remote freshness. No automatic remote lookup/fetch occurs. Legacy fixture payloads without repository context retain prototype routing; unsupported repository webhook events and missing issue criteria are rejected.
-- GitHub branch/commit/PR operations are not implemented; the adapter records mock issue proposals.
+- GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions. Live acceptance remains pending. The CLI is not installed in the current service container. No live task-result publication has been tested.
+- PM draft/write-approval stores remain in memory; restart loses those records. Architect/PM tool binding is implemented, but managed role run/resume and automatic published-target review orchestration are not wired into the HTTP workflow. Published-PR reads expose metadata and filenames, not a reviewable diff or target file content.
 - Meetings construct workflows without executing them, and proactive scans interpret supplied metadata rather than inspecting a repository.
 - Scheduler ticks require an external caller; meeting/scheduler state and non-repository trigger dedupe remain in memory. Previews, approvals and repository issue task/delivery identities persist locally. `dispatched` records metadata routing, not worker completion; inspect the saved queue after restart. Distributed coordination and full lifecycle auditing remain pending.
 - Native runs without a bound preview and unbound legacy runs remain prototypes. Approved native tasks persist unique-path reservations and an absolute deadline, fail closed after abort, and use offline read-only repository execution. Browser/arbitrary MCP adapters are excluded; native memory has a separate scoped SDK store. Distributed coordination, durable auditing and scratch/disk quotas remain pending.
@@ -143,12 +150,31 @@ These items describe code and local test coverage, not production certification.
 - The capability matrix tests check entries, not duplicate implementations; the successful CI baseline does not prove no-duplicate capability enforcement.
 - Docker, MCP, and live-model paths need fresh integration evidence before being considered operational.
 
+### Supervised Example Trial (2026-10-05)
+
+- Target: `uhvogala/aitobuild_example`, repository ID `1405327159`. Preflight found it empty. With explicit human approval, published a minimal five-file Python baseline at `f54d7dd42960d208d04fa1058ec333401c73eef5` on `master` and created [issue #1](https://github.com/uhvogala/aitobuild_example/issues/1). Scope: add integer `multiply`, preserve `add`, and test positive, negative, mixed-sign and zero inputs; only `src/demo_app/math_ops.py` and `tests/test_multiply.py` may change.
+- Attempt 1: live `grok-4.6` requested `developer_find_files(glob="**/*")`. The one-off supervisor incorrectly allowed only writes/pytest and rejected this read-only request. The service correctly failed the task, aborted its budget with zero reserved paths, cleaned up and blocked replay. No edits occurred; verification was not reached. Retained [failed report](sim/.run-artifacts/example-trial-20261005/report.json) and durable state are not reclassified as success.
+- Attempt 2: human-approved read-only scope clarification produced a new immutable task/preview, separate state directory and native session at the same base. Mock fallback, browser and MCP were disabled. The operator checked each saved approval before resuming. Grok completed 13 successful tool calls, including 12 approval rounds, with zero unexpected tool errors. About 56.5 seconds elapsed; SDK-reported total usage was 45,683 tokens across turns. This small task reached the supervisor's approval-round cap, suggesting discovery/approval overhead needs attention.
+- Result: exactly the two scoped files changed; existing `add`, baseline tests and configuration were preserved. Developer and independent `python -B -m pytest -p no:cacheprovider -q` each passed **5 tests**, confirmed integer exit **0**. The fresh verifier session saved a snapshot fingerprint and successful cleanup receipt. The original absolute deadline was unchanged; only the two scoped paths were reserved; the new budget was not aborted. No trial container remained, the trusted seed stayed pristine, and remote `master` still pointed at the baseline. No task-result commit, push, PR or merge occurred.
+- Reporting caveat: the one-off runner incorrectly indexed an absent `aborted` field after successful verification. Success budgets omit that optional field. The [raw report](sim/.run-artifacts/example-trial-20261005-v2/report.json) preserves the reporting error and authoritative `accepted=true`/`verified` receipt; the [review summary](sim/.run-artifacts/example-trial-20261005-v2/review.json) confirms every acceptance check using saved evidence only. No model/verifier rerun or budget reset was used to repair reporting.
+- Boundary: this was operator-driven API execution from a real GitHub issue, not live webhook delivery, an automatic async worker, hosted CI, publication acceptance or hostile-tenant certification. Full M2 remains open.
+
+### Merged PR Review (2026-10-06)
+
+- Integrated PR #2 (Architect/PM tools), #3 (verified-delivery draft publication) and #5 (published-draft Architect review) by fast-forward to `740b385`. Local trial findings were preserved; no new commit or remote write was made during this review. COMMENT-only review deliberately avoids same-token APPROVE/REQUEST_CHANGES self-review failures.
+- **P1, verified snapshot race, fixed locally:** the review reproduced publication of bytes changed after the digest check. Publication now hashes and captures upload bytes and executable modes in the same walk, compares that digest to verification, and uses only the immutable capture. Regressions mutate content, permissions or remove the file after capture; none changes the uploaded snapshot. See [publication implementation](src/aitobuild/developer_delivery.py).
+- **P2, remote side-effect recovery, fixed locally:** missing PR numbers now reconcile the same repository/head/base open draft; missing head receipts reconcile only an exact tree, approved base parent and commit message. Unknown or mismatched refs are not overwritten. Interrupted `publishing` uses the original valid budget; terminal `failed` returns its retained receipt without restoring or replaying an aborted budget. Regressions include uncertain ref success, local receipt-save failure, ready/closed PR refusal, drift and expiry. See [GitHub adapter](src/aitobuild/tools/github.py) and [publication regressions](tests/test_dispatcher.py).
+- Next supervised trial should cover a fresh approved issue through implementation, verification, draft publication and head-bound COMMENT review, after `gh` authentication/hosting/allowlist are checked. The previous trial explicitly prohibited task-result publication and its deadline must not be renewed; require new explicit approval. No self-merge. Full M2/M3 acceptance remains open.
+
 ### Pending Items
 
+- Trial finding: the GitHub MCP connection targets an enterprise host, while the example repo is on github.com; authenticated repository lookup there returned 404. Explicitly configure hosting/API endpoint and verify identity before publication. Operator bootstrap used github.com access, with credentials kept inside the process.
+- Trial finding: repository issue extraction supplies broad default paths/commands even when criteria specify exact files. Add operator-owned policy narrowing before immutable approval, and validated scope-aware approval handling. Do not replace approved policy afterward or simply auto-approve every tool to reduce the 12-round overhead.
+- Trial harness: validate all presented read/discovery/search/write/command approvals and schema-aware evidence grading before another run. Preserve raw failures and missing-field reporting errors; any new task attempt needs explicit approval and separate durable identity/state, never a reset aborted budget.
 - Validate the pinned Agent Framework/Foundry path with real tool calls, approval handling, and visible binding failures before adding provider support.
 - Extend `GroupChatBuilder` kickoff from workflow construction to managed execution/session lifecycle controls.
 - Validate MCP server/tool-name compatibility and approval semantics across target environments.
-- Add end-to-end Developer async loop from approved preview to branch/PR workflow lifecycle (branch creation, commit, PR open/update).
+- Validate the locally fixed publication snapshot/recovery path in a fresh explicitly approved trial. Add an automatic approved-task worker and managed Architect/PM execution; published-target source/diff inspection is required for meaningful Architect review.
 - Add CI-enforced no-duplicate capability audit checks for `reuse_native` items.
 - Add structured audit/trace logging for ingress, dispatch decisions, meeting transitions, and escalation events.
 - Formalize `approval_required` as an explicit workflow transition state across adapters and dispatcher decisions.
@@ -172,4 +198,7 @@ The designated test GitHub repository is
 Staged supervised trials may start as soon as a concrete workflow slice is ready
 to test; full M2 delivery is not a prerequisite. Require approved task scope,
 explicit repository configuration, disposable target checkouts and safeguards
-appropriate to the slice. Current simulations remain copied-fixture only.
+appropriate to the slice. Routine simulations remain copied-fixture based; the
+supervised issue implementation/verification trial above used the actual example
+repository. Draft publication/review are implemented prototypes; their live
+acceptance remains pending after the locally verified publication fixes above.

@@ -10,6 +10,7 @@ import json
 import re
 from subprocess import CalledProcessError, TimeoutExpired, run
 from typing import Any, Literal, Protocol
+from urllib.parse import urlencode
 from uuid import uuid4
 
 from aitobuild.policy import (
@@ -522,6 +523,14 @@ class MockGitHubAdapter:
         ):
             raise ValueError("existing_pull_number must be a positive integer when provided")
         repo_prs = self.pull_requests.setdefault(repo, {})
+        if existing_pull_number is None:
+            matches = [pull for pull in repo_prs.values()
+                       if pull.head_ref == cleaned_head and pull.base_ref == cleaned_base]
+            open_matches = [pull for pull in matches if pull.state == "open"]
+            if matches and len(open_matches) != 1:
+                raise ValueError("Existing task pull request must be one open draft")
+            if open_matches:
+                existing_pull_number = open_matches[0].number
         if existing_pull_number is not None:
             current = repo_prs.get(existing_pull_number)
             if current is None:
@@ -530,9 +539,9 @@ class MockGitHubAdapter:
                 raise ValueError(
                     f"Pull request #{existing_pull_number} head ref does not match the delivery branch"
                 )
-            if not current.draft:
+            if not current.draft or current.state != "open":
                 raise ValueError(
-                    f"Pull request #{existing_pull_number} is not a draft; refusing update"
+                    f"Pull request #{existing_pull_number} must remain an open draft; refusing update"
                 )
             updated = GitHubPullRequest(
                 number=existing_pull_number,
@@ -650,6 +659,29 @@ class GhCliGitHubAdapter:
         if not text:
             return {}
         return json.loads(text)
+
+    def _matching_publish_head(
+        self, *, repository: str, branch: str, base_sha: str, tree_sha: str, commit_message: str,
+    ) -> str | None:
+        try:
+            reference = self._api(f"repos/{repository}/git/ref/heads/{branch}")
+        except RuntimeError as error:
+            if "HTTP 404" in str(error):
+                return None
+            raise
+        head = reference.get("object", {}).get("sha") if isinstance(reference, dict) else None
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+            raise RuntimeError("Unexpected GitHub task reference response")
+        commit = self._api(f"repos/{repository}/git/commits/{head}")
+        if not isinstance(commit, dict):
+            raise RuntimeError("Unexpected GitHub task commit response")
+        tree, parents = commit.get("tree"), commit.get("parents")
+        if (not isinstance(tree, dict) or tree.get("sha") != tree_sha
+                or not isinstance(parents, list) or len(parents) != 1
+                or not isinstance(parents[0], dict) or parents[0].get("sha") != base_sha
+                or str(commit.get("message", "")).strip() != commit_message.strip()):
+            raise ValueError("Existing task branch differs from the approved publication")
+        return head
 
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue:
         repo = self._resolve_repository(repository)
@@ -882,6 +914,12 @@ class GhCliGitHubAdapter:
         )
         if not isinstance(tree, dict) or not isinstance(tree.get("sha"), str):
             raise RuntimeError("Failed to create GitHub tree")
+        existing_head = self._matching_publish_head(
+            repository=repo, branch=branch.strip(), base_sha=base_sha,
+            tree_sha=tree["sha"], commit_message=commit_message,
+        )
+        if existing_head is not None:
+            return existing_head
         commit = self._api(
             f"repos/{repo}/git/commits",
             method="POST",
@@ -903,11 +941,13 @@ class GhCliGitHubAdapter:
                 payload={"ref": f"refs/heads/{branch.strip()}", "sha": head_sha},
             )
         except RuntimeError:
-            self._api(
-                f"repos/{repo}/git/refs/heads/{branch.strip()}",
-                method="PATCH",
-                payload={"sha": head_sha, "force": False},
+            existing_head = self._matching_publish_head(
+                repository=repo, branch=branch.strip(), base_sha=base_sha,
+                tree_sha=tree["sha"], commit_message=commit_message,
             )
+            if existing_head is None:
+                raise
+            return existing_head
         return head_sha
 
     def create_or_update_draft_pull_request(
@@ -942,15 +982,30 @@ class GhCliGitHubAdapter:
             type(existing_pull_number) is not int or existing_pull_number <= 0
         ):
             raise ValueError("existing_pull_number must be a positive integer when provided")
+        if existing_pull_number is None:
+            query = urlencode({"state": "all", "head": f"{repo.split('/')[0]}:{cleaned_head}",
+                               "base": cleaned_base, "per_page": 100})
+            raw_matches = self._api(f"repos/{repo}/pulls?{query}")
+            if not isinstance(raw_matches, list):
+                raise RuntimeError("Unexpected GitHub pull request list response")
+            matches = [raw for raw in raw_matches if isinstance(raw, dict)
+                       and raw.get("head", {}).get("ref") == cleaned_head
+                       and raw.get("head", {}).get("repo", {}).get("full_name", "").lower() == repo
+                       and raw.get("base", {}).get("ref") == cleaned_base]
+            open_matches = [raw for raw in matches if raw.get("state") == "open"]
+            if matches and len(open_matches) != 1:
+                raise ValueError("Existing task pull request must be one open draft")
+            if open_matches:
+                existing_pull_number = int(open_matches[0]["number"])
         if existing_pull_number is not None:
             current = self.get_pull_request(repository=repo, pull_number=existing_pull_number)
             if current.head_ref != cleaned_head:
                 raise ValueError(
                     f"Pull request #{existing_pull_number} head ref does not match the delivery branch"
                 )
-            if not current.draft:
+            if not current.draft or current.state != "open":
                 raise ValueError(
-                    f"Pull request #{existing_pull_number} is not a draft; refusing update"
+                    f"Pull request #{existing_pull_number} must remain an open draft; refusing update"
                 )
             raw = self._api(
                 f"repos/{repo}/pulls/{existing_pull_number}",

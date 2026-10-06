@@ -426,9 +426,31 @@ execution. Failed commands, missing exits, expiry, interruption or cleanup error
 preserve artifacts, abort the original budget and block automatic replay.
 
 `verified` certifies this snapshot against the operator's command plan, not
-semantic completeness, review approval or permission to publish. Publication
-must recheck the snapshot and required approval. Delivery commit/push/draft-PR
-publication is the next M2 slice and remains unimplemented; there is no self-merge.
+semantic completeness, review approval or permission to publish. There is no self-merge.
+
+### Verified Draft Publication
+
+`POST /internal/developer/delivery/publish` accepts only `preview_id` and requires
+internal authentication, the immutable human-approved issue and a live allowlisted
+`gh_cli` adapter. Configure `AITOBUILD_GITHUB_ADAPTER=gh_cli` and
+`AITOBUILD_GITHUB_ALLOWED_REPOS` with the target repository. Install and
+authenticate `gh` against the intended GitHub host before using it; the CLI is
+not included in the service container. Live trial publication needs separate
+explicit scope approval, not permission inferred from a prior no-publication run.
+
+Publication captures immutable upload bytes/modes during the checkout digest
+walk and compares the digest to independent verification before remote writes.
+It records a deterministic task branch, tree fingerprint, head and draft PR receipt.
+Require `accepted=true` and `delivery.state=published`. The returned PR must be
+open, draft and at the expected head/target within the original deadline.
+
+Interrupted `publishing` can reconcile an exact remote commit (tree, approved
+base parent and message) and the existing task-head/base draft PR when a local
+receipt is missing. It does not overwrite mismatched refs or update closed/ready
+PRs. Failed/expired/aborted tasks remain terminal, retain available receipts and
+cannot be replayed by resetting their budgets. Publication and head-pinned
+Architect COMMENT review are prototypes awaiting fresh live acceptance, not
+an automatic issue-to-PR workflow.
 
 Developer prototype run flow (non-issue previews only):
 

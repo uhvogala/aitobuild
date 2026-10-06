@@ -35,13 +35,13 @@ Current foundation scope:
 
 Important limits:
 - Dispatch returns task metadata; it does not yet drive a GitHub branch/PR worker.
-- GitHub writes are mock-only; meetings are constructed, not executed.
+- GitHub defaults to mock. Optional allowlisted `gh_cli` adapters support operator-triggered verified-delivery draft publication and PM issue writes. The 2026-10-06 snapshot/recovery findings are fixed locally with regressions; live publication still needs a fresh explicitly approved trial and checked hosting/authentication/allowlist. Meetings are constructed, not executed.
 - Scheduler ticks require a caller; meeting/scheduler state and non-repository trigger dedupe remain in memory. Previews, approved scope/base, repository issue identity/delivery aliases and metadata dispatch markers persist locally under the Developer state directory.
-- Repository issues opened/assigned/edited require explicit human approval and an operator-supplied base SHA. Criteria must be listed under a Markdown Acceptance Criteria heading. Changed scope requires a new approved task; duplicate delivery/restart cannot replace approval. Local checkout preparation requires explicit trusted seed/name/ID configuration; native issue runs then use that same prepared checkout. Independent verification pins operator commands at preparation and runs them in a fresh constrained session. Publication remains pending.
-- Delivery prepare/status endpoints create one private independent checkout and local task branch from the pinned base, sharing persistent budgets. Native implementation persists one session identity and implementing/awaiting_tool_approval/implemented/failed states, with a local task lock through invocation and restart-safe approval continuation. `implemented` is not verified or publishable. Failures/interruption/rejection preserve artifacts and abort the budget; do not blindly retry. Host Git metadata preparation is not a hardened hostile-repository sandbox. No remote fetch/push or publication occurs.
+- Repository issues opened/assigned/edited require explicit human approval and an operator-supplied base SHA. Criteria must be listed under a Markdown Acceptance Criteria heading. Changed scope requires a new approved task; duplicate delivery/restart cannot replace approval. Local checkout preparation requires explicit trusted seed/name/ID configuration; native issue runs then use that same prepared checkout. Independent verification pins operator commands at preparation and runs them in a fresh constrained session. Publication captures immutable upload bytes/modes in the verified-digest walk; interrupted publishing reconciles exact remote side effects under the original budget. Failed/aborted tasks retain receipts and never automatically replay. Live acceptance remains pending.
+- Delivery prepare/status endpoints create one private independent checkout and local task branch from the pinned base, sharing persistent budgets. Native implementation persists one session identity and implementing/awaiting_tool_approval/implemented/failed states, with a local task lock through invocation and restart-safe approval continuation. `implemented` is not verified or publishable. Failures/interruption/rejection preserve artifacts and abort the budget; do not blindly retry. Host Git metadata preparation is not a hardened hostile-repository sandbox. Preparation does not fetch or publish; the separate publish endpoint performs remote GitHub writes and needs explicit approved trial scope.
 - Preview-bound native tasks persist policy, unique-path pre-write reservations and a shared absolute deadline. Use the constrained Docker profile: read-only repo/root, offline commands and interactive input, dropped capabilities, CPU/memory/PID limits, expiry and terminal-outcome cleanup. Browser/arbitrary MCP adapters and legacy execution of native-bound previews are rejected. Standalone/unbound execution remains a prototype; do not call this a hardened hostile-tenant sandbox.
 - Verification accepts only preview_id, never caller commands. Require accepted=true/state=verified, confirmed integer exit 0 for all pinned commands, successful cleanup and unchanged checkout fingerprint. Missing plan, mock backend and changed/unreserved paths cannot qualify. Successful replay rechecks content without rerunning commands; failure/interruption/expiry aborts budgets and preserves evidence. verified is not semantic review or publication approval; publication must recheck the exact snapshot and required approval.
-- Native pending approvals and sessions persist locally; distributed coordination, durable task/approval auditing, and PM/Architect tool wiring remain pending.
+- Native pending approvals and sessions persist locally. Architect/PM toolsets are wired; PM operator approvals freeze content and are one-shot but remain in memory. Managed role run/resume, automatic review orchestration, distributed coordination and durable task/approval auditing remain pending. Published-draft Architect reviews are COMMENT-only and pin the recorded head SHA; do not claim semantic review from metadata/filenames alone.
 
 Key endpoints:
 - GET /health
@@ -50,6 +50,9 @@ Key endpoints:
 - POST /internal/developer/preview and /internal/developer/preview/approve
 - POST /internal/developer/delivery/prepare and GET /internal/developer/delivery/{preview_id}
 - POST /internal/developer/delivery/verify
+- POST /internal/developer/delivery/publish
+- GET /internal/pm/plans and POST /internal/pm/plan/approve
+- GET /internal/pm/issue-writes and POST /internal/pm/issue-write/approve
 - POST /internal/developer/run
 - GET /internal/runtime/developer-agent
 - POST /internal/developer/agent/run
@@ -76,11 +79,17 @@ restart/concurrency/immutable-scope regressions. The local checkout worker has
 API, pinned-base, timeout, failure-artifact and service-isolation coverage.
 Native SDK issue writes/approval replay use mocked transport; the opt-in real
 Docker probes prove independent success and failure with evidence/cleanup.
-Issue publication remains pending. Hosted CI and new live-model/GitHub
-trials have not run this slice.
+After publication fixes, the 2026-10-06 ordinary gates pass: 364 tests/two optional
+Docker skips, Ruff and mypy for 37 source files. A 2026-10-05 supervised Grok
+example-issue trial passed implementation plus independent five-test verification,
+with scoped artifacts, unchanged deadline/reservations and cleanup. Publication
+and COMMENT review are implemented but not live-certified; fixes and remaining
+acceptance boundaries are recorded in PLAN.md. Hosted CI was not rechecked for these slices.
 M1 constrained native Grok/Kimi approved-task fixtures pass with actual tests,
 persisted budgets, zero unexpected errors and automatic cleanup. M2 delivery is next;
-the designated live GitHub repository remains inactive.
+the designated repository has an approved baseline and trial issue #1. The previous
+trial prohibited result publication; new publication trials need explicit approval
+and must not reset its expired or aborted budgets.
 Live Grok/Kimi tool evaluation remains stricter than tool coverage: require
 artifact correctness, completion, successful cleanup and zero unexpected errors.
 

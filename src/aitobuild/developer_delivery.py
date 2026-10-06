@@ -388,16 +388,11 @@ class DeveloperDeliveryWorker:
                 record = self._load(directory)
             if record is None:
                 raise ValueError("Delivery not found")
-            resumable_failed = (
-                record.state == "failed"
-                and isinstance(record.publication, dict)
-                and isinstance(record.publication.get("pull_number"), int)
-            )
-            if record.state == "failed" and not resumable_failed:
+            if record.state == "failed":
                 return record
             if record.state == "published":
                 return record
-            if record.state not in {"verified", "publishing"} and not resumable_failed:
+            if record.state not in {"verified", "publishing"}:
                 raise ValueError("Publication requires a verified delivery")
             preview = self._previews.get(preview_id)
             if preview is None or not preview.approved or preview.approved_at is None:
@@ -426,9 +421,6 @@ class DeveloperDeliveryWorker:
             try:
                 budget.remaining_seconds()
                 self._verify_checkout(directory, record, budget, pristine=False)
-                digest = self._checkout_digest(Path(record.checkout_path), budget)
-                if digest != record.verification["checkout_digest"]:
-                    raise ValueError("Verified checkout changed; publication is blocked")
                 changed = set(
                     self._git(
                         directory, budget, "-C", record.checkout_path,
@@ -452,22 +444,11 @@ class DeveloperDeliveryWorker:
                     raise ValueError(
                         "Publication changes must be nonempty, within approved paths and reserved file budgets"
                     )
-                files: dict[str, GitHubBlobChange | None] = {}
+                files: dict[str, GitHubBlobChange | None] = {relative: None for relative in sorted(changed)}
                 checkout = Path(record.checkout_path)
-                for relative in sorted(changed):
-                    target = checkout / relative
-                    if target.exists():
-                        if target.is_symlink() or not target.is_file():
-                            raise ValueError("Publication only supports regular file changes")
-                        content = target.read_bytes()
-                        mode: Literal["100644", "100755"] = (
-                            "100755" if stat.S_IXUSR & target.stat().st_mode else "100644"
-                        )
-                        files[relative] = GitHubBlobChange(
-                            mode=mode, content=content, blob_sha=_git_blob_sha(content)
-                        )
-                    else:
-                        files[relative] = None
+                digest = self._checkout_digest(checkout, budget, capture=files)
+                if digest != record.verification["checkout_digest"]:
+                    raise ValueError("Verified checkout changed; publication is blocked")
                 tree_fingerprint = _tree_fingerprint(files)
                 prior = record.publication if isinstance(record.publication, dict) else {}
                 if prior.get("tree_fingerprint") not in (None, tree_fingerprint):
@@ -529,6 +510,7 @@ class DeveloperDeliveryWorker:
                 existing = publication.get("pull_number")
                 if type(existing) is not int:
                     existing = None
+                budget.remaining_seconds()
                 pull = github.create_or_update_draft_pull_request(
                     role=AgentRole.DEVELOPER,
                     repository=issue.repository,
@@ -541,20 +523,24 @@ class DeveloperDeliveryWorker:
                     approved=True,
                     require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
                 )
-                if not pull.draft:
-                    raise RuntimeError("Publication must create a draft pull request")
                 publication = {
                     **publication,
                     "head_sha": head_sha,
                     "pull_number": pull.number,
                     "html_url": pull.html_url,
-                    "draft": True,
+                    "draft": pull.draft,
+                    "pull_head_sha": pull.head_sha,
                 }
                 record = replace(
                     record, state="publishing", publication=publication,
                     updated_at=datetime.now(tz=UTC).isoformat(),
                 )
                 self._save(directory, record)
+                budget.remaining_seconds()
+                if (not pull.draft or pull.state != "open" or pull.head_sha != head_sha
+                        or pull.head_ref != record.branch or pull.base_ref != base_ref
+                        or pull.repository != issue.repository):
+                    raise RuntimeError("Publication requires an open draft PR at the verified head and target")
                 publication = {**publication, "published_at": datetime.now(tz=UTC).isoformat()}
                 record = replace(
                     record, state="published", head_revision=str(head_sha),
@@ -788,7 +774,10 @@ class DeveloperDeliveryWorker:
         return {**result, "output": output[:6000].decode("utf-8", errors="ignore"), "output_truncated": truncated}
 
     @staticmethod
-    def _checkout_digest(checkout: Path, budget: DeveloperTaskBudget) -> str:
+    def _checkout_digest(
+        checkout: Path, budget: DeveloperTaskBudget, *,
+        capture: dict[str, GitHubBlobChange | None] | None = None,
+    ) -> str:
         def fail_walk(error: OSError) -> None:
             raise error
 
@@ -801,16 +790,31 @@ class DeveloperDeliveryWorker:
                 budget.remaining_seconds()
                 path = Path(directory) / name
                 metadata = path.lstat()
-                entry = {"path": path.relative_to(checkout).as_posix(), "mode": stat.S_IMODE(metadata.st_mode)}
+                relative = path.relative_to(checkout).as_posix()
+                entry = {"path": relative, "mode": stat.S_IMODE(metadata.st_mode)}
+                captured = capture is not None and relative in capture
+                if captured and not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError("Publication only supports regular file changes")
                 if path.is_symlink():
                     entry.update(kind="symlink", content=os.readlink(path))
                 elif path.is_file():
                     digest = sha256()
+                    chunks = []
                     with path.open("rb") as stream:
                         while chunk := stream.read(1024 * 1024):
                             budget.remaining_seconds()
                             digest.update(chunk)
+                            if captured:
+                                chunks.append(chunk)
                     entry.update(kind="file", content=digest.hexdigest())
+                    if captured and capture is not None:
+                        content = b"".join(chunks)
+                        mode: Literal["100644", "100755"] = (
+                            "100755" if stat.S_IXUSR & metadata.st_mode else "100644"
+                        )
+                        capture[relative] = GitHubBlobChange(
+                            mode=mode, content=content, blob_sha=_git_blob_sha(content),
+                        )
                 elif path.is_dir():
                     entry.update(kind="directory")
                 else:

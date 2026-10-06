@@ -1048,6 +1048,49 @@ def test_publish_verified_delivery_opens_draft_pr_idempotently(
     assert len(github.branch_commits) == 1
 
 
+@pytest.mark.parametrize("mutation", ["content", "mode", "remove"])
+def test_publish_uploads_only_bytes_hashed_for_verification(
+    implemented_delivery, verification_adapter, monkeypatch, mutation,
+) -> None:
+    from aitobuild.tools.github import MockGitHubAdapter
+
+    worker, preview_id, _, _ = implemented_delivery
+    monkeypatch.setattr(delivery_module, "shell_request", lambda *arguments, **kwargs: {
+        "ok": True, "status": "exited", "exit_code": 0, "output": "ok", "next_cursor": 1,
+    })
+    verified = worker.verify(preview_id, adapter=verification_adapter)
+    assert verified.state == "verified"
+    original_digest = worker._checkout_digest
+    original_content = b"def probe():\n    return True\n"
+
+    def mutate_after_digest(checkout, budget, **kwargs):
+        digest = original_digest(checkout, budget, **kwargs)
+        target = checkout / "src/probe.py"
+        if mutation == "content":
+            target.write_bytes(b"def probe():\n    return False\n")
+        elif mutation == "mode":
+            target.chmod(0o755)
+        else:
+            target.unlink()
+        return digest
+
+    monkeypatch.setattr(worker, "_checkout_digest", mutate_after_digest)
+    github = MockGitHubAdapter(allowed_repositories=frozenset({"fixture/widgets"}), enforce_allowlist=True)
+    uploaded = {}
+    original_upload = github.upsert_branch_commit
+
+    def capture_upload(**kwargs):
+        uploaded.update(kwargs["files"])
+        return original_upload(**kwargs)
+
+    monkeypatch.setattr(github, "upsert_branch_commit", capture_upload)
+    result = worker.publish(preview_id, github=github,
+                            require_human_approval_for_repo_writes=True, allow_mock_publication=True)
+    assert result.state == "published", result.error
+    assert uploaded["src/probe.py"].content == original_content
+    assert uploaded["src/probe.py"].mode == "100644"
+
+
 def test_publish_rejects_wrong_state_and_drift(
     implemented_delivery, verification_adapter, monkeypatch,
 ) -> None:
@@ -1087,8 +1130,9 @@ def test_publish_rejects_wrong_state_and_drift(
     )
 
 
+@pytest.mark.parametrize("saved_pull", [True, False])
 def test_publish_resumes_interrupted_publishing_and_reuses_pull(
-    implemented_delivery, verification_adapter, monkeypatch,
+    implemented_delivery, verification_adapter, monkeypatch, saved_pull,
 ) -> None:
     from aitobuild.tools.github import MockGitHubAdapter
     from dataclasses import replace
@@ -1122,7 +1166,7 @@ def test_publish_resumes_interrupted_publishing_and_reuses_pull(
         publication={
             key: value
             for key, value in published.publication.items()
-            if key != "published_at"
+            if key != "published_at" and (saved_pull or key not in {"pull_number", "html_url", "draft"})
         },
     )
     worker._save(directory, interrupted)
@@ -1136,6 +1180,75 @@ def test_publish_resumes_interrupted_publishing_and_reuses_pull(
     assert resumed.publication["pull_number"] == pull_number
     assert len(github.pull_requests["fixture/widgets"]) == 1
     assert "Verification" in resumed.publication["body"]
+
+
+def test_failed_publication_preserves_receipt_without_replaying_aborted_budget(
+    implemented_delivery, verification_adapter, monkeypatch,
+) -> None:
+    from aitobuild.tools.github import MockGitHubAdapter
+
+    worker, preview_id, budget_path, _ = implemented_delivery
+    monkeypatch.setattr(delivery_module, "shell_request", lambda *arguments, **kwargs: {
+        "ok": True, "status": "exited", "exit_code": 0, "output": "ok", "next_cursor": 1,
+    })
+    assert worker.verify(preview_id, adapter=verification_adapter).state == "verified"
+    github = MockGitHubAdapter(allowed_repositories=frozenset({"fixture/widgets"}), enforce_allowlist=True)
+    original_save = worker._save
+    injected = False
+
+    def fail_receipt_save(directory, record):
+        nonlocal injected
+        if not injected and record.state == "publishing" and record.publication.get("pull_number"):
+            injected = True
+            raise OSError("Injected PR receipt persistence failure")
+        original_save(directory, record)
+
+    monkeypatch.setattr(worker, "_save", fail_receipt_save)
+    failed = worker.publish(preview_id, github=github,
+                            require_human_approval_for_repo_writes=True, allow_mock_publication=True)
+    assert failed.state == "failed" and failed.publication["pull_number"] == 1
+    budget = json.loads(budget_path.read_text())
+    assert budget["aborted"] is True
+    again = worker.publish(preview_id, github=github,
+                           require_human_approval_for_repo_writes=True, allow_mock_publication=True)
+    assert again == failed
+    assert json.loads(budget_path.read_text()) == budget
+    assert len(github.branch_commits) == 1
+    assert len(github.pull_requests["fixture/widgets"]) == 1
+
+
+@pytest.mark.parametrize("failure", ["head_drift", "expiry"])
+def test_publication_preserves_remote_receipt_on_head_drift_or_expiry(
+    implemented_delivery, verification_adapter, monkeypatch, failure,
+) -> None:
+    from dataclasses import replace
+    import aitobuild.developer_isolation as isolation
+    from aitobuild.tools.github import MockGitHubAdapter
+
+    worker, preview_id, budget_path, _ = implemented_delivery
+    monkeypatch.setattr(delivery_module, "shell_request", lambda *arguments, **kwargs: {
+        "ok": True, "status": "exited", "exit_code": 0, "output": "ok", "next_cursor": 1,
+    })
+    assert worker.verify(preview_id, adapter=verification_adapter).state == "verified"
+    github = MockGitHubAdapter(allowed_repositories=frozenset({"fixture/widgets"}), enforce_allowlist=True)
+    original_create = github.create_or_update_draft_pull_request
+
+    def unsafe_result(**kwargs):
+        pull = original_create(**kwargs)
+        if failure == "head_drift":
+            return replace(pull, head_sha="f" * 40)
+        deadline = json.loads(budget_path.read_text())["deadline"]
+        monkeypatch.setattr(isolation, "time", lambda: deadline + 1)
+        return pull
+
+    monkeypatch.setattr(github, "create_or_update_draft_pull_request", unsafe_result)
+    failed = worker.publish(preview_id, github=github,
+                            require_human_approval_for_repo_writes=True, allow_mock_publication=True)
+    assert failed.state == "failed" and failed.publication["pull_number"] == 1
+    assert json.loads(budget_path.read_text())["aborted"] is True
+    assert worker.get(preview_id) == failed
+    assert worker.publish(preview_id, github=github, require_human_approval_for_repo_writes=True,
+                          allow_mock_publication=True) == failed
 
 
 def test_architect_review_published_draft_from_publication_only(
