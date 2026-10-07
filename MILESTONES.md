@@ -37,7 +37,7 @@ execute task code against the aitobuild service checkout.
 
 | Area | Evidence | Status |
 | --- | --- | --- |
-| Organization configuration | Immutable definitions, instance factories, operator model/tool profiles and bounded native graph admission/binding | Library assembly implemented; persisted assignment and managed service integration pending |
+| Organization configuration | Immutable definitions, configured factories/native graphs and persisted assignment ownership/capacity claims | Library admission implemented; managed native execution/service integration next |
 | Local setup | Python 3.14+, uv, certificate bootstrap and 16 certificate tests | Implemented |
 | Ingress/governance | Signed webhooks, internal auth, dedupe, previews, role policy | Local durable previews/issue-task dedupe; other ingress state in memory |
 | Local Developer pipeline | Copied fixture, preview approval, subprocess tests and file write | Verified on 2026-10-05 |
@@ -48,8 +48,8 @@ execute task code against the aitobuild service checkout.
 | Architect/PM/meetings | Wired role tools, operator-gated PM writes, head-bound COMMENT review, GroupChatBuilder construction | Managed role execution, reviewable target diff, durable PM state and meeting execution pending |
 | Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current local gates with Python-native factories/admission: **452 passed, two optional Docker probes skipped**;
-Ruff and mypy (39 source files) pass. Definition-foundation gates passed with 396
+Current local gates with persisted assignments: **492 passed, two optional Docker probes skipped**;
+Ruff and mypy (40 source files) pass. Definition-foundation gates passed with 396
 tests; publication-fix gates previously passed
 with 364 tests. The prior 325-test Docker-enabled baseline
 and supervised example-issue implementation/verification remain historical evidence,
@@ -74,8 +74,8 @@ local pipeline, not GitHub delivery or production isolation.
 
 ## M2 Foundation: Configurable Organization and Workflow Definitions
 
-Status: **definitions, factories and native admission implemented as library APIs;
-persisted assignment/managed service execution pending**.
+Status: **definitions, factories, native admission and persisted assignment claims
+implemented as library APIs; managed native/service execution pending**.
 This foundation precedes automatic issue consumption, not existing operator
 delivery endpoints. Agent roles remain fixed initially; instance IDs, prompts,
 optional model profiles, team membership/coordinator, event routes and delegation
@@ -100,12 +100,16 @@ Deliverables and acceptance sequence:
 3. Structured delegation records for coordinator/rule/human strategies: task,
 	organization revision, team, eligible selected agent, rationale, scope and
 	ownership. Reject unknown/ineligible agents and capacity/approval violations.
-	Assignment is not a GitHub assignee write. **Next**.
+	Assignment is not a GitHub assignee write. **Implemented** as trusted library
+	APIs with explicit pinned revisions and approved preview/original-budget checks.
+	Locked atomic claims enforce one task owner and cross-revision agent capacity.
+	Terminal receipts remain immutable; failure/cancellation aborts the original
+	budget and releases only capacity, not task ownership.
 4. Managed native workflows with persisted run/assignment/checkpoint references,
 	approvals, cancellation and budgets. New runs pin approved revisions; later
 	config changes cannot silently alter active runs or reset failed budgets.
 	Definitions stay separate from execution state; DB storage can later implement
-	the same definition contract. **Pending**.
+	the same definition contract. **Next**.
 
 Local validation (2026-10-06): `uv run pytest` reports 396 passes/two optional
 Docker skips; `uv run ruff check .` and `uv run mypy src` pass (38 source files).
@@ -124,8 +128,17 @@ graph/reference/field cases, non-Boolean predicates and iteration exhaustion fai
 closed. The preceding 443-test declarative adapter was replaced. No live models,
 GitHub/Docker trial or hosted CI was repeated; managed recovery is still pending.
 
-The loader/store/factories are library APIs only. They do not activate service
-routing, enforce capacity or execute delegation. Direct workflow operation bindings
+Assignment validation (2026-10-07): **492 passed/two optional Docker skips**, Ruff
+and mypy (40 source files) pass. Forty assignment tests cover configured strategies,
+authority/eligibility, scope/base/approval pins, restart/idempotency, original ledger
+expiry/abort/missing-state refusal, cross-revision ownership/capacity, actual process
+races, conflicting terminal decisions, corruption and interrupted writes. No
+dependency, live model/GitHub/Docker trial or hosted CI was added. Assignment
+completion is metadata, not delivery verification or cleanup certification.
+
+The loader/store/factories/assignment service are library APIs only. They do not
+activate service routing or invoke a coordinator automatically. Capacity applies
+to journaled claims, not existing unmanaged HTTP runs. Direct workflow operation bindings
 are read-only until managed approved-task execution is available; native agent
 toolsets remain operator-owned and must use existing policy/approval-enforcing
 handlers. Legacy bootstrap/endpoints are unchanged. Caller-supplied native
@@ -356,10 +369,9 @@ Exit criteria:
 ## Immediate Work Queue
 
 1. Preserve the configurable definition/storage regressions and existing M0/M1, exact-span and publication safeguards. Run CI for new slices; never target the service checkout.
-2. Next implementation slice: persisted coordinator/rule/human assignments with revision/team/eligible-agent identity, scope/approval checks and atomic ownership/capacity claims. Keep GitHub assignee writes separate.
-3. Add a native Python managed runner that pins configuration and assignment revisions and connects existing approved delivery stages without a hardcoded team structure. Preserve original deadlines/budgets and distinguish native human-input events from service approval. Use registered operations/predicates and native SDK orchestration/checkpoints, not an expression runtime or custom workflow interpreter.
-4. Validate a configured approved issue-to-draft recipe in copied fixtures, including revision changes, restarts, duplicate assignment and recovery within original budgets.
-5. Stage a freshly approved live draft trial using outcome-based contribution grading. Recheck GitHub hosting/authentication/allowlist; do not replay the previously aborted task. Recovered tool errors are diagnostics, not contribution blockers. Stage head-bound COMMENT review only with actual source/diff inspection before claiming semantic review.
+2. Next implementation slice: a native Python managed runner that pins configuration and assignment revisions, binds authenticated coordinator context and connects existing approved delivery stages without a hardcoded team structure. Preserve original deadlines/budgets and distinguish native human-input events from service approval. Use registered operations/predicates and native SDK orchestration/checkpoints, not an expression runtime or custom workflow interpreter. Revalidate ownership, scope and budget on every run/resume; assignment metadata alone does not authorize execution.
+3. Validate a configured approved issue-to-draft recipe in copied fixtures, including revision changes, restarts, duplicate assignment and recovery within original budgets. Persisted assignment claims are implemented; keep GitHub assignee writes separate.
+4. Stage a freshly approved live draft trial using outcome-based contribution grading. Recheck GitHub hosting/authentication/allowlist; do not replay the previously aborted task. Recovered tool errors are diagnostics, not contribution blockers. Stage head-bound COMMENT review only with actual source/diff inspection before claiming semantic review.
 
 Update this snapshot when a milestone's exit checks have actually run. Record
 the date, commands, observed result, and any unvalidated external dependencies;

@@ -23,7 +23,7 @@ not fixed in code.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Organization configuration | Versioned definitions, immutable revisions, instance factories, model/tool profiles and native graph admission | Recorded assignments and managed execution/service integration |
+| Organization configuration | Versioned definitions, immutable revisions, configured factories/native graphs and durable assignment ownership/capacity claims | Managed native execution and service integration |
 | Ingress and routing | Signed webhooks, internal auth, issue extraction and durable scope approval/dedupe | Configurable assignment routing and automatic task consumption |
 | Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
 | Native model runtime | Foundry binding, configured agent factories, approved Developer invocation, persistent manual approvals and constrained Grok/Kimi trials | Managed PM/Architect execution and service activation |
@@ -31,8 +31,8 @@ not fixed in code.
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **452 tests pass**, with two optional prepared-target Docker
-probes skipped; Ruff and mypy (39 source files) pass. The prior 325-test baseline
+Verified locally: **492 tests pass**, with two optional prepared-target Docker
+probes skipped; Ruff and mypy (40 source files) pass. The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
 The original patch-repair
 failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
@@ -71,8 +71,9 @@ delegation. Optional `model_profile` and `tool_profile` references resolve again
 operator registries, not inline credentials/callables. Tool profiles are restricted
 to their declared role and role-policy ceiling; operators must register existing
 policy/approval-enforcing tool handlers. Developer tools are still bound per
-approved run, not permanently attached by config. Capacity is currently declared
-only. There are no `skills` labels or configurable permission grants.
+approved run, not permanently attached by config. Capacity is enforced for durable
+assignment claims, not by the existing role-based HTTP runtime. There are no
+`skills` labels or configurable permission grants.
 
 Validate and persist an immutable revision through the library API:
 
@@ -90,8 +91,8 @@ Use a trusted service-owned storage directory. Changed definitions create new
 revisions; callers must select a revision explicitly. Storage does not activate
 or approve it. The example workflow is a harmless definition probe, not a delivery
 recipe. Existing service bootstrap/dispatch and execution safeguards are unchanged.
-Recorded delegation and managed run/revision pinning follow in
-[MILESTONES.md](MILESTONES.md).
+Recorded delegation is available through the library; managed run/revision pinning
+and service integration follow in [MILESTONES.md](MILESTONES.md).
 
 Assemble configured instances and the harmless native example in mock mode:
 
@@ -143,6 +144,41 @@ managed restart/resume, human-input adapters and task approval remain pending.
 No PowerFx, .NET or expression evaluator is used or required. Only Python graph
 documents are accepted. Literal payloads, including strings starting with `=`,
 are just data.
+
+### Durable assignment claims
+
+[src/aitobuild/organization_assignments.py](src/aitobuild/organization_assignments.py)
+provides `AssignmentService`, `AssignmentProposal` and an `AssignmentStore` protocol
+with a locked, atomic/fsynced `FileAssignmentStore`. Definition revisions and the
+assignment journal are separate. This is a trusted operator/runtime library API,
+not an HTTP endpoint or automatic coordinator invocation.
+
+`assign` requires an explicit organization revision, event and approved preview.
+The configured route determines team, workflow, eligible agents and strategy.
+Coordinator decisions require the configured `coordinator_id`; human decisions
+require `human_id`; rules select their configured target without overrides.
+Proposals contain only `agent_id` and a nonblank rationale. Identity arguments must
+come from authenticated operator/runtime context, never model-controlled fields.
+
+The service reopens the original budget with `create=False` through an operator
+`budget_path_for(preview_id)` locator. Prepare the approved task's budget first;
+missing, aborted, expired or scope-mismatched ledgers cannot qualify. Claims freeze
+the full approved bundle/base, approval timestamp, revision, route/team/workflow,
+eligible selection, rationale, actor and budget path. No approval or budget is
+created/reset by assignment.
+
+One task/preview has one owner across routes, teams, organizations and revisions.
+Identical claims are idempotent; changed assignments fail. Active capacity is counted
+by organization/agent across revisions, using the most restrictive active capacity
+ceiling. `finish` records an immutable completed/failed/cancelled outcome; failed and
+cancelled tasks abort the original budget without changing deadline/reservations.
+The transition guard and journal update share the ownership transaction. Terminal
+records release capacity for other tasks, never reclaim the original task.
+
+Assignment completion is metadata, not independent verification, semantic review,
+publication approval or sandbox cleanup. Existing operator endpoints are unchanged;
+managed native execution, authenticated coordinator binding, checkpoint recovery
+and automatic cleanup remain the next slice. No GitHub assignee write occurs.
 
 ### API setup
 
