@@ -1,6 +1,6 @@
 # Delivery Milestones
 
-Last verified: 2026-10-06. This is the execution roadmap; [PLAN.md](PLAN.md)
+Last verified: 2026-10-07. This is the execution roadmap; [PLAN.md](PLAN.md)
 describes the target architecture and [README.md](README.md) documents setup.
 Statuses below are evidence-based, not completion estimates or promised dates.
 
@@ -37,7 +37,7 @@ execute task code against the aitobuild service checkout.
 
 | Area | Evidence | Status |
 | --- | --- | --- |
-| Organization configuration | Immutable definitions, configured factories/native graphs and persisted assignment ownership/capacity claims | Library admission implemented; managed native execution/service integration next |
+| Organization configuration | Immutable definitions, native factories/graphs, assignments and revision-pinned managed delivery runner | Operator library execution implemented; service activation/broader scoped roles next |
 | Local setup | Python 3.14+, uv, certificate bootstrap and 16 certificate tests | Implemented |
 | Ingress/governance | Signed webhooks, internal auth, dedupe, previews, role policy | Local durable previews/issue-task dedupe; other ingress state in memory |
 | Local Developer pipeline | Copied fixture, preview approval, subprocess tests and file write | Verified on 2026-10-05 |
@@ -48,8 +48,9 @@ execute task code against the aitobuild service checkout.
 | Architect/PM/meetings | Wired role tools, operator-gated PM writes, head-bound COMMENT review, GroupChatBuilder construction | Managed role execution, reviewable target diff, durable PM state and meeting execution pending |
 | Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current local gates with persisted assignments: **492 passed, two optional Docker probes skipped**;
-Ruff and mypy (40 source files) pass. Definition-foundation gates passed with 396
+Current local gates with managed native execution: **531 passed, two optional Docker probes skipped**;
+Ruff and mypy (42 source files) pass. Assignment gates passed with 492;
+definition-foundation gates passed with 396
 tests; publication-fix gates previously passed
 with 364 tests. The prior 325-test Docker-enabled baseline
 and supervised example-issue implementation/verification remain historical evidence,
@@ -74,8 +75,8 @@ local pipeline, not GitHub delivery or production isolation.
 
 ## M2 Foundation: Configurable Organization and Workflow Definitions
 
-Status: **definitions, factories, native admission and persisted assignment claims
-implemented as library APIs; managed native/service execution pending**.
+Status: **definitions, factories, native admission, persisted assignments and
+managed delivery graphs implemented as library APIs; service activation pending**.
 This foundation precedes automatic issue consumption, not existing operator
 delivery endpoints. Agent roles remain fixed initially; instance IDs, prompts,
 optional model profiles, team membership/coordinator, event routes and delegation
@@ -109,7 +110,8 @@ Deliverables and acceptance sequence:
 	approvals, cancellation and budgets. New runs pin approved revisions; later
 	config changes cannot silently alter active runs or reset failed budgets.
 	Definitions stay separate from execution state; DB storage can later implement
-	the same definition contract. **Next**.
+	the same definition contract. **Implemented for managed operation graphs and the
+	configured native Developer adapter**; broader scoped roles/service activation next.
 
 Local validation (2026-10-06): `uv run pytest` reports 396 passes/two optional
 Docker skips; `uv run ruff check .` and `uv run mypy src` pass (38 source files).
@@ -126,7 +128,7 @@ single fan-out/fan-in aggregation and checkpoint writes pass. Fresh adapter impo
 and branch execution pass with declarative/PowerFx/.NET modules blocked. Unsafe
 graph/reference/field cases, non-Boolean predicates and iteration exhaustion fail
 closed. The preceding 443-test declarative adapter was replaced. No live models,
-GitHub/Docker trial or hosted CI was repeated; managed recovery is still pending.
+GitHub/Docker trial or hosted CI was repeated; managed recovery was pending at that slice.
 
 Assignment validation (2026-10-07): **492 passed/two optional Docker skips**, Ruff
 and mypy (40 source files) pass. Forty assignment tests cover configured strategies,
@@ -136,15 +138,30 @@ races, conflicting terminal decisions, corruption and interrupted writes. No
 dependency, live model/GitHub/Docker trial or hosted CI was added. Assignment
 completion is metadata, not delivery verification or cleanup certification.
 
-The loader/store/factories/assignment service are library APIs only. They do not
-activate service routing or invoke a coordinator automatically. Capacity applies
-to journaled claims, not existing unmanaged HTTP runs. Direct workflow operation bindings
-are read-only until managed approved-task execution is available; native agent
-toolsets remain operator-owned and must use existing policy/approval-enforcing
-handlers. Legacy bootstrap/endpoints are unchanged. Caller-supplied native
-checkpoint storage is supported, but managed checkpoint/run recovery, approvals,
-deadlines and active-run revision pinning are acceptance criteria for the next
-slices, not claims about these configured prototype workflows.
+Managed runner validation (2026-10-07, from `463b257`): **531 passed/two optional
+Docker skips**, Ruff and mypy (42 source files) pass. Thirty-eight runner tests and
+one assignment regression cover immutable run/assignment/scope/revision/binding
+pins, trusted coordinator identity, original budgets, one-shot operator decisions,
+native input versus service approval, checkpoint integrity/restart/partial parallel
+replies, duplicates, cancellation/thread draining, corruption, interruption and
+metadata-only finalization. Actual configured Developer SDK calls use mocked model
+transport and existing scoped tools; approve/reject/recovered exact-span errors pass.
+A disposable-target graph uses existing delivery/independent verification services
+with mocked transport/GitHub publication, preserving deadline/reservations and
+checking evidence/cleanup. No dependency change or live model/GitHub/Docker/hosted
+CI trial was added.
+
+These are library APIs, not automatic service routing/coordinator invocation.
+Journal capacity does not govern unmanaged HTTP runs. Direct workflow operations
+remain read-only. Managed graphs admit operation nodes, including the configured
+native Developer adapter; direct agent nodes await scoped role adapters. Only
+persisted idle waiting boundaries resume; uncertain running side effects are not
+replayed. Finalizing retries record metadata only. Original budgets are never reset.
+Cleanup is mandatory; arbitrary synchronous callback duration remains operator-owned,
+and threaded delivery calls drain before lock release under existing worker limits.
+Run/assignment completion is metadata, not delivery verification, publication
+approval or semantic review. Broader managed roles, service activation and distributed
+controls remain pending. Existing bootstrap/endpoints are unchanged.
 
 ## M0: Reproducible Baseline
 
@@ -369,8 +386,8 @@ Exit criteria:
 ## Immediate Work Queue
 
 1. Preserve the configurable definition/storage regressions and existing M0/M1, exact-span and publication safeguards. Run CI for new slices; never target the service checkout.
-2. Next implementation slice: a native Python managed runner that pins configuration and assignment revisions, binds authenticated coordinator context and connects existing approved delivery stages without a hardcoded team structure. Preserve original deadlines/budgets and distinguish native human-input events from service approval. Use registered operations/predicates and native SDK orchestration/checkpoints, not an expression runtime or custom workflow interpreter. Revalidate ownership, scope and budget on every run/resume; assignment metadata alone does not authorize execution.
-3. Validate a configured approved issue-to-draft recipe in copied fixtures, including revision changes, restarts, duplicate assignment and recovery within original budgets. Persisted assignment claims are implemented; keep GitHub assignee writes separate.
+2. Next bounded implementation slice: service-owned configured approved-task routing/worker invocation using the managed runner, without a fixed team or contribution loop. Establish the original prepared budget before assignment, authenticate coordinator/operator context and preserve existing endpoints/policy ceilings. Journal capacity still does not govern unmanaged HTTP runs. Broader scoped PM/Architect agent-node adapters and distributed cancellation are separate follow-ups.
+3. Extend the passing disposable-fixture configured graph and actual SDK/mock-transport Developer approval/recovery tests into service-level recipe acceptance. Runner restart, duplicates, revision changes and original-budget recovery are covered; automatic event consumption, live delivery and hosted CI remain unverified. Keep GitHub assignee writes separate and do not infer semantic review from metadata.
 4. Stage a freshly approved live draft trial using outcome-based contribution grading. Recheck GitHub hosting/authentication/allowlist; do not replay the previously aborted task. Recovered tool errors are diagnostics, not contribution blockers. Stage head-bound COMMENT review only with actual source/diff inspection before claiming semantic review.
 
 Update this snapshot when a milestone's exit checks have actually run. Record

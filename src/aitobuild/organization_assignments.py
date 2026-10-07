@@ -264,6 +264,39 @@ class AssignmentService:
         )
         return self._assignments.claim(candidate)
 
+    def revalidate(self, assignment_id: str) -> TaskAssignment:
+        record = self._assignments.get(assignment_id)
+        if record is None or record.state != "claimed":
+            raise PermissionError("Managed execution requires a claimed assignment")
+        if self._assignments.for_task(record.task_id) != record:
+            raise PermissionError("Assignment no longer owns its task")
+        snapshot = self._definitions.get(record.organization_id, record.revision)
+        if snapshot is None:
+            raise ValueError("Pinned organization revision not found")
+        definition = snapshot.definition
+        route = next((route for route in definition.routes if route.id == record.route_id), None)
+        team = next((team for team in definition.teams if team.id == record.team_id), None)
+        agent = next((agent for agent in definition.agents if agent.id == record.agent_id), None)
+        if (route is None or team is None or agent is None or record.event not in route.events
+                or route.team != record.team_id or route.workflow != record.workflow_id
+                or route.delegation.strategy != record.strategy
+                or route.delegation.eligible_agents != record.eligible_agents
+                or agent.max_concurrent_runs != record.agent_capacity
+                or (record.strategy == "coordinator" and record.actor_id != team.coordinator)
+                or (record.strategy == "rules" and (record.agent_id != route.delegation.target_agent
+                                                    or record.actor_id != route.id))):
+            raise PermissionError("Assignment differs from its pinned definition")
+        preview = self._previews.get(record.preview_id)
+        if (preview is None or not preview.approved or preview.approved_at != record.approved_at
+                or json.dumps(preview.bundle_payload, sort_keys=True, separators=(",", ":"),
+                              allow_nan=False) != record.bundle_content):
+            raise PermissionError("Assignment approved scope has changed")
+        path = self._budget_path_for(record.preview_id).resolve()
+        if str(path) != record.budget_path:
+            raise ValueError("Assignment must use its original budget ledger")
+        DeveloperTaskBudget(path=path, bundle=record.bundle, create=False).remaining_seconds()
+        return record
+
     def finish(self, assignment_id: str, *, state: TerminalState, outcome: str) -> TaskAssignment:
         def check_budget(record: TaskAssignment) -> None:
             path = self._budget_path_for(record.preview_id).resolve()

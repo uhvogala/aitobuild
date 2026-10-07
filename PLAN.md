@@ -43,8 +43,8 @@ the SDK. Operations and routing predicates reference trusted, operator-owned Pyt
 registries, never inline code, imports or expressions. Predicates are synchronous
 and return strict booleans; operations consume a message and return a synchronous
 or asynchronous result. No PowerFx, .NET or custom expression interpreter is used.
-Read-only workflow operations are available initially; write/review bindings await
-managed approved-task context. Config cannot grant permissions, skip verification,
+Direct workflow operations remain read-only; managed operation bindings use
+frozen approved-task context and role checks. Config cannot grant permissions, skip verification,
 write service state or expose arbitrary HTTP/MCP/file loading. Graph fields,
 topology, exact bindings and routed-team membership are admitted before the SDK
 builds the graph. Operator limits bound graph bytes, nodes, connections and runner
@@ -187,9 +187,29 @@ These items describe code and local test coverage, not production certification.
 - Configured runtime/admission replacement (2026-10-07): `organization_runtime.py` resolves operator-owned model/tool profiles before assembly, keys handles by instance ID, preserves role instruction templates/per-run Developer tools and isolates memory by organization/revision/agent. `build_organization_workflows` binds validated JSON graphs to native `WorkflowBuilder`/`AgentExecutor`, registered read-only message operations and named Python predicates, with caller checkpoint storage and revision-qualified workflow names. Conditional edges, ordered switch/default routing, bounded feedback loops and fan-out/fan-in execute natively without declarative/PowerFx/.NET imports. Only Python graph documents are accepted; no compatibility layer is needed for this new feature. Gates: **452 passed/two optional Docker skips**, Ruff and mypy (39 source files). Tests cover actual SDK agent calls over mocked HTTP with distinct clients, strict Boolean routing, iteration exhaustion, single parallel aggregation, checkpoint writes and blocked non-Python workflow dependencies. The preceding 443-test declarative adapter was replaced, not extended with an expression interpreter. No live model/GitHub/Docker/hosted CI trial or managed runner was added.
 - Persisted assignment slice (2026-10-07): `organization_assignments.py` adds strict proposals/immutable records, a separate `AssignmentStore` protocol and locked atomic/fsynced `FileAssignmentStore`. Trusted `AssignmentService` resolves coordinator/rule/human decisions from explicit definition revisions/routes and freezes approved preview scope/base, approval timestamp, eligible agent/actor/rationale and original budget path. Existing ledgers are reopened with `create=False`; missing, expired, aborted or changed-scope budgets fail closed. One task owner is preserved across teams/organizations/revisions, with atomic cross-revision organization/agent capacity using the most restrictive active ceiling. Terminal decisions serialize budget checks/abort with the journal transition; failure/cancellation keeps original deadlines/reservations and prevents reclaim. Gates: **492 passed/two optional Docker skips**, Ruff and mypy (40 source files). Forty new tests include real process races, restart/idempotency, changed scope/base/revision, corruption, concurrent terminal outcomes and interrupted-write retries. No GitHub assignee writes, service activation, live model/GitHub/Docker/hosted CI trial or managed runner was added.
 
+Managed native runner slice (2026-10-07, starting at `463b257`):
+`organization_runner.py` separates durable run state from definitions/assignments,
+pins workflow/revision/scope/operator bindings and native session/checkpoint
+integrity, and audits consumed trusted-actor decisions and cleanup. Assignment
+ownership, immutable approval/base/scope and original existing budgets are
+revalidated on active run/resume/operations/checkpoints. Coordinator identity comes
+from a trusted runtime provider, never a model field. Native edges/predicates retain
+configurable sequencing/branching/joins, with no fixed contribution loop. Saved
+idle waiting boundaries resume; interrupted running states fail closed, cancellation
+aborts unchanged budgets, threaded delivery calls drain before lock release and
+finalizing retries write metadata only. Native human input is not service approval.
+`organization_delivery.py` connects existing prepare/verify/publish services and a
+configured native Developer adapter with durable SDK sessions/approval content and
+existing per-run exact-span/offline Docker tools. Recovered errors remain diagnostics.
+Gates: **531 passed/two optional Docker skips**, Ruff and mypy (42 source files);
+38 runner tests plus one assignment regression include actual SDK/mock-transport
+approve/reject/recovered-edit scenarios and a disposable-target mock draft graph
+with independent evidence. No dependency change or live model/GitHub/Docker/hosted
+CI trial or remote writes were performed for this slice.
+
 ### Current Limits
 
-- Configured factories/native admission/assignment claims are library APIs, not service activation. Default bootstrap/HTTP dispatch still use one handle per role; managed runner, authenticated coordinator binding and active-run revision pinning are next. Capacity is enforced for journaled assignment claims, not existing unmanaged HTTP runs. Stored snapshots, assignment completion and native human-input events are not delivery approvals. Assignment identities come from trusted operator/runtime context, not model-controlled fields. Direct workflow operations cannot write/review yet; operator agent-tool profiles must use existing policy-enforcing handlers. Graph construction/caller checkpoints do not certify managed recovery, callback duration, semantic correctness or delivery. Managed human-input/approval adapters, execution bindings and sandbox cleanup remain pending.
+- Configured factories/native admission/assignments/managed runner are library APIs, not service activation. Default bootstrap/HTTP dispatch still use one handle per role; automatic configured routing/worker invocation is next. Journal capacity does not govern unmanaged HTTP runs. Managed operation graphs pin active revisions and trusted actor/operator-binding context, but direct agent nodes need scoped role adapters. The native Developer operation resolves the configured selected agent and existing per-run tools; broader PM/Architect managed execution remains pending. Assignment/run completion is metadata, not verification or publication approval. Native human input and service approval are distinct. Direct workflow operations remain read-only. Only saved waiting checkpoints resume; interrupted executing states cannot be blindly replayed. Cleanup is required; arbitrary synchronous callback safety/duration remains operator-owned. Local locks/state are not distributed execution or hostile-tenant certification. Live delivery/hosted CI acceptance remains pending.
 - `developer.async.webhook` returns a task bundle; no worker consumes it automatically.
 - Supported repository issue events produce target-specific bundles and require approval-time base SHA pinning. Checkout preparation validates membership in the explicitly configured local seed/base branch, not live GitHub repository identity or remote freshness. No automatic remote lookup/fetch occurs. Legacy fixture payloads without repository context retain prototype routing; unsupported repository webhook events and missing issue criteria are rejected.
 - GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions at `88720aa`. Live acceptance remains pending. The operator installed checksum-verified `gh` 2.102.0 locally for the fresh trial and verified `uhvogala` on github.com; this is not a default image dependency. No live task-result publication has been tested.

@@ -137,6 +137,21 @@ def coordinator_proposal(agent="developer_one"):
     return {"proposal": AssignmentProposal(agent_id=agent, rationale="Selected for this task"), "coordinator_id": "planner"}
 
 
+def test_managed_revalidation_rejects_changed_approval_without_resetting_budget(tmp_path):
+    service, snapshot, previews, _ = setup_service(tmp_path)
+    preview = approved_task(tmp_path, previews)
+    first = assign(service, snapshot, preview, **coordinator_proposal())
+    assert service.revalidate(first.assignment_id) == first
+    path = Path(first.budget_path)
+    before = path.read_bytes()
+    payload = json.loads((tmp_path / "previews.json").read_text())
+    payload["previews"][0]["bundle_payload"]["objective"] = "Changed scope"
+    (tmp_path / "previews.json").write_text(json.dumps(payload))
+    with pytest.raises(PermissionError, match="scope"):
+        service.revalidate(first.assignment_id)
+    assert path.read_bytes() == before
+
+
 @pytest.mark.parametrize("strategy", ["coordinator", "rules", "human"])
 def test_configured_strategies_pin_approval_revision_scope_and_original_budget(tmp_path, strategy):
     service, snapshot, previews, assignments = setup_service(tmp_path, strategy)

@@ -174,33 +174,40 @@ def build_organization_workflows(
                 nodes[node.id] = AgentExecutor(runtime.agents[str(node.agent)], id=node.id)
             else:
                 nodes[node.id] = _OperationExecutor(node.id, registered[str(node.operation)])
-        builder = WorkflowBuilder(
-            start_executor=nodes[graph.start], checkpoint_storage=checkpoint_storage,
-            max_iterations=graph.max_iterations,
+        workflows[workflow.id] = _build_native_workflow(
+            graph, nodes=nodes, predicates=conditions, checkpoint_storage=checkpoint_storage,
             name=f"{definition.id}.{runtime.snapshot.revision}.{workflow.id}",
-            description=graph.description, output_from=[nodes[name] for name in graph.outputs],
         )
-        for edge in graph.edges:
-            if edge.kind == "edge":
-                condition = (
-                    _condition(edge.condition, conditions[edge.condition])
-                    if edge.condition is not None else None
-                )
-                builder.add_edge(nodes[str(edge.source)], nodes[str(edge.target)], condition=condition)
-            elif edge.kind == "fan_out":
-                builder.add_fan_out_edges(nodes[str(edge.source)], [nodes[name] for name in edge.targets])
-            elif edge.kind == "fan_in":
-                builder.add_fan_in_edges([nodes[name] for name in edge.sources], nodes[str(edge.target)])
-            else:
-                cases: list[Case | Default] = [
-                    Case(condition=_condition(case.condition, conditions[case.condition]), target=nodes[case.target])
-                    for case in edge.cases
-                ]
-                if edge.default is not None:
-                    cases.append(Default(nodes[edge.default]))
-                builder.add_switch_case_edge_group(nodes[str(edge.source)], cases)
-        workflows[workflow.id] = builder.build()
     return MappingProxyType(workflows)
+
+
+def _build_native_workflow(
+    graph: WorkflowGraphDefinition, *, nodes: Mapping[str, Executor],
+    predicates: Mapping[str, WorkflowPredicate], checkpoint_storage: CheckpointStorage | None,
+    name: str,
+) -> Workflow:
+    builder = WorkflowBuilder(
+        start_executor=nodes[graph.start], checkpoint_storage=checkpoint_storage,
+        max_iterations=graph.max_iterations, name=name,
+        description=graph.description, output_from=[nodes[node_id] for node_id in graph.outputs],
+    )
+    for edge in graph.edges:
+        if edge.kind == "edge":
+            condition = _condition(edge.condition, predicates[edge.condition]) if edge.condition is not None else None
+            builder.add_edge(nodes[str(edge.source)], nodes[str(edge.target)], condition=condition)
+        elif edge.kind == "fan_out":
+            builder.add_fan_out_edges(nodes[str(edge.source)], [nodes[node_id] for node_id in edge.targets])
+        elif edge.kind == "fan_in":
+            builder.add_fan_in_edges([nodes[node_id] for node_id in edge.sources], nodes[str(edge.target)])
+        else:
+            cases: list[Case | Default] = [
+                Case(condition=_condition(case.condition, predicates[case.condition]), target=nodes[case.target])
+                for case in edge.cases
+            ]
+            if edge.default is not None:
+                cases.append(Default(nodes[edge.default]))
+            builder.add_switch_case_edge_group(nodes[str(edge.source)], cases)
+    return builder.build()
 
 
 def create_model_profile(

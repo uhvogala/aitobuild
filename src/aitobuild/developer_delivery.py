@@ -85,6 +85,9 @@ class DeveloperDeliveryWorker:
         self._command_timeout = command_timeout_seconds
         self._git_executable = shutil.which("git")
 
+    def budget_path(self, preview_id: str) -> Path:
+        return self._state_dir / "budgets" / (sha256(preview_id.encode()).hexdigest() + ".json")
+
     def _task_dir(self, preview_id: str) -> Path:
         directory = self._state_dir / "deliveries" / sha256(preview_id.encode()).hexdigest()
         if directory.resolve() != directory:

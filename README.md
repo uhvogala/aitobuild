@@ -8,8 +8,8 @@ not yet an autonomous issue-to-PR service. The next delivery target is one
 approved issue producing a tested draft PR in a disposable repository, with a
 human retaining merge authority. Configurable organization definitions, instance
 factories and native workflow admission are available as library APIs. Persisted
-delegation and managed execution are next; the team structure and lifecycle are
-not fixed in code.
+delegation and revision-pinned managed delivery graphs are also library APIs;
+automatic service routing is next. Team structure and lifecycle are not fixed in code.
 
 ## Start here
 
@@ -19,11 +19,11 @@ not fixed in code.
 - [.devcontainer/certs/README.md](.devcontainer/certs/README.md): host certificate setup.
 - [agents.md](agents.md): repository conventions for contributors and coding agents.
 
-## Current status (2026-10-06)
+## Current status (2026-10-07)
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Organization configuration | Versioned definitions, immutable revisions, configured factories/native graphs and durable assignment ownership/capacity claims | Managed native execution and service integration |
+| Organization configuration | Immutable revisions, configured factories/native graphs, durable assignments and revision-pinned managed delivery execution | Service activation and broader scoped role adapters |
 | Ingress and routing | Signed webhooks, internal auth, issue extraction and durable scope approval/dedupe | Configurable assignment routing and automatic task consumption |
 | Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
 | Native model runtime | Foundry binding, configured agent factories, approved Developer invocation, persistent manual approvals and constrained Grok/Kimi trials | Managed PM/Architect execution and service activation |
@@ -31,8 +31,8 @@ not fixed in code.
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **492 tests pass**, with two optional prepared-target Docker
-probes skipped; Ruff and mypy (40 source files) pass. The prior 325-test baseline
+Verified locally: **531 tests pass**, with two optional prepared-target Docker
+probes skipped; Ruff and mypy (42 source files) pass. The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
 The original patch-repair
 failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
@@ -91,8 +91,8 @@ Use a trusted service-owned storage directory. Changed definitions create new
 revisions; callers must select a revision explicitly. Storage does not activate
 or approve it. The example workflow is a harmless definition probe, not a delivery
 recipe. Existing service bootstrap/dispatch and execution safeguards are unchanged.
-Recorded delegation is available through the library; managed run/revision pinning
-and service integration follow in [MILESTONES.md](MILESTONES.md).
+Recorded delegation and managed run/revision pinning are library APIs; service
+integration follows in [MILESTONES.md](MILESTONES.md).
 
 Assemble configured instances and the harmless native example in mock mode:
 
@@ -133,13 +133,13 @@ an actual boolean. Native execution uses `WorkflowBuilder` and `AgentExecutor`.
 Operations consume one incoming message and return a value (or an awaitable).
 Native fan-in passes a list; agents retain SDK message/response types rather than
 implicit string conversion. Operation results are forwarded to connected nodes
-and published only when selected in `outputs`. Bindings are explicitly registered
-read-only operations; write/review bindings await managed approved-task context.
+and published only when selected in `outputs`. Direct bindings are registered
+read-only operations; managed operations use the separate approved-task runner below.
 Unknown fields/kinds, inline agents/files, HTTP/MCP, dynamic references, invalid
 topology and routed-team escapes fail closed. Config cannot write service state.
 Operator ceilings bound document bytes, node/connection counts and native runner
-iterations, not callback duration. Optional SDK checkpoint storage is caller-owned;
-managed restart/resume, human-input adapters and task approval remain pending.
+iterations, not arbitrary synchronous callback duration. Optional direct-workflow
+SDK checkpoint storage is caller-owned and does not certify managed execution.
 
 No PowerFx, .NET or expression evaluator is used or required. Only Python graph
 documents are accepted. Literal payloads, including strings starting with `=`,
@@ -177,8 +177,58 @@ records release capacity for other tasks, never reclaim the original task.
 
 Assignment completion is metadata, not independent verification, semantic review,
 publication approval or sandbox cleanup. Existing operator endpoints are unchanged;
-managed native execution, authenticated coordinator binding, checkpoint recovery
-and automatic cleanup remain the next slice. No GitHub assignee write occurs.
+managed execution is described below. No GitHub assignee write occurs.
+
+### Managed native workflows
+
+[src/aitobuild/organization_runner.py](src/aitobuild/organization_runner.py) adds
+`ManagedWorkflowRunner`, registered `ManagedOperation` bindings and a separate
+`RunStore` contract with atomic/fsynced `FileRunStore`. Runs pin assignment/scope,
+definition/workflow revision, operator `binding_revision`, native session identity,
+checkpoint identity/integrity, consumed decisions and cleanup receipts. Changed
+definitions cannot replace active revisions; changed operator bindings fail closed.
+
+Supply `actor_provider` from trusted operator/runtime context. `runner.assign`
+binds coordinator identity from that provider, never a proposal or graph input.
+Ownership, frozen approval/base/scope and the original existing budget are
+revalidated on each active run/resume, operation and checkpoint save. Establish the
+approved task ledger first (normally `DeveloperDeliveryWorker.prepare`) and assign
+using `budget_path_for=worker.budget_path`; no missing/aborted budget is created/reset.
+
+`start(assignment_id, input=...)` records one immutable invocation. Duplicate calls
+return the receipt without replacing input or replaying completed work. `resume`
+answers saved native `human_input`; `approve` accepts only a trusted operator's
+Boolean `service_approval` decision. These kinds are not interchangeable. Decisions
+are persisted before continuation, and native tool approval retains exact arguments.
+Restart resumes only saved idle waiting checkpoints. An interrupted `running`
+receipt fails closed with cleanup/abort, not blind side-effect replay. `finalizing`
+recovers terminal/assignment metadata only. Cancel in-process asyncio tasks and
+await them; `cancel` handles idle/recovered runs. Busy runs reject competing calls.
+Threaded delivery calls drain before ownership is released; worker limits still apply.
+
+[src/aitobuild/organization_delivery.py](src/aitobuild/organization_delivery.py)
+provides `ManagedDeliveryBindings` for configurable `delivery_prepare`,
+`delivery_implement`, `delivery_verify` and optional `delivery_publish` nodes.
+Definitions choose ordering/branches/joins through native SDK edges, not a fixed
+team or universal contribution loop. `NativeDeliveryImplementation` resolves the
+selected configured Developer using `runtime_for(pinned_snapshot)`, persists SDK
+sessions/approval content and binds existing per-run exact-span tools to the private
+prepared target and constrained offline Docker adapter. Browser/MCP and legacy edits
+are rejected. Recovered tool errors remain diagnostics, not automatic rejection.
+Verification/publication reuse guarded worker APIs with preview identity, not
+graph-supplied commands or target/publication metadata. Publication requires an
+explicit operator GitHub binding; mock publication is opt-in for fixtures only.
+
+Managed graphs currently admit operation nodes, including that native Developer
+adapter; direct configured `agent` nodes fail closed pending scoped role adapters.
+`completed` means the selected graph and cleanup finished, not independent
+verification, semantic review or publication approval; implement-only graphs stop
+at `implemented`. Thirty-eight runner regressions cover actual SDK/mock-transport
+approval/rejection/recovered edits, restart, revision/ownership drift, duplicates,
+cancellation and a disposable-target prepare/implement/verify/mock-draft graph.
+No live model/GitHub/Docker trial or hosted CI was repeated. HTTP workflows remain
+unchanged; journal capacity does not govern unmanaged HTTP runs. Service activation,
+broader managed roles and distributed controls remain pending.
 
 ### API setup
 
