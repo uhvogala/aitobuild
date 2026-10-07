@@ -246,13 +246,70 @@ interruption, duplicate local owners, capacity, cancellation/thread draining and
 actual native SDK mocked transport plus independent verification/mock draft delivery.
 No live model/GitHub/Docker/hosted CI, dependency change, push or remote write.
 
+Scoped native role operations (2026-10-07, from worker commit `51766cb`):
+`organization_roles.py` resolves pinned configured PM/Architect owners without
+persistent tool profiles. `pm_propose_assignment` emits strict eligible-owner
+metadata only, never actor identity, ownership or issue writes. Architect review
+uses a separately approved task/original ledger and operator-pinned publication
+head, matching repository/issue/base/path scope. Native per-run read tools retrieve
+immutable hash-verified UTF-8 blobs and exact pinned-base diffs with bounded inline
+contiguous pages; binary/link/submodule targets are refused and mode changes remain
+explicit. Complete source/diff access is required but does not prove semantic quality.
+Exact target/body/evidence persist; a distinct one-shot service approval publishes
+COMMENT with a write-time original-budget check. Restart never reruns the review
+model, and uncertain submitting effects fail closed. Recovered errors stay diagnostics.
+Default service activation/routes and direct-agent admission are unchanged; operators
+register these library operations explicitly, not a fixed contribution loop.
+Gates: **629 passed/two optional Docker skips**, Ruff/mypy (45 sources), clean diagnostics
+and mock fixture success/artifact/exit 0. Forty-two new cases cover native mock
+transports, exact approvals/evidence/paging/drift/expiry, immutable source/diffs and
+GET-only CLI identity/allowlist/size/link refusals. No live trial, push or remote write.
+
+Native PM coordination continuation (2026-10-07): `NativeCoordinatorProposal`
+connects the native configured PM to existing service/worker admission via an
+explicit coordinator/event-scoped `CoordinatorBinding`. The model emits only
+strict eligible-agent/rationale metadata; service context supplies trusted PM
+identity and assignment authority. Native calls use one scoped read-only tool.
+Atomic/fsynced receipts pin approved scope/time, original ledger/deadline,
+definition/route/team/workflow, coordinator and operator binding. Saved proposals
+survive capacity deferral/restart without model replay or budget reset; interrupted,
+corrupt or changed receipts fail closed. Cancellation, expiry and malformed output
+cannot create ownership. Existing custom callbacks and default bootstrap are unchanged.
+Gates: **646 passed/two optional Docker skips**, Ruff/mypy (45 sources), diagnostics,
+four-call-site API compatibility and mock simulation success/artifact/exit 0.
+Seventeen new native mocked-transport cases cover request/detached admission and
+capacity, interruption, pins, cancellation and runtime/expiry refusal. Coordinator
+callbacks do not claim PM journal capacity; bounded workers remain the local limit.
+No live model/GitHub/Docker/hosted CI, dependency changes, commit, push or remote write.
+
+Published-review admission continuation (2026-10-07): opt-in `PublishedReviewAdmission`
+stages saved published drafts as separate unapproved Architect tasks using atomic,
+fsynced immutable target/head/scope/route/revision receipts. Successful publication
+offers metadata; staging errors preserve the publication result. An authenticated
+metadata-only offer endpoint retries staging without remote publication replay.
+Duplicates/partial staging and changed activation revisions retain the original
+preview and pins; lost/corrupt receipts cannot fall through to Developer routing.
+Fresh task approval routes through service or detached workers without a Developer
+checkout. Separate review ledgers pin approval/path/deadline and refuse recreation,
+expiry/abort or deadline drift, including owned-run restart. No commands/file writes
+are offered; frozen-owner cancellation survives damaged mutable preview metadata.
+Native Architect source/diff inspection still requires exact saved COMMENT approval;
+model calls do not replay on approval restart, and counters do not prove understanding.
+Gates: **664 passed/two optional Docker skips**, Ruff/mypy (46 sources), diagnostics,
+six-call-site service compatibility and successful mock fixture simulation. Eighteen
+new regressions cover request/detached native mocked transport, HTTP staging/approval,
+metadata recovery and scope/revision/ledger/cleanup boundaries. Default startup is
+unchanged; no live model/GitHub/Docker/hosted CI, dependency change, commit, push or
+remote write. Scoped correction, managed PM planning/writes, bounded meetings and
+semantic live acceptance remain pending.
+
 ### Current Limits
 
-- Configured factories/native admission/assignment/runner libraries have opt-in app integration through operator-owned service/worker factories; the default server still uses legacy handles and metadata dispatch. Service-only activation awaits execution in the request; optional workers durably enqueue with lifespan-owned execution and explicit bounded unowned-task startup discovery. Explicit repository/revision/event and actor/binding registries cannot be selected by HTTP callers. Internal shared-token identity is not multi-user authentication. Journal capacity does not govern unmanaged HTTP runs. Managed operation graphs pin active revisions; direct agent nodes need scoped role adapters. The native Developer operation resolves the selected configured agent and existing tools; broader PM/Architect managed execution remains pending. Trusted read-only coordinator callbacks are original-deadline bounded, not arbitrary-code isolation. Run/assignment/admission completion is metadata, not verification/publication approval; native input is distinct from service approval. Only saved waiting checkpoints resume; interrupted running effects cannot be blindly replayed. Busy controls return 409; mandatory cleanup/thread draining and original budgets remain enforced. Cross-process cancellation is polling-based; failed worker slots require inspection/restart. Local locks/state are not distributed execution or hostile-tenant certification. Live delivery/hosted CI acceptance remains pending.
+- Configured factories/native admission/assignment/runner libraries have opt-in app integration through operator-owned service/worker factories; the default server still uses legacy handles and metadata dispatch. Service-only activation awaits execution in the request; optional workers durably enqueue with lifespan-owned execution and explicit bounded unowned-task startup discovery. Explicit repository/revision/event and actor/binding registries cannot be selected by HTTP callers. Internal shared-token identity is not multi-user authentication. Journal capacity does not govern unmanaged HTTP runs. Managed operation graphs pin active revisions; direct agent nodes remain denied. Scoped Developer delivery, PM proposals and Architect review operations are explicit libraries, not automatically activated orchestration. Trusted read-only coordinator callbacks are original-deadline bounded, not arbitrary-code isolation. Run/assignment/admission completion is metadata, not verification/publication approval; native input is distinct from service approval. Only saved waiting checkpoints resume; interrupted running effects cannot be blindly replayed. Busy controls return 409; mandatory cleanup/thread draining and original budgets remain enforced. Cross-process cancellation is polling-based; failed worker slots require inspection/restart. Local locks/state are not distributed execution or hostile-tenant certification. Live delivery/hosted CI acceptance remains pending.
 - `developer.async.webhook` returns task metadata by default. Detached consumption exists only for explicitly service/worker-factory-activated approved repository routes, not default startup.
 - Supported repository issue events produce target-specific bundles and require approval-time base SHA pinning. Checkout preparation validates membership in the explicitly configured local seed/base branch, not live GitHub repository identity or remote freshness. No automatic remote lookup/fetch occurs. Legacy fixture payloads without repository context retain prototype routing; unsupported repository webhook events and missing issue criteria are rejected.
 - GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions at `88720aa`. Live acceptance remains pending. The operator installed checksum-verified `gh` 2.102.0 locally for the fresh trial and verified `uhvogala` on github.com; this is not a default image dependency. No live task-result publication has been tested.
-- PM draft/write-approval stores remain in memory; restart loses those records. Architect/PM tool binding is implemented, but managed role run/resume and automatic published-target review orchestration are not wired into the HTTP workflow. Published-PR reads expose metadata and filenames, not a reviewable diff or target file content.
+- General PM draft/write-approval stores remain in memory. Explicit native PM coordinator bindings now feed saved read-only proposals into trusted service assignments; managed PM planning/issue writes remain pending. Opt-in publication-to-Architect HTTP staging/routing requires separate task and exact COMMENT approvals. Correction/meeting orchestration and live semantic acceptance remain pending. Reads support regular UTF-8 files up to 1 MiB; binary/link/submodule review needs another approved adapter, not a bypass.
 - Meetings construct workflows without executing them, and proactive scans interpret supplied metadata rather than inspecting a repository.
 - Scheduler ticks require an external caller; meeting/scheduler state and non-repository trigger dedupe remain in memory. Previews, approvals and repository issue task/delivery identities persist locally. `dispatched` records metadata routing, not worker completion; inspect the saved queue after restart. Distributed coordination and full lifecycle auditing remain pending.
 - Native runs without a bound preview and unbound legacy runs remain prototypes. Approved native tasks persist unique-path reservations and an absolute deadline, fail closed after abort, and use offline read-only repository execution. Browser/arbitrary MCP adapters are excluded; native memory has a separate scoped SDK store. Distributed coordination, durable auditing and scratch/disk quotas remain pending.

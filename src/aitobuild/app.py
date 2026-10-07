@@ -30,6 +30,7 @@ from aitobuild.developer_preview import DeveloperPreviewRegistry
 from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import make_internal_event, normalize_github_webhook, parse_trigger_request
 from aitobuild.organization_assignments import AssignmentProposal
+from aitobuild.organization_delivery import _delivery_call
 from aitobuild.organization_service import ManagedOrganizationService, ManagedServiceContext
 from aitobuild.organization_worker import ManagedOrganizationWorker, WorkerJob
 from aitobuild.proactive import ArchitectScanRunner
@@ -708,6 +709,21 @@ def create_app(
             return managed_worker.diagnostics()
 
     if managed_service is not None:
+        @app.post("/internal/organization/reviews/offer")
+        async def offer_published_review(
+            payload: dict[str, Any],
+            x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        ) -> dict[str, Any]:
+            _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+            if set(payload) != {"published_preview_id"} or not isinstance(payload["published_preview_id"], str) or not payload["published_preview_id"].strip():
+                raise HTTPException(status_code=400, detail="Review staging accepts only published_preview_id")
+            assert managed_service is not None
+            try:
+                preview = await managed_service.offer_published_review(payload["published_preview_id"].strip())
+            except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return {"review_preview": {"preview_id": preview.preview_id, "approved": preview.approved, "bundle": preview.bundle_payload} if preview else None}
+
         @app.get("/internal/organization/tasks/{preview_id}")
         def managed_task_status(
             preview_id: str,
@@ -930,7 +946,7 @@ def create_app(
 
 
     @app.post("/internal/developer/delivery/publish")
-    def publish_developer_delivery(
+    async def publish_developer_delivery(
         payload: dict[str, Any],
         x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
     ) -> dict[str, Any]:
@@ -952,15 +968,23 @@ def create_app(
                     status_code=409,
                     detail="Publication requires a live GitHub adapter (gh_cli); mock publication is refused",
                 )
-            record = delivery_worker.publish(
+            record = await _delivery_call(lambda: delivery_worker.publish(
                 preview_id,
                 github=github_adapter,
                 require_human_approval_for_repo_writes=app_config.policy.require_human_approval_for_repo_writes,
                 allow_mock_publication=False,
-            )
+            ))
         except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        return {"accepted": record.state == "published", "delivery": record.to_payload()}
+        result = {"accepted": record.state == "published", "delivery": record.to_payload()}
+        if record.state == "published" and managed_service is not None:
+            try:
+                review = await managed_service.offer_published_review(preview_id)
+                if review is not None:
+                    result["review_preview"] = {"preview_id": review.preview_id, "approved": review.approved, "bundle": review.bundle_payload}
+            except Exception as error:
+                result["review_staging_error"] = str(error)
+        return result
 
     @app.get("/internal/developer/delivery/{preview_id}")
     def get_developer_delivery(

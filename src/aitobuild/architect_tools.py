@@ -394,6 +394,28 @@ def build_architect_tools(
             raise ValueError("preview_id must be non-empty")
         return delivery_worker.get_published_pull_request(cleaned, github=github)
 
+    @tool(name="architect_read_published_source", approval_mode="always_require",
+          description="Read bounded UTF-8 source at the published head; only approved changed paths. Follow next_offset for remaining bytes.")
+    def architect_read_published_source(
+        preview_id: str, path: str, offset: Annotated[int, Field(ge=0)] = 0,
+        max_bytes: Annotated[int, Field(ge=1, le=24000)] = 24000,
+    ) -> dict[str, Any]:
+        assert_role_action_allowed(role, ActionClass.READ_ONLY)
+        if delivery_worker is None:
+            raise ValueError("Delivery worker is not configured for Architect review")
+        return delivery_worker.get_published_source(preview_id, github=github, path=path, offset=offset, max_bytes=max_bytes)
+
+    @tool(name="architect_read_published_diff", approval_mode="always_require",
+          description="Read bounded diff of approved base versus published head, with mode pins and explicit truncation. Follow next_offset.")
+    def architect_read_published_diff(
+        preview_id: str, path: str, offset: Annotated[int, Field(ge=0)] = 0,
+        max_bytes: Annotated[int, Field(ge=1, le=24000)] = 24000,
+    ) -> dict[str, Any]:
+        assert_role_action_allowed(role, ActionClass.READ_ONLY)
+        if delivery_worker is None:
+            raise ValueError("Delivery worker is not configured for Architect review")
+        return delivery_worker.get_published_diff(preview_id, github=github, path=path, offset=offset, max_bytes=max_bytes)
+
     @tool(
         name="architect_submit_published_pr_review",
         approval_mode="always_require",
@@ -473,6 +495,8 @@ def build_architect_tools(
         architect_start_session,
         architect_stop_session,
         architect_get_published_pr,
+        architect_read_published_source,
+        architect_read_published_diff,
         architect_submit_published_pr_review,
         architect_memory_query,
         architect_memory_record,

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
+from difflib import unified_diff
 from hashlib import sha256
 import json
 import os
@@ -590,6 +592,9 @@ class DeveloperDeliveryWorker:
         expected_head = str(publication["head_sha"]).lower()
         live_head = (pull.head_sha or "").lower() or None
         head_matches = live_head == expected_head
+        if (pull.repository != publication["repository"] or pull.number != publication["pull_number"] or
+                pull.base_ref != publication["base_ref"]):
+            raise PermissionError("Published pull request repository/number/base differs from the pinned target")
         if pull.head_ref != publication["branch"]:
             raise ValueError("Published pull request head ref does not match the delivery branch")
         if not pull.draft or pull.state != "open":
@@ -602,6 +607,84 @@ class DeveloperDeliveryWorker:
             payload["architect_review"] = prior_review
         return payload
 
+    def get_published_source(
+        self, preview_id: str, *, github: GitHubAdapter, path: str, offset: int = 0,
+        max_bytes: int = 24000,
+    ) -> dict[str, Any]:
+        if type(offset) is not int or offset < 0 or type(max_bytes) is not int or not 1 <= max_bytes <= 24000:
+            raise ValueError("Review paging must use bounded integer byte offsets/limits")
+        pull = self.get_published_pull_request(preview_id, github=github)
+        if not pull["head_matches_publication"]:
+            raise ValueError("Published draft head SHA no longer matches the review target")
+        directory = self._task_dir(preview_id)
+        with FileLock(str(directory) + ".lock", timeout=10):
+            record = self._load(directory)
+            if record is None:
+                raise ValueError("Delivery not found")
+            publication = dict(self._require_published_publication(record))
+            bundle = developer_task_bundle_from_payload(record.bundle_payload)
+            if (bundle.issue_context is None or publication["repository"] != bundle.issue_context.repository or
+                    publication["head_sha"] != pull["expected_head_sha"] or
+                    path not in publication["changed_paths"] or not is_path_allowed(path, policy=bundle.policy)):
+                raise PermissionError("Review source must belong to the exact approved published changes")
+            blob_sha = publication.get("blob_shas", {}).get(path)
+            mode = publication.get("file_modes", {}).get(path)
+            if path not in publication.get("blob_shas", {}) or path not in publication.get("file_modes", {}):
+                raise ValueError("Review source lacks its immutable blob/mode pins")
+        content = b"" if blob_sha is None and mode is None else github.get_blob(
+            repository=publication["repository"], blob_sha=blob_sha,
+        )
+        if blob_sha is not None and (_git_blob_sha(content) != blob_sha or mode not in {"100644", "100755"}):
+            raise ValueError("Review source hash/mode differs from the publication snapshot")
+        if len(content) > 1048576 or offset > len(content):
+            raise ValueError("Review source exceeds size/offset bounds")
+        content.decode("utf-8")
+        page = content[offset:offset + max_bytes].decode("utf-8", errors="ignore")
+        consumed = len(page.encode("utf-8"))
+        if offset < len(content) and (not consumed or content[offset] & 0xC0 == 0x80):
+            raise ValueError("Review byte page must end/advance on a UTF-8 boundary")
+        current = self.get_published_pull_request(preview_id, github=github)
+        if not current["head_matches_publication"] or current["expected_head_sha"] != publication["head_sha"]:
+            raise ValueError("Published draft head SHA changed during source inspection")
+        truncated = offset + consumed < len(content)
+        return {"preview_id": preview_id, "repository": publication["repository"], "head_sha": publication["head_sha"],
+                "base_sha": publication["base_sha"], "path": path, "blob_sha": blob_sha, "mode": mode,
+                "deleted": blob_sha is None, "content": page, "offset": offset, "total_bytes": len(content),
+                "truncated": truncated, "next_offset": offset + consumed if truncated else None}
+
+    def get_published_diff(
+        self, preview_id: str, *, github: GitHubAdapter, path: str, offset: int = 0,
+        max_bytes: int = 24000,
+    ) -> dict[str, Any]:
+        source = self.get_published_source(preview_id, github=github, path=path)
+        before = github.get_file_at_commit(repository=source["repository"], commit_sha=source["base_sha"], path=path)
+        if before is not None and (before.mode not in {"100644", "100755"} or len(before.content) > 1048576 or
+                                   _git_blob_sha(before.content) != before.blob_sha):
+            raise ValueError("Review base blob identity/size is invalid")
+        old = before.content.decode("utf-8") if before else ""
+        after = github.get_blob(repository=source["repository"], blob_sha=source["blob_sha"]) if not source["deleted"] else b""
+        if len(after) > 1048576 or not source["deleted"] and _git_blob_sha(after) != source["blob_sha"]:
+            raise ValueError("Review head blob identity/size is invalid")
+        new = after.decode("utf-8")
+        lines = unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True),
+                             fromfile=f"a/{path}", tofile=f"b/{path}")
+        diff = "".join(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in lines).encode("utf-8")
+        if type(offset) is not int or not 0 <= offset <= len(diff) or type(max_bytes) is not int or not 1 <= max_bytes <= 24000:
+            raise ValueError("Review diff paging requires bounded integer byte offsets/limits")
+        page = diff[offset:offset + max_bytes].decode("utf-8", errors="ignore")
+        consumed = len(page.encode("utf-8"))
+        if offset < len(diff) and (not consumed or diff[offset] & 0xC0 == 0x80):
+            raise ValueError("Review diff byte page must advance on a UTF-8 boundary")
+        current = self.get_published_pull_request(preview_id, github=github)
+        if not current["head_matches_publication"] or current["expected_head_sha"] != source["head_sha"]:
+            raise ValueError("Published draft head SHA changed during diff inspection")
+        truncated = offset + consumed < len(diff)
+        return {**{key: source[key] for key in ("preview_id", "repository", "head_sha", "base_sha", "path")},
+                "before_blob_sha": before.blob_sha if before else None, "after_blob_sha": source["blob_sha"],
+                "before_mode": before.mode if before else None, "after_mode": source["mode"],
+                "diff": page, "offset": offset, "total_bytes": len(diff), "truncated": truncated,
+                "next_offset": offset + consumed if truncated else None}
+
     def submit_architect_review(
         self,
         preview_id: str,
@@ -609,6 +692,8 @@ class DeveloperDeliveryWorker:
         github: GitHubAdapter,
         event: str,
         body: str,
+        expected_target: dict[str, Any] | None = None,
+        before_submit: Callable[[], Any] | None = None,
     ) -> DeliveryPreparation:
         """Submit COMMENT against the published draft; persist last review.
 
@@ -621,6 +706,12 @@ class DeveloperDeliveryWorker:
             if record is None:
                 raise ValueError("Delivery not found")
             publication = dict(self._require_published_publication(record))
+            if expected_target is not None and expected_target != {
+                "preview_id": record.preview_id,
+                **{key: publication.get(key) for key in ("head_sha", "repository", "pull_number", "base_sha",
+                                                       "changed_paths", "blob_shas", "file_modes")},
+            }:
+                raise PermissionError("Architect approved target changed before COMMENT submission")
         cleaned_event = str(event).strip().upper()
         if cleaned_event == "REQUEST_CHANGES":
             raise ValueError(
@@ -636,6 +727,9 @@ class DeveloperDeliveryWorker:
             pull_number=int(publication["pull_number"]),
         )
         live_head = (pull.head_sha or "").lower()
+        if (pull.repository != publication["repository"] or pull.number != publication["pull_number"] or
+                pull.base_ref != publication["base_ref"]):
+            raise PermissionError("Published pull request repository/number/base differs from the pinned target")
         if live_head != expected_head:
             raise ValueError(
                 "Published draft head SHA no longer matches delivery publication; "
@@ -645,6 +739,8 @@ class DeveloperDeliveryWorker:
             raise ValueError("Published pull request head ref does not match the delivery branch")
         if not pull.draft or pull.state != "open":
             raise ValueError("Published pull request must remain an open draft")
+        if before_submit is not None:
+            before_submit()
         review = github.submit_pr_review(
             role=AgentRole.ARCHITECT,
             repository=str(publication["repository"]),

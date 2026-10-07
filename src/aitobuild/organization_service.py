@@ -21,6 +21,7 @@ from aitobuild.organization_runner import (
     ManagedOperation, ManagedRun, ManagedTaskContext, ManagedWorkflowRunner, RunStore, RuntimeActor,
 )
 from aitobuild.organization_runtime import WorkflowLimits, WorkflowPredicate
+from aitobuild.organization_reviews import PublishedReviewAdmission
 
 
 class ManagedRoute(DefinitionModel):
@@ -42,6 +43,17 @@ class ManagedServiceContext:
 CoordinatorProposal = Callable[[DefinitionSnapshot, DeveloperPreview], Awaitable[AssignmentProposal]]
 
 
+@dataclass(frozen=True)
+class CoordinatorBinding:
+    coordinator_id: str
+    event: str
+    proposal: CoordinatorProposal
+
+    def __post_init__(self) -> None:
+        if not self.coordinator_id.strip() or not self.event.strip() or not callable(self.proposal):
+            raise ValueError("Scoped coordinator binding requires explicit coordinator/event and callback")
+
+
 class ManagedOrganizationService:
     def __init__(
         self, *, definitions: DefinitionStore, assignments: AssignmentStore, runs: RunStore,
@@ -49,20 +61,25 @@ class ManagedOrganizationService:
         routes: tuple[ManagedRoute, ...], operator_id: str,
         operations: Mapping[str, ManagedOperation],
         cleanup: Callable[[ManagedTaskContext], Awaitable[None]], binding_revision: str,
-        coordinators: Mapping[str, CoordinatorProposal] | None = None,
+        coordinators: Mapping[str, CoordinatorProposal | CoordinatorBinding] | None = None,
         predicates: Mapping[str, WorkflowPredicate] | None = None,
         limits: WorkflowLimits = WorkflowLimits(),
+        reviews: PublishedReviewAdmission | None = None,
     ) -> None:
         self._definitions = definitions
         self._assignments = assignments
         self._runs = runs
         self._previews = previews
         self._worker = worker
+        if reviews is not None:
+            reviews.validate_binding(definitions=definitions, previews=previews, worker=worker)
+        self._reviews = reviews
         self._routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in routes)
+        self._review_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in reviews.routes) if reviews else ()
         targets = [(route.repository, route.repository_id) for route in self._routes]
         if len(targets) != len(set(targets)):
             raise ValueError("Managed repository routes must be unambiguous")
-        for route in self._routes:
+        for route in (*self._routes, *self._review_routes):
             snapshot = definitions.get(route.organization_id, route.revision)
             if snapshot is None or not any(route.event in item.events for item in snapshot.definition.routes):
                 raise ValueError("Managed activation requires an existing explicit revision/event")
@@ -75,12 +92,18 @@ class ManagedOrganizationService:
             definitions=definitions, assignments=assignments, runs=runs,
             assignment_service=AssignmentService(
                 definitions=definitions, assignments=assignments, previews=previews,
-                budget_path_for=worker.budget_path,
+                budget_path_for=self.budget_path,
             ), actor_provider=self._actor.get, operations=operations, cleanup=cleanup,
             binding_revision=binding_revision, predicates=predicates, limits=limits,
         )
 
     def _route(self, preview: DeveloperPreview) -> ManagedRoute | None:
+        if self._reviews is None and str(preview.bundle_payload.get("task_id", "")).startswith("published-review-"):
+            raise PermissionError("Staged review tasks require their trusted admission binding")
+        if self._reviews is not None:
+            review = self._reviews.route_for(preview.preview_id)
+            if review is not None:
+                return ManagedRoute.model_validate(review.model_dump())
         issue = developer_task_bundle_from_payload(preview.bundle_payload).issue_context
         if issue is None:
             return None
@@ -116,7 +139,17 @@ class ManagedOrganizationService:
         return self._runs.get(assignment.assignment_id) if assignment is not None else None
 
     def budget_path(self, preview_id: str) -> Path:
+        if self._reviews is not None:
+            path = self._reviews.original_budget_path(preview_id)
+            if path is not None:
+                return path
         return self._worker.budget_path(preview_id)
+
+    async def offer_published_review(self, published_preview_id: str) -> DeveloperPreview | None:
+        if self._reviews is None:
+            return None
+        reviews = self._reviews
+        return await _delivery_call(lambda: reviews.offer(published_preview_id))
 
     def approved_previews(self, *, limit: int) -> tuple[DeveloperPreview, ...]:
         return tuple(preview for preview in self._previews.list_previews(pending_only=False, limit=limit) if preview.approved)
@@ -146,6 +179,8 @@ class ManagedOrganizationService:
         if route is None or not preview.approved:
             return None
         if activation is not None:
+            if self._reviews is not None and self._reviews.route_for(preview_id) is not None and activation != route:
+                raise PermissionError("Saved review activation must retain the exact staged revision/event")
             if (activation.repository, activation.repository_id, activation.organization_id) != (
                 route.repository, route.repository_id, route.organization_id,
             ):
@@ -170,19 +205,29 @@ class ManagedOrganizationService:
                     raise PermissionError("Operator selection is not eligible for the activated route")
                 if strategy == "human" and proposal is None:
                     return None
-                coordinator = None
+                coordinator: CoordinatorProposal | None = None
                 if strategy == "coordinator":
                     team = next(team for team in snapshot.definition.teams if team.id == configured.team)
-                    coordinator = self._coordinators.get(str(team.coordinator))
-                    if coordinator is None:
+                    binding = self._coordinators.get(str(team.coordinator))
+                    if binding is None:
                         raise PermissionError("Coordinator has no trusted runtime proposal binding")
-                prepared = await _delivery_call(lambda: self._worker.prepare(preview_id))
-                if prepared.state != "prepared":
-                    raise ValueError("Unowned delivery is not prepared; automatic replay is blocked")
+                    if isinstance(binding, CoordinatorBinding):
+                        if (binding.coordinator_id, binding.event) != (team.coordinator, route.event):
+                            raise PermissionError("Coordinator binding differs from activated coordinator/event")
+                        coordinator = binding.proposal
+                    else:
+                        coordinator = binding
+                reviews = self._reviews
+                if reviews is not None and reviews.route_for(preview_id) is not None:
+                    await _delivery_call(lambda: reviews.prepare(preview_id))
+                else:
+                    prepared = await _delivery_call(lambda: self._worker.prepare(preview_id))
+                    if prepared.state != "prepared":
+                        raise ValueError("Unowned delivery is not prepared; automatic replay is blocked")
                 if coordinator is not None:
                     team = next(team for team in snapshot.definition.teams if team.id == configured.team)
                     self._actor.set(RuntimeActor("agent", str(team.coordinator)))
-                    budget = DeveloperTaskBudget(path=self._worker.budget_path(preview_id),
+                    budget = DeveloperTaskBudget(path=self.budget_path(preview_id),
                                                  bundle=developer_task_bundle_from_payload(preview.bundle_payload), create=False)
                     try:
                         async with asyncio.timeout(budget.remaining_seconds()):
@@ -204,7 +249,7 @@ class ManagedOrganizationService:
         if assignment is None:
             raise ValueError("Assignment not found")
         issue = assignment.bundle.issue_context
-        route = next((route for route in self._routes if issue is not None and
+        route = next((route for route in (*self._routes, *self._review_routes) if issue is not None and
                       (route.repository, route.repository_id, route.organization_id) ==
                       (issue.repository, issue.repository_id, assignment.organization_id)), None)
         if route is None or self._assignments.for_task(assignment.task_id) != assignment:

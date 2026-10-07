@@ -1280,6 +1280,15 @@ def test_architect_review_published_draft_from_publication_only(
     assert pull["draft"] is True
     assert pull["head_matches_publication"] is True
     assert pull["repository"] == "fixture/widgets"
+    path = published.publication["changed_paths"][0]
+    source = worker.get_published_source(preview_id, github=github, path=path)
+    assert source["head_sha"] == published.publication["head_sha"]
+    assert source["content"] == (Path(published.checkout_path) / path).read_text()
+    assert source["truncated"] is False
+    diff = worker.get_published_diff(preview_id, github=github, path=path)
+    assert diff["head_sha"] == source["head_sha"]
+    assert "+" + source["content"].splitlines()[0] in diff["diff"]
+    assert diff["truncated"] is False
     reviewed = worker.submit_architect_review(
         preview_id,
         github=github,

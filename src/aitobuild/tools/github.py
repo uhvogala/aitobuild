@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from hashlib import sha1, sha256
 import json
+from pathlib import PurePosixPath
 import re
 from subprocess import CalledProcessError, TimeoutExpired, run
 from typing import Any, Literal, Protocol
@@ -193,6 +194,10 @@ class GitHubAdapter(Protocol):
 
     def get_pull_request(self, *, repository: str, pull_number: int) -> GitHubPullRequest: ...
 
+    def get_blob(self, *, repository: str, blob_sha: str) -> bytes: ...
+
+    def get_file_at_commit(self, *, repository: str, commit_sha: str, path: str) -> GitHubBlobChange | None: ...
+
     def submit_pr_review(
         self,
         *,
@@ -257,6 +262,7 @@ class MockGitHubAdapter:
     _next_issue: int = 1
     _next_pr: int = 1
     _branch_heads: dict[str, dict[str, str]] = field(default_factory=dict)
+    commit_files: dict[tuple[str, str], dict[str, GitHubBlobChange]] = field(default_factory=dict)
 
     def _resolve_repository(self, repository: str) -> str:
         return assert_repository_allowed(
@@ -418,6 +424,28 @@ class MockGitHubAdapter:
         self.pull_requests[repository][pull_number] = enriched
         return enriched
 
+    def get_blob(self, *, repository: str, blob_sha: str) -> bytes:
+        repository = self._resolve_repository(repository)
+        _validate_blob_sha(blob_sha)
+        for (repo, _), files in self.commit_files.items():
+            if repo == repository:
+                for change in files.values():
+                    if change.blob_sha == blob_sha:
+                        return _decode_blob(base64.b64encode(change.content).decode("ascii"), blob_sha)
+        for commit in self.branch_commits:
+            if commit["repository"] == repository:
+                for change in commit["files"].values():
+                    if change is not None and change["blob_sha"] == blob_sha:
+                        return _decode_blob(change["content_base64"], blob_sha)
+        raise LookupError("Published blob not found")
+
+    def get_file_at_commit(self, *, repository: str, commit_sha: str, path: str) -> GitHubBlobChange | None:
+        repo = self._resolve_repository(repository)
+        _validate_read_path(commit_sha, path)
+        if (repo, commit_sha) not in self.commit_files:
+            raise LookupError("Commit not found")
+        return self.commit_files[(repo, commit_sha)].get(path)
+
     def submit_pr_review(
         self,
         *,
@@ -486,6 +514,14 @@ class MockGitHubAdapter:
             "tree_fingerprint": _tree_fingerprint(files),
         }
         head_sha = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:40]
+        base_files = self.commit_files.setdefault((repo, base_sha), {})
+        head_files = dict(base_files)
+        for path, change in files.items():
+            if change is None:
+                head_files.pop(path, None)
+            else:
+                head_files[path] = change
+        self.commit_files[(repo, head_sha)] = head_files
         self.branch_commits.append({**payload, "head_sha": head_sha})
         self._branch_heads.setdefault(repo, {})[branch.strip()] = head_sha
         return head_sha
@@ -820,6 +856,52 @@ class GhCliGitHubAdapter:
             )
         return _pull_request_from_api(raw, repository=repo, changed_files=changed_files)
 
+    def get_blob(self, *, repository: str, blob_sha: str) -> bytes:
+        repo = self._resolve_repository(repository)
+        _validate_blob_sha(blob_sha)
+        raw = self._api(f"repos/{repo}/git/blobs/{blob_sha}")
+        if (not isinstance(raw, dict) or raw.get("sha") != blob_sha or raw.get("encoding") != "base64" or
+                type(raw.get("size")) is not int or not 0 <= raw["size"] <= 1048576):
+            raise ValueError("GitHub blob identity/encoding/size is invalid or exceeds the review limit")
+        content = _decode_blob(raw.get("content"), blob_sha)
+        if len(content) != raw["size"]:
+            raise ValueError("GitHub blob size differs from its content")
+        return content
+
+    def get_file_at_commit(self, *, repository: str, commit_sha: str, path: str) -> GitHubBlobChange | None:
+        repo = self._resolve_repository(repository)
+        parts = _validate_read_path(commit_sha, path)
+        commit = self._api(f"repos/{repo}/git/commits/{commit_sha}")
+        if not isinstance(commit, dict) or commit.get("sha") != commit_sha or not isinstance(commit.get("tree"), dict):
+            raise ValueError("Review commit identity is invalid")
+        tree_sha = commit["tree"].get("sha")
+        for index, part in enumerate(parts):
+            _validate_blob_sha(tree_sha)
+            tree = self._api(f"repos/{repo}/git/trees/{tree_sha}")
+            if (not isinstance(tree, dict) or tree.get("sha") != tree_sha or tree.get("truncated") is not False or
+                    not isinstance(tree.get("tree"), list) or len(tree["tree"]) > 10000):
+                raise ValueError("Review tree identity is invalid or incomplete")
+            matches = [entry for entry in tree["tree"] if isinstance(entry, dict) and entry.get("path") == part]
+            if not matches:
+                return None
+            if len(matches) != 1:
+                raise ValueError("Review tree contains ambiguous paths")
+            entry = matches[0]
+            if index < len(parts) - 1:
+                if entry.get("type") != "tree" or entry.get("mode") != "040000":
+                    raise ValueError("Review source cannot traverse symlinks or non-tree entries")
+                tree_sha = entry.get("sha")
+            else:
+                if entry.get("type") != "blob" or entry.get("mode") not in {"100644", "100755"}:
+                    raise ValueError("Review source requires a regular file")
+                blob_sha = entry.get("sha")
+                if not isinstance(blob_sha, str):
+                    raise ValueError("Review tree blob SHA is missing")
+                _validate_blob_sha(blob_sha)
+                return GitHubBlobChange(mode=entry["mode"], blob_sha=blob_sha,
+                                        content=self.get_blob(repository=repo, blob_sha=blob_sha))
+        raise ValueError("Review source path is empty")
+
     def submit_pr_review(
         self,
         *,
@@ -1047,6 +1129,30 @@ class GhCliGitHubAdapter:
         # Callers that need a live issue must invoke create_issue explicitly.
         self.proposals.append(proposal)
 
+
+
+def _validate_read_path(commit_sha: str, path: str) -> tuple[str, ...]:
+    _validate_blob_sha(commit_sha)
+    if not isinstance(path, str) or not path or "\\" in path or "\x00" in path:
+        raise ValueError("Review source requires a canonical repository path")
+    parsed = PurePosixPath(path)
+    if parsed.is_absolute() or str(parsed) != path or ".." in parsed.parts or not 1 <= len(parsed.parts) <= 32:
+        raise ValueError("Review source path is outside the repository or exceeds depth bounds")
+    return parsed.parts
+
+
+def _validate_blob_sha(blob_sha: str) -> None:
+    if not isinstance(blob_sha, str) or re.fullmatch(r"[0-9a-f]{40}", blob_sha) is None:
+        raise ValueError("Read operations require an exact Git SHA")
+
+
+def _decode_blob(encoded: Any, blob_sha: str) -> bytes:
+    if not isinstance(encoded, str) or len(encoded) > 1500000:
+        raise ValueError("GitHub blob exceeds the review limit or lacks base64 content")
+    content = base64.b64decode("".join(encoded.split()), validate=True)
+    if len(content) > 1048576 or _git_blob_sha(content) != blob_sha:
+        raise ValueError("GitHub blob hash/size differs from the published snapshot")
+    return content
 
 
 def _git_blob_sha(content: bytes) -> str:

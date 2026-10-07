@@ -24,16 +24,16 @@ Team structure and lifecycle are not fixed in code.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Organization configuration | Immutable revisions, native graphs, durable assignments/runs, opt-in service routing and detached admission/recovery | Broader scoped role adapters and distributed controls |
+| Organization configuration | Immutable revisions, native graphs, durable assignments/runs, opt-in workers and native PM coordination | Review/correction orchestration and distributed controls |
 | Ingress and routing | Signed webhooks, internal auth, issue extraction, durable scope approval/dedupe and activated task queueing | Default activation and live configured-service acceptance |
 | Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
-| Native model runtime | Foundry binding, configured factories, approved Developer/service invocation, persistent approvals and constrained Grok/Kimi trials | Managed PM/Architect execution and live configured-service acceptance |
-| GitHub integration | Operator-gated issue writes, verified draft publication and head-pinned COMMENT reviews through allowlisted gh CLI | Live publication acceptance and meaningful source/diff review |
+| Native model runtime | Configured Developer, read-only PM proposals and scoped Architect operations with persistent approvals | Broader PM planning/writes and live configured-service acceptance |
+| GitHub integration | Verified draft publication, immutable source/base diff reads and head-pinned COMMENT reviews through allowlisted gh CLI | Live publication and semantic review acceptance |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **587 tests pass**, with two optional prepared-target Docker
-probes skipped; Ruff and mypy (44 source files) and the mock fixture simulation pass.
+Verified locally: **664 tests pass**, with two optional prepared-target Docker
+probes skipped; Ruff and mypy (46 source files) and the mock fixture simulation pass.
 The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
 The original patch-repair
@@ -361,6 +361,157 @@ clean editor diagnostics and mock simulation success/artifact/exit 0. This is lo
 file-lock coordination, not distributed execution, hostile-tenant certification or
 multi-user authentication. No new live model/GitHub/Docker trial, hosted CI, remote
 write or default activation occurred.
+
+### Scoped native PM and Architect operations
+
+[src/aitobuild/organization_roles.py](src/aitobuild/organization_roles.py) exposes
+`NativeManagedRoles.operations` for explicit operator-owned managed graphs. Use
+`pm_propose_assignment` for a configured PM's strict `agent_id`/`rationale` proposal
+against a pinned `proposal_event`. It returns metadata only: no assignment claim,
+actor identity, issue write or approval is taken from the model.
+
+`architect_review_published` requires delivery/GitHub bindings and an operator-owned
+`review_target_for(context)` returning `PublishedReviewTarget(preview_id=..., head_sha=...)`.
+Use a separately approved review task and original ledger, matching the published
+repository/issue/base and containing all changed paths. Never reset the Developer's
+completed/expired ledger or reuse its immutable assignment for a different owner.
+Register the adapter's `cleanup`, operations and binding revision with the runner;
+selected roles must use configured native agents without persistent tool profiles.
+No default bootstrap, route or universal contribution loop is installed.
+
+The Architect receives only publication-bound source/diff reads, paged inline at
+up to 1,000 bytes. Reads use hash-verified immutable blobs and the pinned base commit,
+not the mutable checkout or truncated PR patches. Regular UTF-8 files up to 1 MiB
+are supported; binary files, symlinks and submodules fail closed. Mode-only changes
+are reported in before/after mode fields even when the text diff is empty.
+Complete contiguous source AND diff access for every changed path is required
+before a proposal, but access counters do not certify semantic understanding.
+
+The exact saved target/body requires a separate one-shot service approval. Resume
+does not rerun the model; it rechecks saved evidence, head/scope and the original
+budget immediately before COMMENT publication. `submitting`/uncertain effects
+cannot be replayed. Recovered tool errors remain diagnostics, not automatic rejection.
+APPROVE, REQUEST_CHANGES, merge, implementation writes and arbitrary source targets
+are unavailable. General Architect tools also expose `architect_read_published_source`
+and `architect_read_published_diff` under their existing tool-approval policy.
+
+The initial role slice adds 42 regressions, including native SDK mocked transports
+and GET-only CLI adapter stubs. Managed PM issue writes,
+correction/meeting loops and live semantic-review acceptance remain
+pending. Existing operator service/worker factories may register these operations;
+published-review admission below adds opt-in HTTP routing, not default activation
+or an external trial.
+
+### Native PM Coordinator Binding
+
+`NativeCoordinatorProposal` bridges a configured native PM to the service's trusted
+read-only coordinator callback. Inside an operator-owned service factory, register
+its scoped binding in `ManagedOrganizationService(..., coordinators=...)`:
+
+```python
+from aitobuild.organization_roles import NativeCoordinatorProposal
+
+native_pm = NativeCoordinatorProposal(
+	runtime_for=runtime_for,
+	state_dir=context.state_dir / "native-pm-coordinator",
+	previews=context.previews,
+	budget_path_for=context.worker.budget_path,
+	event="github.issue.ready",
+	coordinator_id="planner",
+	binding_revision="pm-bindings-v1",
+)
+coordinators = {"planner": native_pm.service_binding}
+```
+
+The pinned route must use coordinator delegation and name this PM as its team
+coordinator. `.service_binding` checks the activated coordinator/event before
+execution. Existing custom callbacks remain supported. Native PM bindings refuse
+mock runtimes, snapshot drift and persistent tool profiles. The only per-run tool
+inspects the approved task/eligibility; model output is strict `agent_id`/`rationale`
+JSON. Actor identity comes from service context, never output or request fields.
+
+An atomic/fsynced per-preview receipt pins the definition, route/team/workflow,
+coordinator/operator binding, exact approved content/time, ledger path and original
+deadline. It saves `running` before the native call and `proposed` before assignment.
+Capacity contention can reuse a saved proposal after restart without another model
+request, new deadline or reservation reset. Corrupt, changed or uncertain `running`
+receipts fail closed; cancellation, expiry and proposal failures abort the original
+ledger and cannot claim or replay. Retained SDK sessions and bounded tool diagnostics
+remain evidence, not assignment authority or independent verification.
+
+The service alone validates eligibility and creates the Developer assignment under
+trusted PM identity; the callback creates no separate PM assignment or issue write.
+Journal capacity applies to the assigned owner, not coordinator calls; detached
+worker bounds still govern execution. This bridge adds 17 native mock-transport
+regressions for service/detached admission, capacity reuse, corruption/pins,
+cancellation, expiry and runtime refusal. Default startup remains unmanaged;
+no live model/GitHub/Docker trial, hosted CI, push or remote write was added.
+
+### Published Review Admission
+
+`PublishedReviewAdmission` stages a saved published draft as a separate, unapproved
+review task. Add an Architect-only eligible-agent route to the pinned native graph
+definition; the example issue workflow does not define `published.review`.
+Inside the operator-owned service factory:
+
+```python
+from aitobuild.organization_reviews import PublishedReviewAdmission, PublishedReviewRoute
+
+github = context.tools.github_adapter
+if github is None:
+	raise ValueError("Published review requires a configured GitHub adapter")
+reviews = PublishedReviewAdmission(
+	definitions=definitions,
+	previews=context.previews,
+	worker=context.worker,
+	github=github,
+	state_dir=context.state_dir / "published-reviews",
+	routes=(PublishedReviewRoute(
+		repository="owner/repository",
+		repository_id=123,
+		organization_id=snapshot.organization_id,
+		revision=snapshot.revision,
+		event="published.review",
+	),),
+)
+```
+
+Pass `reviews=reviews` to `ManagedOrganizationService`. Register
+`NativeManagedRoles.operations` and its cleanup binding, with
+`review_target_for=lambda task: reviews.target_for(task.assignment.preview_id)`.
+These bindings must share the service-owned definitions, previews and delivery
+worker. Reviewer/team/delegation/workflow remain definition-controlled; there is
+no fixed team or contribution loop. Advance operator binding revisions when behavior changes.
+
+Successful `/internal/developer/delivery/publish` automatically stages review
+metadata only when this binding is present. The response includes `review_preview`;
+a staging failure preserves the published result and reports `review_staging_error`.
+Authenticated `POST /internal/organization/reviews/offer` accepts only
+`{"published_preview_id": "..."}` to retry metadata staging without publication
+replay, task execution or approval. Live identity/open-draft/head checks still apply.
+
+Atomic/fsynced receipts pin the published snapshot, exact head, scope, task identity
+and original route/revision. Duplicates and partial staging recover the same preview,
+including after activation revision changes. Missing/corrupt receipts never permit
+a reserved review task to fall through to ordinary Developer routing.
+
+Approve the new task through `/internal/developer/preview/approve`; only then does
+service/worker admission initialize its separate deadline-pinned ledger and run the
+Architect graph. It creates no Developer checkout, offers no commands and has zero
+file-write capacity; the Developer ledger remains untouched. Missing initialized
+ledgers, expiry, abort or changed deadlines cannot create a replacement budget.
+Frozen-owner cancellation can still abort the original review ledger when mutable
+preview metadata is damaged. The exact saved COMMENT body/target needs another
+one-shot `/internal/organization/tasks/approve` decision; restart does not rerun the model.
+
+Eighteen regressions cover staging/recovery, HTTP authentication and approval,
+immutable revisions/scope/ledgers, and native mocked source/diff inspection followed
+by service/detached COMMENT approval or frozen-owner cancellation. Full local gates
+are 664 passed/two optional Docker skips, Ruff/mypy (46 sources), diagnostics,
+six-call-site service compatibility and successful mock simulation. Access counters
+still do not certify semantic review. No default activation, live trial, remote
+write, dependency change, commit or push accompanies this slice. Scoped correction,
+managed PM writes and bounded meeting execution remain pending.
 
 ### API setup
 

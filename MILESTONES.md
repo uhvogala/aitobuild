@@ -37,7 +37,7 @@ execute task code against the aitobuild service checkout.
 
 | Area | Evidence | Status |
 | --- | --- | --- |
-| Organization configuration | Immutable definitions, native graphs, assignments/runs, opt-in routing and detached admission/recovery | Local worker implemented; broader scoped roles/distributed controls next |
+| Organization configuration | Immutable definitions, native graphs, assignments/runs, opt-in workers and native PM coordination | Review/correction orchestration and distributed controls next |
 | Local setup | Python 3.14+, uv, certificate bootstrap and 16 certificate tests | Implemented |
 | Ingress/governance | Signed webhooks, internal auth, dedupe, previews, role policy | Local durable previews/issue-task dedupe; other ingress state in memory |
 | Local Developer pipeline | Copied fixture, preview approval, subprocess tests and file write | Verified on 2026-10-05 |
@@ -45,11 +45,12 @@ execute task code against the aitobuild service checkout.
 | Persistent Docker sessions | Private checkouts/home volumes, restart memory/history and scoped cleanup | Live integration evidence; prototype isolation only |
 | MCP shell/filesystem | Native stdio transport adapter, configurable names | Optional; compatibility validation pending |
 | GitHub output | Allowlisted gh CLI branch/commit/draft publication, immutable snapshot capture and exact remote reconciliation | Locally regression-verified prototype; live acceptance pending |
-| Architect/PM/meetings | Wired role tools, operator-gated PM writes, head-bound COMMENT review, GroupChatBuilder construction | Managed role execution, reviewable target diff, durable PM state and meeting execution pending |
+| Architect/PM/meetings | Native PM service delegation, opt-in published-review staging/routing and saved head-bound COMMENT approvals | Scoped correction, managed PM writes and meeting execution pending |
 | Operations | Manual tick API, local durable managed worker and successful hosted CI baseline | M0 accepted; broader durable state/distributed controls and tracing missing |
 
-Current local gates with detached managed workers: **587 passed, two optional Docker probes skipped**;
-Ruff and mypy (44 source files) and the mock fixture simulation pass. Service gates
+Current local gates with published-review routing: **664 passed, two optional Docker probes skipped**;
+Ruff and mypy (46 source files) and the mock fixture simulation pass. Worker gates
+passed with 587; service gates
 passed with 549; runner gates
 passed with 531; assignment gates passed with 492;
 definition-foundation gates passed with 396
@@ -382,7 +383,7 @@ Exit criteria:
 
 ## M3: Architect Review and Bounded Meetings
 
-Status: **scaffolding only**. Depends on M2.
+Status: **scoped review operations implemented locally; integrated/live acceptance pending**. Depends on M2.
 
 Architect draft-PR review slice (2026-10-05): published deliveries expose
 `architect_get_published_pr` / `architect_submit_published_pr_review` bound to
@@ -391,6 +392,50 @@ publication identity only (`preview_id` → repository/PR/head). Reviews allow
 exists; `REQUEST_CHANGES`/`APPROVE`/merge stay off on this path. Last review persists on the delivery; submit refuses
 when the live head SHA diverges from publication. Meetings and Developer fix
 loops remain later work.
+
+Scoped native review/proposal slice (2026-10-07, from `51766cb`): configured native
+PM emits eligible-owner proposals without ownership/issue-write effects; a native
+Architect has only pinned published source/base-diff reads. A fresh approved review
+task/original ledger must match the publication's repository/issue/base/path scope.
+Complete contiguous inline UTF-8 source AND diff access precedes a saved COMMENT
+proposal; it does not certify semantic understanding. Exact target/body/evidence,
+operator approval, live head checks and a write-time deadline check gate publication.
+Restart does not rerun the model; uncertain submitting effects cannot replay.
+Recovered tool errors are retained diagnostics. Binary/link/submodule inputs fail
+closed; mode-only changes remain explicit. Gates: **629 passed/two optional Docker
+skips**, Ruff/mypy (45 sources), diagnostics and mock simulation pass. Forty-two new
+regressions use native mocked transports, disposable publication fixtures and stubbed
+GET-only CLI responses. No default activation, live model/GitHub/Docker/hosted CI,
+push or remote writes. Automatic delegation, correction/meeting loops, durable
+managed PM writes and a useful live review still require separate implementation
+and explicit trial approval; M3 exit criteria are not met by these local tests.
+
+Native PM coordinator bridge (2026-10-07): an explicit event/coordinator-scoped
+binding feeds native strict eligible-owner proposals into trusted service assignment,
+including detached workers. Approval/scope/revision/binding/deadline-pinned atomic
+receipts allow capacity retries without another model call and block uncertain
+replay. The service, not model output, supplies PM actor/claim authority. Seventeen
+new native mocked-transport regressions pass; full gates are **646 passed/two optional
+Docker skips**, Ruff/mypy (45 sources), diagnostics and mock simulation pass.
+No default activation or external trial. Coordinator callbacks do not claim separate
+PM journal capacity. Managed PM planning/issue writes, scoped correction
+and bounded meeting execution remain next; live acceptance is still pending.
+
+Published-review routing continuation (2026-10-07): explicitly registered admission
+stages an unapproved, publication/head/scope/revision-pinned Architect task after
+publication. Authenticated metadata-only retry never replays publication; staging
+failures preserve the saved published result. Atomic/fsynced receipts deduplicate
+and recover partial staging without approval; lost receipts block Developer fallback.
+Fresh task approval starts the configured service/detached graph with a separate
+original-deadline ledger, no checkout/commands and zero file-write capacity. Saved
+exact COMMENT approval remains independent, with native model replay refusal;
+frozen-owner cancellation survives corrupt mutable preview metadata. Eighteen new
+local regressions pass, including actual native SDK mocked transports and HTTP
+approval/retry. Full gates: **664 passed/two optional Docker skips**, Ruff/mypy
+(46 sources), diagnostics, service API compatibility and mock simulation pass.
+No default activation, external trial or remote write. Counters/metadata do not
+certify semantic review; live review plus an approved scoped correction and bounded
+meeting execution are still required for M3 acceptance.
 
 
 Deliverables:

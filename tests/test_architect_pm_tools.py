@@ -70,6 +70,8 @@ def test_build_role_tools_includes_architect_and_pm(tmp_path: Path) -> None:
         "architect_start_session",
         "architect_stop_session",
         "architect_get_published_pr",
+        "architect_read_published_source",
+        "architect_read_published_diff",
         "architect_submit_published_pr_review",
         "architect_memory_query",
         "architect_memory_record",
@@ -444,6 +446,66 @@ def test_pm_issue_write_execute_uses_stored_approved_payload(tmp_path: Path) -> 
     )
     assert linked["relationship"] == "blocks"
     assert github.links[-1]["relationship"] == "blocks"
+
+
+@pytest.mark.parametrize("scenario", ["ok", "executable", "missing", "truncated", "ambiguous", "symlink", "submodule",
+                                      "commit_drift", "tree_drift", "blob_drift", "corrupt", "size", "encoding", "unsafe_path", "outside_repo"])
+def test_ghcli_pinned_review_reads_are_get_only_and_fail_closed(monkeypatch, scenario):
+    import base64
+    from aitobuild.tools.github import _git_blob_sha
+
+    adapter = GhCliGitHubAdapter(allowed_repositories=("fixture/widgets",))
+    commit_sha, root_sha, nested_sha = "b" * 40, "c" * 40, "d" * 40
+    content = b"print('reviewed')\n"
+    blob_sha = _git_blob_sha(content)
+    commit = {"sha": commit_sha, "tree": {"sha": root_sha}}
+    root = {"sha": root_sha, "truncated": False, "tree": [{"path": "src", "type": "tree", "mode": "040000", "sha": nested_sha}]}
+    entry = {"path": "probe.py", "type": "blob", "mode": "100644", "sha": blob_sha}
+    nested = {"sha": nested_sha, "truncated": False, "tree": [entry]}
+    blob = {"sha": blob_sha, "encoding": "base64", "size": len(content), "content": base64.b64encode(content).decode()}
+    if scenario == "executable":
+        entry["mode"] = "100755"
+    elif scenario == "missing":
+        nested["tree"] = []
+    elif scenario == "truncated":
+        nested["truncated"] = True
+    elif scenario == "ambiguous":
+        nested["tree"] = [entry, dict(entry)]
+    elif scenario in {"symlink", "submodule"}:
+        entry.update({"mode": "120000" if scenario == "symlink" else "160000", "type": "blob" if scenario == "symlink" else "commit"})
+    elif scenario in {"commit_drift", "tree_drift", "blob_drift"}:
+        {"commit_drift": commit, "tree_drift": nested, "blob_drift": blob}[scenario]["sha"] = "f" * 40
+    elif scenario == "corrupt":
+        blob["content"] = base64.b64encode(b"wrong bytes").decode()
+    elif scenario == "size":
+        blob["size"] = 1048577
+    elif scenario == "encoding":
+        blob["encoding"] = "utf-8"
+    prefix = "repos/fixture/widgets/git/"
+    responses = {prefix + "commits/" + commit_sha: commit, prefix + "trees/" + root_sha: root,
+                 prefix + "trees/" + nested_sha: nested, prefix + "blobs/" + blob_sha: blob}
+    calls = []
+
+    def fake_api(endpoint, *, method="GET", payload=None):
+        assert method == "GET" and payload is None
+        calls.append(endpoint)
+        return responses[endpoint]
+
+    monkeypatch.setattr(adapter, "_api", fake_api)
+    kwargs = {"repository": "elsewhere/target" if scenario == "outside_repo" else "fixture/widgets",
+              "commit_sha": commit_sha, "path": "../probe.py" if scenario == "unsafe_path" else "src/probe.py"}
+    if scenario in {"ok", "executable"}:
+        result = adapter.get_file_at_commit(**kwargs)
+        assert result.content == content and result.blob_sha == blob_sha
+        assert result.mode == ("100755" if scenario == "executable" else "100644")
+        assert calls == list(responses)
+    elif scenario == "missing":
+        assert adapter.get_file_at_commit(**kwargs) is None
+    else:
+        with pytest.raises((ValueError, PermissionError)):
+            adapter.get_file_at_commit(**kwargs)
+        if scenario in {"unsafe_path", "outside_repo"}:
+            assert calls == []
 
 
 def test_ghcli_adapter_enforces_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
