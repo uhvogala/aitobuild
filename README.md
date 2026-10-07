@@ -9,8 +9,8 @@ approved issue producing a tested draft PR in a disposable repository, with a
 human retaining merge authority. Configurable organization definitions, instance
 factories and native workflow admission are available as library APIs. Persisted
 delegation and revision-pinned managed delivery graphs are also library APIs;
-opt-in service routing consumes approved configured tasks. Detached background
-execution is next. Team structure and lifecycle are not fixed in code.
+opt-in service routing and detached local workers consume approved configured tasks.
+Team structure and lifecycle are not fixed in code.
 
 ## Start here
 
@@ -24,16 +24,16 @@ execution is next. Team structure and lifecycle are not fixed in code.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Organization configuration | Immutable revisions, native graphs, durable assignments/runs and opt-in authenticated service routing | Detached worker lifecycle and broader scoped role adapters |
-| Ingress and routing | Signed webhooks, internal auth, issue extraction and durable scope approval/dedupe | Configurable assignment routing and automatic task consumption |
+| Organization configuration | Immutable revisions, native graphs, durable assignments/runs, opt-in service routing and detached admission/recovery | Broader scoped role adapters and distributed controls |
+| Ingress and routing | Signed webhooks, internal auth, issue extraction, durable scope approval/dedupe and activated task queueing | Default activation and live configured-service acceptance |
 | Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
 | Native model runtime | Foundry binding, configured factories, approved Developer/service invocation, persistent approvals and constrained Grok/Kimi trials | Managed PM/Architect execution and live configured-service acceptance |
 | GitHub integration | Operator-gated issue writes, verified draft publication and head-pinned COMMENT reviews through allowlisted gh CLI | Live publication acceptance and meaningful source/diff review |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **549 tests pass**, with two optional prepared-target Docker
-probes skipped; Ruff and mypy (43 source files) and the mock fixture simulation pass.
+Verified locally: **587 tests pass**, with two optional prepared-target Docker
+probes skipped; Ruff and mypy (44 source files) and the mock fixture simulation pass.
 The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
 The original patch-repair
@@ -291,10 +291,76 @@ coordinator identity, admission races/capacity and cleanup after preview corrupt
 Actual native Developer SDK approve/reject/recovered-edit and independent verification/
 mock-draft fixtures also run through the service entrypoint. Full gates: 549 passed,
 two optional Docker skips, Ruff/mypy (43 files), and legacy mock simulation success.
-No live model/GitHub/Docker trial or hosted CI was added. Execution currently awaits
-the graph in the calling request; there is no detached worker, startup drain, durable
-dispatch queue or distributed cancellation. Capacity still excludes unmanaged HTTP
-runs. Live delivery acceptance remains pending and requires fresh explicit approval.
+No live model/GitHub/Docker trial or hosted CI was added. Without a worker factory,
+execution still awaits the graph in the calling request. The optional detached
+worker follows below. Capacity still excludes unmanaged HTTP runs. Live delivery
+acceptance remains pending and requires fresh explicit approval.
+
+### Opt-in detached local worker
+
+[src/aitobuild/organization_worker.py](src/aitobuild/organization_worker.py) adds a
+separate `WorkerStore`/atomic, fsynced `FileWorkerStore` journal. Add a worker factory
+alongside the managed service factory:
+
+```python
+from aitobuild.app import create_app
+from aitobuild.organization_worker import FileWorkerStore, ManagedOrganizationWorker
+
+def worker_factory(service, context):
+	return ManagedOrganizationWorker(
+		service=service,
+		store=FileWorkerStore(context.state_dir / "organization-worker.json"),
+		max_workers=2,
+		recover_approved=False,
+	)
+
+app = create_app(
+	config,
+	managed_service_factory=operator_factory,
+	managed_worker_factory=worker_factory,
+)
+```
+
+Serve that app with ASGI lifespan enabled. FastAPI starts bounded worker tasks and
+drains them on shutdown. Approval, signed webhook and authenticated trigger handling
+durably enqueue before returning; they do not await graph execution. Responses/status
+include `managed_admission` plus the existing `managed_run` when available. A queued
+receipt is not execution success, verification, publication approval or semantic
+review. The normal server still supplies neither factory.
+
+Admission freezes the approved bundle/base, approval time, activation revision,
+binding revision and trusted operator command history before assignment exists.
+Definition updates cannot silently change queued work. Human selections and exact
+service-approval/native-input decisions are durably queued, one-shot and distinct;
+request bodies cannot supply actor identity or widen scope. Before active work, the
+worker and runner recheck approval, ownership, bindings and original budgets. Known
+capacity/lock contention defers the same receipt without resetting its ledger.
+
+Existing queued receipts recover automatically. `recover_approved=True` additionally
+discovers activated approved tasks with no assignment or worker receipt in a bounded
+startup scan (`startup_limit`, default/max 500); it does not adopt old terminal tasks
+or replay uncertain effects. Corrupt state fails closed. Saved idle native waits
+require their exact decision; interrupted unclaimed admission or native running work
+fails with cleanup/abort, never automatic replay. Ready runs may safely start, and
+saved finalizing/terminal results recover metadata only.
+
+Detached `cancel` accepts exactly one of `preview_id` or `assignment_id`, including
+pre-assignment tasks. Durable cancellation intent survives restart. Active local
+cancellation and shutdown drain guarded threaded stages before ownership release.
+Another process's busy cancellation returns 409 while retaining intent; its owning
+worker observes that intent on the polling interval. Idle waiting intent is recovered
+on startup. `GET /internal/organization/worker` requires internal authentication and
+reports live worker slots, active previews and retained lifecycle errors. A failed
+receipt write stops that slot; inspect evidence and restart rather than replaying
+effects or resetting budgets.
+
+Worker validation adds 38 cases, including actual native SDK mocked-transport
+approval/rejection/recovered exact-span editing and independent verification/mock
+draft delivery. Full gates: 587 passed/two optional Docker skips, Ruff/mypy (44 files),
+clean editor diagnostics and mock simulation success/artifact/exit 0. This is local
+file-lock coordination, not distributed execution, hostile-tenant certification or
+multi-user authentication. No new live model/GitHub/Docker trial, hosted CI, remote
+write or default activation occurred.
 
 ### API setup
 

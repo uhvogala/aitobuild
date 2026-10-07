@@ -67,6 +67,8 @@ class ManagedOrganizationService:
             if snapshot is None or not any(route.event in item.events for item in snapshot.definition.routes):
                 raise ValueError("Managed activation requires an existing explicit revision/event")
         self._operator = RuntimeActor("operator", operator_id)
+        self.binding_revision = binding_revision
+        self.operator_id = operator_id
         self._actor: ContextVar[RuntimeActor] = ContextVar("managed_service_actor")
         self._coordinators = dict(coordinators or {})
         self._runner = ManagedWorkflowRunner(
@@ -93,13 +95,62 @@ class ManagedOrganizationService:
             raise PermissionError("Approved task belongs to another managed activation")
         return assignment
 
-    async def consume(self, preview_id: str, *, proposal: AssignmentProposal | None = None) -> ManagedRun | None:
+    def admission(self, preview_id: str) -> tuple[DeveloperPreview, ManagedRoute] | None:
         preview = self._previews.get(preview_id)
         if preview is None:
             raise ValueError("Preview not found")
         route = self._route(preview)
         if route is None or not preview.approved:
             return None
+        assignment = self._owned(preview, route)
+        if assignment is not None:
+            route = route.model_copy(update={"revision": assignment.revision, "event": assignment.event})
+        return preview, route
+
+    def recorded_assignment(self, task_id: str) -> TaskAssignment | None:
+        assignment = self._assignments.for_task(task_id)
+        return self._assignment(assignment.assignment_id) if assignment is not None else None
+
+    def recorded_run(self, task_id: str) -> ManagedRun | None:
+        assignment = self.recorded_assignment(task_id)
+        return self._runs.get(assignment.assignment_id) if assignment is not None else None
+
+    def budget_path(self, preview_id: str) -> Path:
+        return self._worker.budget_path(preview_id)
+
+    def approved_previews(self, *, limit: int) -> tuple[DeveloperPreview, ...]:
+        return tuple(preview for preview in self._previews.list_previews(pending_only=False, limit=limit) if preview.approved)
+
+    def assignment_preview(self, assignment_id: str) -> str:
+        return self._assignment(assignment_id).preview_id
+
+    def validate_selection(self, activation: ManagedRoute, proposal: AssignmentProposal | None) -> None:
+        snapshot = self._definitions.get(activation.organization_id, activation.revision)
+        if snapshot is None:
+            raise ValueError("Activated revision not found")
+        configured = next((route for route in snapshot.definition.routes if activation.event in route.events), None)
+        if configured is None:
+            raise ValueError("Activated event not found")
+        if proposal is not None and (configured.delegation.strategy != "human" or
+                                     proposal.agent_id not in configured.delegation.eligible_agents):
+            raise PermissionError("Only eligible human delegation accepts an operator selection")
+
+    async def consume(
+        self, preview_id: str, *, proposal: AssignmentProposal | None = None,
+        activation: ManagedRoute | None = None,
+    ) -> ManagedRun | None:
+        preview = self._previews.get(preview_id)
+        if preview is None:
+            raise ValueError("Preview not found")
+        route = self._route(preview)
+        if route is None or not preview.approved:
+            return None
+        if activation is not None:
+            if (activation.repository, activation.repository_id, activation.organization_id) != (
+                route.repository, route.repository_id, route.organization_id,
+            ):
+                raise PermissionError("Saved activation is outside this managed service")
+            route = activation
         token = self._actor.set(self._operator)
         try:
             with self._runs.invocation_lock("dispatch-" + preview_id):

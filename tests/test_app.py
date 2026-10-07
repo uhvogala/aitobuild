@@ -30,7 +30,7 @@ def _internal_headers(test_config) -> dict[str, str]:
     return {"X-Internal-Token": token}
 
 
-def _managed_app(config, tmp_path, calls, operation=None, strategy="rules", version=None):
+def _managed_app(config, tmp_path, calls, operation=None, strategy="rules", version=None, detached=False):
     from aitobuild.organization import FileDefinitionStore, parse_organization_definition
     from aitobuild.organization_assignments import FileAssignmentStore
     from aitobuild.organization_runner import FileRunStore, ManagedOperation
@@ -62,7 +62,18 @@ def _managed_app(config, tmp_path, calls, operation=None, strategy="rules", vers
             )}, cleanup=cleanup,
         )
 
-    return create_app(config, managed_service_factory=factory)
+    from aitobuild.organization_worker import FileWorkerStore, ManagedOrganizationWorker
+
+    workers = []
+
+    def worker_factory(service, context):
+        worker = ManagedOrganizationWorker(service=service, store=FileWorkerStore(context.state_dir / "worker.json"))
+        workers.append(worker)
+        return worker
+
+    app = create_app(config, managed_service_factory=factory, managed_worker_factory=worker_factory if detached else None)
+    app.state.test_workers = workers
+    return app
 
 
 def test_managed_service_approval_dispatch_and_restart_are_idempotent(
@@ -291,6 +302,101 @@ def test_managed_activation_rejects_disabled_internal_auth(test_config, tmp_path
     config = replace(test_config, security=replace(test_config.security, require_internal_auth=False))
     with pytest.raises(ValueError, match="authenticated"):
         _managed_app(config, tmp_path, [])
+
+
+def test_detached_app_returns_admission_before_graph_completion(test_config, tmp_path, repository_issue_body, local_issue_repository):
+    from aitobuild.organization_runner import ManagedOperation
+
+    source, revision = local_issue_repository
+    config = replace(test_config, developer=replace(test_config.developer, repository_sources=(
+        RepositorySourceConfig("fixture/widgets", 101, str(source)),
+    )))
+    calls = []
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def operation(context, message):
+        calls.append("run")
+        started.set()
+        await release.wait()
+        return "done"
+
+    app = _managed_app(config, tmp_path, calls, ManagedOperation(operation), detached=True)
+    headers = _internal_headers(config)
+    with TestClient(app) as client:
+        preview = client.post("/internal/developer/preview", headers=headers, json={
+            "github_event": "issues", "action": "opened", "body": repository_issue_body,
+        }).json()
+        approved = client.post("/internal/developer/preview/approve", headers=headers, json={
+            "preview_id": preview["preview_id"], "base_revision": revision,
+        })
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["managed_admission"]["state"] == "queued"
+        client.portal.call(started.wait)
+        duplicate = client.post("/internal/organization/tasks/run", headers=headers, json={"preview_id": preview["preview_id"]})
+        assert duplicate.json()["managed_admission"]["state"] == "running"
+        assert client.get("/internal/organization/worker").status_code == 401
+        health = client.get("/internal/organization/worker", headers=headers).json()
+        assert health["workers"] == 1 and health["active_previews"] == [preview["preview_id"]]
+        client.portal.call(release.set)
+        terminal = client.portal.call(app.state.test_workers[0].wait_idle, preview["preview_id"])
+        assert terminal.state == "completed"
+        assert calls == ["run", "cleanup"]
+
+
+@pytest.mark.parametrize("kind,control,value", [("service_approval", "approve", True), ("human_input", "resume", "chosen")])
+def test_detached_http_admits_exact_decisions_before_running_continuation(
+    test_config, tmp_path, repository_issue_body, local_issue_repository, kind, control, value,
+):
+    from aitobuild.organization_runner import ManagedOperation, WorkflowInput
+
+    source, revision = local_issue_repository
+    config = replace(test_config, developer=replace(test_config.developer, repository_sources=(
+        RepositorySourceConfig("fixture/widgets", 101, str(source)),
+    )))
+    calls = []
+    release = asyncio.Event()
+    resumed = asyncio.Event()
+
+    async def continuation(context, original, response):
+        calls.append(response)
+        resumed.set()
+        await release.wait()
+        return response
+
+    operation = ManagedOperation(lambda context, message: WorkflowInput("Decide", "saved", kind),
+                                 on_response=continuation)
+    app = _managed_app(config, tmp_path, calls, operation, detached=True)
+    headers = _internal_headers(config)
+    with TestClient(app) as client:
+        preview = client.post("/internal/developer/preview", headers=headers, json={
+            "github_event": "issues", "action": "opened", "body": repository_issue_body,
+        }).json()
+        assert client.post("/internal/developer/preview/approve", headers=headers, json={
+            "preview_id": preview["preview_id"], "base_revision": revision,
+        }).status_code == 200
+        worker = app.state.test_workers[0]
+        assert client.portal.call(worker.wait_idle, preview["preview_id"]).state == "waiting"
+        saved = client.get(f"/internal/organization/tasks/{preview['preview_id']}", headers=headers).json()["managed_run"]
+        request_id = saved["pending"][0]["request_id"]
+        payload = {"assignment_id": saved["assignment_id"], "request_id": request_id,
+                   "approved" if control == "approve" else "response": value}
+        assert client.post(f"/internal/organization/tasks/{control}", json=payload).status_code == 401
+        assert client.post(f"/internal/organization/tasks/{control}", headers=headers,
+                           json=payload | {"actor_id": "spoof"}).status_code == 400
+        response = client.post(f"/internal/organization/tasks/{control}", headers=headers, json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["managed_admission"]["state"] == "queued"
+        client.portal.call(resumed.wait)
+        assert client.post(f"/internal/organization/tasks/{control}", headers=headers, json=payload).status_code == 409
+        client.portal.call(release.set)
+        assert client.portal.call(worker.wait_idle, preview["preview_id"]).state == "completed"
+        assert calls == [value, "cleanup"]
+
+
+def test_detached_activation_requires_service_factory(test_config):
+    with pytest.raises(ValueError, match="explicit managed service"):
+        create_app(test_config, managed_worker_factory=lambda service, context: None)
 
 
 def test_repository_issue_api_recovers_approval_and_delivery_after_restart(test_config, repository_issue_body) -> None:

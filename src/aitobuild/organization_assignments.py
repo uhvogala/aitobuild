@@ -124,6 +124,10 @@ class AssignmentStore(Protocol):
     ) -> TaskAssignment: ...
 
 
+class AssignmentCapacityError(ValueError):
+    pass
+
+
 class FileAssignmentStore:
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -171,6 +175,10 @@ class FileAssignmentStore:
                 if existing.model_dump(exclude=ignored) != candidate.model_dump(exclude=ignored):
                     raise ValueError("Task already has an immutable assignment owner")
                 return existing
+            active = [record for record in journal.assignments if record.state == "claimed" and
+                      (record.organization_id, record.agent_id) == (candidate.organization_id, candidate.agent_id)]
+            if len(active) >= min([candidate.agent_capacity, *(record.agent_capacity for record in active)]):
+                raise AssignmentCapacityError("Configured assignment capacity is exhausted")
             updated = AssignmentJournal(schema_version=1, assignments=(*journal.assignments, candidate))
             self._save(updated)
             return candidate

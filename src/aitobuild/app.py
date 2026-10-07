@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from importlib import import_module
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -31,6 +31,7 @@ from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import make_internal_event, normalize_github_webhook, parse_trigger_request
 from aitobuild.organization_assignments import AssignmentProposal
 from aitobuild.organization_service import ManagedOrganizationService, ManagedServiceContext
+from aitobuild.organization_worker import ManagedOrganizationWorker, WorkerJob
 from aitobuild.proactive import ArchitectScanRunner
 from aitobuild.runtime import bootstrap_runtime, kickoff_meeting_bootstrap
 from aitobuild.scheduler import scheduler_from_config
@@ -234,8 +235,11 @@ async def _invoke_agent_run(
 def create_app(
     config: AppConfig | None = None, *,
     managed_service_factory: Callable[[ManagedServiceContext], ManagedOrganizationService] | None = None,
+    managed_worker_factory: Callable[[ManagedOrganizationService, ManagedServiceContext], ManagedOrganizationWorker] | None = None,
 ) -> FastAPI:
     app_config = config or load_config()
+    if managed_worker_factory is not None and managed_service_factory is None:
+        raise ValueError("Managed worker requires an explicit managed service factory")
     if managed_service_factory is not None and (
         not app_config.security.require_internal_auth or not app_config.security.internal_api_token
     ):
@@ -339,10 +343,28 @@ def create_app(
             delivery_worker=delivery_worker,
         )
     role_tools = build_role_tools(context=developer_tool_context)
-    managed_service = managed_service_factory(ManagedServiceContext(
+    managed_context = ManagedServiceContext(
         previews=dispatcher.developer_preview_registry, worker=delivery_worker,
         tools=developer_tool_context, state_dir=developer_state_dir,
-    )) if managed_service_factory is not None else None
+    )
+    managed_service = managed_service_factory(managed_context) if managed_service_factory is not None else None
+    managed_worker = managed_worker_factory(managed_service, managed_context) if (
+        managed_service is not None and managed_worker_factory is not None
+    ) else None
+    if managed_worker is not None:
+        if managed_worker.service is not managed_service:
+            raise ValueError("Managed worker must use the app's managed service")
+
+        @asynccontextmanager
+        async def managed_lifespan(application: FastAPI):
+            assert managed_worker is not None
+            await managed_worker.start()
+            try:
+                yield
+            finally:
+                await managed_worker.close()
+
+        app.router.lifespan_context = managed_lifespan
 
     runtime = bootstrap_runtime(
         app_config.runtime,
@@ -434,16 +456,25 @@ def create_app(
                     }
         return metadata if metadata else None
 
+    def _worker_metadata(job: WorkerJob) -> dict[str, Any]:
+        assert managed_service is not None
+        run = managed_service.recorded_run(job.task_id)
+        return {"managed_admission": job.model_dump(mode="json"),
+                "managed_run": run.model_dump(mode="json") if run is not None else None}
+
     async def _consume_managed(preview_id: str) -> dict[str, Any] | None:
         if managed_service is None:
             return None
         try:
+            if managed_worker is not None:
+                job = managed_worker.enqueue(preview_id)
+                return _worker_metadata(job) if job is not None else None
             run = await managed_service.consume(preview_id)
         except FileLockTimeout as error:
             raise HTTPException(status_code=409, detail="Managed task invocation is already active") from error
         except (ValueError, PermissionError, RuntimeError, OSError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        return run.model_dump(mode="json") if run is not None else None
+        return {"managed_run": run.model_dump(mode="json")} if run is not None else None
 
     async def _dispatch_metadata(result: Any, *, event_payload: dict[str, Any]) -> dict[str, Any] | None:
         metadata = _metadata_with_runtime_hooks(result, event_payload=event_payload)
@@ -452,7 +483,7 @@ def create_app(
             if isinstance(preview_id, str):
                 run = await _consume_managed(preview_id)
                 if run is not None:
-                    metadata["managed_run"] = run
+                    metadata.update(run)
         return metadata
 
     @app.get("/health")
@@ -664,8 +695,17 @@ def create_app(
         }
         run = await _consume_managed(approved.preview_id)
         if run is not None:
-            response["managed_run"] = run
+            response.update(run)
         return response
+
+    if managed_worker is not None:
+        @app.get("/internal/organization/worker")
+        def managed_worker_status(
+            x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        ) -> dict[str, object]:
+            _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+            assert managed_worker is not None
+            return managed_worker.diagnostics()
 
     if managed_service is not None:
         @app.get("/internal/organization/tasks/{preview_id}")
@@ -676,6 +716,10 @@ def create_app(
             _assert_internal_auth(config=app_config, provided_token=x_internal_token)
             assert managed_service is not None
             try:
+                if managed_worker is not None:
+                    job = managed_worker.store.get(preview_id)
+                    if job is not None:
+                        return _worker_metadata(job)
                 run = managed_service.status(preview_id)
             except ValueError as error:
                 raise HTTPException(status_code=404, detail=str(error)) from error
@@ -692,13 +736,18 @@ def create_app(
             assert managed_service is not None
             fields = {
                 "run": {"preview_id", "proposal"}, "approve": {"assignment_id", "request_id", "approved"},
-                "resume": {"assignment_id", "request_id", "response"}, "cancel": {"assignment_id"},
+                "resume": {"assignment_id", "request_id", "response"},
+                "cancel": {"assignment_id", "preview_id"} if managed_worker is not None else {"assignment_id"},
             }.get(operation)
             if fields is None:
                 raise HTTPException(status_code=404, detail="Unknown managed task control")
             if set(payload) - fields:
                 raise HTTPException(status_code=400, detail="Unexpected managed task fields")
             required = fields - {"proposal"}
+            if operation == "cancel" and managed_worker is not None:
+                if set(payload) not in ({"assignment_id"}, {"preview_id"}):
+                    raise HTTPException(status_code=400, detail="Cancellation requires one task identity")
+                required = set(payload)
             if not required <= set(payload) or any(
                 not isinstance(payload[name], str) or not payload[name].strip()
                 for name in required - {"approved", "response"}
@@ -707,6 +756,22 @@ def create_app(
             if operation == "approve" and type(payload["approved"]) is not bool:
                 raise HTTPException(status_code=400, detail="approved must be a Boolean")
             try:
+                if managed_worker is not None:
+                    if operation == "run":
+                        proposal = AssignmentProposal.model_validate(payload["proposal"]) if "proposal" in payload else None
+                        job = managed_worker.enqueue(payload["preview_id"], proposal=proposal)
+                        if job is None:
+                            raise ValueError("Task requires an activated approved repository route")
+                    elif operation in {"approve", "resume"}:
+                        job = managed_worker.enqueue_decision(
+                            payload["assignment_id"], request_id=payload["request_id"],
+                            kind="approve" if operation == "approve" else "resume",
+                            value=payload["approved"] if operation == "approve" else payload["response"],
+                        )
+                    else:
+                        preview_id = payload.get("preview_id") or managed_service.assignment_preview(payload["assignment_id"])
+                        job = await managed_worker.cancel(preview_id)
+                    return _worker_metadata(job)
                 if operation == "run":
                     proposal = AssignmentProposal.model_validate(payload["proposal"]) if "proposal" in payload else None
                     run = await managed_service.consume(payload["preview_id"], proposal=proposal)

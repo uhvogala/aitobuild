@@ -83,7 +83,7 @@ def test_native_human_input_restart_restores_without_replaying_initial_operation
     assert calls == ["initial", "response"]
 
 
-@pytest.mark.parametrize("entrypoint", ["runner", "service"])
+@pytest.mark.parametrize("entrypoint", ["runner", "service", "worker"])
 def test_configured_delivery_stages_reuse_guarded_services_and_original_budget(
     tmp_path, approved_delivery, verification_adapter, monkeypatch, entrypoint,
 ):
@@ -162,14 +162,30 @@ def test_configured_delivery_stages_reuse_guarded_services_and_original_budget(
     )
     budget_path = worker.budget_path(preview_id)
     before = json.loads(budget_path.read_text())
-    run = asyncio.run(managed_service.consume(preview_id) if entrypoint == "service" else runner.start(assignment.assignment_id))
+
+    async def invoke():
+        if entrypoint != "worker":
+            return await managed_service.consume(preview_id) if entrypoint == "service" else await runner.start(assignment.assignment_id)
+        from aitobuild.organization_worker import FileWorkerStore, ManagedOrganizationWorker
+
+        detached = ManagedOrganizationWorker(service=managed_service, store=FileWorkerStore(tmp_path / "worker.json"))
+        detached.enqueue(preview_id)
+        await detached.start()
+        try:
+            async with asyncio.timeout(5):
+                job = await detached.wait_idle(preview_id)
+            return managed_service.recorded_run(job.task_id)
+        finally:
+            await detached.close()
+
+    run = asyncio.run(invoke())
     assert run.state == "completed", run.error
     assert run.outputs == ({"preview_id": preview_id, "state": "published"},)
     assert worker.get(preview_id).verification["cleanup_succeeded"] is True
     assert len(github.branch_commits) == 1
     assert verification_adapter.closed
     assert calls == ["implement", "cleanup"]
-    assert asyncio.run(managed_service.consume(preview_id) if entrypoint == "service" else runner.start(assignment.assignment_id)) == run
+    assert asyncio.run(invoke()) == run
     after = json.loads(budget_path.read_text())
     assert after == before | {"reserved_paths": ["src/probe.py"]}
     assert (source / "README.md").read_text() == "Fixture baseline\n"
@@ -287,6 +303,41 @@ def test_service_cancellation_uses_frozen_assignment_when_preview_is_unreadable(
     assert terminal.state == "cancelled"
     assert calls == ["proposal", "cleanup"]
     assert json.loads(worker.budget_path(preview_id).read_text()) == before | {"aborted": True}
+
+
+def test_detached_worker_durably_enqueues_and_executes_once(tmp_path, approved_delivery):
+    from aitobuild.organization_worker import FileWorkerStore, ManagedOrganizationWorker
+
+    _, _, preview_id, _, _ = approved_delivery
+    calls = []
+
+    async def exercise():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def operation(context, message):
+            calls.append("run")
+            started.set()
+            await release.wait()
+            return "done"
+
+        service, _, _ = _service_fixture(tmp_path, approved_delivery, operation=ManagedOperation(operation))
+        store = FileWorkerStore(tmp_path / "worker.json")
+        worker = ManagedOrganizationWorker(service=service, store=store)
+        admitted = worker.enqueue(preview_id)
+        assert admitted.state == "queued" and calls == []
+        assert FileWorkerStore(tmp_path / "worker.json").get(preview_id) == admitted
+        await worker.start()
+        try:
+            await started.wait()
+            assert worker.enqueue(preview_id).state == "running"
+            release.set()
+            assert (await worker.wait_idle(preview_id)).state == "completed"
+            assert worker.enqueue(preview_id).state == "completed"
+        finally:
+            await worker.close()
+
+    asyncio.run(exercise())
+    assert calls == ["run"]
 
 
 def test_coordinator_identity_is_bound_by_trusted_provider_not_proposal(tmp_path):
@@ -729,7 +780,7 @@ def test_recovered_tool_errors_remain_diagnostics_not_contribution_rejection(tmp
 
 
 @pytest.mark.parametrize("scenario", ["approved", "rejected", "recovered"])
-@pytest.mark.parametrize("entrypoint", ["runner", "service"])
+@pytest.mark.parametrize("entrypoint", ["runner", "service", "worker"])
 def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_tools(
     tmp_path, approved_delivery, verification_adapter, scenario, entrypoint,
 ):
@@ -822,10 +873,29 @@ def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_to
                         operations=bindings.operations, cleanup=bindings.cleanup, binding_revision="native-v1",
                     )
 
+                async def detached_invoke(assignment_id=None, *, request_id=None, approved=None):
+                    from aitobuild.organization_worker import FileWorkerStore, ManagedOrganizationWorker
+
+                    managed = make_service()
+                    detached = ManagedOrganizationWorker(service=managed, store=FileWorkerStore(tmp_path / "worker.json"))
+                    if assignment_id is None:
+                        detached.enqueue(preview_id)
+                    else:
+                        detached.enqueue_decision(assignment_id, request_id=request_id, kind="approve", value=approved)
+                    await detached.start()
+                    try:
+                        async with asyncio.timeout(5):
+                            job = await detached.wait_idle(preview_id)
+                        return managed.recorded_run(job.task_id)
+                    finally:
+                        await detached.close()
+
                 budget_path = worker.budget_path(preview_id)
                 before = json.loads(budget_path.read_text())
                 if entrypoint == "service":
                     waiting = await make_service().consume(preview_id)
+                elif entrypoint == "worker":
+                    waiting = await detached_invoke()
                 else:
                     assignment = assignments.for_task(previews.get(preview_id).bundle_payload["task_id"])
                     waiting = await make_runner().start(assignment.assignment_id)
@@ -834,7 +904,8 @@ def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_to
                 assert worker.get(preview_id).state == "awaiting_tool_approval"
                 assert waiting.pending[0].kind == "service_approval"
                 assert not (Path(worker.get(preview_id).checkout_path) / "src/probe.py").exists()
-                approve = make_service().decide if entrypoint == "service" else make_runner().approve
+                approve = (detached_invoke if entrypoint == "worker" else
+                           make_service().decide if entrypoint == "service" else make_runner().approve)
                 completed = await approve(assignment.assignment_id, request_id=waiting.pending[0].request_id,
                                           approved=scenario != "rejected")
                 if scenario == "rejected":
@@ -846,7 +917,8 @@ def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_to
                     return
                 if scenario == "recovered":
                     assert completed.state == "waiting", completed.error
-                    approve = make_service().decide if entrypoint == "service" else make_runner().approve
+                    approve = (detached_invoke if entrypoint == "worker" else
+                               make_service().decide if entrypoint == "service" else make_runner().approve)
                     completed = await approve(assignment.assignment_id, request_id=completed.pending[0].request_id,
                                               approved=True)
                 assert completed.state == "completed", completed.error

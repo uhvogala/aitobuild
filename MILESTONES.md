@@ -37,7 +37,7 @@ execute task code against the aitobuild service checkout.
 
 | Area | Evidence | Status |
 | --- | --- | --- |
-| Organization configuration | Immutable definitions, native graphs, assignments/runs and opt-in authenticated service routing | Request-scoped configured execution implemented; detached worker/broader scoped roles next |
+| Organization configuration | Immutable definitions, native graphs, assignments/runs, opt-in routing and detached admission/recovery | Local worker implemented; broader scoped roles/distributed controls next |
 | Local setup | Python 3.14+, uv, certificate bootstrap and 16 certificate tests | Implemented |
 | Ingress/governance | Signed webhooks, internal auth, dedupe, previews, role policy | Local durable previews/issue-task dedupe; other ingress state in memory |
 | Local Developer pipeline | Copied fixture, preview approval, subprocess tests and file write | Verified on 2026-10-05 |
@@ -46,10 +46,11 @@ execute task code against the aitobuild service checkout.
 | MCP shell/filesystem | Native stdio transport adapter, configurable names | Optional; compatibility validation pending |
 | GitHub output | Allowlisted gh CLI branch/commit/draft publication, immutable snapshot capture and exact remote reconciliation | Locally regression-verified prototype; live acceptance pending |
 | Architect/PM/meetings | Wired role tools, operator-gated PM writes, head-bound COMMENT review, GroupChatBuilder construction | Managed role execution, reviewable target diff, durable PM state and meeting execution pending |
-| Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
+| Operations | Manual tick API, local durable managed worker and successful hosted CI baseline | M0 accepted; broader durable state/distributed controls and tracing missing |
 
-Current local gates with managed service integration: **549 passed, two optional Docker probes skipped**;
-Ruff and mypy (43 source files) and the mock fixture simulation pass. Runner gates
+Current local gates with detached managed workers: **587 passed, two optional Docker probes skipped**;
+Ruff and mypy (44 source files) and the mock fixture simulation pass. Service gates
+passed with 549; runner gates
 passed with 531; assignment gates passed with 492;
 definition-foundation gates passed with 396
 tests; publication-fix gates previously passed
@@ -112,8 +113,8 @@ Deliverables and acceptance sequence:
 	config changes cannot silently alter active runs or reset failed budgets.
 	Definitions stay separate from execution state; DB storage can later implement
 	the same definition contract. **Implemented for managed operation graphs and the
-	configured native Developer adapter and opt-in request-scoped service routing**;
-	detached worker lifecycle/broader scoped roles next.
+		configured native Developer adapter, opt-in service routing and detached local
+		worker admission/lifecycle/recovery**; broader scoped roles/distributed controls next.
 
 Local validation (2026-10-06): `uv run pytest` reports 396 passes/two optional
 Docker skips; `uv run ruff check .` and `uv run mypy src` pass (38 source files).
@@ -181,13 +182,38 @@ SDK/mock-transport approve/reject/recovered-edit and independent verification/mo
 draft graphs run through service admission. No live model/GitHub/Docker/hosted CI or
 dependency change. No push, publication or merge.
 
-This is request-scoped activation, not a detached issue worker or startup queue drain.
+That service-only factory uses request-scoped activation; optional detached workers
+are recorded below.
 Default server startup has no managed factory; operator-owned bootstrap must supply
 one. Busy invocation controls return 409, while asyncio cancellation preserves guarded
 thread draining. Coordinator callbacks are trusted/read-only and deadline bounded,
 not arbitrary-code isolation. Journal capacity still does not cover unmanaged HTTP
 runs. Shared internal-token identity is not multi-user authentication. Full M2/live
 delivery and hosted CI acceptance remain open.
+
+Detached worker gates (2026-10-07, from `9d13dcf`): **587 passed/two optional Docker
+skips**, Ruff/mypy (44 files), diagnostics and legacy mock simulation pass
+(`succeeded=true`, generated artifact, command exit 0). Thirty-eight added cases
+cover durable nonblocking HTTP admission/decisions, exact command/actor history,
+queued activation revision/scope/binding/original-budget pins, explicit bounded
+startup discovery, corruption/interrupted writes, local ownership races, capacity
+deferral, cancellation intent and shutdown/thread draining. Actual configured native
+SDK mocked-transport approval/rejection/recovered exact-span and independent
+verification/mock draft graphs run through detached admission.
+
+An explicit worker factory alongside the service factory owns bounded tasks through
+ASGI lifespan. Separate atomic/fsynced receipts distinguish admission from native
+execution and delivery acceptance. Queued work recovers under original pins; only
+unowned activated approved tasks without receipts qualify for optional startup
+discovery. Uncertain pre-assignment/native running work fails closed without replay;
+saved waits need exact decisions; finalizing/terminal retries record metadata only.
+Known capacity contention defers without abort/reset. Durable cancel intent is
+observed by other local owners through polling; busy controls return 409. Receipt
+failures stop affected slots and require evidence inspection/restart. This is local
+coordination, not distributed execution or multi-user/hostile-tenant certification.
+Default startup remains unmanaged; broader role adapters and live/hosted acceptance
+are still pending. No dependency change, live model/GitHub/Docker trial, hosted CI,
+push or remote write occurred for this slice.
 
 ## M0: Reproducible Baseline
 
@@ -412,8 +438,8 @@ Exit criteria:
 ## Immediate Work Queue
 
 1. Preserve the configurable definition/storage regressions and existing M0/M1, exact-span and publication safeguards. Run CI for new slices; never target the service checkout.
-2. Opt-in configured service routing/invocation is implemented. Next bounded service slice: operator-owned detached worker admission/lifecycle and explicit startup recovery of eligible approved/unstarted tasks, so webhook/approval responses need not await model execution. Reuse immutable assignment/run receipts and original budgets; never replay interrupted running side effects or widen unmanaged endpoint permissions. Keep activation explicit, with no fixed team/contribution loop. Broader scoped PM/Architect adapters and distributed controls remain separate follow-ups.
-3. Preserve passing service-level fixture acceptance (signed/authenticated delivery, decisions/restart, native SDK/mock-transport tools and independent verification/mock draft graph), and run hosted CI when authorized publication of the service changes is available. Default server activation, detached event consumption, live delivery and hosted CI remain unverified. Keep GitHub assignee writes separate and do not infer semantic review from metadata.
+2. Opt-in configured service routing and detached worker admission/lifecycle/startup recovery are locally implemented. Next bounded integration: broader scoped PM/Architect adapters and reviewable target source/diff, with configurable native orchestration and trusted actor context. Preserve immutable assignment/run/admission receipts and original budgets; never replay interrupted effects or widen unmanaged endpoint permissions. Keep activation explicit, with no fixed team/contribution loop. Distributed controls remain a separate follow-up.
+3. Preserve passing request-scoped/detached fixture acceptance (signed/authenticated delivery, decisions/restart, native SDK/mock-transport tools and independent verification/mock draft graph), and run hosted CI when authorized publication of the service changes is available. Default server activation, live configured-worker delivery and hosted CI remain unverified. Keep GitHub assignee writes separate and do not infer semantic review from metadata.
 4. Stage a freshly approved live draft trial using outcome-based contribution grading. Recheck GitHub hosting/authentication/allowlist; do not replay the previously aborted task. Recovered tool errors are diagnostics, not contribution blockers. Stage head-bound COMMENT review only with actual source/diff inspection before claiming semantic review.
 
 Update this snapshot when a milestone's exit checks have actually run. Record

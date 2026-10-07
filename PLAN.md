@@ -226,10 +226,30 @@ target isolation, coordinator identity, concurrency/capacity and actual native S
 mocked model transport. The existing verified mock draft graph also passes through
 service admission. No live model/GitHub/Docker/hosted CI, dependency or remote write.
 
+Opt-in detached worker lifecycle (2026-10-07, from service commit `9d13dcf`):
+`organization_worker.py` adds a separate strict atomic/fsynced admission journal,
+immutable approved scope/activation/binding pins and one-shot trusted command history.
+`create_app(..., managed_service_factory=..., managed_worker_factory=...)` enqueues
+approved tasks/decisions before returning; ASGI lifespan owns bounded worker slots
+and drains threaded stages on cancellation/shutdown. Explicit bounded startup
+discovery admits only activated approved tasks without existing ownership/receipts;
+existing queued jobs recover under original pins/budgets. Capacity/lock contention
+defers, while uncertain unclaimed/running effects fail closed without replay.
+Saved waiting decisions and metadata-only finalizing/terminal recovery remain distinct.
+Cancellation intent is atomic/durable; other local owners observe it by polling.
+Authenticated worker diagnostics expose failed slots; receipt failure requires
+inspection/restart, not blind effect retry. Default startup still supplies no factory.
+Gates: **587 passed/two optional Docker skips**, Ruff/mypy (44 source files), clean
+editor diagnostics and mock fixture success/artifact/exit 0. Thirty-eight new cases
+cover queued revision/scope/binding/budget pins, decisions, startup, corruption/save
+interruption, duplicate local owners, capacity, cancellation/thread draining and
+actual native SDK mocked transport plus independent verification/mock draft delivery.
+No live model/GitHub/Docker/hosted CI, dependency change, push or remote write.
+
 ### Current Limits
 
-- Configured factories/native admission/assignment/runner libraries have opt-in app integration through an operator-owned factory; the default server still uses legacy handles and metadata dispatch. Activated routes consume approved repository tasks in the calling request, not a detached worker or startup queue drain. Explicit repository/revision/event and actor/binding registries cannot be selected by HTTP callers. Internal shared-token identity is not multi-user authentication. Journal capacity does not govern unmanaged HTTP runs. Managed operation graphs pin active revisions; direct agent nodes need scoped role adapters. The native Developer operation resolves the selected configured agent and existing tools; broader PM/Architect managed execution remains pending. Trusted read-only coordinator callbacks are original-deadline bounded, not arbitrary-code isolation. Run/assignment completion is metadata, not verification/publication approval; native input is distinct from service approval. Only saved waiting checkpoints resume; interrupted running effects cannot be blindly replayed. Busy controls return 409; mandatory cleanup/thread draining and original budgets remain enforced. Local locks/state are not distributed execution or hostile-tenant certification. Live delivery/hosted CI acceptance remains pending.
-- `developer.async.webhook` returns task metadata by default. Only explicitly factory-activated repository routes invoke the managed worker; there is no autonomous detached task consumer.
+- Configured factories/native admission/assignment/runner libraries have opt-in app integration through operator-owned service/worker factories; the default server still uses legacy handles and metadata dispatch. Service-only activation awaits execution in the request; optional workers durably enqueue with lifespan-owned execution and explicit bounded unowned-task startup discovery. Explicit repository/revision/event and actor/binding registries cannot be selected by HTTP callers. Internal shared-token identity is not multi-user authentication. Journal capacity does not govern unmanaged HTTP runs. Managed operation graphs pin active revisions; direct agent nodes need scoped role adapters. The native Developer operation resolves the selected configured agent and existing tools; broader PM/Architect managed execution remains pending. Trusted read-only coordinator callbacks are original-deadline bounded, not arbitrary-code isolation. Run/assignment/admission completion is metadata, not verification/publication approval; native input is distinct from service approval. Only saved waiting checkpoints resume; interrupted running effects cannot be blindly replayed. Busy controls return 409; mandatory cleanup/thread draining and original budgets remain enforced. Cross-process cancellation is polling-based; failed worker slots require inspection/restart. Local locks/state are not distributed execution or hostile-tenant certification. Live delivery/hosted CI acceptance remains pending.
+- `developer.async.webhook` returns task metadata by default. Detached consumption exists only for explicitly service/worker-factory-activated approved repository routes, not default startup.
 - Supported repository issue events produce target-specific bundles and require approval-time base SHA pinning. Checkout preparation validates membership in the explicitly configured local seed/base branch, not live GitHub repository identity or remote freshness. No automatic remote lookup/fetch occurs. Legacy fixture payloads without repository context retain prototype routing; unsupported repository webhook events and missing issue criteria are rejected.
 - GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions at `88720aa`. Live acceptance remains pending. The operator installed checksum-verified `gh` 2.102.0 locally for the fresh trial and verified `uhvogala` on github.com; this is not a default image dependency. No live task-result publication has been tested.
 - PM draft/write-approval stores remain in memory; restart loses those records. Architect/PM tool binding is implemented, but managed role run/resume and automatic published-target review orchestration are not wired into the HTTP workflow. Published-PR reads expose metadata and filenames, not a reviewable diff or target file content.
