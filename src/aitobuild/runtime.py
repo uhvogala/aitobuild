@@ -226,49 +226,55 @@ def _build_role_agent_handles(
     role_tools: dict[str, tuple[Callable[..., Any], ...]] | None,
     developer_state_dir: Path | None = None,
 ) -> dict[str, Any]:
-    handles: dict[str, Any] = {}
     tools_by_role = role_tools or {}
-    for spec in specs:
-        tools = list(tools_by_role.get(spec.role.value, ()))
-        if agent_class is not None:
-            options: dict[str, Any] = {}
-            if spec.role.value == "developer" and developer_state_dir is not None:
-                options = {
-                    "context_providers": [
-                        FileHistoryProvider(developer_state_dir / "history", skip_excluded=True),
-                        FoundryCompatibleFileMemoryProvider(
-                            FileSystemAgentFileStore(developer_state_dir / "memory"),
-                        ),
-                        CompactionProvider(
-                            history_source_id="file_history",
-                            before_strategy=ContextWindowCompactionStrategy(
-                                max_context_window_tokens=32000, max_output_tokens=4096,
-                                keep_last_tool_call_groups=4, preserve_first_user_group=True,
-                            ),
-                        ),
-                    ],
-                    "default_options": {"store": False, "max_tokens": 4096},
-                    "require_per_service_call_history_persistence": True,
-                }
-            try:
-                handles[spec.role.value] = agent_class(
-                    client=client,
-                    name=spec.name,
-                    instructions=spec.instructions,
-                    tools=[] if spec.role.value == "developer" else tools,
-                    **options,
-                )
-                continue
-            except Exception as error:
-                raise RuntimeError(f"Failed to bind {spec.role.value} agent with its tools") from error
+    return {
+        spec.role.value: build_agent_handle(
+            spec, client=client, agent_class=agent_class,
+            tools=tools_by_role.get(spec.role.value, ()), developer_state_dir=developer_state_dir,
+        )
+        for spec in specs
+    }
 
-        handles[spec.role.value] = {
-            "name": spec.name,
-            "instructions": spec.instructions,
-            "client": client,
-            "tools": tuple(tools),
+
+def build_agent_handle(
+    spec: AgentSpec,
+    *,
+    client: Any,
+    agent_class: type[Any] | None,
+    tools: tuple[Callable[..., Any], ...] = (),
+    developer_state_dir: Path | None = None,
+) -> Any:
+    if agent_class is None:
+        return {
+            "name": spec.name, "instructions": spec.instructions,
+            "client": client, "tools": tools,
         }
-    return handles
+    options: dict[str, Any] = {}
+    if spec.role.value == "developer" and developer_state_dir is not None:
+        options = {
+            "context_providers": [
+                FileHistoryProvider(developer_state_dir / "history", skip_excluded=True),
+                FoundryCompatibleFileMemoryProvider(
+                    FileSystemAgentFileStore(developer_state_dir / "memory"),
+                ),
+                CompactionProvider(
+                    history_source_id="file_history",
+                    before_strategy=ContextWindowCompactionStrategy(
+                        max_context_window_tokens=32000, max_output_tokens=4096,
+                        keep_last_tool_call_groups=4, preserve_first_user_group=True,
+                    ),
+                ),
+            ],
+            "default_options": {"store": False, "max_tokens": 4096},
+            "require_per_service_call_history_persistence": True,
+        }
+    try:
+        return agent_class(
+            client=client, name=spec.name, instructions=spec.instructions,
+            tools=[] if spec.role.value == "developer" else list(tools), **options,
+        )
+    except Exception as error:
+        raise RuntimeError(f"Failed to bind {spec.role.value} agent with its tools") from error
 
 
 def kickoff_meeting_bootstrap(

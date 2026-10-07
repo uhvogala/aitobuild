@@ -31,6 +31,7 @@ class AgentDefinition(DefinitionModel):
     role: AgentRole
     instructions: Annotated[StrictStr, Field(min_length=1, max_length=32000)]
     model_profile: Identifier | None = None
+    tool_profile: Identifier | None = None
     max_concurrent_runs: Annotated[StrictInt, Field(ge=1, le=64)] = 1
 
     @model_validator(mode="after")
@@ -46,21 +47,114 @@ class TeamDefinition(DefinitionModel):
     coordinator: Identifier | None = None
 
 
+class WorkflowNodeDefinition(DefinitionModel):
+    id: Identifier
+    kind: Literal["agent", "operation"]
+    agent: Identifier | None = None
+    operation: Identifier | None = None
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> Self:
+        if self.kind == "agent" and (self.agent is None or self.operation is not None):
+            raise ValueError("Agent nodes require only an agent reference")
+        if self.kind == "operation" and (self.operation is None or self.agent is not None):
+            raise ValueError("Operation nodes require only an operation reference")
+        return self
+
+
+class WorkflowCaseDefinition(DefinitionModel):
+    condition: Identifier
+    target: Identifier
+
+
+class WorkflowEdgeDefinition(DefinitionModel):
+    kind: Literal["edge", "fan_out", "fan_in", "switch"] = "edge"
+    source: Identifier | None = None
+    target: Identifier | None = None
+    sources: tuple[Identifier, ...] = ()
+    targets: tuple[Identifier, ...] = ()
+    condition: Identifier | None = None
+    cases: tuple[WorkflowCaseDefinition, ...] = ()
+    default: Identifier | None = None
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> Self:
+        if self.kind == "edge":
+            valid = self.source is not None and self.target is not None
+            valid = valid and not (self.sources or self.targets or self.cases or self.default)
+        elif self.kind == "fan_out":
+            valid = self.source is not None and len(self.targets) >= 2
+            valid = valid and not (self.target or self.sources or self.condition or self.cases or self.default)
+        elif self.kind == "fan_in":
+            valid = self.target is not None and len(self.sources) >= 2
+            valid = valid and not (self.source or self.targets or self.condition or self.cases or self.default)
+        else:
+            valid = self.source is not None and bool(self.cases)
+            valid = valid and not (self.target or self.sources or self.targets or self.condition)
+        if not valid:
+            raise ValueError("Invalid fields for the selected native edge kind")
+        for references in (self.sources, self.targets, tuple(case.target for case in self.cases)):
+            if len(references) != len(set(references)):
+                raise ValueError("Native edge targets/sources must be unique")
+        conditions = [case.condition for case in self.cases]
+        if len(conditions) != len(set(conditions)):
+            raise ValueError("Switch conditions must be unique")
+        return self
+
+    def connections(self) -> tuple[tuple[str, str], ...]:
+        if self.kind == "fan_out":
+            return tuple((str(self.source), target) for target in self.targets)
+        if self.kind == "fan_in":
+            return tuple((source, str(self.target)) for source in self.sources)
+        if self.kind == "switch":
+            targets = [case.target for case in self.cases]
+            if self.default is not None:
+                targets.append(self.default)
+            return tuple((str(self.source), target) for target in targets)
+        return ((str(self.source), str(self.target)),)
+
+
+class WorkflowGraphDefinition(DefinitionModel):
+    format: Literal["python_graph"]
+    start: Identifier
+    nodes: Annotated[tuple[WorkflowNodeDefinition, ...], Field(min_length=1)]
+    edges: tuple[WorkflowEdgeDefinition, ...] = ()
+    outputs: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    max_iterations: Annotated[StrictInt, Field(ge=1)] = 100
+    description: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def validate_graph(self) -> Self:
+        identifiers = {node.id for node in self.nodes}
+        if len(identifiers) != len(self.nodes):
+            raise ValueError("Workflow node IDs must be unique")
+        if self.start not in identifiers or not set(self.outputs) <= identifiers:
+            raise ValueError("Workflow start/outputs must reference configured nodes")
+        if len(self.outputs) != len(set(self.outputs)):
+            raise ValueError("Workflow output nodes must be unique")
+        connections = [connection for edge in self.edges for connection in edge.connections()]
+        if any(source not in identifiers or target not in identifiers for source, target in connections):
+            raise ValueError("Workflow edges must reference configured nodes")
+        if len(connections) != len(set(connections)):
+            raise ValueError("Workflow connections must be unique")
+        reachable = {self.start}
+        while True:
+            expanded = reachable | {target for source, target in connections if source in reachable}
+            if expanded == reachable:
+                break
+            reachable = expanded
+        if reachable != identifiers:
+            raise ValueError("All workflow nodes must be reachable from the start")
+        return self
+
+
 class WorkflowDefinition(DefinitionModel):
     id: Identifier
     document: dict[StrictStr, JsonValue]
 
     @model_validator(mode="after")
     def validate_document(self) -> Self:
-        actions = self.document.get("actions")
-        if not isinstance(actions, list) or not actions:
-            raise ValueError("Native workflow documents require nonempty actions")
-        for action in actions:
-            if not isinstance(action, dict):
-                raise ValueError("Native workflow actions must be objects")
-            kind = action.get("kind")
-            if not isinstance(kind, str) or not kind.strip():
-                raise ValueError("Native workflow actions require a kind")
+        WorkflowGraphDefinition.model_validate(self.document)
         return self
 
 

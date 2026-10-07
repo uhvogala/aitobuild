@@ -13,8 +13,11 @@
     {
       "id": "definition_probe",
       "document": {
-        "name": "definition_probe",
-        "actions": [{"kind": "SendActivity", "activity": {"text": "Organization definition loaded."}}]
+        "format": "python_graph",
+        "start": "probe",
+        "nodes": [{"id": "probe", "kind": "operation", "operation": "definition_probe"}],
+        "edges": [],
+        "outputs": ["probe"]
       }
     }
   ],

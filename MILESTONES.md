@@ -37,7 +37,7 @@ execute task code against the aitobuild service checkout.
 
 | Area | Evidence | Status |
 | --- | --- | --- |
-| Organization definitions | Strict versioned JSON, agent/team/workflow/route references, selectable delegation and immutable file-backed revisions | Definition foundation; runtime, assignment and native graph admission integration pending |
+| Organization configuration | Immutable definitions, instance factories, operator model/tool profiles and bounded native graph admission/binding | Library assembly implemented; persisted assignment and managed service integration pending |
 | Local setup | Python 3.14+, uv, certificate bootstrap and 16 certificate tests | Implemented |
 | Ingress/governance | Signed webhooks, internal auth, dedupe, previews, role policy | Local durable previews/issue-task dedupe; other ingress state in memory |
 | Local Developer pipeline | Copied fixture, preview approval, subprocess tests and file write | Verified on 2026-10-05 |
@@ -48,8 +48,9 @@ execute task code against the aitobuild service checkout.
 | Architect/PM/meetings | Wired role tools, operator-gated PM writes, head-bound COMMENT review, GroupChatBuilder construction | Managed role execution, reviewable target diff, durable PM state and meeting execution pending |
 | Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current local gates with the definition foundation: **396 passed, two optional Docker probes skipped**;
-Ruff and mypy (38 source files) pass. Publication-fix gates previously passed
+Current local gates with Python-native factories/admission: **452 passed, two optional Docker probes skipped**;
+Ruff and mypy (39 source files) pass. Definition-foundation gates passed with 396
+tests; publication-fix gates previously passed
 with 364 tests. The prior 325-test Docker-enabled baseline
 and supervised example-issue implementation/verification remain historical evidence,
 not live publication acceptance. Both original patch-repair
@@ -73,7 +74,8 @@ local pipeline, not GitHub delivery or production isolation.
 
 ## M2 Foundation: Configurable Organization and Workflow Definitions
 
-Status: **definition/storage slice implemented; execution integration pending**.
+Status: **definitions, factories and native admission implemented as library APIs;
+persisted assignment/managed service execution pending**.
 This foundation precedes automatic issue consumption, not existing operator
 delivery endpoints. Agent roles remain fixed initially; instance IDs, prompts,
 optional model profiles, team membership/coordinator, event routes and delegation
@@ -83,17 +85,22 @@ Deliverables and acceptance sequence:
 1. Strict versioned JSON definitions and a storage interface with a file-backed
 	implementation. Content-addressed immutable snapshots survive reload; changed
 	definitions create distinct revisions. Unknown fields, ambiguous routes and
-	invalid membership/references fail closed. **Implemented**; example native
-	workflow loads with the pinned SDK. The example is a probe, not delivery.
+	invalid membership/references fail closed. **Implemented**; the example Python
+	graph assembles with the pinned SDK. The example is a probe, not delivery.
 2. Configurable agent factories and operator-owned model/tool-profile registries;
-	resolve profile references and bind native actions against an allowlisted
-	operation registry. Validate full native graphs and agent/function references
-	before activation. Config cannot extend role policy or grant arbitrary code,
-	HTTP/MCP access or file imports. **Next**.
+	resolve references before creating instances, preserve role instructions and
+	per-run Developer tools, and isolate memory by organization/revision/agent.
+	Admit Python graph nodes/edges and exact agent/operation/predicate references,
+	then bind pinned SDK `WorkflowBuilder`/`AgentExecutor` and native conditional,
+	switch, feedback and fan-out/fan-in edges. Reject inline agents/imports,
+	HTTP/MCP, dynamic references, team escape and service-state writes. Enforce
+	operator byte/node/connection/iteration ceilings. **Implemented** as library
+	APIs; no PowerFx/.NET, expression language, custom evaluator or organization
+	compatibility layer. Only Python graph documents are accepted.
 3. Structured delegation records for coordinator/rule/human strategies: task,
 	organization revision, team, eligible selected agent, rationale, scope and
 	ownership. Reject unknown/ineligible agents and capacity/approval violations.
-	Assignment is not a GitHub assignee write. **Pending**.
+	Assignment is not a GitHub assignee write. **Next**.
 4. Managed native workflows with persisted run/assignment/checkpoint references,
 	approvals, cancellation and budgets. New runs pin approved revisions; later
 	config changes cannot silently alter active runs or reset failed budgets.
@@ -107,10 +114,24 @@ rejection, delegation modes, reload, canonical/concurrent saves, immutable
 revisions, corruption/address rejection and interrupted-save recovery. No live
 models, GitHub writes, real Docker probes or hosted CI were repeated.
 
-The configuration loader/store are library APIs only. They do not activate
-routing, enforce capacity, execute delegation, register model profiles or replace
-the current hardcoded runtime. Runtime pinning is an acceptance criterion for the
-managed-run slice, not a claim about current endpoints.
+Python-native factory/admission validation (2026-10-07): **452 passed/two optional Docker
+skips**, Ruff and mypy (39 source files) pass. Actual SDK agent invocations use
+mocked HTTP transports with distinct configured clients. Conditional edges,
+ordered switch/default routing, bounded feedback loops, read-only operations,
+single fan-out/fan-in aggregation and checkpoint writes pass. Fresh adapter imports
+and branch execution pass with declarative/PowerFx/.NET modules blocked. Unsafe
+graph/reference/field cases, non-Boolean predicates and iteration exhaustion fail
+closed. The preceding 443-test declarative adapter was replaced. No live models,
+GitHub/Docker trial or hosted CI was repeated; managed recovery is still pending.
+
+The loader/store/factories are library APIs only. They do not activate service
+routing, enforce capacity or execute delegation. Direct workflow operation bindings
+are read-only until managed approved-task execution is available; native agent
+toolsets remain operator-owned and must use existing policy/approval-enforcing
+handlers. Legacy bootstrap/endpoints are unchanged. Caller-supplied native
+checkpoint storage is supported, but managed checkpoint/run recovery, approvals,
+deadlines and active-run revision pinning are acceptance criteria for the next
+slices, not claims about these configured prototype workflows.
 
 ## M0: Reproducible Baseline
 
@@ -335,8 +356,8 @@ Exit criteria:
 ## Immediate Work Queue
 
 1. Preserve the configurable definition/storage regressions and existing M0/M1, exact-span and publication safeguards. Run CI for new slices; never target the service checkout.
-2. Next implementation slice: configurable agent factories, profile resolution and native action/graph admission. Keep existing runtime APIs compatible; no workflow activation before validation.
-3. Add validated persisted coordinator/rule/human assignments, then a native managed runner that pins configuration revisions and connects existing approved delivery stages without a hardcoded team structure.
+2. Next implementation slice: persisted coordinator/rule/human assignments with revision/team/eligible-agent identity, scope/approval checks and atomic ownership/capacity claims. Keep GitHub assignee writes separate.
+3. Add a native Python managed runner that pins configuration and assignment revisions and connects existing approved delivery stages without a hardcoded team structure. Preserve original deadlines/budgets and distinguish native human-input events from service approval. Use registered operations/predicates and native SDK orchestration/checkpoints, not an expression runtime or custom workflow interpreter.
 4. Validate a configured approved issue-to-draft recipe in copied fixtures, including revision changes, restarts, duplicate assignment and recovery within original budgets.
 5. Stage a freshly approved live draft trial using outcome-based contribution grading. Recheck GitHub hosting/authentication/allowlist; do not replay the previously aborted task. Recovered tool errors are diagnostics, not contribution blockers. Stage head-bound COMMENT review only with actual source/diff inspection before claiming semantic review.
 

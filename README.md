@@ -6,9 +6,10 @@ roles, built on Microsoft Agent Framework and FastAPI.
 Current stage: foundation plus a local Developer execution prototype. This is
 not yet an autonomous issue-to-PR service. The next delivery target is one
 approved issue producing a tested draft PR in a disposable repository, with a
-human retaining merge authority. Before adding that managed workflow, the current
-focus is configurable organization definitions, agent factories and delegation
-rather than a fixed team structure or hardcoded lifecycle.
+human retaining merge authority. Configurable organization definitions, instance
+factories and native workflow admission are available as library APIs. Persisted
+delegation and managed execution are next; the team structure and lifecycle are
+not fixed in code.
 
 ## Start here
 
@@ -22,16 +23,16 @@ rather than a fixed team structure or hardcoded lifecycle.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Organization definitions | Versioned JSON, configurable instances/teams/routes/delegation, immutable file-backed revisions | Factories, native graph admission, recorded assignments and managed execution |
+| Organization configuration | Versioned definitions, immutable revisions, instance factories, model/tool profiles and native graph admission | Recorded assignments and managed execution/service integration |
 | Ingress and routing | Signed webhooks, internal auth, issue extraction and durable scope approval/dedupe | Configurable assignment routing and automatic task consumption |
 | Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
-| Native model runtime | Foundry binding, approved Developer invocation, persistent manual approvals and constrained Grok/Kimi trials | Configurable agent factories and managed PM/Architect execution |
+| Native model runtime | Foundry binding, configured agent factories, approved Developer invocation, persistent manual approvals and constrained Grok/Kimi trials | Managed PM/Architect execution and service activation |
 | GitHub integration | Operator-gated issue writes, verified draft publication and head-pinned COMMENT reviews through allowlisted gh CLI | Live publication acceptance and meaningful source/diff review |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **396 tests pass**, with two optional prepared-target Docker
-probes skipped; Ruff and mypy (38 source files) pass. The prior 325-test baseline
+Verified locally: **452 tests pass**, with two optional prepared-target Docker
+probes skipped; Ruff and mypy (39 source files) pass. The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
 The original patch-repair
 failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
@@ -64,11 +65,14 @@ files with bounded previews and paged retrieval; oversized API prompts are rejec
 ### Organization definition foundation
 
 [config/organization.example.json](config/organization.example.json) describes
-named agents (multiple instances per role), prompts, teams/coordinator, native
-declarative workflow documents and event routes with coordinator/rule/human
-delegation. `model_profile` is an optional operator-profile reference, not inline
-credentials; profile resolution is a later runtime slice. Capacity is currently
-declared only. There are no `skills` labels or configurable permission grants.
+named agents (multiple instances per role), prompts, teams/coordinator, Python-native
+workflow graphs and event routes with coordinator/rule/human
+delegation. Optional `model_profile` and `tool_profile` references resolve against
+operator registries, not inline credentials/callables. Tool profiles are restricted
+to their declared role and role-policy ceiling; operators must register existing
+policy/approval-enforcing tool handlers. Developer tools are still bound per
+approved run, not permanently attached by config. Capacity is currently declared
+only. There are no `skills` labels or configurable permission grants.
 
 Validate and persist an immutable revision through the library API:
 
@@ -85,10 +89,60 @@ restored = store.get(snapshot.organization_id, snapshot.revision)
 Use a trusted service-owned storage directory. Changed definitions create new
 revisions; callers must select a revision explicitly. Storage does not activate
 or approve it. The example workflow is a harmless definition probe, not a delivery
-recipe. Definitions are not yet connected to runtime/dispatch: full native graph
-validation, configurable factories, recorded delegation and managed run/revision
-pinning follow in [MILESTONES.md](MILESTONES.md). Existing execution safeguards
-and endpoints are unchanged.
+recipe. Existing service bootstrap/dispatch and execution safeguards are unchanged.
+Recorded delegation and managed run/revision pinning follow in
+[MILESTONES.md](MILESTONES.md).
+
+Assemble configured instances and the harmless native example in mock mode:
+
+```python
+from aitobuild.config import RuntimeConfig
+from aitobuild.organization_runtime import (
+	WorkflowOperation, bootstrap_organization, build_organization_workflows, create_model_profile,
+)
+
+profile = create_model_profile(RuntimeConfig(
+	foundry_endpoint=None, foundry_api_key=None,
+	foundry_model="test-model", allow_mock_model=True,
+))
+runtime = bootstrap_organization(
+	snapshot, model_profiles={"operator_default": profile},
+	default_model_profile="operator_default",
+	state_dir=Path("/tmp/aitobuild-agent-state"),
+)
+workflows = build_organization_workflows(runtime, operations={
+	"definition_probe": WorkflowOperation(lambda message: message),
+})
+```
+
+Native agent invocations require native model profiles, not mock handles. Role
+templates precede configured guidance, and Developer memory is isolated by
+organization/revision/agent. Workflow construction is not managed execution,
+delivery acceptance or approval; task scope/budgets/verification remain separate.
+
+Workflow documents use `format: "python_graph"`, a `start` node, `nodes`, `edges`
+and explicit `outputs`. Nodes reference configured agents or registered operations.
+Edges map directly to SDK `add_edge`, `add_fan_out_edges`, `add_fan_in_edges` and
+`add_switch_case_edge_group`; conditional feedback edges support bounded loops.
+`condition` names resolve through the caller's `predicates` registry, never an
+expression string. Switch `cases` are ordered condition/target pairs with an
+optional `default` target. Predicates are synchronous Python callables returning
+an actual boolean. Native execution uses `WorkflowBuilder` and `AgentExecutor`.
+
+Operations consume one incoming message and return a value (or an awaitable).
+Native fan-in passes a list; agents retain SDK message/response types rather than
+implicit string conversion. Operation results are forwarded to connected nodes
+and published only when selected in `outputs`. Bindings are explicitly registered
+read-only operations; write/review bindings await managed approved-task context.
+Unknown fields/kinds, inline agents/files, HTTP/MCP, dynamic references, invalid
+topology and routed-team escapes fail closed. Config cannot write service state.
+Operator ceilings bound document bytes, node/connection counts and native runner
+iterations, not callback duration. Optional SDK checkpoint storage is caller-owned;
+managed restart/resume, human-input adapters and task approval remain pending.
+
+No PowerFx, .NET or expression evaluator is used or required. Only Python graph
+documents are accepted. Literal payloads, including strings starting with `=`,
+are just data.
 
 ### API setup
 

@@ -36,12 +36,20 @@ Teams configure members and an optional coordinator. Routes select native workfl
 definitions and eligible delegates. No `skills` labels are part of this schema;
 optional attached skill files are a separate future feature.
 
-Start with JSON organization definitions containing native declarative workflow
-documents. Reuse Agent Framework `WorkflowFactory`/`WorkflowBuilder`, handoffs and
-checkpoints rather than inventing a workflow language. An application-owned
-registry will bind approved service operations; config cannot grant permissions,
-skip verification or expose arbitrary HTTP/MCP/file loading. Native graph/action
-admission must be validated before anything is connected to live execution.
+Start with JSON organization definitions describing Python-native executor graphs.
+Bind nodes and edges directly through Agent Framework `WorkflowBuilder`,
+`AgentExecutor` and native checkpoints; routing, loops and parallel joins stay in
+the SDK. Operations and routing predicates reference trusted, operator-owned Python
+registries, never inline code, imports or expressions. Predicates are synchronous
+and return strict booleans; operations consume a message and return a synchronous
+or asynchronous result. No PowerFx, .NET or custom expression interpreter is used.
+Read-only workflow operations are available initially; write/review bindings await
+managed approved-task context. Config cannot grant permissions, skip verification,
+write service state or expose arbitrary HTTP/MCP/file loading. Graph fields,
+topology, exact bindings and routed-team membership are admitted before the SDK
+builds the graph. Operator limits bound graph bytes, nodes, connections and runner
+iterations, not callback duration. Only Python graph documents are accepted;
+there is no organization-format compatibility or migration layer.
 
 Definitions and execution state have separate storage contracts. Immutable,
 content-addressed definition revisions let new runs adopt updates while existing
@@ -127,13 +135,13 @@ not yet operationally complete:
 * **Phase 5: Review and Coordination.** Configured review/fix/meeting recipes and managed scheduling with durable state and escalation.
 * **Phase 6: Supervised Pilot.** Broaden PM backlog/planning and proactive proposals after delivery/recovery gates pass; evaluate before expanding autonomy.
 
-## 7. Implementation Snapshot (2026-10-06)
+## 7. Implementation Snapshot (2026-10-07)
 
 ### Implemented Building Blocks
 
 These items describe code and local test coverage, not production certification.
 
-- Organization definition library: strict schema version 1 JSON with stable agent/team/workflow/route IDs, prompts, optional model-profile references, capacity declarations and coordinator/rule/human delegation configuration; no skills or permission grants. File-backed `DefinitionStore` saves canonical SHA-256-addressed immutable snapshots with locked atomic/fsynced writes and integrity checks. Example native declarative document loads with pinned SDK 1.20; no live activation or full graph admission is implemented.
+- Organization definition library: strict schema version 1 JSON with stable agent/team/workflow/route IDs, prompts, optional model/tool-profile references, capacity declarations and coordinator/rule/human delegation configuration; no skills or permission grants. File-backed `DefinitionStore` saves canonical SHA-256-addressed immutable snapshots with locked atomic/fsynced writes and integrity checks. The example is a harmless Python-native operation graph. Graph admission is implemented as a library API, not service activation.
 - Unified trigger model with webhook and internal event normalization.
 - FastAPI ingress endpoints: `/health`, `/webhook`, `/internal/triggers`, `/internal/scheduler/tick`.
 - FastAPI internal developer preview endpoints: `/internal/developer/preview` and `/internal/developer/preview/approve`.
@@ -176,10 +184,11 @@ These items describe code and local test coverage, not production certification.
 - Integrated baseline verification on 2026-10-06 at `740b385`: **347 passed, two optional Docker probes skipped**, Ruff passes, and mypy passes for 37 source files. Focused role/delivery/policy tests: 105 passed/two skipped. This gate run did not repeat live models, real Docker probes or hosted CI, and passing regressions do not waive the reproduced publication findings below.
 - Publication-fix verification on 2026-10-06: **364 passed, two optional Docker probes skipped**, `uv run ruff check .`, `uv run mypy src` (37 source files) and whitespace checks pass. Regressions cover content/mode/removal after capture, missing PR/head receipts, uncertain ref creation, remote drift/denied lookup, expiry and terminal failed-budget replay. No live publication/model trial or hosted CI was repeated.
 - Configurable-definition foundation verification on 2026-10-06: **396 passed, two optional Docker probes skipped**, Ruff, mypy (38 source files) and whitespace checks pass. Definition tests cover multiple instances per role, native example compatibility, configurable delegation, invalid versions/fields/references, immutable/canonical revisions, reload, concurrency, tampering and interrupted-save recovery. No automatic routing/runtime activation or external trials were added.
+- Configured runtime/admission replacement (2026-10-07): `organization_runtime.py` resolves operator-owned model/tool profiles before assembly, keys handles by instance ID, preserves role instruction templates/per-run Developer tools and isolates memory by organization/revision/agent. `build_organization_workflows` binds validated JSON graphs to native `WorkflowBuilder`/`AgentExecutor`, registered read-only message operations and named Python predicates, with caller checkpoint storage and revision-qualified workflow names. Conditional edges, ordered switch/default routing, bounded feedback loops and fan-out/fan-in execute natively without declarative/PowerFx/.NET imports. Only Python graph documents are accepted; no compatibility layer is needed for this new feature. Gates: **452 passed/two optional Docker skips**, Ruff and mypy (39 source files). Tests cover actual SDK agent calls over mocked HTTP with distinct clients, strict Boolean routing, iteration exhaustion, single parallel aggregation, checkpoint writes and blocked non-Python workflow dependencies. The preceding 443-test declarative adapter was replaced, not extended with an expression interpreter. No live model/GitHub/Docker/hosted CI trial or managed runner was added.
 
 ### Current Limits
 
-- Organization definitions/store are not wired into runtime bootstrap or dispatch. Profile resolution, native action/reference admission, persisted assignments, managed runner and active-run revision pinning are next; stored revisions are not approvals. The existing runtime still has one handle per role. Capacity is declared, not enforced. Native document shape validation is not graph validation or a security admission gate.
+- Configured instance factories/native admission are library APIs, not service activation. Default bootstrap/HTTP dispatch still use one handle per role; persisted assignments, managed runner and active-run revision pinning are next. Capacity is declared, not enforced. Stored snapshots/native human-input events are not approvals. Direct workflow operations cannot write/review yet; operator agent-tool profiles must use existing policy-enforcing handlers. Python-native routing needs no expression runtime, but graph construction/caller checkpoints do not certify managed recovery, budgets, callback duration, semantic correctness or delivery. Managed human-input/approval adapters and execution bindings remain pending.
 - `developer.async.webhook` returns a task bundle; no worker consumes it automatically.
 - Supported repository issue events produce target-specific bundles and require approval-time base SHA pinning. Checkout preparation validates membership in the explicitly configured local seed/base branch, not live GitHub repository identity or remote freshness. No automatic remote lookup/fetch occurs. Legacy fixture payloads without repository context retain prototype routing; unsupported repository webhook events and missing issue criteria are rejected.
 - GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions at `88720aa`. Live acceptance remains pending. The operator installed checksum-verified `gh` 2.102.0 locally for the fresh trial and verified `uhvogala` on github.com; this is not a default image dependency. No live task-result publication has been tested.

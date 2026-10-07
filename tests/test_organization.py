@@ -6,10 +6,10 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
-from agent_framework_declarative import WorkflowFactory
 
 from aitobuild.organization import (
-    DefinitionStore, FileDefinitionStore, load_organization_definition, parse_organization_definition,
+    DefinitionStore, FileDefinitionStore, WorkflowGraphDefinition,
+    load_organization_definition, parse_organization_definition,
 )
 from aitobuild.policy import AgentRole
 
@@ -21,13 +21,14 @@ def payload() -> dict:
     return json.loads(EXAMPLE.read_text())
 
 
-def test_multiple_agents_per_role_and_native_workflow_document() -> None:
+def test_multiple_agents_per_role_and_python_graph_document() -> None:
     definition = load_organization_definition(EXAMPLE)
     assert [agent.id for agent in definition.agents if agent.role is AgentRole.DEVELOPER] == [
         "developer_one", "developer_two",
     ]
     assert definition.teams[0].coordinator == "planner"
-    WorkflowFactory().create_workflow_from_definition(definition.workflows[0].document)
+    graph = WorkflowGraphDefinition.model_validate(definition.workflows[0].document)
+    assert graph.start == "probe" and graph.outputs == ("probe",)
 
 
 @pytest.mark.parametrize("strategy,target", [("coordinator", None), ("rules", "developer_two"), ("human", None)])
@@ -43,7 +44,7 @@ def test_configurable_delegation_definitions(strategy, target) -> None:
     "skills", "permissions", "role", "blank_prompt", "duplicate_agent", "unknown_member",
     "duplicate_member", "unknown_coordinator", "unknown_team", "unknown_workflow",
     "unknown_delegate", "missing_coordinator", "missing_target", "duplicate_event",
-    "boolean_capacity", "boolean_version", "unsupported_version", "empty_actions",
+    "boolean_capacity", "boolean_version", "unsupported_version", "empty_nodes",
 ])
 def test_invalid_definitions_fail_closed(case) -> None:
     document = payload()
@@ -82,7 +83,7 @@ def test_invalid_definitions_fail_closed(case) -> None:
     elif case == "unsupported_version":
         document["schema_version"] = 2
     else:
-        document["workflows"][0]["document"]["actions"] = []
+        document["workflows"][0]["document"]["nodes"] = []
     with pytest.raises(ValueError):
         parse_organization_definition(json.dumps(document))
 
@@ -174,3 +175,12 @@ def test_interrupted_save_keeps_previous_revision_and_retries_safely(tmp_path, m
 def test_definition_addresses_cannot_escape_store(tmp_path, organization_id, revision) -> None:
     with pytest.raises(ValueError):
         FileDefinitionStore(tmp_path).get(organization_id, revision)
+
+
+def test_action_documents_are_not_organization_graphs() -> None:
+    document = payload()
+    document["workflows"][0]["document"] = {
+        "actions": [{"kind": "SendActivity", "activity": "unsupported"}],
+    }
+    with pytest.raises(ValueError):
+        parse_organization_definition(json.dumps(document))
