@@ -207,10 +207,29 @@ approve/reject/recovered-edit scenarios and a disposable-target mock draft graph
 with independent evidence. No dependency change or live model/GitHub/Docker/hosted
 CI trial or remote writes were performed for this slice.
 
+Opt-in managed service integration (2026-10-07, from `8351092`):
+`organization_service.py` binds exact trusted repository/revision/event activations,
+app-owned previews/worker/tools and context-local operator/coordinator identity.
+`create_app(..., managed_service_factory=...)` enables request-scoped consumption
+after authenticated approval and signed webhook/authenticated trigger delivery,
+including durable duplicate dispatch metadata. Existing claims always use their
+pinned revision; preparation reuses the original approved target/ledger. Optional
+authenticated status/run/approve/resume/cancel controls reject identity/workflow/
+revision/path overrides and retain distinct native input/service approval. Rules,
+human decisions and registered read-only coordinator callbacks remain configurable.
+Coordinator failure/cancellation aborts the original prepared budget; cancellation
+authorization uses frozen ownership so corrupt mutable previews cannot prevent cleanup.
+Gates: **549 passed/two optional Docker skips**, Ruff/mypy (43 source files), clean
+editor diagnostics and a successful legacy mock fixture simulation with artifact and
+exit 0. Eighteen added cases include HTTP admission/decisions/restart/expiry/interruption,
+target isolation, coordinator identity, concurrency/capacity and actual native SDK over
+mocked model transport. The existing verified mock draft graph also passes through
+service admission. No live model/GitHub/Docker/hosted CI, dependency or remote write.
+
 ### Current Limits
 
-- Configured factories/native admission/assignments/managed runner are library APIs, not service activation. Default bootstrap/HTTP dispatch still use one handle per role; automatic configured routing/worker invocation is next. Journal capacity does not govern unmanaged HTTP runs. Managed operation graphs pin active revisions and trusted actor/operator-binding context, but direct agent nodes need scoped role adapters. The native Developer operation resolves the configured selected agent and existing per-run tools; broader PM/Architect managed execution remains pending. Assignment/run completion is metadata, not verification or publication approval. Native human input and service approval are distinct. Direct workflow operations remain read-only. Only saved waiting checkpoints resume; interrupted executing states cannot be blindly replayed. Cleanup is required; arbitrary synchronous callback safety/duration remains operator-owned. Local locks/state are not distributed execution or hostile-tenant certification. Live delivery/hosted CI acceptance remains pending.
-- `developer.async.webhook` returns a task bundle; no worker consumes it automatically.
+- Configured factories/native admission/assignment/runner libraries have opt-in app integration through an operator-owned factory; the default server still uses legacy handles and metadata dispatch. Activated routes consume approved repository tasks in the calling request, not a detached worker or startup queue drain. Explicit repository/revision/event and actor/binding registries cannot be selected by HTTP callers. Internal shared-token identity is not multi-user authentication. Journal capacity does not govern unmanaged HTTP runs. Managed operation graphs pin active revisions; direct agent nodes need scoped role adapters. The native Developer operation resolves the selected configured agent and existing tools; broader PM/Architect managed execution remains pending. Trusted read-only coordinator callbacks are original-deadline bounded, not arbitrary-code isolation. Run/assignment completion is metadata, not verification/publication approval; native input is distinct from service approval. Only saved waiting checkpoints resume; interrupted running effects cannot be blindly replayed. Busy controls return 409; mandatory cleanup/thread draining and original budgets remain enforced. Local locks/state are not distributed execution or hostile-tenant certification. Live delivery/hosted CI acceptance remains pending.
+- `developer.async.webhook` returns task metadata by default. Only explicitly factory-activated repository routes invoke the managed worker; there is no autonomous detached task consumer.
 - Supported repository issue events produce target-specific bundles and require approval-time base SHA pinning. Checkout preparation validates membership in the explicitly configured local seed/base branch, not live GitHub repository identity or remote freshness. No automatic remote lookup/fetch occurs. Legacy fixture payloads without repository context retain prototype routing; unsupported repository webhook events and missing issue criteria are rejected.
 - GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions at `88720aa`. Live acceptance remains pending. The operator installed checksum-verified `gh` 2.102.0 locally for the fresh trial and verified `uhvogala` on github.com; this is not a default image dependency. No live task-result publication has been tested.
 - PM draft/write-approval stores remain in memory; restart loses those records. Architect/PM tool binding is implemented, but managed role run/resume and automatic published-target review orchestration are not wired into the HTTP workflow. Published-PR reads expose metadata and filenames, not a reviewable diff or target file content.

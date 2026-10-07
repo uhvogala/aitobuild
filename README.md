@@ -9,7 +9,8 @@ approved issue producing a tested draft PR in a disposable repository, with a
 human retaining merge authority. Configurable organization definitions, instance
 factories and native workflow admission are available as library APIs. Persisted
 delegation and revision-pinned managed delivery graphs are also library APIs;
-automatic service routing is next. Team structure and lifecycle are not fixed in code.
+opt-in service routing consumes approved configured tasks. Detached background
+execution is next. Team structure and lifecycle are not fixed in code.
 
 ## Start here
 
@@ -23,16 +24,17 @@ automatic service routing is next. Team structure and lifecycle are not fixed in
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Organization configuration | Immutable revisions, configured factories/native graphs, durable assignments and revision-pinned managed delivery execution | Service activation and broader scoped role adapters |
+| Organization configuration | Immutable revisions, native graphs, durable assignments/runs and opt-in authenticated service routing | Detached worker lifecycle and broader scoped role adapters |
 | Ingress and routing | Signed webhooks, internal auth, issue extraction and durable scope approval/dedupe | Configurable assignment routing and automatic task consumption |
 | Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
-| Native model runtime | Foundry binding, configured agent factories, approved Developer invocation, persistent manual approvals and constrained Grok/Kimi trials | Managed PM/Architect execution and service activation |
+| Native model runtime | Foundry binding, configured factories, approved Developer/service invocation, persistent approvals and constrained Grok/Kimi trials | Managed PM/Architect execution and live configured-service acceptance |
 | GitHub integration | Operator-gated issue writes, verified draft publication and head-pinned COMMENT reviews through allowlisted gh CLI | Live publication acceptance and meaningful source/diff review |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **531 tests pass**, with two optional prepared-target Docker
-probes skipped; Ruff and mypy (42 source files) pass. The prior 325-test baseline
+Verified locally: **549 tests pass**, with two optional prepared-target Docker
+probes skipped; Ruff and mypy (43 source files) and the mock fixture simulation pass.
+The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
 The original patch-repair
 failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
@@ -91,8 +93,8 @@ Use a trusted service-owned storage directory. Changed definitions create new
 revisions; callers must select a revision explicitly. Storage does not activate
 or approve it. The example workflow is a harmless definition probe, not a delivery
 recipe. Existing service bootstrap/dispatch and execution safeguards are unchanged.
-Recorded delegation and managed run/revision pinning are library APIs; service
-integration follows in [MILESTONES.md](MILESTONES.md).
+Recorded delegation and managed run/revision pinning are library APIs; opt-in service
+activation is described below. Delivery acceptance follows [MILESTONES.md](MILESTONES.md).
 
 Assemble configured instances and the harmless native example in mock mode:
 
@@ -226,9 +228,73 @@ verification, semantic review or publication approval; implement-only graphs sto
 at `implemented`. Thirty-eight runner regressions cover actual SDK/mock-transport
 approval/rejection/recovered edits, restart, revision/ownership drift, duplicates,
 cancellation and a disposable-target prepare/implement/verify/mock-draft graph.
-No live model/GitHub/Docker trial or hosted CI was repeated. HTTP workflows remain
-unchanged; journal capacity does not govern unmanaged HTTP runs. Service activation,
-broader managed roles and distributed controls remain pending.
+No live model/GitHub/Docker trial or hosted CI was repeated for that runner slice.
+Default HTTP workflows remain unchanged; journal capacity does not govern unmanaged
+HTTP runs. Broader managed roles and distributed controls remain pending.
+
+### Opt-in managed service
+
+[src/aitobuild/organization_service.py](src/aitobuild/organization_service.py) connects
+the managed runner to the app through
+`create_app(config, managed_service_factory=operator_factory)`. The normal server
+entrypoint and configuration alone do not activate it. The factory receives
+`ManagedServiceContext` with the app-owned preview registry, delivery worker, tools
+and state directory. Register immutable definitions, assignment/run stores,
+`ManagedDeliveryBindings`/`NativeDeliveryImplementation`, predicates and mandatory
+cleanup in the returned `ManagedOrganizationService`; supply a trusted
+`runtime_for(pinned_snapshot)` and native model profiles for native delivery.
+Existing constrained-container, role, scope and publication gates still apply.
+
+Operator-owned `ManagedRoute` records select exact repository name/ID, organization,
+explicit definition revision and configured event. There is no request-supplied
+revision, workflow, actor, command plan, seed path or budget override. Internal
+authentication is required for activation. `operator_id` identifies the trusted
+shared-token operator context, not a body field or multi-user identity system.
+Rules use their configured target. Human delegation waits for a strict
+`AssignmentProposal` with only `agent_id`/`rationale`. Coordinator delegation invokes
+an operator-registered read-only proposal callback under the prepared task's original
+deadline; the configured coordinator ID is bound by service context, never returned
+by the model. Callback failure/cancellation aborts that ledger. These trusted callbacks
+must preserve role/tool ceilings; arbitrary operator Python is not sandboxed.
+
+For activated repository tasks, authenticated preview approval and signed webhook/
+authenticated trigger delivery invoke the configured graph automatically. Preparation
+uses only the approved target/base and original worker ledger. Duplicate dispatch
+metadata, including a durable `dedupe` result, resolves existing ownership and run
+receipts; the dispatch marker cannot suppress recovery after an earlier service
+interruption. New activation revisions apply to unclaimed tasks, not existing runs.
+Unactivated repositories and apps without a factory keep their prior behavior.
+
+Optional internal controls (all require `X-Internal-Token`):
+- `GET /internal/organization/tasks/{preview_id}` returns `managed_run` or null.
+- `POST /internal/organization/tasks/run` takes `preview_id` and, for human delegation,
+	an optional `proposal` containing only `agent_id` and `rationale`.
+- `POST /internal/organization/tasks/approve` takes `assignment_id`, saved
+	`request_id` and an actual Boolean `approved` for service approval.
+- `POST /internal/organization/tasks/resume` takes `assignment_id`, saved
+	`request_id` and JSON `response` for native human input only.
+- `POST /internal/organization/tasks/cancel` takes `assignment_id` for an idle or
+	recovered invocation. Busy invocations return 409; active task cancellation drains
+	guarded delivery calls before releasing locks.
+
+Activated approval responses and dispatch metadata include `managed_run` when a run
+exists. Approval/dispatch HTTP success is not delivery success: inspect its state,
+pending requests and guarded verification/publication receipts. A waiting human
+selection has no run yet; status does not certify budgets or delivery. Cancellation
+uses frozen assignment ownership even if mutable preview state becomes unreadable.
+Failed/expired/interrupted runs retain terminal evidence and never get fresh budgets.
+
+Service validation on 2026-10-07 adds 18 cases: authentication/strict fields,
+approval/webhook/trigger routing, restart/duplicate delivery, original revision,
+decision kinds/rejection, cancellation/expiry/interruption, activation isolation,
+coordinator identity, admission races/capacity and cleanup after preview corruption.
+Actual native Developer SDK approve/reject/recovered-edit and independent verification/
+mock-draft fixtures also run through the service entrypoint. Full gates: 549 passed,
+two optional Docker skips, Ruff/mypy (43 files), and legacy mock simulation success.
+No live model/GitHub/Docker trial or hosted CI was added. Execution currently awaits
+the graph in the calling request; there is no detached worker, startup drain, durable
+dispatch queue or distributed cancellation. Capacity still excludes unmanaged HTTP
+runs. Live delivery acceptance remains pending and requires fresh explicit approval.
 
 ### API setup
 

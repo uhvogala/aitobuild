@@ -37,7 +37,7 @@ execute task code against the aitobuild service checkout.
 
 | Area | Evidence | Status |
 | --- | --- | --- |
-| Organization configuration | Immutable definitions, native factories/graphs, assignments and revision-pinned managed delivery runner | Operator library execution implemented; service activation/broader scoped roles next |
+| Organization configuration | Immutable definitions, native graphs, assignments/runs and opt-in authenticated service routing | Request-scoped configured execution implemented; detached worker/broader scoped roles next |
 | Local setup | Python 3.14+, uv, certificate bootstrap and 16 certificate tests | Implemented |
 | Ingress/governance | Signed webhooks, internal auth, dedupe, previews, role policy | Local durable previews/issue-task dedupe; other ingress state in memory |
 | Local Developer pipeline | Copied fixture, preview approval, subprocess tests and file write | Verified on 2026-10-05 |
@@ -48,8 +48,9 @@ execute task code against the aitobuild service checkout.
 | Architect/PM/meetings | Wired role tools, operator-gated PM writes, head-bound COMMENT review, GroupChatBuilder construction | Managed role execution, reviewable target diff, durable PM state and meeting execution pending |
 | Operations | Manual tick API, capability matrix tests and successful hosted CI baseline | M0 accepted; durable worker/state and tracing missing |
 
-Current local gates with managed native execution: **531 passed, two optional Docker probes skipped**;
-Ruff and mypy (42 source files) pass. Assignment gates passed with 492;
+Current local gates with managed service integration: **549 passed, two optional Docker probes skipped**;
+Ruff and mypy (43 source files) and the mock fixture simulation pass. Runner gates
+passed with 531; assignment gates passed with 492;
 definition-foundation gates passed with 396
 tests; publication-fix gates previously passed
 with 364 tests. The prior 325-test Docker-enabled baseline
@@ -76,7 +77,7 @@ local pipeline, not GitHub delivery or production isolation.
 ## M2 Foundation: Configurable Organization and Workflow Definitions
 
 Status: **definitions, factories, native admission, persisted assignments and
-managed delivery graphs implemented as library APIs; service activation pending**.
+managed delivery graphs implemented, with opt-in authenticated service activation**.
 This foundation precedes automatic issue consumption, not existing operator
 delivery endpoints. Agent roles remain fixed initially; instance IDs, prompts,
 optional model profiles, team membership/coordinator, event routes and delegation
@@ -111,7 +112,8 @@ Deliverables and acceptance sequence:
 	config changes cannot silently alter active runs or reset failed budgets.
 	Definitions stay separate from execution state; DB storage can later implement
 	the same definition contract. **Implemented for managed operation graphs and the
-	configured native Developer adapter**; broader scoped roles/service activation next.
+	configured native Developer adapter and opt-in request-scoped service routing**;
+	detached worker lifecycle/broader scoped roles next.
 
 Local validation (2026-10-06): `uv run pytest` reports 396 passes/two optional
 Docker skips; `uv run ruff check .` and `uv run mypy src` pass (38 source files).
@@ -151,7 +153,7 @@ with mocked transport/GitHub publication, preserving deadline/reservations and
 checking evidence/cleanup. No dependency change or live model/GitHub/Docker/hosted
 CI trial was added.
 
-These are library APIs, not automatic service routing/coordinator invocation.
+These runner APIs do not themselves activate service routing/coordinator invocation.
 Journal capacity does not govern unmanaged HTTP runs. Direct workflow operations
 remain read-only. Managed graphs admit operation nodes, including the configured
 native Developer adapter; direct agent nodes await scoped role adapters. Only
@@ -160,8 +162,32 @@ replayed. Finalizing retries record metadata only. Original budgets are never re
 Cleanup is mandatory; arbitrary synchronous callback duration remains operator-owned,
 and threaded delivery calls drain before lock release under existing worker limits.
 Run/assignment completion is metadata, not delivery verification, publication
-approval or semantic review. Broader managed roles, service activation and distributed
-controls remain pending. Existing bootstrap/endpoints are unchanged.
+approval or semantic review. Broader managed roles and distributed controls remain
+pending. Default bootstrap/endpoints remain unchanged; opt-in integration follows.
+
+Opt-in service integration (2026-10-07, from `8351092`): **549 passed/two optional
+Docker skips**, Ruff and mypy (43 source files) pass; legacy copied-fixture simulation
+records `succeeded=true`, generated artifact and command exit 0. An operator factory
+passed to `create_app` binds exact repository/revision/event routes, app-owned previews/
+delivery tools and trusted actor context. Authenticated approval and signed webhook/
+authenticated trigger delivery consume approved tasks; duplicate metadata recovers
+existing assignment/run receipts rather than replaying work. Optional authenticated
+task run/status/approve/resume/cancel controls reject caller identity/revision/path/
+workflow overrides. Human selection and trusted coordinator proposals remain distinct.
+Original budgets precede assignment and are never reset. Eighteen new cases cover
+HTTP routing/auth/restart/decisions, revision pins, cancellation/expiry/interruption,
+unactivated targets, concurrency/capacity and frozen-owner cleanup. Actual native
+SDK/mock-transport approve/reject/recovered-edit and independent verification/mock
+draft graphs run through service admission. No live model/GitHub/Docker/hosted CI or
+dependency change. No push, publication or merge.
+
+This is request-scoped activation, not a detached issue worker or startup queue drain.
+Default server startup has no managed factory; operator-owned bootstrap must supply
+one. Busy invocation controls return 409, while asyncio cancellation preserves guarded
+thread draining. Coordinator callbacks are trusted/read-only and deadline bounded,
+not arbitrary-code isolation. Journal capacity still does not cover unmanaged HTTP
+runs. Shared internal-token identity is not multi-user authentication. Full M2/live
+delivery and hosted CI acceptance remain open.
 
 ## M0: Reproducible Baseline
 
@@ -386,8 +412,8 @@ Exit criteria:
 ## Immediate Work Queue
 
 1. Preserve the configurable definition/storage regressions and existing M0/M1, exact-span and publication safeguards. Run CI for new slices; never target the service checkout.
-2. Next bounded implementation slice: service-owned configured approved-task routing/worker invocation using the managed runner, without a fixed team or contribution loop. Establish the original prepared budget before assignment, authenticate coordinator/operator context and preserve existing endpoints/policy ceilings. Journal capacity still does not govern unmanaged HTTP runs. Broader scoped PM/Architect agent-node adapters and distributed cancellation are separate follow-ups.
-3. Extend the passing disposable-fixture configured graph and actual SDK/mock-transport Developer approval/recovery tests into service-level recipe acceptance. Runner restart, duplicates, revision changes and original-budget recovery are covered; automatic event consumption, live delivery and hosted CI remain unverified. Keep GitHub assignee writes separate and do not infer semantic review from metadata.
+2. Opt-in configured service routing/invocation is implemented. Next bounded service slice: operator-owned detached worker admission/lifecycle and explicit startup recovery of eligible approved/unstarted tasks, so webhook/approval responses need not await model execution. Reuse immutable assignment/run receipts and original budgets; never replay interrupted running side effects or widen unmanaged endpoint permissions. Keep activation explicit, with no fixed team/contribution loop. Broader scoped PM/Architect adapters and distributed controls remain separate follow-ups.
+3. Preserve passing service-level fixture acceptance (signed/authenticated delivery, decisions/restart, native SDK/mock-transport tools and independent verification/mock draft graph), and run hosted CI when authorized publication of the service changes is available. Default server activation, detached event consumption, live delivery and hosted CI remain unverified. Keep GitHub assignee writes separate and do not infer semantic review from metadata.
 4. Stage a freshly approved live draft trial using outcome-based contribution grading. Recheck GitHub hosting/authentication/allowlist; do not replay the previously aborted task. Recovered tool errors are diagnostics, not contribution blockers. Stage head-bound COMMENT review only with actual source/diff inspection before claiming semantic review.
 
 Update this snapshot when a milestone's exit checks have actually run. Record

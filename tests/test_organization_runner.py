@@ -83,8 +83,9 @@ def test_native_human_input_restart_restores_without_replaying_initial_operation
     assert calls == ["initial", "response"]
 
 
+@pytest.mark.parametrize("entrypoint", ["runner", "service"])
 def test_configured_delivery_stages_reuse_guarded_services_and_original_budget(
-    tmp_path, approved_delivery, verification_adapter, monkeypatch,
+    tmp_path, approved_delivery, verification_adapter, monkeypatch, entrypoint,
 ):
     previews, _, preview_id, source, _ = approved_delivery
     worker = DeveloperDeliveryWorker(
@@ -106,12 +107,14 @@ def test_configured_delivery_stages_reuse_guarded_services_and_original_budget(
     service = AssignmentService(
         definitions=definitions, previews=previews, assignments=assignments, budget_path_for=worker.budget_path,
     )
-    assignment = assign(service, snapshot, previews.get(preview_id), **coordinator_proposal())
+    if entrypoint == "runner":
+        assignment = assign(service, snapshot, previews.get(preview_id), **coordinator_proposal())
     calls = []
 
     class Implementation:
         async def run(self, context):
             calls.append("implement")
+            assignment = context.assignment
             with worker.implementation_lock(preview_id):
                 record = worker.begin_implementation(
                     preview_id, bundle=context.assignment.bundle, session_id=context.run.session_id, resume=False,
@@ -144,18 +147,146 @@ def test_configured_delivery_stages_reuse_guarded_services_and_original_budget(
         runs=FileRunStore(tmp_path / "runs"), actor_provider=lambda: RuntimeActor("operator", "operator"),
         operations=bindings.operations, cleanup=bindings.cleanup, binding_revision="delivery-test-v1",
     )
-    before = json.loads(Path(assignment.budget_path).read_text())
-    run = asyncio.run(runner.start(assignment.assignment_id))
+    from aitobuild.organization_service import ManagedOrganizationService, ManagedRoute
+
+    async def coordinator(snapshot, preview):
+        return coordinator_proposal()["proposal"]
+
+    managed_service = ManagedOrganizationService(
+        definitions=definitions, assignments=assignments, runs=FileRunStore(tmp_path / "runs"),
+        previews=previews, worker=worker, operator_id="service-operator",
+        routes=(ManagedRoute(repository="fixture/widgets", repository_id=101,
+                             organization_id=snapshot.organization_id, revision=snapshot.revision,
+                             event="github.issue.ready"),), coordinators={"planner": coordinator},
+        operations=bindings.operations, cleanup=bindings.cleanup, binding_revision="delivery-test-v1",
+    )
+    budget_path = worker.budget_path(preview_id)
+    before = json.loads(budget_path.read_text())
+    run = asyncio.run(managed_service.consume(preview_id) if entrypoint == "service" else runner.start(assignment.assignment_id))
     assert run.state == "completed", run.error
     assert run.outputs == ({"preview_id": preview_id, "state": "published"},)
     assert worker.get(preview_id).verification["cleanup_succeeded"] is True
     assert len(github.branch_commits) == 1
     assert verification_adapter.closed
     assert calls == ["implement", "cleanup"]
-    assert asyncio.run(runner.start(assignment.assignment_id)) == run
-    after = json.loads(Path(assignment.budget_path).read_text())
+    assert asyncio.run(managed_service.consume(preview_id) if entrypoint == "service" else runner.start(assignment.assignment_id)) == run
+    after = json.loads(budget_path.read_text())
     assert after == before | {"reserved_paths": ["src/probe.py"]}
     assert (source / "README.md").read_text() == "Fixture baseline\n"
+
+
+def _service_fixture(tmp_path, approved_delivery, operation=None, coordinator=None):
+    from aitobuild.organization_service import ManagedOrganizationService, ManagedRoute
+
+    previews, worker, preview_id, _, _ = approved_delivery
+    document = json.loads((Path(__file__).resolve().parents[1] / "config/organization.example.json").read_text())
+    for agent in document["agents"]:
+        agent["max_concurrent_runs"] = 1
+    definitions = FileDefinitionStore(tmp_path / "service-definitions")
+    snapshot = definitions.save(parse_organization_definition(json.dumps(document)))
+    assignments = FileAssignmentStore(tmp_path / "service-assignments.json")
+    calls = []
+
+    async def propose(snapshot, preview):
+        calls.append("proposal")
+        return coordinator_proposal()["proposal"]
+
+    async def cleanup(context):
+        calls.append("cleanup")
+
+    service = ManagedOrganizationService(
+        definitions=definitions, assignments=assignments, runs=FileRunStore(tmp_path / "service-runs"),
+        previews=previews, worker=worker, operator_id="trusted-operator",
+        routes=(ManagedRoute(repository="fixture/widgets", repository_id=101,
+                             organization_id=snapshot.organization_id, revision=snapshot.revision,
+                             event="github.issue.ready"),),
+        coordinators={"planner": coordinator or propose},
+        operations={"definition_probe": operation or ManagedOperation(lambda context, message: calls.append("run") or "done")},
+        cleanup=cleanup, binding_revision="service-v1",
+    )
+    return service, assignments, calls
+
+
+def test_service_consumes_approved_preview_once(tmp_path, approved_delivery):
+    service, assignments, calls = _service_fixture(tmp_path, approved_delivery)
+    _, worker, preview_id, _, _ = approved_delivery
+    run = asyncio.run(service.consume(preview_id))
+    assert run.state == "completed", run.error
+    before = worker.budget_path(preview_id).read_bytes()
+    assert asyncio.run(service.consume(preview_id)) == run
+    assert assignments.get(run.assignment_id).actor_id == "planner"
+    assert calls == ["proposal", "run", "cleanup"]
+    assert worker.budget_path(preview_id).read_bytes() == before
+
+
+def test_service_admission_concurrency_and_cancellation_abort_original_budget(tmp_path, approved_delivery):
+    _, worker, preview_id, _, _ = approved_delivery
+    calls = []
+
+    async def exercise():
+        started = asyncio.Event()
+
+        async def coordinator(snapshot, preview):
+            calls.append("proposal")
+            started.set()
+            await asyncio.Event().wait()
+
+        service, assignments, _ = _service_fixture(tmp_path, approved_delivery, coordinator=coordinator)
+        task = asyncio.create_task(service.consume(preview_id))
+        await started.wait()
+        before = json.loads(worker.budget_path(preview_id).read_text())
+        with pytest.raises(LockTimeout):
+            await service.consume(preview_id)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert assignments.for_task(approved_delivery[0].get(preview_id).bundle_payload["task_id"]) is None
+        assert json.loads(worker.budget_path(preview_id).read_text()) == before | {"aborted": True}
+        with pytest.raises(ValueError):
+            await service.consume(preview_id)
+
+    asyncio.run(exercise())
+    assert calls == ["proposal"]
+
+
+def test_service_capacity_rejection_keeps_prepared_budget_for_later_admission(tmp_path, approved_delivery):
+    previews, worker, preview_id, _, revision = approved_delivery
+    operation = ManagedOperation(lambda context, message: WorkflowInput("Wait", None),
+                                 on_response=lambda context, original, response: response)
+    service, assignments, _ = _service_fixture(tmp_path, approved_delivery, operation=operation)
+    first = asyncio.run(service.consume(preview_id))
+    assert first.state == "waiting"
+    payload = json.loads(json.dumps(previews.get(preview_id).bundle_payload))
+    payload["task_id"] = "other-approved-task"
+    other = previews.create_or_get(dedupe_key="other-approved-task", bundle_payload=payload, source_payload={})
+    other = previews.approve(other.preview_id, base_revision=revision)
+    with pytest.raises(ValueError, match="capacity"):
+        asyncio.run(service.consume(other.preview_id))
+    assert assignments.for_task("other-approved-task") is None
+    before = worker.budget_path(other.preview_id).read_bytes()
+    assert asyncio.run(service.cancel(first.assignment_id)).state == "cancelled"
+    admitted = asyncio.run(service.consume(other.preview_id))
+    assert admitted.state == "waiting"
+    assert worker.budget_path(other.preview_id).read_bytes() == before
+    assert asyncio.run(service.cancel(admitted.assignment_id)).state == "cancelled"
+
+
+def test_service_cancellation_uses_frozen_assignment_when_preview_is_unreadable(tmp_path, approved_delivery, monkeypatch):
+    previews, worker, preview_id, _, _ = approved_delivery
+    operation = ManagedOperation(lambda context, message: WorkflowInput("Wait", None),
+                                 on_response=lambda context, original, response: response)
+    service, _, calls = _service_fixture(tmp_path, approved_delivery, operation=operation)
+    waiting = asyncio.run(service.consume(preview_id))
+    before = json.loads(worker.budget_path(preview_id).read_text())
+
+    def unreadable(preview_id):
+        raise ValueError("Corrupt mutable preview")
+
+    monkeypatch.setattr(previews, "get", unreadable)
+    terminal = asyncio.run(service.cancel(waiting.assignment_id))
+    assert terminal.state == "cancelled"
+    assert calls == ["proposal", "cleanup"]
+    assert json.loads(worker.budget_path(preview_id).read_text()) == before | {"aborted": True}
 
 
 def test_coordinator_identity_is_bound_by_trusted_provider_not_proposal(tmp_path):
@@ -598,8 +729,9 @@ def test_recovered_tool_errors_remain_diagnostics_not_contribution_rejection(tmp
 
 
 @pytest.mark.parametrize("scenario", ["approved", "rejected", "recovered"])
+@pytest.mark.parametrize("entrypoint", ["runner", "service"])
 def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_tools(
-    tmp_path, approved_delivery, verification_adapter, scenario,
+    tmp_path, approved_delivery, verification_adapter, scenario, entrypoint,
 ):
     previews, worker, preview_id, source, _ = approved_delivery
     worker.prepare(preview_id)
@@ -614,7 +746,8 @@ def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_to
     assignments = FileAssignmentStore(tmp_path / "assignments.json")
     service = AssignmentService(definitions=definitions, previews=previews, assignments=assignments,
                                 budget_path_for=worker.budget_path)
-    assignment = assign(service, snapshot, previews.get(preview_id), **coordinator_proposal())
+    if entrypoint == "runner":
+        assign(service, snapshot, previews.get(preview_id), **coordinator_proposal())
     bodies = []
 
     def model_reply(request):
@@ -674,15 +807,36 @@ def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_to
                         operations=bindings.operations, cleanup=bindings.cleanup, binding_revision="native-v1",
                     )
 
-                before = json.loads(Path(assignment.budget_path).read_text())
-                waiting = await make_runner().start(assignment.assignment_id)
+                def make_service():
+                    from aitobuild.organization_service import ManagedOrganizationService, ManagedRoute
+
+                    async def coordinator(snapshot, preview):
+                        return coordinator_proposal()["proposal"]
+
+                    return ManagedOrganizationService(
+                        definitions=definitions, assignments=assignments, runs=FileRunStore(tmp_path / "runs"),
+                        previews=previews, worker=worker, operator_id="service-operator",
+                        routes=(ManagedRoute(repository="fixture/widgets", repository_id=101,
+                                             organization_id=snapshot.organization_id, revision=snapshot.revision,
+                                             event="github.issue.ready"),), coordinators={"planner": coordinator},
+                        operations=bindings.operations, cleanup=bindings.cleanup, binding_revision="native-v1",
+                    )
+
+                budget_path = worker.budget_path(preview_id)
+                before = json.loads(budget_path.read_text())
+                if entrypoint == "service":
+                    waiting = await make_service().consume(preview_id)
+                else:
+                    assignment = assignments.for_task(previews.get(preview_id).bundle_payload["task_id"])
+                    waiting = await make_runner().start(assignment.assignment_id)
+                assignment = assignments.for_task(previews.get(preview_id).bundle_payload["task_id"])
                 assert waiting.state == "waiting", waiting.error
                 assert worker.get(preview_id).state == "awaiting_tool_approval"
                 assert waiting.pending[0].kind == "service_approval"
                 assert not (Path(worker.get(preview_id).checkout_path) / "src/probe.py").exists()
-                completed = await make_runner().approve(
-                    assignment.assignment_id, request_id=waiting.pending[0].request_id, approved=scenario != "rejected",
-                )
+                approve = make_service().decide if entrypoint == "service" else make_runner().approve
+                completed = await approve(assignment.assignment_id, request_id=waiting.pending[0].request_id,
+                                          approved=scenario != "rejected")
                 if scenario == "rejected":
                     assert completed.state == "failed" and "rejected" in completed.error
                     assert worker.get(preview_id).state == "failed"
@@ -692,9 +846,9 @@ def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_to
                     return
                 if scenario == "recovered":
                     assert completed.state == "waiting", completed.error
-                    completed = await make_runner().approve(
-                        assignment.assignment_id, request_id=completed.pending[0].request_id, approved=True,
-                    )
+                    approve = make_service().decide if entrypoint == "service" else make_runner().approve
+                    completed = await approve(assignment.assignment_id, request_id=completed.pending[0].request_id,
+                                              approved=True)
                 assert completed.state == "completed", completed.error
                 record = worker.get(preview_id)
                 assert record.state == "implemented" and record.verification is None and record.publication is None

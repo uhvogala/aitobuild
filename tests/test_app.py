@@ -30,6 +30,269 @@ def _internal_headers(test_config) -> dict[str, str]:
     return {"X-Internal-Token": token}
 
 
+def _managed_app(config, tmp_path, calls, operation=None, strategy="rules", version=None):
+    from aitobuild.organization import FileDefinitionStore, parse_organization_definition
+    from aitobuild.organization_assignments import FileAssignmentStore
+    from aitobuild.organization_runner import FileRunStore, ManagedOperation
+    from aitobuild.organization_service import ManagedOrganizationService, ManagedRoute
+
+    document = json.loads((Path(__file__).resolve().parents[1] / "config/organization.example.json").read_text())
+    if version is not None:
+        document["agents"][0]["instructions"] += " " + version
+    delegation = document["routes"][0]["delegation"]
+    delegation["strategy"] = strategy
+    if strategy == "rules":
+        delegation["target_agent"] = delegation["eligible_agents"][0]
+    definitions = FileDefinitionStore(tmp_path / "managed-definitions")
+    snapshot = definitions.save(parse_organization_definition(json.dumps(document)))
+
+    def factory(context):
+        async def cleanup(task):
+            calls.append("cleanup")
+
+        return ManagedOrganizationService(
+            definitions=definitions, assignments=FileAssignmentStore(context.state_dir / "assignments.json"),
+            runs=FileRunStore(context.state_dir / "managed-runs"), previews=context.previews, worker=context.worker,
+            routes=(ManagedRoute(repository="fixture/widgets", repository_id=101,
+                                 organization_id=snapshot.organization_id, revision=snapshot.revision,
+                                 event="github.issue.ready"),),
+            operator_id="configured-operator", binding_revision="service-test-v1",
+            operations={"definition_probe": operation or ManagedOperation(
+                lambda task, message: calls.append(task.assignment.assignment_id) or "done",
+            )}, cleanup=cleanup,
+        )
+
+    return create_app(config, managed_service_factory=factory)
+
+
+def test_managed_service_approval_dispatch_and_restart_are_idempotent(
+    test_config, tmp_path, repository_issue_body, local_issue_repository,
+):
+    source, revision = local_issue_repository
+    config = replace(test_config, developer=replace(test_config.developer, repository_sources=(
+        RepositorySourceConfig("fixture/widgets", 101, str(source)),
+    )))
+    calls = []
+    client = TestClient(_managed_app(config, tmp_path, calls))
+    headers = _internal_headers(config)
+    preview = client.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "action": "opened", "body": repository_issue_body,
+    }).json()
+    assert client.get(f"/internal/organization/tasks/{preview['preview_id']}").status_code == 401
+    for key in ("actor_id", "revision", "workflow_id", "input", "source_path"):
+        assert client.post("/internal/organization/tasks/run", headers=headers,
+                           json={"preview_id": preview["preview_id"], key: "spoof"}).status_code == 400
+    assert client.post("/internal/organization/tasks/run", headers=headers,
+                       json={"preview_id": preview["preview_id"]}).status_code == 409
+    approved = client.post("/internal/developer/preview/approve", headers=headers, json={
+        "preview_id": preview["preview_id"], "base_revision": revision,
+    })
+    assert approved.status_code == 200, approved.text
+    run = approved.json()["managed_run"]
+    assert run["state"] == "completed", run["error"]
+    assert calls == [run["assignment_id"], "cleanup"]
+    client = TestClient(_managed_app(config, tmp_path, calls))
+    assert client.get(f"/internal/organization/tasks/{preview['preview_id']}", headers=headers).json()["managed_run"] == run
+    repository_issue_body["action"] = "opened"
+    body = json.dumps(repository_issue_body).encode()
+    for delivery in ("managed-first", "managed-replay"):
+        response = client.post("/webhook", content=body, headers={
+            "X-GitHub-Event": "issues", "X-GitHub-Delivery": delivery,
+            "X-Hub-Signature-256": _signature(config.webhook_secret, body),
+        })
+        assert response.status_code == 200, response.text
+        assert response.json()["metadata"]["managed_run"] == run
+    assert calls == [run["assignment_id"], "cleanup"]
+    assert (source / "README.md").read_text() == "Fixture baseline\n"
+    from aitobuild.events import EventOrigin, EventType
+
+    triggered = client.post("/internal/triggers", headers=headers, json={
+        "origin": EventOrigin.GITHUB_WEBHOOK.value, "event_type": EventType.WEBHOOK_EVENT_RECEIVED.value,
+        "dedupe_key": "managed-trigger", "payload": {"github_event": "issues", "action": "opened", "body": repository_issue_body},
+    })
+    assert triggered.status_code == 200, triggered.text
+    assert triggered.json()["metadata"]["managed_run"] == run
+    assert calls == [run["assignment_id"], "cleanup"]
+    assert TestClient(create_app(config)).post("/internal/organization/tasks/run", headers=headers,
+                                            json={"preview_id": preview["preview_id"]}).status_code == 404
+
+
+@pytest.mark.parametrize("kind,control,value", [
+    ("service_approval", "approve", True), ("service_approval", "approve", False),
+    ("human_input", "resume", "answer"),
+])
+def test_managed_service_waiting_decisions_survive_restart(
+    test_config, tmp_path, repository_issue_body, local_issue_repository, kind, control, value,
+):
+    from aitobuild.organization_runner import ManagedOperation, WorkflowInput
+
+    source, revision = local_issue_repository
+    config = replace(test_config, developer=replace(test_config.developer, repository_sources=(
+        RepositorySourceConfig("fixture/widgets", 101, str(source)),
+    )))
+    calls = []
+
+    def respond(context, original, response):
+        calls.append("response")
+        if response is False:
+            raise PermissionError("Operator rejected the task")
+        return {"value": response, "revision": context.run.revision}
+
+    operation = ManagedOperation(lambda context, message: calls.append("initial") or
+                                 WorkflowInput("Decision", {"approved_task": context.assignment.task_id}, kind=kind),
+                                 on_response=respond)
+    client = TestClient(_managed_app(config, tmp_path, calls, operation))
+    headers = _internal_headers(config)
+    preview = client.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "action": "opened", "body": repository_issue_body,
+    }).json()
+    waiting = client.post("/internal/developer/preview/approve", headers=headers, json={
+        "preview_id": preview["preview_id"], "base_revision": revision,
+    }).json()["managed_run"]
+    assert waiting["state"] == "waiting", waiting["error"]
+    budget_path = next((Path(config.developer.state_dir) / "budgets").glob("*.json"))
+    before = json.loads(budget_path.read_text())
+    client = TestClient(_managed_app(config, tmp_path, calls, operation, version="new revision"))
+    replay = client.post("/internal/organization/tasks/run", headers=headers,
+                         json={"preview_id": preview["preview_id"]})
+    assert replay.json()["managed_run"] == waiting
+    request_id = waiting["pending"][0]["request_id"]
+    decision = {"assignment_id": waiting["assignment_id"], "request_id": request_id,
+                "approved" if control == "approve" else "response": value}
+    assert client.post(f"/internal/organization/tasks/{control}", json=decision).status_code == 401
+    if control == "approve":
+        for invalid in ("true", 1, None):
+            assert client.post("/internal/organization/tasks/approve", headers=headers,
+                               json=decision | {"approved": invalid}).status_code == 400
+        wrong_kind = {"assignment_id": waiting["assignment_id"], "request_id": request_id, "response": True}
+        wrong_control = "resume"
+    else:
+        wrong_kind = {"assignment_id": waiting["assignment_id"], "request_id": request_id, "approved": True}
+        wrong_control = "approve"
+    assert client.post(f"/internal/organization/tasks/{wrong_control}", headers=headers, json=wrong_kind).status_code == 409
+    assert client.post(f"/internal/organization/tasks/{control}", headers=headers,
+                       json=decision | {"request_id": "wrong-request"}).status_code == 409
+    response = client.post(f"/internal/organization/tasks/{control}", headers=headers, json=decision)
+    assert response.status_code == 200, response.text
+    run = response.json()["managed_run"]
+    assert run["state"] == ("failed" if value is False else "completed"), run["error"]
+    assert run["revision"] == waiting["revision"]
+    assert run["decisions"][0]["actor_id"] == "configured-operator"
+    assert calls == ["initial", "response", "cleanup"]
+    assert client.post(f"/internal/organization/tasks/{control}", headers=headers, json=decision).status_code == 409
+    after = json.loads(budget_path.read_text())
+    assert after["deadline"] == before["deadline"]
+    assert after["reserved_paths"] == before["reserved_paths"]
+    assert bool(after.get("aborted")) == (value is False)
+
+
+@pytest.mark.parametrize("outcome", ["cancel", "expired", "interrupted"])
+def test_managed_service_terminal_recovery_keeps_original_budget(
+    test_config, tmp_path, repository_issue_body, local_issue_repository, outcome,
+):
+    from aitobuild.organization_runner import ManagedOperation, WorkflowInput
+
+    source, revision = local_issue_repository
+    config = replace(test_config, developer=replace(test_config.developer, repository_sources=(
+        RepositorySourceConfig("fixture/widgets", 101, str(source)),
+    )))
+    calls = []
+    operation = ManagedOperation(lambda context, message: calls.append("initial") or WorkflowInput("Wait", None),
+                                 on_response=lambda context, original, response: response)
+    client = TestClient(_managed_app(config, tmp_path, calls, operation))
+    headers = _internal_headers(config)
+    preview = client.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "action": "opened", "body": repository_issue_body,
+    }).json()
+    waiting = client.post("/internal/developer/preview/approve", headers=headers, json={
+        "preview_id": preview["preview_id"], "base_revision": revision,
+    }).json()["managed_run"]
+    budget_path = next((Path(config.developer.state_dir) / "budgets").glob("*.json"))
+    before = json.loads(budget_path.read_text())
+    if outcome == "cancel":
+        decision = {"assignment_id": waiting["assignment_id"]}
+        assert client.post("/internal/organization/tasks/cancel", json=decision).status_code == 401
+        response = client.post("/internal/organization/tasks/cancel", headers=headers, json=decision)
+    else:
+        if outcome == "expired":
+            before["deadline"] = 0
+            budget_path.write_text(json.dumps(before))
+        else:
+            from aitobuild.organization_runner import FileRunStore
+
+            runs = FileRunStore(Path(config.developer.state_dir) / "managed-runs")
+            runs.save(runs.get(waiting["assignment_id"]).model_copy(update={"state": "running", "pending": ()}))
+        client = TestClient(_managed_app(config, tmp_path, calls, operation))
+        response = client.post("/internal/organization/tasks/run", headers=headers,
+                               json={"preview_id": preview["preview_id"]})
+    assert response.status_code == 200, response.text
+    terminal = response.json()["managed_run"]
+    assert terminal["state"] == ("cancelled" if outcome == "cancel" else "failed")
+    if outcome == "interrupted":
+        assert "Interrupted" in terminal["error"]
+    assert calls == ["initial", "cleanup"]
+    after = json.loads(budget_path.read_text())
+    assert after == before | {"aborted": True}
+    assert client.post("/internal/organization/tasks/run", headers=headers,
+                       json={"preview_id": preview["preview_id"]}).json()["managed_run"] == terminal
+
+
+def test_managed_service_human_delegation_requires_selection(
+    test_config, tmp_path, repository_issue_body, local_issue_repository,
+):
+    source, revision = local_issue_repository
+    config = replace(test_config, developer=replace(test_config.developer, repository_sources=(
+        RepositorySourceConfig("fixture/widgets", 101, str(source)),
+    )))
+    calls = []
+    client = TestClient(_managed_app(config, tmp_path, calls, strategy="human"))
+    headers = _internal_headers(config)
+    preview = client.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "action": "opened", "body": repository_issue_body,
+    }).json()
+    approved = client.post("/internal/developer/preview/approve", headers=headers, json={
+        "preview_id": preview["preview_id"], "base_revision": revision,
+    })
+    assert approved.status_code == 200, approved.text
+    assert "managed_run" not in approved.json() and calls == []
+    for proposal in (
+        {"agent_id": "developer_one", "rationale": "Select", "human_id": "spoof"},
+        {"agent_id": "planner", "rationale": "Ineligible"},
+    ):
+        assert client.post("/internal/organization/tasks/run", headers=headers,
+                           json={"preview_id": preview["preview_id"], "proposal": proposal}).status_code == 409
+    selected = client.post("/internal/organization/tasks/run", headers=headers, json={
+        "preview_id": preview["preview_id"], "proposal": {"agent_id": "developer_one", "rationale": "Operator selected"},
+    })
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["managed_run"]["state"] == "completed"
+    assert len(calls) == 2
+
+
+def test_managed_service_leaves_unactivated_repository_tasks_unmanaged(test_config, tmp_path, repository_issue_body):
+    calls = []
+    client = TestClient(_managed_app(test_config, tmp_path, calls))
+    headers = _internal_headers(test_config)
+    repository_issue_body["repository"]["full_name"] = "fixture/unmanaged"
+    preview = client.post("/internal/developer/preview", headers=headers, json={
+        "github_event": "issues", "action": "opened", "body": repository_issue_body,
+    }).json()
+    approved = client.post("/internal/developer/preview/approve", headers=headers, json={
+        "preview_id": preview["preview_id"], "base_revision": "a" * 40,
+    })
+    assert approved.status_code == 200 and "managed_run" not in approved.json()
+    assert calls == []
+    assert not list((Path(test_config.developer.state_dir) / "budgets").glob("*.json"))
+    assert client.post("/internal/organization/tasks/run", headers=headers,
+                       json={"preview_id": preview["preview_id"]}).status_code == 409
+
+
+def test_managed_activation_rejects_disabled_internal_auth(test_config, tmp_path):
+    config = replace(test_config, security=replace(test_config.security, require_internal_auth=False))
+    with pytest.raises(ValueError, match="authenticated"):
+        _managed_app(config, tmp_path, [])
+
+
 def test_repository_issue_api_recovers_approval_and_delivery_after_restart(test_config, repository_issue_body) -> None:
     headers = _internal_headers(test_config)
     repository_issue_body["action"] = "opened"

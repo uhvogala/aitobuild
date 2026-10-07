@@ -29,6 +29,8 @@ from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bu
 from aitobuild.developer_preview import DeveloperPreviewRegistry
 from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import make_internal_event, normalize_github_webhook, parse_trigger_request
+from aitobuild.organization_assignments import AssignmentProposal
+from aitobuild.organization_service import ManagedOrganizationService, ManagedServiceContext
 from aitobuild.proactive import ArchitectScanRunner
 from aitobuild.runtime import bootstrap_runtime, kickoff_meeting_bootstrap
 from aitobuild.scheduler import scheduler_from_config
@@ -229,8 +231,15 @@ async def _invoke_agent_run(
     return outcome
 
 
-def create_app(config: AppConfig | None = None) -> FastAPI:
+def create_app(
+    config: AppConfig | None = None, *,
+    managed_service_factory: Callable[[ManagedServiceContext], ManagedOrganizationService] | None = None,
+) -> FastAPI:
     app_config = config or load_config()
+    if managed_service_factory is not None and (
+        not app_config.security.require_internal_auth or not app_config.security.internal_api_token
+    ):
+        raise ValueError("Managed organization service requires authenticated internal controls")
     if app_config.developer.enable_browser and app_config.developer.execution_mode != "container_session":
         raise ValueError("Developer browser requires container_session mode")
 
@@ -330,6 +339,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             delivery_worker=delivery_worker,
         )
     role_tools = build_role_tools(context=developer_tool_context)
+    managed_service = managed_service_factory(ManagedServiceContext(
+        previews=dispatcher.developer_preview_registry, worker=delivery_worker,
+        tools=developer_tool_context, state_dir=developer_state_dir,
+    )) if managed_service_factory is not None else None
 
     runtime = bootstrap_runtime(
         app_config.runtime,
@@ -421,6 +434,27 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     }
         return metadata if metadata else None
 
+    async def _consume_managed(preview_id: str) -> dict[str, Any] | None:
+        if managed_service is None:
+            return None
+        try:
+            run = await managed_service.consume(preview_id)
+        except FileLockTimeout as error:
+            raise HTTPException(status_code=409, detail="Managed task invocation is already active") from error
+        except (ValueError, PermissionError, RuntimeError, OSError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return run.model_dump(mode="json") if run is not None else None
+
+    async def _dispatch_metadata(result: Any, *, event_payload: dict[str, Any]) -> dict[str, Any] | None:
+        metadata = _metadata_with_runtime_hooks(result, event_payload=event_payload)
+        if metadata is not None and result.route in {"developer.async.webhook", "dedupe"}:
+            preview_id = metadata.get("preview_id")
+            if isinstance(preview_id, str):
+                run = await _consume_managed(preview_id)
+                if run is not None:
+                    metadata["managed_run"] = run
+        return metadata
+
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -459,12 +493,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "accepted": result.accepted,
             "route": result.route,
             "reason": result.reason,
-            "metadata": _metadata_with_runtime_hooks(result, event_payload=event.payload),
+            "metadata": await _dispatch_metadata(result, event_payload=event.payload),
             "correlation_id": event.envelope.correlation_id,
         }
 
     @app.post("/internal/triggers")
-    def internal_trigger(
+    async def internal_trigger(
         payload: dict[str, Any],
         x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
     ) -> dict[str, Any]:
@@ -486,7 +520,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "accepted": result.accepted,
             "route": result.route,
             "reason": result.reason,
-            "metadata": _metadata_with_runtime_hooks(result, event_payload=event.payload),
+            "metadata": await _dispatch_metadata(result, event_payload=event.payload),
             "correlation_id": event.envelope.correlation_id,
         }
 
@@ -600,7 +634,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         }
 
     @app.post("/internal/developer/preview/approve")
-    def approve_developer_preview(
+    async def approve_developer_preview(
         payload: dict[str, Any],
         x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
     ) -> dict[str, Any]:
@@ -620,7 +654,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         if approved is None:
             raise HTTPException(status_code=404, detail="preview_id not found")
 
-        return {
+        response = {
             "preview_id": approved.preview_id,
             "dedupe_key": approved.dedupe_key,
             "approved": approved.approved,
@@ -628,6 +662,69 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "bundle": approved.bundle_payload,
             "approved_at": approved.approved_at.isoformat() if approved.approved_at else None,
         }
+        run = await _consume_managed(approved.preview_id)
+        if run is not None:
+            response["managed_run"] = run
+        return response
+
+    if managed_service is not None:
+        @app.get("/internal/organization/tasks/{preview_id}")
+        def managed_task_status(
+            preview_id: str,
+            x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        ) -> dict[str, Any]:
+            _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+            assert managed_service is not None
+            try:
+                run = managed_service.status(preview_id)
+            except ValueError as error:
+                raise HTTPException(status_code=404, detail=str(error)) from error
+            except (PermissionError, OSError) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return {"managed_run": run.model_dump(mode="json") if run is not None else None}
+
+        @app.post("/internal/organization/tasks/{operation}")
+        async def managed_task_control(
+            operation: str, payload: dict[str, Any],
+            x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        ) -> dict[str, Any]:
+            _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+            assert managed_service is not None
+            fields = {
+                "run": {"preview_id", "proposal"}, "approve": {"assignment_id", "request_id", "approved"},
+                "resume": {"assignment_id", "request_id", "response"}, "cancel": {"assignment_id"},
+            }.get(operation)
+            if fields is None:
+                raise HTTPException(status_code=404, detail="Unknown managed task control")
+            if set(payload) - fields:
+                raise HTTPException(status_code=400, detail="Unexpected managed task fields")
+            required = fields - {"proposal"}
+            if not required <= set(payload) or any(
+                not isinstance(payload[name], str) or not payload[name].strip()
+                for name in required - {"approved", "response"}
+            ):
+                raise HTTPException(status_code=400, detail="Missing or invalid managed task identity")
+            if operation == "approve" and type(payload["approved"]) is not bool:
+                raise HTTPException(status_code=400, detail="approved must be a Boolean")
+            try:
+                if operation == "run":
+                    proposal = AssignmentProposal.model_validate(payload["proposal"]) if "proposal" in payload else None
+                    run = await managed_service.consume(payload["preview_id"], proposal=proposal)
+                    if run is None:
+                        raise ValueError("Task requires an activated approved repository route and delegation decision")
+                elif operation == "approve":
+                    run = await managed_service.decide(payload["assignment_id"], request_id=payload["request_id"],
+                                                       approved=payload["approved"])
+                elif operation == "resume":
+                    run = await managed_service.respond(payload["assignment_id"], request_id=payload["request_id"],
+                                                        response=payload["response"])
+                else:
+                    run = await managed_service.cancel(payload["assignment_id"])
+            except FileLockTimeout as error:
+                raise HTTPException(status_code=409, detail="Managed task invocation is already active") from error
+            except (ValueError, PermissionError, RuntimeError, OSError) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return {"managed_run": run.model_dump(mode="json")}
 
     @app.get("/internal/pm/plans")
     def list_pm_plans(
