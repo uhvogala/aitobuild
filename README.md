@@ -32,7 +32,7 @@ Team structure and lifecycle are not fixed in code.
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **664 tests pass**, with two optional prepared-target Docker
+Verified locally: **684 tests pass**, with two optional prepared-target Docker
 probes skipped; Ruff and mypy (46 source files) and the mock fixture simulation pass.
 The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
@@ -510,8 +510,59 @@ by service/detached COMMENT approval or frozen-owner cancellation. Full local ga
 are 664 passed/two optional Docker skips, Ruff/mypy (46 sources), diagnostics,
 six-call-site service compatibility and successful mock simulation. Access counters
 still do not certify semantic review. No default activation, live trial, remote
-write, dependency change, commit or push accompanies this slice. Scoped correction,
-managed PM writes and bounded meeting execution remain pending.
+write or dependency change accompanied those checks. The role/coordinator/review
+baseline was subsequently committed locally at `823ea98`, without a push. Scoped
+correction handoff is described below; managed PM writes and bounded meetings remain pending.
+
+### Scoped Correction Handoff
+
+Enable `allow_correction_proposals=True` on the explicitly registered
+`NativeManagedRoles` binding and advance its operator binding revision. After
+complete source/diff inspection, the per-run `architect_propose_correction` tool
+can save one bounded objective and explicit published paths. It cannot assign,
+approve, execute or widen task authority. The exact proposal is included in the
+saved COMMENT approval; changed content or scope is refused on restart. Existing
+comment-only reviews expose no new tool.
+
+Add a Developer-only eligible-agent route to the pinned definition, then supply
+`correction_routes=(PublishedReviewRoute(..., event="published.correction"),)` to
+`PublishedReviewAdmission`. The route controls organization/revision, delegation,
+owner and native graph; there is no hardcoded team, correction loop or workflow.
+Correction routes are separate from ordinary issue and Architect review routes.
+
+Authenticated `POST /internal/organization/corrections/offer` accepts only
+`{"review_preview_id": "..."}`. It requires a completed, cleaned-up approved review,
+its saved COMMENT receipt and unchanged live published target. The response contains
+`correction_preview`, initially unapproved. Offer/retry is metadata-only: no model
+replay, checkout, commands, approval, budget initialization or remote writes.
+
+Atomic/fsynced receipts save staging intent before preview creation and preserve
+the completed review, proposal, target, original route/revision and exact scope.
+Partial staging/duplicates recover the same preview; missing receipts, changed
+scope and stale heads cannot fall through to the ordinary Developer route.
+The task copies the original publication's policy ceilings, narrows file scope to
+literal proposed paths and caps unique file changes at their count. It uses the
+reviewed head as its base and the published task branch as its base branch.
+
+Approve it separately through `/internal/developer/preview/approve`. Existing
+managed Developer graphs can then prepare a fresh private checkout/branch and
+budget, never reuse the original Developer or review task's approval/ledger.
+The configured local seed must already contain the exact reviewed commit and
+published branch; preparation does not fetch, and missing heads fail closed.
+Deleted initialized budgets cannot be recreated by replaying preparation.
+Register the existing delivery operations for implementation and independent
+verification; a completed metadata graph is neither an implemented correction
+nor a verified/publishable artifact. Same-PR update/reconciliation is not added.
+
+Twenty correction regressions cover actual native Architect mocked transports,
+exact approval and refusals, request/detached handoff, authenticated HTTP offers,
+staging recovery, scope/head/revision pins and fresh/missing-seed preparation.
+They prove handoff/preparation, not a live Developer correction or semantic review.
+Current gates: 684 passed/two optional Docker skips, Ruff/mypy (46 sources), clean
+diagnostics, constructor compatibility and successful mock fixture simulation.
+This continuation is uncommitted; no dependencies, push, remote writes, live model,
+GitHub/Docker trial or hosted CI were added. Native correction artifact acceptance,
+same-PR update, managed PM planning/writes and bounded meetings remain pending.
 
 ### API setup
 

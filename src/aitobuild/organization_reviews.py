@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from glob import escape
 import json
 import os
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
 from filelock import FileLock
-from pydantic import Field, StrictStr
+from pydantic import Field, StrictStr, model_validator
 
 from aitobuild.developer_delivery import DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry
 from aitobuild.organization import DefinitionModel, DefinitionStore, EventName, Identifier
-from aitobuild.organization_runner import _sync_directory
+from aitobuild.organization_runner import ManagedRun, _sync_directory
 from aitobuild.policy import AgentRole
 from aitobuild.tools.github import GitHubAdapter
 
@@ -23,6 +24,18 @@ from aitobuild.tools.github import GitHubAdapter
 class PublishedReviewTarget(DefinitionModel):
     preview_id: Annotated[StrictStr, Field(min_length=1)]
     head_sha: Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{40}$")]
+
+
+class CorrectionProposal(DefinitionModel):
+    objective: Annotated[StrictStr, Field(min_length=1, max_length=2000)]
+    paths: Annotated[tuple[StrictStr, ...], Field(min_length=1, max_length=32)]
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> Self:
+        if (not self.objective.strip() or "\x00" in self.objective or len(self.objective.encode("utf-8")) > 2000 or
+                len(set(self.paths)) != len(self.paths) or any(not path or "\x00" in path for path in self.paths)):
+            raise ValueError("Correction proposals require a bounded objective and unique explicit paths")
+        return self
 
 
 class PublishedReviewRoute(DefinitionModel):
@@ -47,15 +60,27 @@ class _ReviewReceipt(DefinitionModel):
     deadline: Annotated[float, Field(strict=True, allow_inf_nan=False)] | None = None
 
 
+class _CorrectionReceipt(DefinitionModel):
+    task_id: StrictStr
+    review_preview_id: StrictStr
+    target: PublishedReviewTarget
+    route: PublishedReviewRoute
+    run_content: StrictStr
+    bundle_content: StrictStr
+    state: Literal["staging", "staged"] = "staging"
+    correction_preview_id: StrictStr | None = None
+
+
 class _ReviewJournal(DefinitionModel):
     schema_version: Literal[1] = 1
     receipts: dict[str, _ReviewReceipt] = {}
+    corrections: dict[str, _CorrectionReceipt] = {}
 
 
 class PublishedReviewAdmission:
     def __init__(self, *, definitions: DefinitionStore, previews: DeveloperPreviewRegistry,
                  worker: DeveloperDeliveryWorker, github: GitHubAdapter, state_dir: Path,
-                 routes: tuple[PublishedReviewRoute, ...]) -> None:
+                 routes: tuple[PublishedReviewRoute, ...], correction_routes: tuple[PublishedReviewRoute, ...] = ()) -> None:
         self._definitions = definitions
         self._previews = previews
         self._worker = worker
@@ -64,26 +89,35 @@ class PublishedReviewAdmission:
         self._directory.mkdir(parents=True, exist_ok=True)
         self._path = self._directory / "reviews.json"
         self._routes = tuple(PublishedReviewRoute.model_validate(route.model_dump()) for route in routes)
+        self._correction_routes = tuple(PublishedReviewRoute.model_validate(route.model_dump()) for route in correction_routes)
         if len({(route.repository, route.repository_id) for route in routes}) != len(routes):
             raise ValueError("Published review routes must be unambiguous")
         for route in routes:
             self._validate_route(route)
+        if len({(route.repository, route.repository_id) for route in correction_routes}) != len(correction_routes):
+            raise ValueError("Correction routes must be unambiguous")
+        for route in correction_routes:
+            self._validate_route(route, role=AgentRole.DEVELOPER)
 
     @property
     def routes(self) -> tuple[PublishedReviewRoute, ...]:
         return self._routes
 
+    @property
+    def correction_routes(self) -> tuple[PublishedReviewRoute, ...]:
+        return self._correction_routes
+
     def validate_binding(self, *, definitions: DefinitionStore, previews: DeveloperPreviewRegistry, worker: DeveloperDeliveryWorker) -> None:
         if (definitions is not self._definitions or previews is not self._previews or worker is not self._worker):
             raise PermissionError("Published review admission must use the service-owned definitions, previews and worker")
 
-    def _validate_route(self, activation: PublishedReviewRoute) -> None:
+    def _validate_route(self, activation: PublishedReviewRoute, *, role: AgentRole = AgentRole.ARCHITECT) -> None:
         snapshot = self._definitions.get(activation.organization_id, activation.revision)
         route = next((route for route in snapshot.definition.routes if activation.event in route.events), None) if snapshot else None
         if (snapshot is None or route is None or any(
-                agent.role != AgentRole.ARCHITECT for agent in snapshot.definition.agents
+                agent.role != role for agent in snapshot.definition.agents
                 if agent.id in route.delegation.eligible_agents)):
-            raise PermissionError("Published review requires a pinned route with Architect-only eligibility")
+            raise PermissionError("Published task requires a pinned route with role-scoped eligibility")
 
     def _load(self) -> _ReviewJournal:
         if self._path.resolve() != self._path:
@@ -100,6 +134,11 @@ class PublishedReviewAdmission:
                 receipt.state == "staging" and receipt.ledger_state != "none" or
                     (receipt.ledger_state == "ready") != (receipt.deadline is not None)):
                 raise ValueError("Review journal task identity/state is invalid")
+        for task_id, correction in journal.corrections.items():
+            payload = json.loads(correction.bundle_content)
+            if (not isinstance(payload, dict) or correction.task_id != task_id or payload.get("task_id") != task_id or
+                    (correction.state == "staged") != (correction.correction_preview_id is not None)):
+                raise ValueError("Correction journal task identity/state is invalid")
         return journal
 
     def _save(self, journal: _ReviewJournal) -> None:
@@ -113,6 +152,12 @@ class PublishedReviewAdmission:
                     receipt.approved_at is not None and (receipt.approved_at, receipt.budget_path) != (updated.approved_at, updated.budget_path) or
                     receipt.deadline is not None and receipt.deadline != updated.deadline):
                 raise PermissionError("Review pins and staged receipts are immutable")
+        for task_id, correction in original.corrections.items():
+            updated_correction = journal.corrections.get(task_id)
+            if (updated_correction is None or correction.model_dump(exclude={"state", "correction_preview_id"}) !=
+                    updated_correction.model_dump(exclude={"state", "correction_preview_id"}) or
+                    correction.state == "staged" and correction != updated_correction):
+                raise PermissionError("Correction pins and staged receipts are immutable")
         temporary = self._path.with_suffix(".tmp")
         if temporary.resolve() != temporary:
             raise ValueError("Review temporary journals cannot follow symlinks")
@@ -215,6 +260,101 @@ class PublishedReviewAdmission:
         if json.dumps(publication, sort_keys=True, separators=(",", ":"), allow_nan=False) != receipt.publication_content:
             raise PermissionError("Published review target snapshot changed")
         return receipt.target
+
+    def offer_correction(self, review_preview_id: str, run: ManagedRun) -> DeveloperPreview | None:
+        review = self._receipt(review_preview_id)
+        if review is None:
+            raise PermissionError("Correction requires a trusted staged review")
+        preview = self._previews.get(review_preview_id)
+        if (run.state != "completed" or run.cleanup_succeeded is not True or
+            (run.organization_id, run.revision) != (review.route.organization_id, review.route.revision) or preview is None or not preview.approved or
+                run.scope_digest != sha256(review.bundle_content.encode()).hexdigest()):
+            raise PermissionError("Correction requires a completed approved review with unchanged scope")
+        candidates = [output for output in run.outputs if isinstance(output, dict) and "correction" in output]
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise PermissionError("Correction requires one unambiguous completed proposal")
+        output = candidates[0]
+        target_payload = output.get("target")
+        if not isinstance(target_payload, dict):
+            raise PermissionError("Completed correction proposal requires explicit target pins")
+        target = PublishedReviewTarget.model_validate({key: target_payload.get(key) for key in ("preview_id", "head_sha")})
+        if target != self.target_for(review_preview_id) or output.get("metadata_only") is not True:
+            raise PermissionError("Correction proposal differs from the completed reviewed target")
+        published = self._worker.get(target.preview_id)
+        assert published is not None and published.publication is not None
+        if not published.architect_review or output.get("architect_review") != published.architect_review:
+            raise PermissionError("Correction requires the saved approved COMMENT receipt")
+        proposal = CorrectionProposal.model_validate(output["correction"])
+        if not all(path in published.publication["changed_paths"] for path in proposal.paths):
+            raise PermissionError("Correction proposal escapes the inspected published paths")
+        issue = published.bundle_payload["issue_context"]
+        route = next((route for route in self._correction_routes if (route.repository, route.repository_id) ==
+                      (issue["repository"], issue["repository_id"])), None)
+        if route is None:
+            return None
+        run_content = run.model_dump_json()
+        with FileLock(str(self._path) + ".lock", timeout=10):
+            journal = self._load()
+            saved = [receipt for receipt in journal.corrections.values() if receipt.review_preview_id == review_preview_id]
+            if len(saved) > 1:
+                raise PermissionError("Review has ambiguous correction receipts")
+            if saved:
+                original = saved[0]
+                if original.run_content != run_content or original.target != target or original.route.organization_id != route.organization_id:
+                    raise PermissionError("Correction source/target/activation changed")
+                route = original.route
+            self._validate_route(route, role=AgentRole.DEVELOPER)
+            task_id = "published-correction-" + sha256(json.dumps({"review": review_preview_id, "run": run_content,
+                                                                  "route": route.model_dump()}, sort_keys=True).encode()).hexdigest()
+            bundle = json.loads(json.dumps(published.bundle_payload))
+            bundle["task_id"] = task_id
+            bundle["objective"] = proposal.objective
+            bundle["issue_context"]["base_revision"] = target.head_sha
+            bundle["issue_context"]["base_branch"] = published.branch
+            bundle["policy"]["allowed_paths"] = [escape(path) for path in proposal.paths]
+            bundle["policy"]["max_file_changes"] = min(len(proposal.paths), bundle["policy"]["max_file_changes"])
+            developer_task_bundle_from_payload(bundle)
+            content = json.dumps(bundle, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            receipt = journal.corrections.get(task_id)
+            if receipt is None:
+                receipt = _CorrectionReceipt(task_id=task_id, review_preview_id=review_preview_id, target=target,
+                                             route=route, run_content=run_content, bundle_content=content)
+                journal.corrections[task_id] = receipt
+                self._save(journal)
+            elif receipt.bundle_content != content:
+                raise PermissionError("Correction scope cannot replace its staging receipt")
+            staged = self._previews.create_or_get(dedupe_key=task_id, bundle_payload=bundle,
+                                                  source_payload={"correction_from_review": review_preview_id, "published_review": target.model_dump(mode="json")})
+            if receipt.state == "staged":
+                if receipt.correction_preview_id != staged.preview_id:
+                    raise PermissionError("Correction preview identity changed")
+            else:
+                journal.corrections[task_id] = receipt.model_copy(update={"state": "staged", "correction_preview_id": staged.preview_id})
+                self._save(journal)
+            return staged
+
+    def correction_route_for(self, preview_id: str) -> PublishedReviewRoute | None:
+        preview = self._previews.get(preview_id)
+        if preview is None:
+            raise ValueError("Correction preview not found")
+        with FileLock(str(self._path) + ".lock", timeout=10):
+            receipt = self._load().corrections.get(str(preview.bundle_payload["task_id"]))
+        if receipt is None:
+            if str(preview.bundle_payload["task_id"]).startswith("published-correction-"):
+                raise PermissionError("Correction task lacks its trusted staging receipt")
+            return None
+        if (receipt.state != "staged" or receipt.correction_preview_id != preview_id or
+                json.dumps(preview.bundle_payload, sort_keys=True, separators=(",", ":"), allow_nan=False) != receipt.bundle_content):
+            raise PermissionError("Correction staging is incomplete or scope differs")
+        if not any((route.repository, route.repository_id, route.organization_id) ==
+                   (receipt.route.repository, receipt.route.repository_id, receipt.route.organization_id) for route in self._correction_routes):
+            raise PermissionError("Correction is outside this operator activation")
+        self._validate_route(receipt.route, role=AgentRole.DEVELOPER)
+        if self.target_for(receipt.review_preview_id) != receipt.target:
+            raise PermissionError("Correction reviewed head is stale")
+        return receipt.route
 
     def budget_path(self, preview_id: str) -> Path:
         path = self._directory / "budgets" / (sha256(preview_id.encode()).hexdigest() + ".json")

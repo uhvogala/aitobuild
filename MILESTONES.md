@@ -45,10 +45,10 @@ execute task code against the aitobuild service checkout.
 | Persistent Docker sessions | Private checkouts/home volumes, restart memory/history and scoped cleanup | Live integration evidence; prototype isolation only |
 | MCP shell/filesystem | Native stdio transport adapter, configurable names | Optional; compatibility validation pending |
 | GitHub output | Allowlisted gh CLI branch/commit/draft publication, immutable snapshot capture and exact remote reconciliation | Locally regression-verified prototype; live acceptance pending |
-| Architect/PM/meetings | Native PM service delegation, opt-in published-review staging/routing and saved head-bound COMMENT approvals | Scoped correction, managed PM writes and meeting execution pending |
+| Architect/PM/meetings | Native PM delegation, published-review routing, saved COMMENT approvals and scoped correction handoff/preparation | Native correction acceptance, managed PM writes and meetings pending |
 | Operations | Manual tick API, local durable managed worker and successful hosted CI baseline | M0 accepted; broader durable state/distributed controls and tracing missing |
 
-Current local gates with published-review routing: **664 passed, two optional Docker probes skipped**;
+Current local gates with scoped correction handoff: **684 passed, two optional Docker probes skipped**;
 Ruff and mypy (46 source files) and the mock fixture simulation pass. Worker gates
 passed with 587; service gates
 passed with 549; runner gates
@@ -436,6 +436,22 @@ approval/retry. Full gates: **664 passed/two optional Docker skips**, Ruff/mypy
 No default activation, external trial or remote write. Counters/metadata do not
 certify semantic review; live review plus an approved scoped correction and bounded
 meeting execution are still required for M3 acceptance.
+
+Scoped correction handoff (2026-10-07, baseline committed locally at `823ea98`):
+an opt-in native Architect tool saves one bounded objective/explicit published-path
+proposal inside the exact COMMENT approval. A completed approved review with its
+saved COMMENT/target can be offered as a separate unapproved Developer task through
+an authenticated metadata-only endpoint and configured native Developer route.
+Atomic/fsynced staging receipts pin source run/scope/head/original revision, recover
+partial staging and refuse lost receipts/scope drift/stale heads. Fresh approval
+prepares a separate checkout/branch/budget from the reviewed head in an explicitly
+provisioned local seed; no fetch or old approval/deadline reset. Twenty new native
+Architect mock/request/detached/HTTP/recovery/preparation cases pass. Full gates:
+**684 passed/two optional Docker skips**, Ruff/mypy (46 sources), diagnostics,
+constructor compatibility and mock simulation. This continuation is uncommitted;
+no external trial or remote write. Handoff/preparation is not a native corrected
+artifact or independent verification. Same-PR update, useful live review/correction
+and bounded meeting execution remain required before M3 acceptance.
 
 
 Deliverables:

@@ -709,6 +709,21 @@ def create_app(
             return managed_worker.diagnostics()
 
     if managed_service is not None:
+        @app.post("/internal/organization/corrections/offer")
+        async def offer_scoped_correction(
+            payload: dict[str, Any],
+            x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        ) -> dict[str, Any]:
+            _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+            if set(payload) != {"review_preview_id"} or not isinstance(payload["review_preview_id"], str) or not payload["review_preview_id"].strip():
+                raise HTTPException(status_code=400, detail="Correction staging accepts only review_preview_id")
+            assert managed_service is not None
+            try:
+                preview = await managed_service.offer_correction(payload["review_preview_id"].strip())
+            except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return {"correction_preview": {"preview_id": preview.preview_id, "approved": preview.approved, "bundle": preview.bundle_payload} if preview else None}
+
         @app.post("/internal/organization/reviews/offer")
         async def offer_published_review(
             payload: dict[str, Any],

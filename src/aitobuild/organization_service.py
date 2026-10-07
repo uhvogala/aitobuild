@@ -76,10 +76,11 @@ class ManagedOrganizationService:
         self._reviews = reviews
         self._routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in routes)
         self._review_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in reviews.routes) if reviews else ()
+        self._correction_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in reviews.correction_routes) if reviews else ()
         targets = [(route.repository, route.repository_id) for route in self._routes]
         if len(targets) != len(set(targets)):
             raise ValueError("Managed repository routes must be unambiguous")
-        for route in (*self._routes, *self._review_routes):
+        for route in (*self._routes, *self._review_routes, *self._correction_routes):
             snapshot = definitions.get(route.organization_id, route.revision)
             if snapshot is None or not any(route.event in item.events for item in snapshot.definition.routes):
                 raise ValueError("Managed activation requires an existing explicit revision/event")
@@ -98,9 +99,12 @@ class ManagedOrganizationService:
         )
 
     def _route(self, preview: DeveloperPreview) -> ManagedRoute | None:
-        if self._reviews is None and str(preview.bundle_payload.get("task_id", "")).startswith("published-review-"):
+        if self._reviews is None and str(preview.bundle_payload.get("task_id", "")).startswith(("published-review-", "published-correction-")):
             raise PermissionError("Staged review tasks require their trusted admission binding")
         if self._reviews is not None:
+            correction = self._reviews.correction_route_for(preview.preview_id)
+            if correction is not None:
+                return ManagedRoute.model_validate(correction.model_dump())
             review = self._reviews.route_for(preview.preview_id)
             if review is not None:
                 return ManagedRoute.model_validate(review.model_dump())
@@ -151,6 +155,15 @@ class ManagedOrganizationService:
         reviews = self._reviews
         return await _delivery_call(lambda: reviews.offer(published_preview_id))
 
+    async def offer_correction(self, review_preview_id: str) -> DeveloperPreview | None:
+        reviews = self._reviews
+        if reviews is None:
+            return None
+        run = self.status(review_preview_id)
+        if run is None:
+            raise PermissionError("Correction requires a completed managed review")
+        return await _delivery_call(lambda: reviews.offer_correction(review_preview_id, run))
+
     def approved_previews(self, *, limit: int) -> tuple[DeveloperPreview, ...]:
         return tuple(preview for preview in self._previews.list_previews(pending_only=False, limit=limit) if preview.approved)
 
@@ -179,7 +192,7 @@ class ManagedOrganizationService:
         if route is None or not preview.approved:
             return None
         if activation is not None:
-            if self._reviews is not None and self._reviews.route_for(preview_id) is not None and activation != route:
+            if self._reviews is not None and (self._reviews.route_for(preview_id) is not None or self._reviews.correction_route_for(preview_id) is not None) and activation != route:
                 raise PermissionError("Saved review activation must retain the exact staged revision/event")
             if (activation.repository, activation.repository_id, activation.organization_id) != (
                 route.repository, route.repository_id, route.organization_id,
@@ -249,7 +262,7 @@ class ManagedOrganizationService:
         if assignment is None:
             raise ValueError("Assignment not found")
         issue = assignment.bundle.issue_context
-        route = next((route for route in (*self._routes, *self._review_routes) if issue is not None and
+        route = next((route for route in (*self._routes, *self._review_routes, *self._correction_routes) if issue is not None and
                       (route.repository, route.repository_id, route.organization_id) ==
                       (issue.repository, issue.repository_id, assignment.organization_id)), None)
         if route is None or self._assignments.for_task(assignment.task_id) != assignment:

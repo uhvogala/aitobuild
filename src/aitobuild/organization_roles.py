@@ -24,6 +24,7 @@ from aitobuild.organization_delivery import _delivery_call
 from aitobuild.organization_runner import ManagedOperation, ManagedTaskContext, WorkflowInput, _sync_directory
 from aitobuild.organization_runtime import OrganizationRuntime
 from aitobuild.organization_reviews import PublishedReviewTarget as PublishedReviewTarget
+from aitobuild.organization_reviews import CorrectionProposal
 from aitobuild.organization_service import CoordinatorBinding
 from aitobuild.policy import ActionClass, AgentRole
 from aitobuild.tool_outputs import MAX_PROMPT_BYTES, MAX_TOOL_RESULT_BYTES, build_output_guard
@@ -203,6 +204,7 @@ class NativeManagedRoles:
         proposal_event: str, worker: DeveloperDeliveryWorker | None = None, github: GitHubAdapter | None = None,
         review_target_for: Callable[[ManagedTaskContext], PublishedReviewTarget] | None = None,
         invoke_timeout_seconds: float = 180,
+        allow_correction_proposals: bool = False,
     ) -> None:
         if not proposal_event.strip() or not math.isfinite(invoke_timeout_seconds) or invoke_timeout_seconds <= 0:
             raise ValueError("Managed roles require an explicit proposal route and positive timeout")
@@ -214,6 +216,7 @@ class NativeManagedRoles:
         self._github = github
         self._target_for = review_target_for
         self._timeout = invoke_timeout_seconds
+        self._allow_corrections = allow_correction_proposals
 
     @property
     def operations(self) -> Mapping[str, ManagedOperation]:
@@ -340,7 +343,10 @@ class NativeManagedRoles:
     async def review(self, context: ManagedTaskContext, message: Any) -> WorkflowInput:
         agent = self._agent(context, AgentRole.ARCHITECT)
         target = await self._target(context)
-        session = await self._session(context, agent, {"role": "architect", "target": target})
+        extra: dict[str, Any] = {"role": "architect", "target": target}
+        if self._allow_corrections:
+            extra["correction_proposals"] = True
+        session = await self._session(context, agent, extra)
         if session.state.get("aitobuild_comment_state") is not None:
             raise PermissionError("Saved review must continue through its exact approval; model replay is blocked")
         inspections = session.state.setdefault("aitobuild_review_inspections", {})
@@ -378,10 +384,32 @@ class NativeManagedRoles:
                             max_bytes: Annotated[int, Field(ge=1, le=1000)] = 1000) -> dict[str, Any]:
             return await read("diff", path, offset, max_bytes)
 
-        text = await self._invoke(context, agent, session, (read_source, read_diff),
-                                  "Inspect complete source AND diff for each approved changed path at the pinned target below. "
-                                  "Return COMMENT review text only; never claim metadata alone proves semantic correctness. "
-                                  "Publication requires a separate operator approval.\nTarget: " + json.dumps(target, sort_keys=True))
+        @tool(name="architect_propose_correction", approval_mode="never_require")
+        async def propose_correction(paths: list[str], objective: str) -> dict[str, Any]:
+            context.revalidate()
+            if await self._target(context) != target:
+                raise PermissionError("Correction proposal target changed")
+            self._require_inspections(target, inspections)
+            proposal = CorrectionProposal.model_validate({"paths": paths, "objective": objective}).model_dump(mode="json")
+            if not all(path in target["changed_paths"] for path in paths):
+                raise PermissionError("Corrections can only propose inspected published paths")
+            if len(json.dumps(proposal).encode("utf-8")) > MAX_TOOL_RESULT_BYTES - 256:
+                raise ValueError("Correction proposal must fit inline")
+            saved = session.state.get("aitobuild_correction_proposal")
+            if saved is not None and saved != proposal:
+                raise PermissionError("Saved correction proposal cannot be replaced")
+            session.state["aitobuild_correction_proposal"] = proposal
+            await self._sessions.set(context.run.session_id, session)
+            return {"correction": proposal, "metadata_only": True}
+
+        guidance = ("Inspect complete source AND diff for each approved changed path at the pinned target below. "
+                    "Return COMMENT review text only; never claim metadata alone proves semantic correctness. "
+                    "Publication requires a separate operator approval.")
+        tools: tuple[Any, ...] = (read_source, read_diff)
+        if self._allow_corrections:
+            tools += (propose_correction,)
+            guidance += " Optionally propose one scoped correction after inspection; this cannot assign, approve or execute a Developer task."
+        text = await self._invoke(context, agent, session, tools, guidance + "\nTarget: " + json.dumps(target, sort_keys=True))
         self._require_inspections(target, inspections)
         assert self._worker is not None
         text = text.replace("\x00", "").strip()
@@ -391,7 +419,10 @@ class NativeManagedRoles:
         session.state["aitobuild_comment_state"] = "proposed"
         session.state["aitobuild_comment_body"] = text
         await self._sessions.set(context.run.session_id, session)
-        return WorkflowInput("Approve exact Architect COMMENT review", {"target": target, "body": text}, "service_approval")
+        data: dict[str, Any] = {"target": target, "body": text}
+        if session.state.get("aitobuild_correction_proposal") is not None:
+            data["correction"] = session.state["aitobuild_correction_proposal"]
+        return WorkflowInput("Approve exact Architect COMMENT review", data, "service_approval")
 
     async def approve_review(self, context: ManagedTaskContext, original: Any, approved: Any) -> dict[str, Any]:
         self._agent(context, AgentRole.ARCHITECT)
@@ -399,12 +430,20 @@ class NativeManagedRoles:
             raise PermissionError("Operator rejected or omitted Architect COMMENT approval")
         target = await self._target(context)
         session = await self._sessions.get(context.run.session_id)
-        expected_pins = {"assignment_id": context.assignment.assignment_id, "revision": context.assignment.revision,
+        expected_pins: dict[str, Any] = {"assignment_id": context.assignment.assignment_id, "revision": context.assignment.revision,
                          "scope_digest": context.assignment.scope_digest, "budget_path": context.assignment.budget_path,
                          "role": "architect", "target": target}
+        if self._allow_corrections:
+            expected_pins["correction_proposals"] = True
+        data = {"target": target, "body": session.state.get("aitobuild_comment_body") if session else None}
+        correction = session.state.get("aitobuild_correction_proposal") if session else None
+        if correction is not None:
+            proposal = CorrectionProposal.model_validate(correction)
+            if not self._allow_corrections or not all(path in target["changed_paths"] for path in proposal.paths):
+                raise PermissionError("Saved correction proposal is outside this review binding/scope")
+            data["correction"] = proposal.model_dump(mode="json")
         if (session is None or session.state.get("aitobuild_role_pins") != expected_pins or
-                session.state.get("aitobuild_comment_state") != "proposed" or original !=
-                {"target": target, "body": session.state.get("aitobuild_comment_body")}):
+                session.state.get("aitobuild_comment_state") != "proposed" or original != data):
             raise PermissionError("Architect approval must retain the exact saved target/body and one-shot state")
         self._require_inspections(target, session.state.get("aitobuild_review_inspections"))
         session.state["aitobuild_comment_state"] = "submitting"
@@ -419,7 +458,10 @@ class NativeManagedRoles:
         session.state["aitobuild_comment_receipt"] = record.architect_review
         await self._sessions.set(context.run.session_id, session)
         context.revalidate()
-        return {"target": target, "architect_review": record.architect_review, "metadata_only": True}
+        result = {"target": target, "architect_review": record.architect_review, "metadata_only": True}
+        if correction is not None:
+            result["correction"] = correction
+        return result
 
     async def cleanup(self, context: ManagedTaskContext) -> None:
         session = await self._sessions.get(context.run.session_id)
