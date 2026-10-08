@@ -644,6 +644,75 @@ def test_ghcli_recovers_only_the_exact_remote_commit(monkeypatch, remote) -> Non
     assert all(method != "PATCH" for method, _ in calls)
 
 
+@pytest.mark.parametrize("remote", ["advance", "reconciled", "uncertain", "drift", "wrong_parent", "missing", "race", "expired"])
+def test_ghcli_correction_update_never_forces_or_replaces_an_unrelated_head(monkeypatch, remote):
+    from aitobuild.tools.github import GitHubBlobChange, _git_blob_sha
+
+    adapter = GhCliGitHubAdapter(allowed_repositories=("fixture/widgets",))
+    base, head, tree, foreign = "a" * 40, "b" * 40, "c" * 40, "f" * 40
+    current = head if remote in {"reconciled", "wrong_parent"} else foreign if remote == "drift" else base
+    content, calls = b"corrected\n", []
+    branch = "aitobuild/issue-7-task"
+    checks = []
+
+    def api(endpoint, *, method="GET", payload=None):
+        nonlocal current
+        calls.append((method, endpoint, payload))
+        if endpoint.endswith("/pulls/7"):
+            return {"number": 7, "title": "Correction", "body": "Closes #7", "state": "open", "draft": True,
+                "head": {"ref": branch, "sha": current, "repo": {"full_name": "fixture/widgets"}},
+                "base": {"ref": "main"}}
+        if endpoint.endswith("/git/commits/" + base):
+            return {"tree": {"sha": "d" * 40}}
+        if "/git/ref/heads/" in endpoint:
+            if remote == "missing":
+                raise RuntimeError("HTTP 404")
+            return {"object": {"sha": current}}
+        if endpoint.endswith("/git/commits/" + current):
+            return {"tree": {"sha": tree if current == head else foreign}, "message": "Correction",
+                    "parents": [{"sha": foreign if remote == "wrong_parent" else base}]}
+        if endpoint.endswith("?recursive=1"):
+            entries = [{"path": "README.md", "mode": "100644", "type": "blob", "sha": "9" * 40}]
+            if f"/git/trees/{tree}?" in endpoint or f"/git/trees/{foreign}?" in endpoint:
+                blob = _git_blob_sha(content) if f"/git/trees/{tree}?" in endpoint else foreign
+                entries.append({"path": "src/probe.py", "mode": "100644", "type": "blob", "sha": blob})
+            return {"tree": entries, "truncated": False}
+        if endpoint.endswith("/git/blobs"):
+            return {"sha": _git_blob_sha(content)}
+        if endpoint.endswith("/git/trees"):
+            return {"sha": tree}
+        if endpoint.endswith("/git/commits"):
+            return {"sha": head, "tree": {"sha": tree}}
+        if "/git/refs/heads/" in endpoint:
+            assert method == "PATCH" and payload == {"sha": head, "force": False}
+            current = foreign if remote == "race" else head
+            if remote in {"uncertain", "race"}:
+                raise RuntimeError("Lost ref update response")
+            return {"object": {"sha": current}}
+        raise AssertionError(endpoint)
+
+    def before_write():
+        checks.append(len(checks) + 1)
+        if remote == "expired" and len(checks) == 4:
+            raise TimeoutError("Original correction budget expired")
+
+    monkeypatch.setattr(adapter, "_api", api)
+    arguments = dict(role=AgentRole.DEVELOPER, repository="fixture/widgets", head_branch=branch, base_ref="main", pull_number=7,
+                     expected_head_sha=base, before_write=before_write, commit_message="Correction",
+                     files={"src/probe.py": GitHubBlobChange("100644", content, _git_blob_sha(content))},
+                     approved=True, require_human_approval_for_repo_writes=True)
+    if remote in {"drift", "wrong_parent", "missing", "race", "expired"}:
+        with pytest.raises((ValueError, PermissionError, RuntimeError, TimeoutError)):
+            adapter.advance_draft_pull_request_head(**arguments)
+    else:
+        assert adapter.advance_draft_pull_request_head(**arguments).head_sha == head
+        assert adapter.advance_draft_pull_request_head(**arguments).head_sha == head
+    if remote == "expired":
+        assert len(checks) == 4 and sum(method == "POST" for method, _, _ in calls) == 3
+    assert sum(method == "PATCH" for method, _, _ in calls) == (1 if remote in {"advance", "uncertain", "race"} else 0)
+    assert all(not (method == "POST" and endpoint.endswith("/git/refs")) for method, endpoint, _ in calls)
+
+
 def test_build_github_adapter_gh_cli_requires_allowlist() -> None:
     with pytest.raises(ValueError, match="allowlist"):
         build_github_adapter(mode="gh_cli", allowed_repositories=())

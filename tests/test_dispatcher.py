@@ -1048,6 +1048,33 @@ def test_publish_verified_delivery_opens_draft_pr_idempotently(
     assert len(github.branch_commits) == 1
 
 
+def test_correction_branch_update_is_expected_head_pinned_and_idempotent():
+    from dataclasses import replace
+
+    from aitobuild.policy import AgentRole
+    from aitobuild.tools.github import GitHubBlobChange, MockGitHubAdapter, _git_blob_sha
+
+    github = MockGitHubAdapter(allowed_repositories=frozenset({"fixture/widgets"}), enforce_allowlist=True)
+    content = b"corrected artifact\n"
+    arguments = dict(role=AgentRole.DEVELOPER, repository="fixture/widgets", head_branch="aitobuild/task-branch",
+                     base_ref="main", pull_number=1, expected_head_sha="a" * 40, commit_message="Approved correction",
+                     files={"src/probe.py": GitHubBlobChange("100644", content, _git_blob_sha(content))},
+                     approved=True, require_human_approval_for_repo_writes=True)
+    github._branch_heads["fixture/widgets"] = {"aitobuild/task-branch": "a" * 40}
+    github.create_or_update_draft_pull_request(role=AgentRole.DEVELOPER, repository="fixture/widgets",
+        title="Approved task", body="Closes #1", head_branch="aitobuild/task-branch", base_ref="main",
+        issue_number=1, approved=True, require_human_approval_for_repo_writes=True)
+    head = github.advance_draft_pull_request_head(**arguments).head_sha
+    assert head != "a" * 40
+    assert github.advance_draft_pull_request_head(**arguments).head_sha == head
+    assert len(github.branch_commits) == 1
+    github._branch_heads["fixture/widgets"]["aitobuild/task-branch"] = "b" * 40
+    github.pull_requests["fixture/widgets"][1] = replace(github.pull_requests["fixture/widgets"][1], head_sha="b" * 40)
+    with pytest.raises((ValueError, PermissionError), match="head|branch"):
+        github.advance_draft_pull_request_head(**arguments)
+    assert github._branch_heads["fixture/widgets"]["aitobuild/task-branch"] == "b" * 40
+
+
 @pytest.mark.parametrize("mutation", ["content", "mode", "remove"])
 def test_publish_uploads_only_bytes_hashed_for_verification(
     implemented_delivery, verification_adapter, monkeypatch, mutation,

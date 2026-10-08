@@ -513,10 +513,17 @@ def test_moved_head_keeps_holding_and_cannot_be_retired(correction_chain, monkey
         worker.stage_correction_publication(sibling, review_receipt_digest=RECEIPT)
 
 
-def test_retire_releases_an_abandoned_correction_only_at_the_parent_head(correction_chain):
+@pytest.mark.parametrize(("state", "aborted"), [("verified", False), ("awaiting_tool_approval", False), ("awaiting_tool_approval", True)])
+def test_retire_releases_an_abandoned_correction_only_at_the_parent_head(correction_chain, state, aborted):
     worker, published_id, github, head, make = correction_chain
     abandoned = make()
     staged = worker.stage_correction_publication(abandoned, review_receipt_digest=RECEIPT)
+    budget_before = json.loads(worker.budget_path(abandoned).read_text())
+    if aborted:
+        DeveloperTaskBudget(path=worker.budget_path(abandoned),
+                            bundle=developer_task_bundle_from_payload(worker.get(abandoned).bundle_payload), create=False).abort()
+    if state == "awaiting_tool_approval":
+        worker._save(worker._task_dir(abandoned), replace(worker.get(abandoned), state=state, verification=None))
     with pytest.raises(ValueError, match="live GitHub adapter"):
         worker.retire_correction(abandoned, actor_id="operator", github=github)
     with pytest.raises(PermissionError, match="operator identity"):
@@ -524,11 +531,15 @@ def test_retire_releases_an_abandoned_correction_only_at_the_parent_head(correct
     _move_head(github, worker, published_id, "f" * 40)
     with pytest.raises(PermissionError, match="parent head"):
         worker.retire_correction(abandoned, actor_id="operator", github=github, allow_mock_publication=True)
-    assert worker.get(abandoned).state == "verified" and worker._approvals.get(abandoned).state == "pending"
+    assert worker.get(abandoned).state == state and worker._approvals.get(abandoned).state == "pending"
     _move_head(github, worker, published_id, head)
     retired = worker.retire_correction(abandoned, actor_id="operator", github=github, allow_mock_publication=True)
-    assert retired.state == "retired" and retired.retirement["previous_state"] == "verified"
+    assert retired.state == "retired" and retired.retirement["previous_state"] == state
     assert retired.retirement["actor_id"] == "operator" and retired.retirement["live_head_sha"] == head
+    budget_after = json.loads(worker.budget_path(abandoned).read_text())
+    assert budget_after["aborted"] is True
+    assert budget_after["deadline"] == budget_before["deadline"]
+    assert budget_after["reserved_paths"] == budget_before["reserved_paths"]
     assert worker.get(abandoned) == retired
     assert worker.retire_correction(abandoned, actor_id="operator", github=github, allow_mock_publication=True) == retired
     assert worker._approvals.get(abandoned).state == "invalidated"
@@ -714,7 +725,6 @@ def test_approval_store_is_single_use_and_tamper_evident(tmp_path):
     with pytest.raises(PermissionError, match="already consumed"):
         store.begin_consume("p1", digest=digest, recomputed_content_digest=content, actor_id="op")
     path = next((tmp_path / "approvals").glob("*.json"))
-    # Backstop under every public method: consumed is final, and states never skip or go back.
     revived = PublishApproval.model_validate({
         "preview_id": "p1", "snapshot": consumed.snapshot, "content_digest": content, "nonce": "1" * 32,
         "digest": approval_digest(content, "1" * 32), "state": "pending", "staged_at": consumed.staged_at,

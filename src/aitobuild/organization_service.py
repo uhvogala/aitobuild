@@ -66,6 +66,7 @@ class ManagedOrganizationService:
         predicates: Mapping[str, WorkflowPredicate] | None = None,
         limits: WorkflowLimits = WorkflowLimits(),
         reviews: PublishedReviewAdmission | None = None,
+        automatic_review_followups: bool = False,
     ) -> None:
         self._definitions = definitions
         self._assignments = assignments
@@ -75,6 +76,9 @@ class ManagedOrganizationService:
         if reviews is not None:
             reviews.validate_binding(definitions=definitions, previews=previews, worker=worker)
         self._reviews = reviews
+        if type(automatic_review_followups) is not bool or automatic_review_followups and reviews is None:
+            raise ValueError("Automatic review follow-ups require an explicit review admission binding")
+        self._automatic_followups = automatic_review_followups
         self._routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in routes)
         self._review_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in reviews.routes) if reviews else ()
         self._correction_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in reviews.correction_routes) if reviews else ()
@@ -189,7 +193,13 @@ class ManagedOrganizationService:
             actor_id=self.operator_id, github=github, require_human_approval_for_repo_writes=True,
             allow_mock_publication=allow_mock_publication,
         ))
-        review = await _delivery_call(lambda: reviews.offer(correction_preview_id))
+        run = self.status(correction_preview_id)
+        if run is not None and run.state == "completed" and run.cleanup_succeeded is True:
+            followup = await _delivery_call(lambda: reviews.follow_up(correction_preview_id, run))
+            review_id = followup.get("next_preview_id")
+            review = self._previews.get(review_id) if isinstance(review_id, str) else None
+        else:
+            review = await _delivery_call(lambda: reviews.offer(correction_preview_id))
         return record, review
 
     async def retire_correction(
@@ -201,6 +211,23 @@ class ManagedOrganizationService:
         return await _delivery_call(lambda: self._worker.retire_correction(
             correction_preview_id, actor_id=self.operator_id, github=github,
             allow_mock_publication=allow_mock_publication))
+    def follow_up_status(self, run_id: str) -> dict[str, JsonValue] | None:
+        return self._reviews.follow_up_status(run_id) if self._reviews is not None else None
+
+    async def offer_follow_up(self, preview_id: str) -> dict[str, JsonValue] | None:
+        reviews = self._reviews
+        if reviews is None:
+            return None
+        run = self.status(preview_id)
+        if run is None:
+            raise PermissionError("Follow-up requires a saved completed managed run")
+        return await _delivery_call(lambda: reviews.follow_up(preview_id, run))
+
+    async def _follow_up(self, preview_id: str, run: ManagedRun) -> ManagedRun:
+        reviews = self._reviews
+        if self._automatic_followups and reviews is not None and run.state == "completed" and run.cleanup_succeeded is True:
+            await _delivery_call(lambda: reviews.follow_up(preview_id, run))
+        return run
 
     def approved_previews(self, *, limit: int) -> tuple[DeveloperPreview, ...]:
         return tuple(preview for preview in self._previews.list_previews(pending_only=False, limit=limit) if preview.approved)
@@ -244,7 +271,7 @@ class ManagedOrganizationService:
                 if assignment is not None:
                     if proposal is not None:
                         raise ValueError("Existing ownership cannot be replaced by a new proposal")
-                    return await self._runner.start(assignment.assignment_id)
+                    return await self._follow_up(preview_id, await self._runner.start(assignment.assignment_id))
                 snapshot = self._definitions.get(route.organization_id, route.revision)
                 if snapshot is None:
                     raise ValueError("Activated revision not found")
@@ -291,7 +318,7 @@ class ManagedOrganizationService:
                     event=route.event, preview_id=preview_id, proposal=proposal,
                 )
                 self._actor.set(self._operator)
-                return await self._runner.start(assignment.assignment_id)
+                return await self._follow_up(preview_id, await self._runner.start(assignment.assignment_id))
         finally:
             self._actor.reset(token)
 
@@ -311,6 +338,12 @@ class ManagedOrganizationService:
         preview = self._previews.get(preview_id)
         if preview is None:
             raise ValueError("Preview not found")
+        owner = self._assignments.for_task(str(preview.bundle_payload.get("task_id", "")))
+        if owner is not None and owner.preview_id == preview_id:
+            self._assignment(owner.assignment_id)
+            terminal = self._runs.get(owner.assignment_id)
+            if terminal is not None and terminal.state in {"completed", "failed", "cancelled"}:
+                return terminal
         route = self._route(preview)
         if route is None:
             raise PermissionError("Preview is outside this managed activation")
@@ -318,19 +351,20 @@ class ManagedOrganizationService:
         return self._runs.get(assignment.assignment_id) if assignment else None
 
     async def decide(self, assignment_id: str, *, request_id: str, approved: bool) -> ManagedRun:
-        self._assignment(assignment_id)
+        assignment = self._assignment(assignment_id)
         token = self._actor.set(self._operator)
         try:
-            return await self._runner.approve(assignment_id, request_id=request_id, approved=approved)
+            run = await self._runner.approve(assignment_id, request_id=request_id, approved=approved)
+            return await self._follow_up(assignment.preview_id, run)
         finally:
             self._actor.reset(token)
 
     async def respond(self, assignment_id: str, *, request_id: str, response: JsonValue) -> ManagedRun:
-        self._assignment(assignment_id)
+        assignment = self._assignment(assignment_id)
         token = self._actor.set(self._operator)
         try:
-            return await self._runner.resume(assignment_id, request_id=request_id,
-                                             response=response)
+            run = await self._runner.resume(assignment_id, request_id=request_id, response=response)
+            return await self._follow_up(assignment.preview_id, run)
         finally:
             self._actor.reset(token)
 

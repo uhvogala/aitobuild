@@ -299,6 +299,8 @@ class ManagedDeliveryBindings:
         github = self._github
         if github is None:
             raise PermissionError("Publication is not registered by the operator")
+        if context.assignment.task_id.startswith("published-correction-"):
+            raise PermissionError("Corrections require exact one-use operator publication approval")
         record = await _delivery_call(lambda: self._worker.publish(
             context.assignment.preview_id, github=github,
             require_human_approval_for_repo_writes=True, allow_mock_publication=self._allow_mock,

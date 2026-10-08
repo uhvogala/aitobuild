@@ -3,10 +3,10 @@
 An agentic product-team framework with Product Manager, Architect, and Developer
 roles, built on Microsoft Agent Framework and FastAPI.
 
-Current stage: foundation plus a local Developer execution prototype. This is
-not yet an autonomous issue-to-PR service. The next delivery target is one
-approved issue producing a tested draft PR in a disposable repository, with a
-human retaining merge authority. Configurable organization definitions, instance
+Current stage: supervised, opt-in issue-to-draft execution. This is
+not an autonomous issue-to-PR service. Approved tasks can produce tested draft
+PRs in disposable repositories, with humans retaining merge authority.
+Configurable organization definitions, instance
 factories and native workflow admission are available as library APIs. Persisted
 delegation and revision-pinned managed delivery graphs are also library APIs;
 opt-in service routing and detached local workers consume approved configured tasks.
@@ -20,20 +20,74 @@ Team structure and lifecycle are not fixed in code.
 - [.devcontainer/certs/README.md](.devcontainer/certs/README.md): host certificate setup.
 - [agents.md](agents.md): repository conventions for contributors and coding agents.
 
-## Current status (2026-10-07)
+## Current status (2026-10-08)
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Organization configuration | Immutable revisions, native graphs, durable assignments/runs, opt-in workers and native PM coordination | Review/correction orchestration and distributed controls |
-| Ingress and routing | Signed webhooks, internal auth, issue extraction, durable scope approval/dedupe and activated task queueing | Default activation and live configured-service acceptance |
-| Developer execution | Preview approval, command/file runs, structured exact-text edits, Docker sessions | Complete issue-to-branch-to-PR delivery |
-| Native model runtime | Configured Developer, read-only PM proposals and scoped Architect operations with persistent approvals | Broader PM planning/writes and live configured-service acceptance |
-| GitHub integration | Verified draft publication, immutable source/base diff reads and head-pinned COMMENT reviews through allowlisted gh CLI | Live publication and semantic review acceptance |
+| Organization configuration | Immutable revisions, native graphs, durable assignments/runs, opt-in workers, native PM coordination and bounded correction follow-ups | Broader live configuration coverage and distributed controls |
+| Ingress and routing | Signed webhooks, internal auth, issue extraction, durable scope approval/dedupe and activated task queueing | Hosted GitHub webhook delivery and deployment activation |
+| Developer execution | Preview approval, scoped exact-text edits, independent verification and approval-gated draft/correction delivery | Live same-PR correction and stronger isolation |
+| Native model runtime | Configured Developer, read-only PM proposals and scoped Architect operations with persistent approvals | Broader PM planning/writes and live model coverage |
+| GitHub integration | Verified draft publication, immutable source/base diff reads and head-pinned COMMENT reviews through allowlisted gh CLI | Live same-PR correction |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **805 tests pass**, with two optional prepared-target Docker
-probes skipped; Ruff and mypy (47 source files) and the mock fixture simulation pass.
+Current local gates after merged PRs #11/#13 at `69aa8d4` and bounded follow-ups: **853 tests pass**,
+with two optional prepared-target Docker probes skipped; Ruff and mypy (48 source
+files) pass. Local bounded follow-ups are preserved. Issues #9/#10 are resolved:
+uncertain PR creation adopts only the exact draft, state writes share the durable
+writer, and runtime checks survive Python `-O`. Correction reconciliation is
+read-only; only actual writes need the original live budget.
+Both real Docker probes passed separately. A fresh Grok trial for example issue
+#3 completed scoped implementation and five-test independent verification with
+cleanup, unchanged deadline and one recovered exact-span error. No task-result
+publication occurred in that first trial. A separately approved fresh issue #4
+trial then passed implementation, independent verification, exact remote snapshot
+checks and restart deduplication, producing [draft PR #5](https://github.com/uhvogala/aitobuild_example/pull/5).
+A native configured Architect inspected complete source/diffs and posted the exact
+operator-approved head-pinned COMMENT. The first review's five-minute budget
+expired and refused submission; a separately approved fresh 30-minute review
+completed with cleanup, without resetting the failed ledger. Its one-off report
+was adapted to retain JSON-safe role evidence rather than native message objects.
+No genuine defect or correction was proposed; live same-PR correction remains
+unrun. This is supervised operator-driven acceptance, not autonomous configured
+service/webhook acceptance. No merge, service commit/push or default activation.
+The subsequent approved service trial for issue #6 published
+[draft PR #7](https://github.com/uhvogala/aitobuild_example/pull/7) through the
+authenticated ASGI app and detached worker, with live Grok/Docker/GitHub adapters.
+Signed webhook injection, idle-approval restart, duplicate delivery, independent
+five-test verification and exact remote snapshot checks passed. One exact-span
+edit error was recovered before verification. Initial Architect inspection hit
+GitHub read errors and a model timeout; its failed run/aborted ledger are retained.
+A separately approved fresh revision/task/session/30-minute ledger completed
+source/diff inspection and the exact final-only COMMENT. Approval-boundary and
+terminal restarts preserved runs/budgets and exactly one remote review; cleanup
+passed. This local TestClient trial does not certify hosted webhook delivery,
+distributed execution or live correction. Evidence is retained under
+`sim/.run-artifacts/example-service-20261008`.
+A separately approved fresh full repeat for issue #8 produced
+[draft PR #9](https://github.com/uhvogala/aitobuild_example/pull/9) and its exact
+final-only COMMENT. Both native roles completed on their first attempt with zero
+saved diagnostics; ten narrowly checked native approvals, five independent tests,
+complete source/diff inspection, idle and terminal restarts, duplicate admission,
+exact remote snapshot and cleanup checks passed. Original ledgers and the prior
+trial remain unchanged. One-off metadata audit mistakes were corrected without
+model replay or COMMENT resubmission. Evidence is retained under
+`sim/.run-artifacts/example-service-20261008-fresh`; the same hosting and
+distributed-execution limits apply.
+The later explicitly labeled synthetic correction fixture for issue #10 produced
+[draft PR #11](https://github.com/uhvogala/aitobuild_example/pull/11). A fresh
+Architect review identified its negative-left sign bug and posted an exact
+final-only COMMENT under standing operator authorization. A linked fresh Developer
+correction passed six independent tests and exact nonce-bound publication approval,
+fast-forwarding that same PR to `9ddc9dcedacb70bb075bf2c3fd91f5444b36a3e8`.
+Restart/duplicate publication, exact remote snapshot, original ledger preservation,
+one-round bound and cleanup passed. Earlier timeout/provider failures and a
+supervisor-rejected harmless `true` command remain recorded. Operator retirement
+now supports abandoned idle approvals and already-aborted original budgets;
+neither is replayed or reset. The corrected-head review failed closed on provider
+`429 pd_decode_pushback`, so publication passed but the full correction/re-review
+cycle is not accepted. Evidence: `sim/.run-artifacts/example-correction-20261008/final-correction-report.json`.
 The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
 The original patch-repair
@@ -552,7 +606,7 @@ published branch; preparation does not fetch, and missing heads fail closed.
 Deleted initialized budgets cannot be recreated by replaying preparation.
 Register the existing delivery operations for implementation and independent
 verification; a completed metadata graph is neither an implemented correction
-nor a verified/publishable artifact.
+nor a verified/publishable artifact. The handoff slice was committed at `7d7ea13`.
 
 Same-PR correction publication (operator-only): each verified `published-correction-*`
 delivery is its own record holding one round and never rewrites the original. Authenticated
@@ -585,27 +639,93 @@ unreadable head stays `publishing`. Authenticated `POST
 /internal/organization/corrections/retire {correction_preview_id}` (live adapter only) retires a
 failed or abandoned unpublished correction only while the live PR head still equals its parent,
 invalidating any pending approval; both sibling checks skip released and retired corrections.
-Offering the same review again after its correction released the head (`not_applied` or retired)
-creates a new attempt with its own task ID, recording `correction_attempt` and the preview it
-replaces; offering while the latest attempt still holds the head returns that same preview.
-If our push landed but the PR was then closed or marked ready before reconciliation, the record
-stays `publishing` and cannot be retired; that case needs operator inspection.
+Re-offering that completed review after release or retirement creates the next linked attempt
+with a new task/preview and `replaces_correction`; an attempt still holding the head is reused.
+The replacement stays unapproved and needs fresh task and exact publication approval. Old
+receipts, approvals and aborted budgets remain unchanged; partial replacement staging recovers
+the same preview, not another attempt.
 An Architect COMMENT that GitHub binds to another commit is recorded, so a retry refuses instead
 of posting a duplicate. Only correction records related to the checked PR or parent head can
-block those checks, but any delivery file that cannot be parsed at all, even an unrelated one,
-fails every correction check closed until it is repaired or removed.
+block those checks; files that cannot be parsed at all still fail closed.
+A push that landed before the PR closed or became ready stays `publishing` for operator
+inspection; the service does not reopen the PR or change its state.
 Managed `delivery_publish` and the legacy publish endpoint refuse correction tasks.
 
 Twenty correction regressions cover actual native Architect mocked transports,
 exact approval and refusals, request/detached handoff, authenticated HTTP offers,
 staging recovery, scope/head/revision pins and fresh/missing-seed preparation.
-They prove handoff/preparation, not a live Developer correction or semantic review.
-Current gates: 684 passed/two optional Docker skips, Ruff/mypy (46 sources), clean
-diagnostics, constructor compatibility and successful mock fixture simulation.
-This continuation is committed as `7d7ea13`; no dependencies, remote writes, live model,
-GitHub/Docker trial or hosted CI were added. Same-PR correction publication is implemented
-(above) but has no live GitHub trial yet; native correction artifact acceptance, managed PM
-planning/writes and bounded meetings remain pending.
+That baseline proves handoff/preparation, not a live Developer correction or semantic review.
+
+### Complete Supervised Correction Cycle
+
+Register `NativeDeliveryImplementation` and `ManagedDeliveryBindings` against the
+same worker and scoped tools. Configure the Developer correction graph to use
+`delivery_implement`, then `delivery_verify`, through native graph edges, and finish
+with verified evidence. Publication is a separate operator action using the exact
+staged digest above; task/tool/COMMENT approval does not authorize it. There is no
+`delivery_publish_correction` operation or correction-target callback on the binding.
+No fixed team or universal contribution recipe is introduced; normal issue
+publication uses `delivery_publish`, which refuses corrections.
+
+Implementation retains exact saved tool approvals, scoped exact-span edits, cleanup
+and the original correction ledger. Independent verification uses the preparation-time
+operator command plan, a fresh constrained session, integer exit zero, successful
+cleanup and the unchanged checkout digest. Recovered errors remain diagnostics.
+
+Correction publication extends the reviewed head and updates the same pinned open
+draft PR, using its original public branch/base and a non-force update. It never
+publishes the private checkout branch or replaces the original delivery/review receipts.
+Exact parent/tree/message reconciliation supports interrupted publication; unrelated
+heads, target drift, changed artifacts and invalid budgets fail closed. Budget checks
+precede every correction upload and ref update, including reconciliation object
+writes. The head/target are rechecked immediately before the non-force PATCH, and
+the live ref is checked again afterward before reporting our commit as published.
+Failed/aborted runs are not replayable; only uncertain publication may reconcile
+under its saved consuming approval and original operator/budget.
+
+Set `automatic_review_followups=True` on the explicit managed service binding to stage
+a correction after a completed approved COMMENT, or a fresh head-pinned review after
+published delivery. A verified-only correction does not stage its next review until
+the operator publishes it. Follow-ups are separate **unapproved** tasks, not model assignment,
+approval or execution authority. Each task and COMMENT still needs fresh approval.
+Before each correction's preparation, the operator must provision its reviewed head
+and published branch in the local seed; the service does not fetch them.
+
+Set `max_correction_rounds` on review admission (integer 0-32, default 1). The root
+review's approved scope pins that ceiling, root identity and round; configuration
+changes cannot reset an active cycle. At the ceiling, another correction proposal
+records human escalation instead of creating a task. No proposal means no correction;
+neither outcome certifies semantic review or authorizes merge.
+
+Task responses/status and operator publication responses include saved `follow_up`
+metadata when present. Authenticated
+`POST /internal/organization/followups/offer` accepts only `{"preview_id": "..."}` and
+retries staging after interruption/error without replaying models, publication,
+approval or budgets. Staging failures preserve completed delivery and visible errors.
+
+PR consolidation (2026-10-08): [PR #11](https://github.com/uhvogala/aitobuild/pull/11)
+at `8bd1015` is imported locally atop `38c721d`, together with the preserved lifecycle.
+The operator-only one-use publisher replaces the earlier direct managed correction
+publisher. Combined gates: **798 passed/two optional Docker skips**, Ruff/mypy
+(47 sources), clean diagnostics, compatible callers and successful mock simulation.
+Regressions retain native SDK mocked-model exact edits, real disposable-file
+assertions through a recording verifier, request/detached decisions, bounded lineage
+and staging retries, plus exact approvals, chain/failure/retirement checks and
+per-write expiry and pre/post-PATCH race guards. The refresh adds six request/detached
+replacement-attempt cases covering release, retirement, interruption, tampering and immutable
+predecessors. Earlier lifecycle/sync/consolidation gates were 715/733/792 passing tests.
+Both existing hosted baseline checks for upstream `8bd1015` passed. The upstream adapter
+still lacks our budget callbacks and pre/post-PATCH guards; seven isolated upstream probes
+confirm the missing hooks and race gaps, reported in a [PR comment](https://github.com/uhvogala/aitobuild/pull/11#issuecomment-6055261194).
+No live model/Docker/contribution-publication trial, new hosted run, dependency change,
+default activation, commit, push or remote merge accompanies this refresh.
+Local evidence is not semantic/live acceptance.
+
+Next: [issue #9](https://github.com/uhvogala/aitobuild/issues/9)
+(uncertain PR-create response) and [issue #10](https://github.com/uhvogala/aitobuild/issues/10)
+(atomic-write/symlink/permission hardening), then freshly approved hosted/live
+delivery and review acceptance. Managed PM planning/writes and executed meetings
+remain separate work.
 
 ### API setup
 

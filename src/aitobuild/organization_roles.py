@@ -267,10 +267,13 @@ class NativeManagedRoles:
         context.revalidate()
         if response.user_input_requests:
             raise PermissionError("Unsupported native input cannot become managed role service approval")
+        final_message = response.messages[-1] if response.messages else None
+        if final_message is None or final_message.role != "assistant" or not final_message.text.strip():
+            raise ValueError("Managed role requires a final assistant response")
         if len(response.text.encode("utf-8")) > MAX_PROMPT_BYTES:
             raise ValueError("Managed role response exceeds the byte limit")
         await self._sessions.set(context.run.session_id, session)
-        return response.text
+        return final_message.text
 
     async def propose(self, context: ManagedTaskContext, message: Any) -> dict[str, Any]:
         agent = self._agent(context, AgentRole.PM)

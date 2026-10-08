@@ -74,7 +74,7 @@ def test_native_pm_proposal_is_scoped_read_only_metadata(tmp_path, proposal):
         body = json.loads(request.content)
         bodies.append(body)
         if len(bodies) == 1:
-            message = {"role": "assistant", "content": None, "tool_calls": [{"id": "read", "type": "function", "function": {
+            message = {"role": "assistant", "content": "I'll inspect the approved task before proposing an agent.", "tool_calls": [{"id": "read", "type": "function", "function": {
                 "name": "pm_inspect_approved_task", "arguments": "{}",
             }}]}
             finish = "tool_calls"
@@ -406,9 +406,12 @@ def test_publication_stages_unapproved_head_pinned_review_once(tmp_path, publish
 @pytest.mark.parametrize("detached", [False, True])
 @pytest.mark.parametrize("outcome", ["approve", "cancel_corrupt_preview", "correction", "correction_missing_seed",
                                      "correction_partial", "correction_scope", "correction_journal_loss", "correction_head_drift",
-                                     "correction_revision", "correction_missing_budget", "correction_sibling", "correction_retry"])
-def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, published_delivery, detached, outcome, monkeypatch, test_config,
-                                                                     verification_adapter):
+                                     "correction_revision", "correction_missing_budget", "correction_sibling", "correction_publication", "correction_publication_recovery",
+                                     "correction_retry", "correction_retry_retired", "correction_retry_interrupted",
+                                     "correction_native", "correction_native_recovered", "correction_native_rejected",
+                                     "correction_native_outside", "correction_native_verification_failure", "correction_native_head_drift",
+                                     "correction_native_followup_retry", "correction_native_two_rounds", "correction_native_publish_bypass", "correction_limit_zero"])
+def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, published_delivery, detached, outcome, monkeypatch, test_config, verification_adapter):
     from aitobuild.organization_reviews import PublishedReviewAdmission, PublishedReviewRoute
     from aitobuild.organization_service import ManagedOrganizationService
     from aitobuild.organization_worker import FileWorkerStore, ManagedOrganizationWorker
@@ -416,6 +419,24 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
     worker, published_id, developer_budget, github, _ = published_delivery
     definitions, snapshot = review_definition(tmp_path)
     correcting = outcome.startswith("correction")
+    native_correcting = outcome.startswith("correction_native")
+    if native_correcting:
+        document = snapshot.definition.model_dump(mode="json")
+        document["workflows"][0]["document"] = {
+            "format": "python_graph", "start": "implement",
+            "nodes": [{"id": "implement", "kind": "operation", "operation": "delivery_implement"},
+                      {"id": "verify", "kind": "operation", "operation": "delivery_verify"}],
+            "edges": [{"kind": "edge", "source": "implement", "target": "verify"}], "outputs": ["verify"],
+        }
+        if outcome == "correction_native_publish_bypass":
+            graph = document["workflows"][0]["document"]
+            graph["nodes"].append({"id": "publish", "kind": "operation", "operation": "delivery_publish"})
+            graph["edges"].append({"kind": "edge", "source": "verify", "target": "publish"})
+            graph["outputs"] = ["publish"]
+        snapshot = definitions.save(parse_organization_definition(json.dumps(document)))
+        expected = "True" if outcome == "correction_native_verification_failure" else "False"
+        command = "python -c \"import runpy; assert runpy.run_path('src/probe.py')['probe']() is " + expected + "\""
+        worker._sources = tuple(replace(source, verification_commands=(command,)) for source in worker._sources)
     previews = worker._previews if correcting else DeveloperPreviewRegistry(tmp_path / "review-previews.json")
     if correcting and outcome != "correction_missing_seed":
         published = worker.get(published_id)
@@ -432,8 +453,8 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
         worker._save(checkout.parent, replace(published, head_revision=head, publication=published.publication | {"head_sha": head}))
         number, repository = published.publication["pull_number"], published.publication["repository"]
         github.pull_requests[repository][number] = replace(github.pull_requests[repository][number], head_sha=head)
+        github._branch_heads[repository][published.branch] = head
         github.commit_files[(repository, head)] = github.commit_files[(repository, old_head)]
-        github._branch_heads.setdefault(repository, {})[published.branch] = head
         git(Path(published.source_path), "fetch", "--no-tags", "--no-write-fetch-head", str(checkout), head)
         git(Path(published.source_path), "update-ref", "refs/heads/" + published.branch, head)
     reviews = PublishedReviewAdmission(
@@ -442,21 +463,39 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                                      revision=snapshot.revision, event="published.review"),),
         correction_routes=(PublishedReviewRoute(repository="fixture/widgets", repository_id=101, organization_id=snapshot.organization_id,
                                                 revision=snapshot.revision, event="published.correction"),) if correcting else (),
+        max_correction_rounds=2 if outcome == "correction_native_two_rounds" else 0 if outcome == "correction_limit_zero" else 1,
     )
     before_developer = developer_budget.read_bytes()
     bodies = []
+    developer_bodies = []
 
     def reply(request):
         body = json.loads(request.content)
+        if any(tool["function"]["name"] == "developer_edit_file" for tool in body.get("tools", [])):
+            developer_bodies.append(body)
+            step = len(developer_bodies)
+            if step == 1 or step == 2 and outcome == "correction_native_recovered":
+                arguments = {"path": "outside.py" if outcome == "correction_native_outside" else "src/probe.py",
+                             "old_text": "stale exact span" if step == 1 and outcome == "correction_native_recovered" else "return True",
+                             "new_text": "return False", "approved": True}
+                message = {"role": "assistant", "content": None, "tool_calls": [{"id": f"edit-{step}", "type": "function", "function": {
+                    "name": "developer_edit_file", "arguments": json.dumps(arguments),
+                }}]}
+                finish = "tool_calls"
+            else:
+                message, finish = {"role": "assistant", "content": "Correction complete; independent verification required."}, "stop"
+            return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
+                                            "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
         bodies.append(body)
-        if len(bodies) == 3 and correcting:
+        step = (len(bodies) - 1) % 4 + 1 if native_correcting else len(bodies)
+        if step == 3 and correcting:
             message = {"role": "assistant", "content": None, "tool_calls": [{"id": "correction", "type": "function", "function": {
                 "name": "architect_propose_correction", "arguments": json.dumps({"paths": worker.get(published_id).publication["changed_paths"],
                                                                                 "objective": "Fix the inspected edge case"}),
             }}]}
             finish = "tool_calls"
-        elif len(bodies) <= 2:
-            name = "architect_read_published_source" if len(bodies) == 1 else "architect_read_published_diff"
+        elif step <= 2:
+            name = "architect_read_published_source" if step == 1 else "architect_read_published_diff"
             path = worker.get(published_id).publication["changed_paths"][0]
             message = {"role": "assistant", "content": None, "tool_calls": [{"id": f"read-{len(bodies)}", "type": "function", "function": {
                 "name": name, "arguments": json.dumps({"path": path}),
@@ -485,10 +524,30 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                     from aitobuild.organization_runner import ManagedOperation
 
                     operations["definition_probe"] = ManagedOperation(lambda task, message: {"prepared_correction": task.assignment.preview_id})
+                    cleanup = roles.cleanup
+                    if native_correcting:
+                        from aitobuild.agent_tools import DeveloperToolContext
+                        from aitobuild.organization_delivery import ManagedDeliveryBindings, NativeDeliveryImplementation
+                        from aitobuild.policy import AgentRole
+                        from aitobuild.tools.filesystem import MockFilesystemAdapter
+
+                        native = NativeDeliveryImplementation(worker=worker, runtime_for=runtime_for, state_dir=tmp_path / "correction-native",
+                            tools=DeveloperToolContext(bash_adapter=verification_adapter, filesystem_adapter=MockFilesystemAdapter(),
+                                container_session_adapter=verification_adapter, workspace_root=Path.cwd(), require_human_approval_for_repo_writes=True))
+                        bindings = ManagedDeliveryBindings(worker=worker, implementation=native, verification_adapter=verification_adapter,
+                            github=github, allow_mock_publication=True)
+                        assert "delivery_publish_correction" not in bindings.operations
+                        operations.update(bindings.operations)
+
+                        async def cleanup(task):
+                            role = next(agent.role for agent in task.snapshot.definition.agents if agent.id == task.assignment.agent_id)
+                            await (bindings.cleanup(task) if role == AgentRole.DEVELOPER else roles.cleanup(task))
+
                     return ManagedOrganizationService(
                         definitions=definitions, assignments=FileAssignmentStore(tmp_path / "review-assignments.json"), runs=FileRunStore(tmp_path / "review-runs"),
-                        previews=previews, worker=worker, routes=(), reviews=reviews, operations=operations, cleanup=roles.cleanup,
+                        previews=previews, worker=worker, routes=(), reviews=reviews, operations=operations, cleanup=cleanup,
                         operator_id="trusted-review-operator", binding_revision="reviews-v1",
+                        automatic_review_followups=native_correcting,
                     )
 
                 current = service()
@@ -529,6 +588,12 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                 assert reviews.budget_path(preview.preview_id).read_bytes() == budget_before
                 assert developer_budget.read_bytes() == before_developer
                 if correcting:
+                    if outcome == "correction_limit_zero":
+                        with pytest.raises(PermissionError, match="round limit"):
+                            await service().offer_correction(preview.preview_id)
+                        assert len(previews.list_previews(pending_only=True, limit=10)) == 0
+                        assert developer_budget.read_bytes() == before_developer
+                        return
                     with pytest.raises(PermissionError):
                         reviews.offer_correction(preview.preview_id, waiting)
                     if outcome == "correction_partial":
@@ -564,9 +629,9 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         assert previews.list_previews(pending_only=True, limit=10) == pending_before
                         assert [receipt.task_id for receipt in reviews._load().corrections.values()] == ["published-correction-sibling"]
                         assert developer_budget.read_bytes() == before_developer
-                        holds = worker.correction_releases_parent
+                        releases = worker.correction_releases_parent
                         monkeypatch.setattr(worker, "correction_releases_parent",
-                                            lambda preview_id: preview_id == "sibling-correction" or holds(preview_id))
+                                            lambda preview_id: preview_id == "sibling-correction" or releases(preview_id))
                         released = await service().offer_correction(preview.preview_id)
                         assert released is not None and released.preview_id != "sibling-correction" and not released.approved
                         assert developer_budget.read_bytes() == before_developer
@@ -647,6 +712,179 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         assert refused_retire.status_code == 409 and "mock reads are refused" in refused_retire.json()["detail"]
                         assert worker._approvals.get(correction.preview_id) is None
                     previews.approve(correction.preview_id)
+                    if native_correcting:
+                        original = worker.get(published_id)
+                        original_commits = len(github.branch_commits)
+
+                        def verify_command(adapter, session_id, request):
+                            record = worker.get(correction.preview_id)
+                            assert session_id != record.session_id
+                            result = subprocess.run(["sh", "-c", request["command"]], cwd=record.checkout_path,
+                                                    capture_output=True, text=True, timeout=5)
+                            if outcome == "correction_native_head_drift":
+                                github.pull_requests[repository][number] = replace(github.pull_requests[repository][number], head_sha="f" * 40)
+                                github._branch_heads[repository][original.publication["branch"]] = "f" * 40
+                            return {"ok": True, "status": "exited", "exit_code": result.returncode,
+                                    "output": result.stdout + result.stderr, "next_cursor": 1}
+
+                        monkeypatch.setattr("aitobuild.developer_delivery.shell_request", verify_command)
+
+                        async def invoke_native(assignment_id=None, request_id=None, approved=True):
+                            current = service()
+                            if not detached:
+                                return await current.consume(correction.preview_id) if assignment_id is None else await current.decide(
+                                    assignment_id, request_id=request_id, approved=approved)
+                            background = ManagedOrganizationWorker(service=current, store=FileWorkerStore(tmp_path / "correction-worker.json"))
+                            if assignment_id is None:
+                                background.enqueue(correction.preview_id)
+                            else:
+                                background.enqueue_decision(assignment_id, request_id=request_id, kind="approve", value=approved)
+                            await background.start()
+                            try:
+                                await background.wait_idle(correction.preview_id)
+                                return current.status(correction.preview_id)
+                            finally:
+                                await background.close()
+
+                        waiting = await invoke_native()
+                        assert waiting.state == "waiting", waiting.error
+                        if outcome == "correction_native_followup_retry":
+                            offer = reviews.offer
+                            attempts = []
+
+                            def interrupted_offer(preview_id):
+                                attempts.append(preview_id)
+                                if len(attempts) == 1:
+                                    raise OSError("Follow-up staging interrupted after successful publication")
+                                return offer(preview_id)
+
+                            monkeypatch.setattr(reviews, "offer", interrupted_offer)
+                        prepared = worker.get(correction.preview_id)
+                        artifact = Path(prepared.checkout_path) / "src/probe.py"
+                        assert artifact.read_text() == "def probe():\n    return True\n"
+                        budget_before = json.loads(worker.budget_path(correction.preview_id).read_text())
+                        completed = await invoke_native(waiting.assignment_id, waiting.pending[0].request_id,
+                                                        approved=outcome != "correction_native_rejected")
+                        if outcome == "correction_native_recovered":
+                            assert completed.state == "waiting", completed.error
+                            completed = await invoke_native(completed.assignment_id, completed.pending[0].request_id)
+                        record = worker.get(correction.preview_id)
+                        failed = outcome in {"correction_native_rejected", "correction_native_outside", "correction_native_verification_failure", "correction_native_publish_bypass"}
+                        assert completed.state == ("failed" if failed else "completed"), completed.error
+                        assert completed.cleanup_succeeded is True
+                        final_budget = json.loads(worker.budget_path(correction.preview_id).read_text())
+                        assert final_budget["deadline"] == budget_before["deadline"]
+                        assert worker.get(published_id) == original and developer_budget.read_bytes() == before_developer
+                        if failed:
+                            assert len(github.branch_commits) == original_commits and final_budget["aborted"]
+                            assert service().follow_up_status(completed.run_id) is None
+                            assert worker._approvals.get(correction.preview_id) is None
+                            return
+                        assert record.state == "verified" and artifact.read_text() == "def probe():\n    return False\n"
+                        assert completed.outputs[-1]["state"] == "verified"
+                        assert len(github.branch_commits) == original_commits
+                        assert service().follow_up_status(completed.run_id) is None
+                        assert worker._approvals.get(correction.preview_id) is None
+                        assert record.verification["commands"][0]["exit_code"] == 0 and record.verification["cleanup_succeeded"] is True
+                        assert record.verification["session_id"] != record.session_id
+                        assert final_budget["reserved_paths"] == ["src/probe.py"] and not final_budget.get("aborted", False)
+                        staged = await service().stage_correction_publication(correction.preview_id)
+                        assert staged["state"] == "pending" and staged["snapshot"]["parent_head_sha"] == original.publication["head_sha"]
+                        with pytest.raises(PermissionError, match="digest"):
+                            await service().publish_correction(correction.preview_id, approval_digest="0" * 64,
+                                                               github=github, allow_mock_publication=True)
+                        assert worker._approvals.get(correction.preview_id).state == "pending"
+                        if outcome == "correction_native_head_drift":
+                            with pytest.raises(ValueError, match="head moved"):
+                                await service().publish_correction(correction.preview_id, approval_digest=staged["digest"],
+                                                                   github=github, allow_mock_publication=True)
+                            assert worker.get(correction.preview_id).state == "failed"
+                            assert json.loads(worker.budget_path(correction.preview_id).read_text())["aborted"]
+                            assert len(github.branch_commits) == original_commits
+                            assert service().status(correction.preview_id) == completed
+                            return
+                        if outcome == "correction_native_followup_retry":
+                            class LiveFixtureGitHub:
+                                def __getattr__(self, name):
+                                    return getattr(github, name)
+
+                            with monkeypatch.context() as patched:
+                                patched.setattr("aitobuild.app.build_github_adapter", lambda **kwargs: LiveFixtureGitHub())
+                                with TestClient(create_app(test_config, managed_service_factory=lambda context: service())) as client:
+                                    response = client.post("/internal/organization/corrections/publish",
+                                        headers={"X-Internal-Token": test_config.security.internal_api_token},
+                                        json={"correction_preview_id": correction.preview_id, "approval_digest": staged["digest"]})
+                                    assert response.status_code == 200, response.json()
+                                    assert response.json()["accepted"] and response.json()["delivery"]["state"] == "published"
+                                    assert response.json()["review_preview"] is None and response.json()["follow_up"]["state"] == "error"
+                            record = worker.get(correction.preview_id)
+                        else:
+                            record, _ = await service().publish_correction(correction.preview_id, approval_digest=staged["digest"],
+                                                                          github=github, allow_mock_publication=True)
+                        assert record.state == "published" and worker._approvals.get(correction.preview_id).state == "consumed"
+                        assert record.publication["pull_number"] == original.publication["pull_number"]
+                        assert len(github.pull_requests[repository]) == 1
+                        followup = service().follow_up_status(completed.run_id)
+                        if outcome == "correction_native_followup_retry":
+                            assert followup["state"] == "error" and record.state == "published"
+                            count, commits = len(developer_bodies), len(github.branch_commits)
+                            with TestClient(create_app(test_config, managed_service_factory=lambda context: service())) as client:
+                                headers = {"X-Internal-Token": test_config.security.internal_api_token}
+                                endpoint = "/internal/organization/followups/offer"
+                                assert client.post(endpoint, json={"preview_id": correction.preview_id}).status_code == 401
+                                assert client.post(endpoint, headers=headers, json={"preview_id": correction.preview_id, "max_rounds": 32}).status_code == 400
+                                response = client.post(endpoint, headers=headers, json={"preview_id": correction.preview_id})
+                                assert response.status_code == 200 and response.json()["follow_up"]["state"] == "staged"
+                                assert client.post(endpoint, headers=headers, json={"preview_id": correction.preview_id}).json() == response.json()
+                                assert client.get("/internal/organization/tasks/" + correction.preview_id, headers=headers).json()["follow_up"] == response.json()["follow_up"]
+                            followup = service().follow_up_status(completed.run_id)
+                            assert len(developer_bodies) == count and len(github.branch_commits) == commits
+                            assert json.loads(worker.budget_path(correction.preview_id).read_text()) == final_budget
+                        assert followup["state"] == "staged"
+                        rereview_id = followup["next_preview_id"]
+                        assert not previews.get(rereview_id).approved and not reviews.budget_path(rereview_id).exists()
+                        assert reviews.target_for(rereview_id).head_sha == record.publication["head_sha"]
+                        count = len(developer_bodies)
+                        assert await service().consume(correction.preview_id) == completed
+                        assert len(developer_bodies) == count
+                        if outcome == "correction_native_recovered":
+                            from agent_framework import FileSessionStore
+
+                            session = await FileSessionStore(tmp_path / "correction-native" / "sessions").get(record.session_id)
+                            assert session.state["aitobuild_managed_diagnostics"]
+                        previews.approve(rereview_id)
+                        reviewing = await service().consume(rereview_id)
+                        assert reviewing.state == "waiting", reviewing.error
+                        reviewed = await service().decide(reviewing.assignment_id, request_id=reviewing.pending[0].request_id, approved=True)
+                        assert reviewed.state == "completed", reviewed.error
+                        escalated = service().follow_up_status(reviewed.run_id)
+                        if outcome == "correction_native_two_rounds":
+                            assert escalated["state"] == "staged"
+                            second_correction = previews.get(escalated["next_preview_id"])
+                            assert not second_correction.approved and not worker.budget_path(second_correction.preview_id).exists()
+                            assert reviews.correction_target_for(second_correction.preview_id)["preview_id"] == correction.preview_id
+                        else:
+                            assert escalated["state"] == "escalated" and "round limit" in escalated["error"]
+                            reset = PublishedReviewAdmission(definitions=definitions, previews=previews, worker=worker, github=github,
+                                state_dir=tmp_path / "review-admission", routes=reviews.routes, correction_routes=reviews.correction_routes,
+                                max_correction_rounds=32)
+                            with pytest.raises(PermissionError, match="round limit"):
+                                reset.offer_correction(rereview_id, reviewed)
+                            assert reset.follow_up_status(reviewed.run_id) == escalated
+                            journal_path = tmp_path / "review-admission" / "reviews.json"
+                            before_journal = journal_path.read_bytes()
+                            journal = json.loads(before_journal)
+                            for receipt in journal["receipts"].values():
+                                if receipt["review_preview_id"] == rereview_id:
+                                    receipt["max_correction_rounds"] = 32
+                            journal_path.write_text(json.dumps(journal))
+                            with pytest.raises(ValueError, match="lineage"):
+                                reset.route_for(rereview_id)
+                            journal_path.write_bytes(before_journal)
+                        assert len(github.reviews) == 2 and len(developer_bodies) == count
+                        assert json.loads(worker.budget_path(correction.preview_id).read_text()) == final_budget
+                        assert developer_budget.read_bytes() == before_developer
+                        return
                     if outcome == "correction_missing_seed":
                         with pytest.raises(ValueError, match="not prepared"):
                             await service().consume(correction.preview_id)
@@ -673,7 +911,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         assert {repo: dict(prs) for repo, prs in github.pull_requests.items()} == pulls_before
                         assert worker.get(correction.preview_id).state == prepared.state
                         assert json.loads(budget.path.read_text())["reserved_paths"] == []
-                        if outcome == "correction_retry":
+                        if outcome.startswith("correction_retry"):
                             corrected_path = done.outputs[0]["correction"]["paths"][0]
 
                             def implement_and_verify(preview_id):
@@ -690,22 +928,48 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
 
                             implement_and_verify(correction.preview_id)
                             staged_push = await service().stage_correction_publication(correction.preview_id)
-                            advance = github.advance_draft_pull_request_head
+                            if outcome == "correction_retry_retired":
+                                await service().retire_correction(correction.preview_id, github=github, allow_mock_publication=True)
+                                assert worker.get(correction.preview_id).state == "retired"
+                                assert worker._approvals.get(correction.preview_id).state == "invalidated"
+                            else:
+                                def rejected(**kwargs):
+                                    raise RuntimeError("GitHub rejected the ref update")
 
-                            def rejected(**kwargs):
-                                raise RuntimeError("GitHub rejected the ref update")
+                                with monkeypatch.context() as patched:
+                                    patched.setattr(github, "advance_draft_pull_request_head", rejected)
+                                    with pytest.raises(RuntimeError, match="rejected"):
+                                        await service().publish_correction(correction.preview_id, approval_digest=staged_push["digest"],
+                                                                           github=github, allow_mock_publication=True)
+                                assert worker.get(correction.preview_id).publication["push_outcome"] == "not_applied"
+                            previous_record = worker.get(correction.preview_id)
+                            previous_budget = worker.budget_path(correction.preview_id).read_bytes()
+                            previous_approval = worker._approvals.get(correction.preview_id)
+                            assert json.loads(previous_budget)["aborted"]
+                            if outcome == "correction_retry_interrupted":
+                                save = reviews._save
 
-                            monkeypatch.setattr(github, "advance_draft_pull_request_head", rejected)
-                            with pytest.raises(RuntimeError, match="rejected"):
-                                await service().publish_correction(correction.preview_id, approval_digest=staged_push["digest"],
-                                                                   github=github, allow_mock_publication=True)
-                            monkeypatch.setattr(github, "advance_draft_pull_request_head", advance)
-                            assert worker.get(correction.preview_id).publication["push_outcome"] == "not_applied"
+                                def interrupt_retry(journal):
+                                    if any(receipt.attempt == 2 and receipt.state == "staged" for receipt in journal.corrections.values()):
+                                        raise OSError("Replacement staging interrupted")
+                                    save(journal)
+
+                                with monkeypatch.context() as patched:
+                                    patched.setattr(reviews, "_save", interrupt_retry)
+                                    with pytest.raises(OSError, match="Replacement staging"):
+                                        await service().offer_correction(preview.preview_id)
+                                partial = next(item for item in previews.list_previews(pending_only=True, limit=10)
+                                               if item.source_payload.get("replaces_correction") == correction.preview_id)
+                                with pytest.raises(PermissionError):
+                                    reviews.correction_route_for(partial.preview_id)
                             retry = await service().offer_correction(preview.preview_id)
                             assert retry is not None and retry.preview_id != correction.preview_id and not retry.approved
                             assert retry.bundle_payload["task_id"] != correction.bundle_payload["task_id"]
                             assert retry.source_payload["replaces_correction"] == correction.preview_id
                             assert retry.source_payload["correction_attempt"] == 2
+                            assert not worker.budget_path(retry.preview_id).exists() and worker.get(retry.preview_id) is None
+                            if outcome == "correction_retry_interrupted":
+                                assert retry.preview_id == partial.preview_id
                             assert await service().offer_correction(preview.preview_id) == retry
                             journal_bytes = reviews._path.read_bytes()
                             reviews._load()
@@ -728,19 +992,88 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                                     reviews._load()
                             reviews._load()
                             assert reviews.correction_route_for(retry.preview_id).event == "published.correction"
+                            journal_path = tmp_path / "review-admission" / "reviews.json"
+                            original_journal = journal_path.read_bytes()
+                            for mutation in ("attempt", "predecessor", "target"):
+                                journal = json.loads(original_journal)
+                                latest = journal["corrections"][retry.bundle_payload["task_id"]]
+                                if mutation == "attempt":
+                                    latest["attempt"] = 3
+                                elif mutation == "predecessor":
+                                    latest["predecessor_preview_id"] = "unrelated-preview"
+                                else:
+                                    latest["target"]["head_sha"] = "f" * 40
+                                journal_path.write_text(json.dumps(journal))
+                                with pytest.raises(ValueError, match="attempt chain"):
+                                    reviews._load()
+                                journal_path.write_bytes(original_journal)
                             previews.approve(retry.preview_id)
                             assert (await service().consume(retry.preview_id)).state == "completed"
                             implement_and_verify(retry.preview_id)
                             staged_retry = await service().stage_correction_publication(retry.preview_id)
+                            assert staged_retry["digest"] != staged_push["digest"]
+                            with pytest.raises(PermissionError, match="digest"):
+                                await service().publish_correction(retry.preview_id, approval_digest=staged_push["digest"],
+                                                                   github=github, allow_mock_publication=True)
                             published_retry, _ = await service().publish_correction(
                                 retry.preview_id, approval_digest=staged_retry["digest"], github=github, allow_mock_publication=True)
                             assert published_retry.state == "published"
                             assert published_retry.publication["parent_head_sha"] == prepared.base_revision
                             assert github.pull_requests[repository][number].head_sha == published_retry.publication["head_sha"]
                             assert worker.superseded_by(published_id) == retry.preview_id
+                            assert worker.get(correction.preview_id) == previous_record
+                            assert worker.budget_path(correction.preview_id).read_bytes() == previous_budget
+                            assert worker._approvals.get(correction.preview_id) == previous_approval
+                            assert developer_budget.read_bytes() == before_developer
                             with pytest.raises(PermissionError, match="superseded"):
                                 await service().offer_correction(preview.preview_id)
                             return
+                        if outcome.startswith("correction_publication"):
+                            budget.reserve_paths(tuple(done.outputs[0]["correction"]["paths"]))
+                            worker.begin_implementation(correction.preview_id, bundle=bundle, session_id="correction-fixture", resume=False)
+                            artifact = Path(prepared.checkout_path) / done.outputs[0]["correction"]["paths"][0]
+                            artifact.write_text("def probe():\n    return False\n")
+                            worker.finish_implementation(correction.preview_id, session_id="correction-fixture")
+                            assert worker.verify(correction.preview_id, adapter=verification_adapter).state == "verified"
+                            original = worker.get(published_id)
+                            with pytest.raises(PermissionError):
+                                worker.publish(correction.preview_id, github=github,
+                                               require_human_approval_for_repo_writes=True, allow_mock_publication=True)
+                            staged = await service().stage_correction_publication(correction.preview_id)
+                            if outcome == "correction_publication_recovery":
+                                advance = github.advance_draft_pull_request_head
+
+                                def interrupted(**kwargs):
+                                    advance(**kwargs)
+                                    raise OSError("Applied push response interrupted")
+
+                                def unreadable(**kwargs):
+                                    raise RuntimeError("GitHub temporarily unavailable")
+
+                                with monkeypatch.context() as patched:
+                                    patched.setattr(github, "advance_draft_pull_request_head", interrupted)
+                                    patched.setattr(github, "reconcile_advanced_head", unreadable)
+                                    with pytest.raises(OSError, match="response interrupted"):
+                                        await service().publish_correction(correction.preview_id, approval_digest=staged["digest"],
+                                                                           github=github, allow_mock_publication=True)
+                                assert worker.get(correction.preview_id).state == "publishing"
+                                assert worker._approvals.get(correction.preview_id).state == "consuming"
+                            count = len(github.branch_commits)
+                            ledger = worker.budget_path(correction.preview_id).read_bytes()
+                            published_correction, _ = await service().publish_correction(
+                                correction.preview_id, approval_digest=staged["digest"], github=github, allow_mock_publication=True)
+                            assert published_correction.state == "published", published_correction.error
+                            assert published_correction.publication["pull_number"] == original.publication["pull_number"]
+                            assert published_correction.publication["branch"] == original.branch != prepared.branch
+                            assert worker.get(published_id) == original
+                            assert len(github.pull_requests[repository]) == 1
+                            assert reviews.correction_route_for(correction.preview_id).event == "published.correction"
+                            if outcome == "correction_publication_recovery":
+                                assert len(github.branch_commits) == count and worker.budget_path(correction.preview_id).read_bytes() == ledger
+                            repeated, _ = await service().publish_correction(correction.preview_id, approval_digest=staged["digest"],
+                                                                           github=github, allow_mock_publication=True)
+                            assert repeated == published_correction
+                            assert reviews.offer(correction.preview_id) is not None
                         if outcome == "correction_missing_budget":
                             budget.path.unlink()
                             assert worker.prepare(correction.preview_id).state == "failed"
@@ -917,7 +1250,7 @@ def test_published_review_http_hook_and_metadata_only_retry(tmp_path, published_
         assert developer_budget.read_bytes() == before
 
 
-@pytest.mark.parametrize("scenario", ["approved", "rejected", "metadata_only", "head_drift", "recovered", "publication_race",
+@pytest.mark.parametrize("scenario", ["approved", "preamble", "empty_final", "rejected", "metadata_only", "head_drift", "recovered", "publication_race",
                                       "partial_page", "skip_page", "oversized_output", "body_drift", "evidence_drift", "uncertain_submit", "expired_at_write",
                                       "correction", "correction_outside", "correction_partial", "correction_drift"])
 def test_native_architect_review_requires_inspection_and_exact_saved_approval(
@@ -955,11 +1288,12 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
             }}]}
             finish = "tool_calls"
         elif scenario == "metadata_only" or step >= 3:
-            message = {"role": "assistant", "content": "  Scoped source/diff inspected; retain human merge authority.  "}
+            message = {"role": "assistant", "content": "   " if scenario == "empty_final" else "  Scoped source/diff inspected; retain human merge authority.  "}
             finish = "stop"
         else:
             name = "architect_read_published_source" if step <= 1 else "architect_read_published_diff"
-            message = {"role": "assistant", "content": None, "tool_calls": [{"id": f"read-{len(bodies)}", "type": "function", "function": {
+            preamble = "I'll inspect the published source and base diffs for both changed files, then evaluate multiply behavior, add preservation, and test coverage."
+            message = {"role": "assistant", "content": preamble if scenario in {"preamble", "empty_final"} else None, "tool_calls": [{"id": f"read-{len(bodies)}", "type": "function", "function": {
                 "name": name, "arguments": json.dumps({"path": "outside.py" if step == 0 else path} |
                     ({"max_bytes": 1} if scenario in {"partial_page", "correction_partial"} else {}) |
                     ({"offset": 5} if scenario == "skip_page" and step == 1 else {})),
@@ -983,11 +1317,16 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
 
                 before = json.loads(Path(assignment.budget_path).read_text())
                 waiting = await make_runner(adapter()).start(assignment.assignment_id)
-                if scenario in {"metadata_only", "partial_page", "skip_page", "oversized_output", "correction_partial"}:
+                if scenario == "empty_final":
+                    assert waiting.state == "failed" and "final assistant response" in waiting.error
+                    assert not waiting.pending and not github.reviews
+                    assert json.loads(Path(assignment.budget_path).read_text()) == before | {"aborted": True}
+                elif scenario in {"metadata_only", "partial_page", "skip_page", "oversized_output", "correction_partial"}:
                     assert waiting.state == "failed" and "complete source and diff" in waiting.error
                 else:
                     assert waiting.state == "waiting", waiting.error
                     assert waiting.pending[0].kind == "service_approval"
+                    assert waiting.pending[0].data["body"] == "Scoped source/diff inspected; retain human merge authority."
                     assert github.reviews == []
                     if scenario == "correction":
                         assert waiting.pending[0].data["correction"] == {"paths": [path], "objective": "Correct the inspected edge case and retain passing tests"}
@@ -1035,7 +1374,7 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                         monkeypatch.setattr(worker, "submit_architect_review", expired)
                     done = await make_runner(adapter()).approve(assignment.assignment_id, request_id=waiting.pending[0].request_id,
                                                                approved=scenario != "rejected")
-                    if scenario in {"approved", "recovered", "correction", "correction_outside"}:
+                    if scenario in {"approved", "preamble", "recovered", "correction", "correction_outside"}:
                         assert done.state == "completed", done.error
                         assert github.reviews[0].body == "aitobuild Architect review\n\nScoped source/diff inspected; retain human merge authority."
                         assert len(github.reviews) == 1

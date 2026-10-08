@@ -51,7 +51,7 @@ CORRECTION_TASK_PREFIX = "published-correction-"
 
 
 _UNBOUND_REVIEW_PREFIX = "Architect COMMENT already posted for head "
-_RETIRABLE_STATES = frozenset({"failed", "prepared", "implemented", "verified"})
+_RETIRABLE_STATES = frozenset({"failed", "prepared", "awaiting_tool_approval", "implemented", "verified"})
 
 
 def _is_correction_record(record: Any) -> bool:
@@ -473,6 +473,7 @@ class DeveloperDeliveryWorker:
                     raise ValueError("Publication tree fingerprint changed; renew verification")
                 title, body, commit_message = self._publication_metadata(bundle, record)
                 base_ref = issue.base_branch
+                publication_branch = record.branch
                 publication = {
                     **{key: prior[key] for key in ("pull_number", "html_url", "head_sha") if key in prior},
                     "title": title,
@@ -491,7 +492,7 @@ class DeveloperDeliveryWorker:
                     },
                     "base_ref": base_ref,
                     "base_sha": record.base_revision,
-                    "branch": record.branch,
+                    "branch": publication_branch,
                     "repository": issue.repository,
                     "issue_number": issue.issue_number,
                 }
@@ -510,7 +511,7 @@ class DeveloperDeliveryWorker:
                     head_sha = github.upsert_branch_commit(
                         role=AgentRole.DEVELOPER,
                         repository=issue.repository,
-                        branch=record.branch,
+                        branch=publication_branch,
                         base_sha=record.base_revision,
                         commit_message=commit_message,
                         files=files,
@@ -535,7 +536,7 @@ class DeveloperDeliveryWorker:
                     repository=issue.repository,
                     title=title,
                     body=body,
-                    head_branch=record.branch,
+                    head_branch=publication_branch,
                     base_ref=base_ref,
                     issue_number=issue.issue_number,
                     existing_pull_number=existing,
@@ -558,8 +559,8 @@ class DeveloperDeliveryWorker:
                 self._save(directory, record)
                 budget.remaining_seconds()
                 if (not pull.draft or pull.state != "open" or pull.head_sha != head_sha
-                        or pull.head_ref != record.branch or pull.base_ref != base_ref
-                        or pull.repository != issue.repository):
+                    or pull.head_ref != publication_branch or pull.base_ref != base_ref
+                    or pull.repository != issue.repository):
                     raise RuntimeError("Publication requires an open draft PR at the verified head and target")
                 publication = {**publication, "published_at": datetime.now(tz=UTC).isoformat()}
                 record = replace(
@@ -1124,7 +1125,7 @@ class DeveloperDeliveryWorker:
                 budget_path = self.budget_path(preview_id)
                 if budget_path.exists():
                     bundle = developer_task_bundle_from_payload(record.bundle_payload)
-                    DeveloperTaskBudget(path=budget_path, bundle=bundle, create=False).abort()
+                    DeveloperTaskBudget(path=budget_path, bundle=bundle, create=False, allow_aborted=True).abort()
             now = datetime.now(tz=UTC).isoformat()
             record = replace(record, state="retired", error=record.error or "Retired by operator",
                              retirement={"actor_id": actor_id.strip(), "retired_at": now,

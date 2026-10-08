@@ -1,8 +1,53 @@
 # Delivery Milestones
 
-Last verified: 2026-10-07. This is the execution roadmap; [PLAN.md](PLAN.md)
+Last verified: 2026-10-08. This is the execution roadmap; [PLAN.md](PLAN.md)
 describes the target architecture and [README.md](README.md) documents setup.
 Statuses below are evidence-based, not completion estimates or promised dates.
+
+Latest refresh: merged PRs #11/#13 pulled to `69aa8d4`, preserving local bounded
+follow-ups. Current gates: 853 tests pass/two optional Docker skips; Ruff/mypy (48 sources) pass.
+Issues #9/#10/#12 are resolved. Exact recovery is read-only; every actual remote
+write remains original-budget guarded. Older consolidation counts and blocker
+descriptions below are historical. Both real Docker probes and fresh Grok scoped
+implementation/independent five-test verification passed with cleanup. A separate
+approved fresh issue #4 task published draft PR #5 after exact remote snapshot
+and restart-deduplication checks. Configured native Architect source/diff review
+and exact approved head-pinned COMMENT also passed. An expired first review
+remains failed/aborted; its successor's approved original window was 30 minutes,
+not an extension. Reporting recovery did not replay the model. No correction was
+proposed; live same-PR correction remains pending. No merge or service commit/push occurred.
+The subsequent supervised local service trial published draft PR #7 for fresh
+issue #6 through signed webhook injection/authenticated ASGI TestClient controls
+and the detached worker using live Grok/Docker/GitHub. Idle-checkpoint restart,
+duplicate delivery, independent five-test verification, exact remote snapshot and
+cleanup checks passed. One exact-span error was recovered before verification.
+The first Architect task failed on network reads/model timeout and retains its
+failed run/aborted ledger. A separately approved fresh revision/task/session and
+30-minute ledger passed complete source/diff review and exact final-only COMMENT.
+Approval-boundary/terminal restart and duplicate run preserved runs/ledgers and
+one remote review. Local reports: `sim/.run-artifacts/example-service-20261008`.
+Hosted webhook delivery, distributed execution and live correction are not certified.
+An independently approved full repeat for fresh issue #8 published draft PR #9
+and exact final-only COMMENT at head `f4c7d00b6754f7e31c1ea25fb06ab06eb0b5c013`.
+Both native roles completed their first attempt with zero saved diagnostics;
+ten checked native approvals, independent five-test verification, complete
+source/diff inspection, idle/terminal restart, duplicate admission, exact remote
+pins and cleanup passed. One review, unchanged original ledgers and preserved
+prior trial evidence were confirmed. Reporting-only audit mistakes were repaired
+without model replay or reposting. Report:
+`sim/.run-artifacts/example-service-20261008-fresh/report.json`. No hosted,
+distributed or live-correction acceptance is implied.
+Subsequent live correction publication passed on the explicitly synthetic issue
+#10/draft PR #11: Architect inspection and exact final-only COMMENT proposed a
+two-path fix; a linked fresh Developer task passed six independent tests and
+advanced the same PR under exact nonce-bound approval. Remote bytes/modes/parent,
+restart/duplicate publication, unchanged original ledgers, retired predecessor,
+one-round ceiling and cleanup passed. Timeout/provider failures and a supervisor
+no-op refusal are retained; idle retirement/aborted-budget recovery were fixed with
+regressions, never by resetting or replaying tasks. The corrected-head Architect
+review failed on provider `429 pd_decode_pushback`; the full correction/re-review
+cycle remains pending. Evidence:
+`sim/.run-artifacts/example-correction-20261008/final-correction-report.json`.
 
 ## Direction
 
@@ -37,19 +82,20 @@ execute task code against the aitobuild service checkout.
 
 | Area | Evidence | Status |
 | --- | --- | --- |
-| Organization configuration | Immutable definitions, native graphs, assignments/runs, opt-in workers and native PM coordination | Review/correction orchestration and distributed controls next |
+| Organization configuration | Immutable definitions, native graphs, assignments/runs, opt-in workers, native PM coordination and bounded supervised correction cycles | Broader PM/meeting work and distributed controls next |
 | Local setup | Python 3.14+, uv, certificate bootstrap and 16 certificate tests | Implemented |
 | Ingress/governance | Signed webhooks, internal auth, dedupe, previews, role policy | Local durable previews/issue-task dedupe; other ingress state in memory |
 | Local Developer pipeline | Copied fixture, preview approval, subprocess tests and file write | Verified on 2026-10-05 |
 | Developer model/tool path | Foundry/v1 clients, private tools, terminal/process/browser and file memory | Live Grok/Kimi evaluations; strict zero-error acceptance pending |
 | Persistent Docker sessions | Private checkouts/home volumes, restart memory/history and scoped cleanup | Live integration evidence; prototype isolation only |
 | MCP shell/filesystem | Native stdio transport adapter, configurable names | Optional; compatibility validation pending |
-| GitHub output | Allowlisted gh CLI branch/commit/draft publication, immutable snapshot capture and exact remote reconciliation | Locally regression-verified prototype; live acceptance pending |
-| Architect/PM/meetings | Native PM delegation, published-review routing, saved COMMENT approvals and scoped correction handoff/preparation | Native correction acceptance, managed PM writes and meetings pending |
+| GitHub output | Allowlisted gh CLI branch/commit/draft publication, immutable snapshot capture and exact remote reconciliation | Supervised local service live acceptance passed; hosted delivery/correction pending |
+| Architect/PM/meetings | Native PM delegation, saved COMMENT approvals, native correction/verification, same-PR updates and bounded re-review staging | Scoped live Architect review passed; live correction, managed PM writes and meetings pending |
 | Operations | Manual tick API, local durable managed worker and successful hosted CI baseline | M0 accepted; broader durable state/distributed controls and tracing missing |
 
-Current local gates with scoped correction handoff: **684 passed, two optional Docker probes skipped**;
-Ruff and mypy (46 source files) and the mock fixture simulation pass. Worker gates
+Current local gates with consolidated PR #11 and supervised correction cycles atop
+`38c721d`: **798 passed, two optional Docker probes skipped**;
+Ruff and mypy (47 source files) and the mock fixture simulation pass. Worker gates
 passed with 587; service gates
 passed with 549; runner gates
 passed with 531; assignment gates passed with 492;
@@ -448,12 +494,12 @@ prepares a separate checkout/branch/budget from the reviewed head in an explicit
 provisioned local seed; no fetch or old approval/deadline reset. Twenty new native
 Architect mock/request/detached/HTTP/recovery/preparation cases pass. Full gates:
 **684 passed/two optional Docker skips**, Ruff/mypy (46 sources), diagnostics,
-constructor compatibility and mock simulation. This continuation is committed as `7d7ea13`;
+constructor compatibility and mock simulation. This handoff was committed at `7d7ea13`;
 no external trial or remote write. Handoff/preparation is not a native corrected
 artifact or independent verification. Useful live review/correction and bounded meeting
 execution remain required before M3 acceptance.
 
-Same-PR correction publication (2026-10-08, PR #11): verified corrections become a chain of
+Consolidated correction lifecycle (2026-10-08, PR #11 head `8bd1015`): verified corrections become a chain of
 immutable records, each fast-forwarding the pinned draft PR once behind an operator's one-use,
 nonce-bound exact approval, then staging the next Architect review at the new head. Only the
 chain tip may be offered or published; superseded IDs are refused with the tip. Push failures
@@ -462,6 +508,42 @@ failed/abandoned correction while the live head still equals its parent, and re-
 after a release starts a new attempt with a new task ID. Gates: **805
 passed/two optional Docker skips**, Ruff/mypy (47 sources). A live GitHub trial of the
 same-PR loop is still required before M3 acceptance.
+failed/abandoned correction while the live head still equals its parent.
+Re-offering after release/retirement creates a linked fresh attempt requiring fresh task and
+publication approval; holding attempts dedupe, interrupted staging recovers the same preview,
+and predecessor budgets/approvals remain unchanged. Unparseable records fail closed; a landed
+push on a closed/ready PR needs operator inspection rather than reopening the PR.
+
+Native configured Developer tools produce scoped corrections through exact saved
+approvals and finish with independent preparation-pinned verification. Publication
+is a separate exact-digest operator action, not a native graph operation; a verified
+run cannot invent publication approval or stage its next review before publication.
+Correction commits extend the reviewed parent on the original public branch using
+non-force updates and exact remote reconciliation, leaving private branches and
+original receipts/ledgers separate. Opt-in service follow-ups stage unapproved
+correction and fresh re-review tasks; approval and execution remain separate.
+The approved root scope pins round/ceiling (0-32, default 1); exhausted correction
+proposals escalate to humans. Saved staging retries cannot replay model/publication
+or reset budgets, and failures retain published evidence and diagnostics. Each
+correction still needs an operator-provisioned reviewed head/branch in its seed.
+Full gates: **798 passed/two optional Docker skips**, Ruff/mypy (47 sources), editor
+diagnostics, compatible callers and mock simulation. Thirty-one new regressions
+include native SDK mocked transport, real disposable-file edits/assertions through
+recording verification sessions, request/detached recovery and mocked CLI writes.
+Per-write original-budget checks cover uploads and reconciliation; a pre-PATCH
+head/target recheck refuses a competing update; a post-PATCH live-ref check refuses
+to report an already-moved head as our commit. Operator publication responses retain
+saved follow-up errors for ID-only metadata retries without replaying the push.
+The PR import and local lifecycle are consolidated uncommitted atop `38c721d`;
+earlier lifecycle/sync/consolidation gates were 715/733/792 passing tests. Six added
+request/detached cases cover replacement release/retirement, recovery, tamper and immutable
+predecessors. Existing hosted baseline checks passed at upstream `8bd1015`, but its adapter
+still lacks the local budget callbacks and pre/post-PATCH guards. Seven isolated upstream
+probes confirm those gaps, reported in a [PR comment](https://github.com/uhvogala/aitobuild/pull/11#issuecomment-6055261194).
+No live model/Docker/contribution-publication trial, new hosted run, dependencies, commit,
+push or remote merge.
+This completes local correction-lifecycle implementation, not semantic/live M3
+acceptance or executed meeting coverage.
 
 
 Deliverables:
@@ -508,8 +590,15 @@ Exit criteria:
 
 ## Immediate Work Queue
 
+Local integration of [PR #11](https://github.com/uhvogala/aitobuild/pull/11)
+(operator-only correction approvals/chain recovery) and the preserved managed
+lifecycle is complete and uncommitted. Next resolve [issue #9](https://github.com/uhvogala/aitobuild/issues/9)
+(uncertain PR-create receipt) and [issue #10](https://github.com/uhvogala/aitobuild/issues/10)
+(atomic-write/symlink/permission hardening) before claiming live delivery acceptance.
+These remain open; no remote PR merge or live trial was performed.
+
 1. Preserve the configurable definition/storage regressions and existing M0/M1, exact-span and publication safeguards. Run CI for new slices; never target the service checkout.
-2. Opt-in configured service routing and detached worker admission/lifecycle/startup recovery are locally implemented. Next bounded integration: broader scoped PM/Architect adapters and reviewable target source/diff, with configurable native orchestration and trusted actor context. Preserve immutable assignment/run/admission receipts and original budgets; never replay interrupted effects or widen unmanaged endpoint permissions. Keep activation explicit, with no fixed team/contribution loop. Distributed controls remain a separate follow-up.
+2. Prioritize uncertain PR-create recovery and shared storage/permission hardening before fresh live delivery acceptance. Opt-in service/worker routing, PM coordination, source/diff inspection and supervised correction cycles are locally implemented. Broader integration remains managed PM planning/issue writes and bounded executed meetings. Preserve immutable receipts, exact separate approvals and original budgets; never replay uncertain effects or widen permissions. Keep activation explicit, with no fixed team/contribution loop. Distributed controls remain separate.
 3. Preserve passing request-scoped/detached fixture acceptance (signed/authenticated delivery, decisions/restart, native SDK/mock-transport tools and independent verification/mock draft graph), and run hosted CI when authorized publication of the service changes is available. Default server activation, live configured-worker delivery and hosted CI remain unverified. Keep GitHub assignee writes separate and do not infer semantic review from metadata.
 4. Stage a freshly approved live draft trial using outcome-based contribution grading. Recheck GitHub hosting/authentication/allowlist; do not replay the previously aborted task. Recovered tool errors are diagnostics, not contribution blockers. Stage head-bound COMMENT review only with actual source/diff inspection before claiming semantic review.
 

@@ -260,6 +260,79 @@ def test_gh_advance_refuses_foreign_head_and_lost_race(monkeypatch) -> None:
     _never_creates_or_rebases(raced)
 
 
+@pytest.mark.parametrize("stop_at", [1, 2, 3, 4])
+def test_advance_rechecks_original_budget_before_every_remote_write(stop_at, monkeypatch) -> None:
+    head = "b" * 40
+    fake = FakeGitHub(head=head)
+    checks = []
+
+    def before_write():
+        checks.append(len(checks) + 1)
+        if len(checks) == stop_at:
+            raise TimeoutError("Original correction deadline expired")
+
+    with pytest.raises(TimeoutError, match="deadline expired"):
+        _advance(_gh(fake, monkeypatch), expected=head, before_write=before_write)
+    assert len(checks) == stop_at
+    assert sum(method == "POST" for method, _ in fake.calls) == stop_at - 1
+    assert all(method != "PATCH" for method, _ in fake.calls)
+    assert fake.ref == head
+
+
+def test_advance_rechecks_head_after_commit_creation_before_patch(monkeypatch) -> None:
+    head = "b" * 40
+    fake = FakeGitHub(head=head)
+    adapter = _gh(fake, monkeypatch)
+
+    def race_after_commit(endpoint, *, method="GET", payload=None):
+        result = fake(endpoint, method=method, payload=payload)
+        if method == "POST" and endpoint.endswith("/git/commits"):
+            fake.ref = "f" * 40
+            fake.commits[fake.ref] = {"tree": {"sha": "9" * 40}, "parents": [{"sha": head}], "message": "other"}
+        return result
+
+    monkeypatch.setattr(adapter, "_api", race_after_commit)
+    with pytest.raises(ValueError, match="moved from the pinned SHA"):
+        _advance(adapter, expected=head)
+    assert all(method != "PATCH" for method, _ in fake.calls)
+    assert fake.ref == "f" * 40
+
+
+def test_advance_does_not_report_our_head_after_a_post_patch_race(monkeypatch) -> None:
+    head = "b" * 40
+    fake = FakeGitHub(head=head)
+    adapter = _gh(fake, monkeypatch)
+
+    def race_after_patch(endpoint, *, method="GET", payload=None):
+        result = fake(endpoint, method=method, payload=payload)
+        if method == "PATCH":
+            fake.ref = "f" * 40
+            fake.commits[fake.ref] = {"tree": {"sha": "9" * 40}, "parents": [{"sha": head}], "message": "other"}
+        return result
+
+    monkeypatch.setattr(adapter, "_api", race_after_patch)
+    with pytest.raises(RuntimeError, match="head moved after the correction push"):
+        _advance(adapter, expected=head)
+    assert sum(method == "PATCH" for method, _ in fake.calls) == 1
+    assert fake.ref == "f" * 40 and _reconcile(adapter, expected=head)[0] == "moved"
+
+
+def test_reconciliation_needs_no_object_writes_after_budget_expiry(monkeypatch) -> None:
+    head = "b" * 40
+    fake = FakeGitHub(head=head)
+    adapter = _gh(fake, monkeypatch)
+    _advance(adapter, expected=head)
+    fake.calls.clear()
+
+    def expired(*arguments, **keywords):
+        raise TimeoutError("Original correction deadline expired")
+
+    monkeypatch.setattr(adapter, "_create_publish_tree", expired)
+    outcome, pull = _reconcile(adapter, expected=head)
+    assert outcome == "ours" and pull.head_sha == fake.ref
+    assert all(method == "GET" for method, _ in fake.calls)
+
+
 @pytest.mark.parametrize(("kwargs", "message"), [
     ({"draft": False}, "open draft"),
     ({"state": "closed"}, "open draft"),

@@ -4,6 +4,66 @@ This document describes the target architecture, not a fully implemented system.
 The implementation snapshot in section 7 distinguishes available capabilities
 from remaining work. Operational milestones are tracked in [MILESTONES.md](MILESTONES.md).
 
+Latest refresh (2026-10-08): master is `69aa8d4` after merged PRs #11/#13, with
+local bounded follow-ups preserved. Current gates: 853 tests pass/two optional Docker
+skips, Ruff and mypy (48 sources). Issues #9/#10/#12 are resolved upstream.
+Read-only exact reconciliation supersedes older notes about recovery object
+uploads; write-time budget and pre/post-PATCH guards remain enforced. Historical
+consolidation counts and then-open blocker descriptions below are not current.
+Both real Docker probes and a fresh scoped Grok implementation/independent
+five-test verification trial passed. A separate approved fresh issue #4 task then
+published [draft PR #5](https://github.com/uhvogala/aitobuild_example/pull/5) with
+exact tree/bytes/modes/head/base checks and restart deduplication. A configured
+native Architect inspected complete immutable source/diffs and submitted only
+the exact operator-approved COMMENT, pinned to that head. An initial five-minute
+review expired and failed closed; a freshly approved 30-minute task completed
+without changing the prior deadline/abort. A reporting-only native Message
+serialization error was recovered from persisted metadata, without model replay.
+No genuine defect/correction was proposed. Live same-PR correction and combined
+configured-service acceptance were pending at that slice; old deadlines are never reset.
+Subsequent supervised service acceptance (2026-10-08): signed webhook injection
+through the authenticated ASGI app/TestClient and detached worker produced
+draft PR #7 for fresh issue #6 with live Grok, Docker and GitHub adapters. Idle
+checkpoint restart, duplicate delivery, five-test independent verification,
+exact remote bytes/modes/parent/head/base and cleanup passed. An exact-span edit
+error was recovered. The first Architect task failed on GitHub read errors/model
+timeout and remains failed/aborted; a separately approved new revision/task/session
+and original 30-minute ledger completed full source/diff inspection and exact
+final-only COMMENT submission. Saved-approval and terminal restart/deduplication
+preserved ledgers and exactly one review. Reports are in
+`sim/.run-artifacts/example-service-20261008`. Hosted webhook delivery, distributed
+operations and live same-PR correction remain unverified. No merge, service
+commit/push, dependencies or default activation.
+Fresh full service repeat (2026-10-08): separately approved issue #8 produced
+draft PR #9 at `f4c7d00b6754f7e31c1ea25fb06ab06eb0b5c013`. Both native roles
+completed their first attempt with zero saved diagnostics. Ten checked native
+approvals, independent five-test verification, four complete source/diff
+inspections, exact separately approved final-only COMMENT, idle/terminal restart,
+duplicate admission, remote pins and cleanup passed. Exactly one COMMENT remains
+at review `5457488010`, with original Developer/review ledgers and prior trial
+evidence unchanged. Metadata-only audit mistakes were corrected without model
+replay or COMMENT resubmission. Evidence:
+`sim/.run-artifacts/example-service-20261008-fresh/report.json`. This is still
+local signed-webhook/TestClient acceptance, not hosted or distributed execution;
+no correction, merge, service commit/push, dependencies or default activation.
+Bounded live same-PR correction publication (2026-10-08): a new explicitly
+synthetic known-fault issue #10/draft PR #11 was inspected by the native Architect,
+with exact final-only COMMENT and a two-path signed-multiplication proposal.
+Three failed review attempts remain intact; the successful fresh review used the
+correctly wired role timeout. A first correction was cancelled after the trial
+supervisor rejected harmless `true`; operator retirement now permits its abandoned
+idle state with an already-aborted original budget, without resets. A linked fresh
+task completed six independent tests and consumed its exact nonce-bound approval
+to advance the same PR from `a99e973116ebd31800af11de56c51e78c77ffbcb` to
+`9ddc9dcedacb70bb075bf2c3fd91f5444b36a3e8`. Exact remote pins, preserved tests,
+restart/duplicate publication, original ledgers, retired predecessor, one-round
+limit and cleanup passed. Corrected-head Architect review failed closed on provider
+`429 pd_decode_pushback`; full correction/re-review acceptance remains pending.
+Report: `sim/.run-artifacts/example-correction-20261008/final-correction-report.json`.
+Standing user authorization is consumed through scoped service approvals and exact
+publication digests, not approval bypass or default activation. No merge or service
+commit/push; hosted delivery and distributed operation remain unverified.
+
 ## 1. Executive Summary
 This document outlines a supervised, configurable product-team framework using
 the **Microsoft Agent Framework (Python)**. PM, Architect and Developer are
@@ -324,10 +384,11 @@ Docker skips**, Ruff/mypy (46 sources), diagnostics, role/admission/service cons
 compatibility and successful mock fixture simulation. Twenty new parameterized
 cases include actual native Architect mocked transport and request/detached/HTTP
 handoff/recovery. No dependency/live model/GitHub/Docker/hosted CI/push/remote write.
-This continuation is committed as `7d7ea13`; native correction artifact acceptance, managed
+This handoff continuation was committed locally at `7d7ea13`; native correction artifact acceptance, managed
 PM planning/writes, bounded meetings and live review remain pending.
 
-Same-PR correction publication (2026-10-08, PR #11, branch `feat/same-pr-correction`):
+Consolidated correction lifecycle (2026-10-08, PR #11 head `8bd1015`, locally
+imported atop `38c721d` without a commit or remote merge):
 each verified correction is its own immutable delivery record holding one round; the original
 is never rewritten. Operator-only `stage-publication`/`publish`/`retire` endpoints pin one exact
 snapshot (diff, PR, branch/base, parent head, chain, triggering review receipt) behind a one-use,
@@ -346,6 +407,55 @@ release creates a new attempt with a new task ID. A landed push on a PR closed o
 before reconciliation stays publishing for operator inspection. Gates: **805 passed/two
 optional Docker skips**, Ruff/mypy (47 sources). No live GitHub trial, hosted CI or automatic
 correction loop yet.
+moved head fails and keeps holding it, an unreadable head stays resumable. Retire releases a
+failed/abandoned correction only while the live head equals its parent.
+Re-offering a released/retired correction starts a linked fresh attempt with a new task/preview
+and fresh approvals, without rewriting predecessor receipts, approvals or budgets. Holding
+attempts and partial replacement staging remain idempotent; attempt gaps, wrong predecessors
+and target drift fail closed. Attempts do not advance or reset the pinned correction-round limit.
+Unparseable delivery files block correction checks; a landed push on a closed/ready PR remains
+publishing for operator inspection, without reopening it.
+
+Configured native Developer graphs reuse implementation/independent verification
+and end verified, without publication. Operator staging and exact digest approval
+are required separately; task/tool/COMMENT approvals cannot substitute. The earlier
+direct `delivery_publish_correction` operation and binding callback are removed.
+Exact tree/parent/message reconciliation handles uncertain publishing under the
+saved consuming approval/operator. Original-budget checks precede every upload/ref
+update, including reconciliation object writes; live target/head are rechecked
+immediately before PATCH. Private checkout branches remain separate.
+An opt-in service follow-up binding stages unapproved correction/re-review tasks,
+never actor selection, task/COMMENT approval or execution. Root identity, round and
+operator ceiling (0-32, default 1) are pinned in approved review scope/journals;
+exhaustion records human escalation and changed bindings cannot reset the cycle.
+Saved errors/next-task metadata are visible in status, with ID-only authenticated
+staging retries that cannot replay native work/publication or reset ledgers.
+Frozen terminal status remains visible after live-head drift; active admission
+still refuses stale targets. Every preparation needs an already-provisioned seed.
+Combined gates: **798 passed/two optional Docker skips**, Ruff/mypy (47 sources), diagnostics,
+caller compatibility and mock simulation. Thirty-one new cases include native SDK
+mocked transport with real scoped file edits/disposable-file assertions, request
+and detached execution, rejection/recovered errors, verification failure, same-PR
+recovery, mocked CLI non-force/expiry/race checks and immutable round ceilings.
+Additional tests cover verify-only completion with no approval/write, managed
+publication bypass refusal, exact operator publication and visible saved staging
+errors, last-moment expiry, pre/post-PATCH races and service recovery without replay.
+Six added request/detached cases cover released/retired replacements, interrupted staging,
+attempt-chain tampering and immutable predecessor budgets/approvals. Existing hosted baseline
+checks passed for upstream `8bd1015`; local-only budget callbacks and pre/post-PATCH guards are
+still absent there. Seven isolated upstream probes expose those gaps, reported in a
+[PR comment](https://github.com/uhvogala/aitobuild/pull/11#issuecomment-6055261194).
+No live model/Docker/contribution-publication trial, new hosted run, dependencies, commit or push;
+local evidence is not semantic/live acceptance. PM planning/writes and executed
+meetings remain separate milestones.
+
+Historical lifecycle/sync/consolidation gates were 715/733/792 passing tests. The consolidation
+retains draft-ref validation, review `commit_id` receipts and removal of the stale
+Architect-approve setting. Open [issue #9](https://github.com/uhvogala/aitobuild/issues/9)
+requires immediate reconciliation of uncertain PR-create responses; [issue #10](https://github.com/uhvogala/aitobuild/issues/10)
+tracks shared atomic-write, symlink and permission hardening. Those fixes remain
+pending. Address them before fresh approved live/hosted acceptance; PM planning/writes
+and bounded executed meetings remain separate milestones.
 
 ### Current Limits
 
@@ -353,7 +463,7 @@ correction loop yet.
 - `developer.async.webhook` returns task metadata by default. Detached consumption exists only for explicitly service/worker-factory-activated approved repository routes, not default startup.
 - Supported repository issue events produce target-specific bundles and require approval-time base SHA pinning. Checkout preparation validates membership in the explicitly configured local seed/base branch, not live GitHub repository identity or remote freshness. No automatic remote lookup/fetch occurs. Legacy fixture payloads without repository context retain prototype routing; unsupported repository webhook events and missing issue criteria are rejected.
 - GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions at `88720aa`. Live acceptance remains pending. The operator installed checksum-verified `gh` 2.102.0 locally for the fresh trial and verified `uhvogala` on github.com; this is not a default image dependency. No live task-result publication has been tested.
-- General PM draft/write-approval stores remain in memory. Explicit native PM coordinator bindings now feed saved read-only proposals into trusted service assignments; managed PM planning/issue writes remain pending. Opt-in publication-to-Architect staging/routing and scoped correction handoff retain separate task and exact COMMENT approvals. Native correction artifact acceptance, live same-PR update acceptance, automatic correction/meeting orchestration and live semantic acceptance remain pending. Reads support regular UTF-8 files up to 1 MiB; binary/link/submodule review needs another approved adapter, not a bypass.
+- General PM draft/write-approval stores remain in memory. Explicit native PM coordinator bindings feed saved read-only proposals into trusted service assignments; managed PM planning/issue writes remain pending. Opt-in publication-to-Architect staging and bounded correction/re-review follow-ups retain separate task, exact COMMENT and one-use correction publication approvals. Native correction edits, verification and same-PR updates are locally regression-tested, not live-certified. Meetings and live semantic acceptance remain pending. Reads support regular UTF-8 files up to 1 MiB; binary/link/submodule review needs another approved adapter, not a bypass.
 - Meetings construct workflows without executing them, and proactive scans interpret supplied metadata rather than inspecting a repository.
 - Scheduler ticks require an external caller; meeting/scheduler state and non-repository trigger dedupe remain in memory. Previews, approvals and repository issue task/delivery identities persist locally. `dispatched` records metadata routing, not worker completion; inspect the saved queue after restart. Distributed coordination and full lifecycle auditing remain pending.
 - Native runs without a bound preview and unbound legacy runs remain prototypes. Approved native tasks persist unique-path reservations and an absolute deadline, fail closed after abort, and use offline read-only repository execution. Browser/arbitrary MCP adapters are excluded; native memory has a separate scoped SDK store. Distributed coordination, durable auditing and scratch/disk quotas remain pending.

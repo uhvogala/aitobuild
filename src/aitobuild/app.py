@@ -31,6 +31,7 @@ from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import make_internal_event, normalize_github_webhook, parse_trigger_request
 from aitobuild.organization_assignments import AssignmentProposal
 from aitobuild.organization_delivery import _delivery_call
+from aitobuild.organization_runner import ManagedRun
 from aitobuild.organization_service import ManagedOrganizationService, ManagedServiceContext
 from aitobuild.organization_worker import ManagedOrganizationWorker, WorkerJob
 from aitobuild.proactive import ArchitectScanRunner
@@ -458,12 +459,19 @@ def create_app(
                     }
         return metadata if metadata else None
 
+    def _run_metadata(run: ManagedRun | None) -> dict[str, Any]:
+        result = {"managed_run": run.model_dump(mode="json") if run is not None else None}
+        if run is not None and managed_service is not None:
+            followup = managed_service.follow_up_status(run.run_id)
+            if followup is not None:
+                result["follow_up"] = followup
+        return result
+
     def _worker_metadata(job: WorkerJob) -> dict[str, Any]:
         if managed_service is None:
             raise RuntimeError("Internal invariant violated: managed_service is not None")
         run = managed_service.recorded_run(job.task_id)
-        return {"managed_admission": job.model_dump(mode="json"),
-                "managed_run": run.model_dump(mode="json") if run is not None else None}
+        return {"managed_admission": job.model_dump(mode="json"), **_run_metadata(run)}
 
     async def _consume_managed(preview_id: str) -> dict[str, Any] | None:
         if managed_service is None:
@@ -477,7 +485,7 @@ def create_app(
             raise HTTPException(status_code=409, detail="Managed task invocation is already active") from error
         except (ValueError, PermissionError, RuntimeError, OSError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        return {"managed_run": run.model_dump(mode="json")} if run is not None else None
+        return _run_metadata(run) if run is not None else None
 
     async def _dispatch_metadata(result: Any, *, event_payload: dict[str, Any]) -> dict[str, Any] | None:
         metadata = _metadata_with_runtime_hooks(result, event_payload=event_payload)
@@ -712,6 +720,22 @@ def create_app(
             return managed_worker.diagnostics()
 
     if managed_service is not None:
+        @app.post("/internal/organization/followups/offer")
+        async def offer_managed_follow_up(
+            payload: dict[str, Any],
+            x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        ) -> dict[str, Any]:
+            _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+            if set(payload) != {"preview_id"} or not isinstance(payload["preview_id"], str) or not payload["preview_id"].strip():
+                raise HTTPException(status_code=400, detail="Follow-up staging accepts only preview_id")
+            if managed_service is None:
+                raise RuntimeError("Internal invariant violated: managed_service is not None")
+            try:
+                result = await managed_service.offer_follow_up(payload["preview_id"].strip())
+            except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return {"follow_up": result}
+
         @app.post("/internal/organization/corrections/offer")
         async def offer_scoped_correction(
             payload: dict[str, Any],
@@ -765,9 +789,14 @@ def create_app(
                 )
             except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
-            return {"accepted": record.state == "published", "delivery": record.to_payload(),
-                    "review_preview": {"preview_id": review.preview_id, "approved": review.approved,
-                                       "bundle": review.bundle_payload} if review else None}
+            result = {"accepted": record.state == "published", "delivery": record.to_payload(),
+                      "review_preview": {"preview_id": review.preview_id, "approved": review.approved,
+                                         "bundle": review.bundle_payload} if review else None}
+            run = managed_service.status(record.preview_id)
+            followup = managed_service.follow_up_status(run.run_id) if run is not None else None
+            if followup is not None:
+                result["follow_up"] = followup
+            return result
 
         @app.post("/internal/organization/corrections/retire")
         async def retire_scoped_correction(
@@ -822,7 +851,7 @@ def create_app(
                 raise HTTPException(status_code=404, detail=str(error)) from error
             except (PermissionError, OSError) as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
-            return {"managed_run": run.model_dump(mode="json") if run is not None else None}
+            return _run_metadata(run)
 
         @app.post("/internal/organization/tasks/{operation}")
         async def managed_task_control(
@@ -887,7 +916,7 @@ def create_app(
                 raise HTTPException(status_code=409, detail="Managed task invocation is already active") from error
             except (ValueError, PermissionError, RuntimeError, OSError) as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
-            return {"managed_run": run.model_dump(mode="json")}
+            return _run_metadata(run)
 
     @app.get("/internal/pm/plans")
     def list_pm_plans(
@@ -1043,13 +1072,16 @@ def create_app(
             raise HTTPException(status_code=400, detail="preview_id must be a non-empty string")
         preview_id = preview_id.strip()
         try:
-            if delivery_worker.get(preview_id) is None:
+            current_delivery = delivery_worker.get(preview_id)
+            if current_delivery is None:
                 raise HTTPException(status_code=404, detail="Delivery not found")
             if isinstance(github_adapter, MockGitHubAdapter):
                 raise HTTPException(
                     status_code=409,
                     detail="Publication requires a live GitHub adapter (gh_cli); mock publication is refused",
                 )
+            if current_delivery.task_id.startswith("published-correction-"):
+                raise HTTPException(status_code=409, detail="Corrections require exact one-use operator publication approval")
             record = await _delivery_call(lambda: delivery_worker.publish(
                 preview_id,
                 github=github_adapter,

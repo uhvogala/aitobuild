@@ -311,6 +311,7 @@ class GitHubAdapter(Protocol):
         changes: Mapping[str, GitHubPinnedChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], Any] | None = None,
     ) -> tuple[AdvanceOutcome, GitHubPullRequest]: ...
 
 
@@ -642,6 +643,8 @@ class MockGitHubAdapter:
             if remote_head != expected:
                 raise ValueError("Pull request head moved from the pinned SHA; refusing stale correction")
             _check_write_budget(before_write)
+            if self._branch_heads.get(repo, {}).get(branch, current.head_sha) != expected:
+                raise ValueError("Pull request head moved from the pinned SHA; refusing stale correction")
             self._record_mock_commit(repo, head_sha, payload, expected, files)
             self._branch_heads.setdefault(repo, {})[branch] = head_sha
         advanced = replace(current, head_sha=head_sha)
@@ -661,6 +664,7 @@ class MockGitHubAdapter:
         changes: Mapping[str, GitHubPinnedChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], Any] | None = None,
     ) -> tuple[AdvanceOutcome, GitHubPullRequest]:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -1417,6 +1421,7 @@ class GhCliGitHubAdapter:
         changes: Mapping[str, GitHubPinnedChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], Any] | None = None,
     ) -> tuple[AdvanceOutcome, GitHubPullRequest]:
         """Classify the live branch head after an uncertain push: untouched parent, our exact commit, or moved.
 
