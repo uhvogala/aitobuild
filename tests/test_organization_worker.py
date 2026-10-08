@@ -524,7 +524,7 @@ def test_interrupted_admission_save_never_invokes_graph(tmp_path, approved_deliv
     _, _, preview_id, _, _ = approved_delivery
     worker, _, _, calls = make_worker(tmp_path, approved_delivery)
     with monkeypatch.context() as patch:
-        patch.setattr("aitobuild.organization_worker.os.fsync",
+        patch.setattr("aitobuild.durable_files.os.fsync",
                       lambda *args: (_ for _ in ()).throw(OSError("Interrupted admission")))
         with pytest.raises(OSError, match="Interrupted admission"):
             worker.enqueue(preview_id)

@@ -13,6 +13,7 @@ from math import isfinite
 from typing import Any
 
 from filelock import FileLock
+from aitobuild.durable_files import atomic_write_text
 
 
 class IsolationTool(StrEnum):
@@ -99,9 +100,7 @@ class DeveloperTaskBudget:
 
     def _save(self, state: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(state), encoding="utf-8")
-        temporary.replace(self.path)
+        atomic_write_text(self.path, json.dumps(state))
 
     def remaining_seconds(self) -> float:
         with self._lock:

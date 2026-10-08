@@ -32,7 +32,7 @@ Team structure and lifecycle are not fixed in code.
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **792 tests pass**, with two optional prepared-target Docker
+Verified locally: **805 tests pass**, with two optional prepared-target Docker
 probes skipped; Ruff and mypy (47 source files) and the mock fixture simulation pass.
 The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.

@@ -7,13 +7,13 @@ from datetime import UTC, datetime
 from hashlib import sha256
 import json
 import math
-import os
 from pathlib import Path
 from typing import Annotated, Literal, Protocol, Self
 
 from filelock import FileLock, Timeout as LockTimeout
 from pydantic import AwareDatetime, Field, JsonValue, StrictBool, StrictInt, StrictStr, model_validator
 
+from aitobuild.durable_files import atomic_write_text
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.organization import DefinitionModel
 from aitobuild.organization_assignments import AssignmentCapacityError, AssignmentProposal, Digest
@@ -123,17 +123,7 @@ class FileWorkerStore:
         return journal
 
     def _save(self, journal: WorkerJournal) -> None:
-        temporary = self._checked(self._path.with_suffix(".tmp"))
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(journal.model_dump_json())
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(self._checked(self._path))
-        descriptor = os.open(self._path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        atomic_write_text(self._checked(self._path), journal.model_dump_json())
 
     def get(self, preview_id: str) -> WorkerJob | None:
         with self._lock():
@@ -271,7 +261,8 @@ class ManagedOrganizationWorker:
         self.service.validate_selection(route, proposal)
         content = json.dumps(preview.bundle_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
         now = datetime.now(tz=UTC)
-        assert preview.approved_at is not None
+        if preview.approved_at is None:
+            raise PermissionError("Worker admission requires an approved preview")
         job = self.store.admit(WorkerJob(
             preview_id=preview_id, task_id=str(preview.bundle_payload["task_id"]), activation=route,
             binding_revision=self.service.binding_revision, bundle_content=content,
@@ -351,7 +342,8 @@ class ManagedOrganizationWorker:
                 await self._abort(current)
                 self._update(current, state="cancelled", error="Operator cancelled worker admission")
         result = self.store.get(preview_id)
-        assert result is not None
+        if result is None:
+            raise RuntimeError("Internal invariant violated: result is not None")
         return result
 
     async def wait_idle(self, preview_id: str) -> WorkerJob:
@@ -381,7 +373,8 @@ class ManagedOrganizationWorker:
                         if current is not None and (current.state in {"queued", "running"} or
                                                     current.state == "waiting" and current.cancel_requested):
                             parent = asyncio.current_task()
-                            assert parent is not None
+                            if parent is None:
+                                raise RuntimeError("Internal invariant violated: parent is not None")
                             task = asyncio.create_task(self._execute(current))
                             self._active[current.preview_id] = task
                             try:
@@ -471,7 +464,8 @@ class ManagedOrganizationWorker:
                     raise RuntimeError("Interrupted worker decision; automatic replay is blocked")
                 if run is not None and run.state in {"ready", "running"}:
                     run = await self.service.consume(job.preview_id, activation=job.activation)
-                    assert run is not None
+                    if run is None:
+                        raise RuntimeError("Internal invariant violated: run is not None")
                     self._update(job, state=run.state, error=run.error)
                     return
             self._update(job, state="running")

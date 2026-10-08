@@ -22,6 +22,7 @@ from uuid import uuid4
 
 from filelock import FileLock
 
+from aitobuild.durable_files import atomic_write_text
 from aitobuild.developer_isolation import (
     DeveloperTaskBudget, DeveloperTaskBundle, developer_task_bundle_from_payload, is_command_allowed, is_path_allowed,
 )
@@ -915,7 +916,8 @@ class DeveloperDeliveryWorker:
                 return current
             resuming = current is not None and current.state == "publishing"
             if resuming:
-                assert current is not None
+                if current is None:
+                    raise RuntimeError("Internal invariant violated: current is not None")
                 settled = self._resume_by_live_head(
                     directory, current, approval_digest=approval_digest, review_receipt_digest=review_receipt_digest,
                     actor_id=actor_id, github=github,
@@ -970,7 +972,8 @@ class DeveloperDeliveryWorker:
     def _finish_correction_publication(
         self, directory: Path, record: DeliveryPreparation, pull: Any, *, approval_digest: str,
     ) -> DeliveryPreparation:
-        assert record.publication is not None
+        if record.publication is None:
+            raise RuntimeError("Internal invariant violated: record.publication is not None")
         head_sha = (pull.head_sha or "").lower()
         publication = {**record.publication, "head_sha": head_sha, "html_url": pull.html_url, "draft": True,
                        "pull_head_sha": head_sha, "published_at": datetime.now(tz=UTC).isoformat()}
@@ -1041,7 +1044,8 @@ class DeveloperDeliveryWorker:
         approval_digest: str, budget: DeveloperTaskBudget | None,
     ) -> None:
         """Terminal push failure: `not_applied` releases the parent head, `moved` keeps holding it."""
-        assert record.publication is not None
+        if record.publication is None:
+            raise RuntimeError("Internal invariant violated: record.publication is not None")
         if budget is not None:
             budget.abort()
         self._save(directory, replace(
@@ -1064,7 +1068,8 @@ class DeveloperDeliveryWorker:
           resumable only under the same approval and operator.
         The original exception is always re-raised unless the push is reconciled as published.
         """
-        assert record.publication is not None
+        if record.publication is None:
+            raise RuntimeError("Internal invariant violated: record.publication is not None")
         error = str(failure) or type(failure).__name__
         try:
             outcome, pull = github.reconcile_advanced_head(
@@ -1703,14 +1708,4 @@ class DeveloperDeliveryWorker:
 
     def _save(self, directory: Path, record: DeliveryPreparation) -> None:
         directory.mkdir(parents=True, exist_ok=True)
-        temporary = directory / "state.tmp"
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump({"version": 1, "record": record.to_payload()}, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(directory / "state.json")
-        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        atomic_write_text(directory / "state.json", json.dumps({"version": 1, "record": record.to_payload()}))

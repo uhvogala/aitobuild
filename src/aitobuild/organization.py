@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,6 +14,7 @@ from pydantic import (
     BaseModel, ConfigDict, Field, JsonValue, StrictInt, StrictStr, TypeAdapter, model_validator,
 )
 
+from aitobuild.durable_files import atomic_write_text, sync_directory
 from aitobuild.policy import AgentRole
 
 
@@ -24,14 +24,6 @@ EventName = Annotated[StrictStr, Field(pattern=r"^[a-z][a-z0-9_.-]*$", max_lengt
 
 class DefinitionModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-
-
-def sync_directory(directory: Path) -> None:
-    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 class AgentDefinition(DefinitionModel):
@@ -309,12 +301,6 @@ class FileDefinitionStore:
         with FileLock(str(path.parent / ".lock"), timeout=10):
             if self.get(snapshot.organization_id, snapshot.revision) is not None:
                 return snapshot
-            temporary = path.with_suffix(".tmp")
-            with temporary.open("w", encoding="utf-8") as handle:
-                handle.write(snapshot.content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            temporary.replace(path)
-            for directory in (path.parent, self._root):
-                sync_directory(directory)
+            atomic_write_text(path, snapshot.content)
+            sync_directory(self._root)
         return snapshot

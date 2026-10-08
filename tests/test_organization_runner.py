@@ -683,7 +683,7 @@ def test_run_store_rejects_rewinding_and_interrupted_save_preserves_receipt(tmp_
         store.save(ManagedRun.model_validate(waiting.model_dump() | {"state": "ready", "pending": ()}))
     running = ManagedRun.model_validate(waiting.model_dump() | {"state": "running", "pending": ()})
     with monkeypatch.context() as patch:
-        patch.setattr("aitobuild.organization_runner.os.fsync", lambda descriptor: (_ for _ in ()).throw(OSError("Interrupted")))
+        patch.setattr("aitobuild.durable_files.os.fsync", lambda descriptor: (_ for _ in ()).throw(OSError("Interrupted")))
         with pytest.raises(OSError, match="Interrupted"):
             store.save(running)
     assert store.get(assignment.assignment_id) == waiting

@@ -305,7 +305,8 @@ def kickoff_meeting_bootstrap(
     orchestrator_agent = runtime.role_agents.get("pm") or participants[0]
     try:
         builder_class = runtime.bindings.group_chat_builder_class
-        assert builder_class is not None
+        if builder_class is None:
+            raise RuntimeError("Internal invariant violated: builder_class is not None")
         workflow_builder = builder_class(
             participants=participants,
             orchestrator_agent=orchestrator_agent,

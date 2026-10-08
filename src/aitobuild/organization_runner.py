@@ -20,8 +20,9 @@ from agent_framework import (
 from filelock import FileLock
 from pydantic import AwareDatetime, JsonValue, StrictBool, StrictStr, TypeAdapter, model_validator
 
+from aitobuild.durable_files import atomic_write_text, sync_directory
 from aitobuild.developer_isolation import DeveloperTaskBudget
-from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, Identifier, sync_directory
+from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, Identifier
 from aitobuild.organization_assignments import (
     AssignmentProposal, AssignmentService, AssignmentStore, Digest, TaskAssignment,
 )
@@ -178,13 +179,7 @@ class FileRunStore:
                     raise ValueError("Managed run state cannot rewind or skip finalization")
                 if run.decisions[:len(original.decisions)] != original.decisions:
                     raise ValueError("Consumed workflow decisions are immutable")
-            temporary = path.with_suffix(".tmp")
-            with temporary.open("w", encoding="utf-8") as handle:
-                handle.write(run.model_dump_json())
-                handle.flush()
-                os.fsync(handle.fileno())
-            temporary.replace(path)
-            sync_directory(directory)
+            atomic_write_text(path, run.model_dump_json())
             sync_directory(self._directory)
 
 

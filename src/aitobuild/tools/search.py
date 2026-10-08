@@ -86,7 +86,8 @@ def _run_rg(
         timer.start()
         exhausted = False
         try:
-            assert process.stdout is not None
+            if process.stdout is None:
+                raise RuntimeError("Internal invariant violated: process.stdout is not None")
             yield from _records(process.stdout, kind)
             exhausted = True
         finally:
@@ -94,7 +95,8 @@ def _run_rg(
                 process.kill()
             process.wait()
             timer.cancel()
-            assert process.stdout is not None
+            if process.stdout is None:
+                raise RuntimeError("Internal invariant violated: process.stdout is not None")
             process.stdout.close()
         errors.seek(0)
         diagnosis = errors.read(2000).decode("utf-8", errors="replace").strip()

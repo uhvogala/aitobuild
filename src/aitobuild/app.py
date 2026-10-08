@@ -358,7 +358,8 @@ def create_app(
 
         @asynccontextmanager
         async def managed_lifespan(application: FastAPI):
-            assert managed_worker is not None
+            if managed_worker is None:
+                raise RuntimeError("Internal invariant violated: managed_worker is not None")
             await managed_worker.start()
             try:
                 yield
@@ -458,7 +459,8 @@ def create_app(
         return metadata if metadata else None
 
     def _worker_metadata(job: WorkerJob) -> dict[str, Any]:
-        assert managed_service is not None
+        if managed_service is None:
+            raise RuntimeError("Internal invariant violated: managed_service is not None")
         run = managed_service.recorded_run(job.task_id)
         return {"managed_admission": job.model_dump(mode="json"),
                 "managed_run": run.model_dump(mode="json") if run is not None else None}
@@ -705,7 +707,8 @@ def create_app(
             x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
         ) -> dict[str, object]:
             _assert_internal_auth(config=app_config, provided_token=x_internal_token)
-            assert managed_worker is not None
+            if managed_worker is None:
+                raise RuntimeError("Internal invariant violated: managed_worker is not None")
             return managed_worker.diagnostics()
 
     if managed_service is not None:
@@ -717,7 +720,8 @@ def create_app(
             _assert_internal_auth(config=app_config, provided_token=x_internal_token)
             if set(payload) != {"review_preview_id"} or not isinstance(payload["review_preview_id"], str) or not payload["review_preview_id"].strip():
                 raise HTTPException(status_code=400, detail="Correction staging accepts only review_preview_id")
-            assert managed_service is not None
+            if managed_service is None:
+                raise RuntimeError("Internal invariant violated: managed_service is not None")
             try:
                 preview = await managed_service.offer_correction(payload["review_preview_id"].strip())
             except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
@@ -733,7 +737,8 @@ def create_app(
             if (set(payload) != {"correction_preview_id"} or not isinstance(payload["correction_preview_id"], str)
                     or not payload["correction_preview_id"].strip()):
                 raise HTTPException(status_code=400, detail="Correction publication staging accepts only correction_preview_id")
-            assert managed_service is not None
+            if managed_service is None:
+                raise RuntimeError("Internal invariant violated: managed_service is not None")
             try:
                 staged = await managed_service.stage_correction_publication(payload["correction_preview_id"].strip())
             except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
@@ -751,7 +756,8 @@ def create_app(
                 raise HTTPException(status_code=400, detail="Correction publish accepts only correction_preview_id and approval_digest")
             if isinstance(github_adapter, MockGitHubAdapter):
                 raise HTTPException(status_code=409, detail="Publication requires a live GitHub adapter (gh_cli); mock publication is refused")
-            assert managed_service is not None
+            if managed_service is None:
+                raise RuntimeError("Internal invariant violated: managed_service is not None")
             try:
                 record, review = await managed_service.publish_correction(
                     payload["correction_preview_id"].strip(), approval_digest=payload["approval_digest"].strip(),
@@ -774,7 +780,8 @@ def create_app(
                 raise HTTPException(status_code=400, detail="Correction retire accepts only correction_preview_id")
             if isinstance(github_adapter, MockGitHubAdapter):
                 raise HTTPException(status_code=409, detail="Retiring requires a live GitHub adapter (gh_cli); mock reads are refused")
-            assert managed_service is not None
+            if managed_service is None:
+                raise RuntimeError("Internal invariant violated: managed_service is not None")
             try:
                 record = await managed_service.retire_correction(payload["correction_preview_id"].strip(), github=github_adapter)
             except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
@@ -789,7 +796,8 @@ def create_app(
             _assert_internal_auth(config=app_config, provided_token=x_internal_token)
             if set(payload) != {"published_preview_id"} or not isinstance(payload["published_preview_id"], str) or not payload["published_preview_id"].strip():
                 raise HTTPException(status_code=400, detail="Review staging accepts only published_preview_id")
-            assert managed_service is not None
+            if managed_service is None:
+                raise RuntimeError("Internal invariant violated: managed_service is not None")
             try:
                 preview = await managed_service.offer_published_review(payload["published_preview_id"].strip())
             except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
@@ -802,7 +810,8 @@ def create_app(
             x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
         ) -> dict[str, Any]:
             _assert_internal_auth(config=app_config, provided_token=x_internal_token)
-            assert managed_service is not None
+            if managed_service is None:
+                raise RuntimeError("Internal invariant violated: managed_service is not None")
             try:
                 if managed_worker is not None:
                     job = managed_worker.store.get(preview_id)
@@ -821,7 +830,8 @@ def create_app(
             x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
         ) -> dict[str, Any]:
             _assert_internal_auth(config=app_config, provided_token=x_internal_token)
-            assert managed_service is not None
+            if managed_service is None:
+                raise RuntimeError("Internal invariant violated: managed_service is not None")
             fields = {
                 "run": {"preview_id", "proposal"}, "approve": {"assignment_id", "request_id", "approved"},
                 "resume": {"assignment_id", "request_id", "response"},
