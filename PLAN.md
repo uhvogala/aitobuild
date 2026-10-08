@@ -303,7 +303,7 @@ unchanged; no live model/GitHub/Docker/hosted CI, dependency change, commit, pus
 remote write. Scoped correction, managed PM planning/writes, bounded meetings and
 semantic live acceptance remain pending.
 
-Scoped correction handoff continuation (2026-10-07, from locally committed
+Scoped correction handoff continuation (2026-10-07, from committed
 `823ea98`): native Architect bindings can opt into one read-only scoped correction
 proposal after complete published source/diff inspection. Objective/explicit paths
 become part of exact saved COMMENT approval, with replacement/scope drift refusal.
