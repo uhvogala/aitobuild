@@ -740,3 +740,94 @@ def test_mock_publish_commit_and_draft_pr_respect_allowlist() -> None:
             approved=True,
             require_human_approval_for_repo_writes=True,
         )
+
+
+@pytest.mark.parametrize("adapter_kind", ["mock", "gh_cli"])
+@pytest.mark.parametrize(
+    ("head_branch", "base_ref", "message"),
+    [
+        ("main", "main", "head_branch must be an aitobuild/"),
+        ("feature/not-scoped", "main", "head_branch must be an aitobuild/"),
+        ("aitobuild/", "main", "head_branch must be an aitobuild/"),
+        ("aitobuild/../main", "main", "head_branch must be an aitobuild/"),
+        ("aitobuild/issue-1-task", "aitobuild/issue-1-task", "base_ref must differ"),
+        ("aitobuild/issue-1-task", "refs/heads/main", "base_ref must be a plain branch"),
+        ("aitobuild/issue-1-task", "main..x", "base_ref must be a plain branch"),
+        ("aitobuild/issue-1-task", "-main", "base_ref must be a plain branch"),
+    ],
+)
+def test_draft_pr_adapters_refuse_unscoped_head_or_bad_base(
+    adapter_kind: str, head_branch: str, base_ref: str, message: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aitobuild.policy import AgentRole
+
+    if adapter_kind == "mock":
+        adapter = MockGitHubAdapter(
+            allowed_repositories=frozenset({"fixture/widgets"}), enforce_allowlist=True,
+        )
+    else:
+        adapter = GhCliGitHubAdapter(allowed_repositories=("fixture/widgets",))
+
+        def api(*_args, **_kwargs):
+            raise AssertionError("Invalid refs must be refused before any GitHub call")
+
+        monkeypatch.setattr(adapter, "_api", api)
+    with pytest.raises(ValueError, match=message):
+        adapter.create_or_update_draft_pull_request(
+            role=AgentRole.DEVELOPER, repository="fixture/widgets", title="Trial", body="Closes #1",
+            head_branch=head_branch, base_ref=base_ref, issue_number=1, approved=True,
+            require_human_approval_for_repo_writes=True,
+        )
+    if adapter_kind == "mock":
+        assert not adapter.pull_requests.get("fixture/widgets")
+
+
+@pytest.mark.parametrize("adapter_kind", ["mock", "gh_cli"])
+def test_pr_review_records_bound_commit_id(adapter_kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from aitobuild.policy import AgentRole
+
+    head = "b" * 40
+    if adapter_kind == "mock":
+        from aitobuild.tools.github import GitHubBlobChange, _git_blob_sha
+
+        adapter = MockGitHubAdapter(
+            allowed_repositories=frozenset({"fixture/widgets"}), enforce_allowlist=True,
+        )
+        content = b"x = 1\n"
+        adapter.upsert_branch_commit(
+            role=AgentRole.DEVELOPER, repository="fixture/widgets", branch="aitobuild/issue-1-task",
+            base_sha="a" * 40, commit_message="aitobuild: implement #1",
+            files={"src/probe.py": GitHubBlobChange(mode="100644", content=content, blob_sha=_git_blob_sha(content))},
+            approved=True, require_human_approval_for_repo_writes=True,
+        )
+        pull = adapter.create_or_update_draft_pull_request(
+            role=AgentRole.DEVELOPER, repository="fixture/widgets", title="Trial", body="Closes #1",
+            head_branch="aitobuild/issue-1-task", base_ref="main", issue_number=1, approved=True,
+            require_human_approval_for_repo_writes=True,
+        )
+        assert pull.head_sha is not None
+        head = pull.head_sha
+        number = pull.number
+    else:
+        adapter = GhCliGitHubAdapter(allowed_repositories=("fixture/widgets",))
+        number = 8
+        sent: list[dict] = []
+        raw = {"number": 8, "title": "Trial", "body": "Body", "state": "open", "draft": True,
+               "head": {"ref": "aitobuild/issue-1-task", "sha": head,
+                        "repo": {"full_name": "fixture/widgets"}}, "base": {"ref": "main"}}
+
+        def api(endpoint, *, method="GET", payload=None):
+            if method == "POST":
+                sent.append(dict(payload or {}))
+                return {"id": 1, "html_url": "https://github.com/fixture/widgets/pull/8#r1"}
+            return raw
+
+        monkeypatch.setattr(adapter, "_api", api)
+    review = adapter.submit_pr_review(
+        role=AgentRole.ARCHITECT, repository="fixture/widgets", pull_number=number, event="COMMENT",
+        body="Looks scoped.", commit_id=head.upper(),
+    )
+    assert review.commit_id == head.lower()
+    assert review.to_dict()["commit_id"] == head.lower()
+    if adapter_kind == "gh_cli":
+        assert sent and sent[-1].get("commit_id") == head.lower()
