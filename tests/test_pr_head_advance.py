@@ -105,6 +105,18 @@ def test_advance_refuses_bad_inputs_before_any_call(adapter_kind, field, value, 
         _advance(adapter, expected=head, **{field: value})
 
 
+def _entry(text: str) -> tuple[str, str]:
+    return ("100644", _git_blob_sha(text.encode()))
+
+
+# Shared, content-addressed tree store so commits copied between fakes stay readable.
+TREES: dict[str, dict[str, tuple[str, str]]] = {
+    "0" * 40: {"src/probe.py": _entry("x = 1\n"), "README.md": _entry("readme\n")},
+    "9" * 40: {"src/probe.py": _entry("other\n"), "README.md": _entry("readme\n")},
+    "1" * 40: {"src/probe.py": _entry("someone\n"), "README.md": _entry("readme\n")},
+}
+
+
 class FakeGitHub:
     def __init__(self, *, head: str, draft: bool = True, state: str = "open", fork: bool = False) -> None:
         self.ref = head
@@ -114,6 +126,7 @@ class FakeGitHub:
         self.calls: list[tuple[str, str]] = []
         self.patch_mode = "apply"
         self.on_commit: Any = None
+        self.truncated = False
 
     def pull(self) -> dict[str, Any]:
         return {"number": 1, "title": "Trial", "body": "Closes #7", "state": self.state, "draft": self.draft,
@@ -131,7 +144,22 @@ class FakeGitHub:
         if endpoint == f"repos/{REPO}/git/blobs" and method == "POST":
             return {"sha": _git_blob_sha(base64.b64decode(payload["content"]))}
         if endpoint == f"repos/{REPO}/git/trees" and method == "POST":
-            return {"sha": sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:40]}
+            sha = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:40]
+            entries = dict(TREES[payload["base_tree"]])
+            for item in payload["tree"]:
+                if item["sha"] is None:
+                    entries.pop(item["path"], None)
+                else:
+                    entries[item["path"]] = (item["mode"], item["sha"])
+            TREES[sha] = entries
+            return {"sha": sha}
+        if endpoint.startswith(f"repos/{REPO}/git/trees/") and endpoint.endswith("?recursive=1") and method == "GET":
+            sha = endpoint.rsplit("/", 1)[1].split("?")[0]
+            if sha not in TREES:
+                raise RuntimeError("HTTP 404: tree not found")
+            return {"sha": sha, "truncated": self.truncated, "tree": [
+                {"path": "src", "mode": "040000", "type": "tree", "sha": "d" * 40},
+                *({"path": path, "mode": mode, "type": "blob", "sha": blob} for path, (mode, blob) in TREES[sha].items())]}
         if endpoint == f"repos/{REPO}/git/commits" and method == "POST":
             sha = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:40]
             self.commits[sha] = {"tree": {"sha": payload["tree"]}, "parents": [{"sha": p} for p in payload["parents"]],
@@ -284,8 +312,8 @@ def test_reconcile_reports_parent_ours_and_moved(monkeypatch) -> None:
 
 
 def _writes(fake: FakeGitHub) -> list[str]:
-    return [endpoint.rsplit("/git/", 1)[1].split("/")[0] for method, endpoint in fake.calls
-            if method in {"POST", "PATCH"}]
+    return [endpoint.rsplit("/git/", 1)[1].split("/")[0] if "/git/" in endpoint else endpoint.rsplit("/", 1)[1]
+            for method, endpoint in fake.calls if method in {"POST", "PATCH"}]
 
 
 @pytest.mark.parametrize("expire_at", [1, 2, 3, 4])
@@ -312,26 +340,59 @@ def test_gh_advance_checks_the_budget_before_every_write(expire_at, monkeypatch)
     assert calls == [[], ["blobs"], ["blobs", "trees"], ["blobs", "trees", "commits"]]
 
 
-def test_reconcile_and_mock_check_the_budget_before_writes(monkeypatch) -> None:
+def test_reconcile_is_read_only_and_matches_exact_changes(monkeypatch) -> None:
+    """Settlement must never depend on the task budget, so reconcile performs no GitHub writes."""
     head = "b" * 40
+    ours = _our_commit(head, monkeypatch)
     fake = FakeGitHub(head=head)
+    fake.ref = "e" * 40
+    fake.commits[fake.ref] = ours
     adapter = _gh(fake, monkeypatch)
+    assert _reconcile(adapter, expected=head)[0] == "ours"
+    assert _reconcile(adapter, expected=head, files={"src/probe.py": _change("fixed = False\n")})[0] == "moved"
+    assert _reconcile(adapter, expected=head, files={"src/probe.py": _change("fixed = True\n"),
+                                                     "README.md": None})[0] == "moved"
+    executable = GitHubBlobChange(mode="100755", content=b"fixed = True\n", blob_sha=_git_blob_sha(b"fixed = True\n"))
+    assert _reconcile(adapter, expected=head, files={"src/probe.py": executable})[0] == "moved"
+    extra = json.loads(json.dumps(ours))
+    TREES["7" * 40] = {**TREES[ours["tree"]["sha"]], "src/extra.py": _entry("sneaky\n")}
+    extra["tree"] = {"sha": "7" * 40}
+    fake.commits[fake.ref] = extra
+    assert _reconcile(adapter, expected=head)[0] == "moved"
+    fake.commits[fake.ref] = ours
 
     def expired() -> float:
         raise TimeoutError("expired")
 
-    assert _reconcile(adapter, expected=head, before_write=expired)[0] == "parent"  # read-only, no write needed
-    fake.ref = "e" * 40
-    fake.commits[fake.ref] = {"tree": {"sha": "9" * 40}, "parents": [{"sha": head}], "message": "x"}
-    with pytest.raises(TimeoutError):
-        _reconcile(adapter, expected=head, before_write=expired)
+    # A retry after our push landed is decided by the same read-only rule, so it needs no budget.
+    assert _advance(adapter, expected=head, before_write=expired).head_sha == "e" * 40
+    fake.truncated = True
+    with pytest.raises(RuntimeError, match="truncated"):
+        _reconcile(adapter, expected=head)
     assert _writes(fake) == []
+
+
+def test_mock_checks_the_budget_before_writes() -> None:
+    def expired() -> float:
+        raise TimeoutError("expired")
+
     mock, mock_head = _published_mock()
     commits = len(mock.branch_commits)
     with pytest.raises(TimeoutError):
         _advance(mock, expected=mock_head, before_write=expired)
     assert len(mock.branch_commits) == commits
     assert mock.get_pull_request(repository=REPO, pull_number=1).head_sha == mock_head
+    with pytest.raises(TimeoutError):
+        mock.upsert_branch_commit(
+            role=AgentRole.DEVELOPER, repository=REPO, branch="aitobuild/issue-8-task", base_sha="a" * 40,
+            commit_message="aitobuild: implement #8", files={"src/probe.py": _change("y = 1\n")},
+            approved=True, require_human_approval_for_repo_writes=True, before_write=expired)
+    with pytest.raises(TimeoutError):
+        mock.create_or_update_draft_pull_request(
+            role=AgentRole.DEVELOPER, repository=REPO, title="T", body="Closes #8", head_branch="aitobuild/issue-8-task",
+            base_ref="main", issue_number=8, approved=True, require_human_approval_for_repo_writes=True,
+            before_write=expired)
+    assert len(mock.branch_commits) == commits and list(mock.pull_requests[REPO]) == [1]
 
 
 @pytest.mark.parametrize("race", ["foreign_head", "marked_ready", "closed"])
@@ -363,3 +424,49 @@ def test_gh_advance_never_reports_our_sha_when_the_ref_moved_after_patch(monkeyp
         _advance(adapter, expected=head)
     assert fake.ref == "f" * 40
     assert _reconcile(adapter, expected=head)[0] == "moved"
+
+
+class FreshBranchGitHub(FakeGitHub):
+    """Ordinary publish: a new task branch and a new draft PR."""
+
+    def __call__(self, endpoint: str, *, method: str = "GET", payload: dict | None = None) -> Any:
+        if endpoint == f"repos/{REPO}/git/ref/heads/aitobuild/issue-8-task" and method == "GET":
+            self.calls.append((method, endpoint))
+            raise RuntimeError("HTTP 404: Not Found")
+        if endpoint == f"repos/{REPO}/git/refs" and method == "POST":
+            self.calls.append((method, endpoint))
+            return {"object": {"sha": (payload or {})["sha"]}}
+        if endpoint.startswith(f"repos/{REPO}/pulls?") and method == "GET":
+            self.calls.append((method, endpoint))
+            return []
+        if endpoint == f"repos/{REPO}/pulls" and method == "POST":
+            self.calls.append((method, endpoint))
+            return {**self.pull(), "number": 2, "head": {"ref": "aitobuild/issue-8-task", "sha": "c" * 40,
+                                                         "repo": {"full_name": REPO}}}
+        return super().__call__(endpoint, method=method, payload=payload)
+
+
+@pytest.mark.parametrize("expire_at", [1, 2, 3, 4, 5])
+def test_gh_ordinary_publish_checks_the_budget_before_every_write(expire_at, monkeypatch) -> None:
+    fake = FreshBranchGitHub(head="b" * 40)
+    adapter = _gh(fake, monkeypatch)
+    checks = 0
+
+    def budget() -> float:
+        nonlocal checks
+        checks += 1
+        if checks == expire_at:
+            raise TimeoutError("expired")
+        return 60.0
+
+    with pytest.raises(TimeoutError):
+        head = adapter.upsert_branch_commit(
+            role=AgentRole.DEVELOPER, repository=REPO, branch="aitobuild/issue-8-task", base_sha="b" * 40,
+            commit_message="aitobuild: implement #8", files={"src/probe.py": _change("y = 1\n")},
+            approved=True, require_human_approval_for_repo_writes=True, before_write=budget)
+        adapter.create_or_update_draft_pull_request(
+            role=AgentRole.DEVELOPER, repository=REPO, title="T", body="Closes #8",
+            head_branch="aitobuild/issue-8-task", base_ref="main", issue_number=8, approved=True,
+            require_human_approval_for_repo_writes=True, before_write=budget)
+        assert head
+    assert _writes(fake) == ["blobs", "trees", "commits", "refs", "pulls"][: expire_at - 1]

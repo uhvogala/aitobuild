@@ -500,6 +500,7 @@ class DeveloperDeliveryWorker:
                         files=files,
                         approved=True,
                         require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+                        before_write=budget.remaining_seconds,
                     )
                     if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
                         raise RuntimeError("GitHub adapter returned an invalid head SHA")
@@ -524,6 +525,7 @@ class DeveloperDeliveryWorker:
                     existing_pull_number=existing,
                     approved=True,
                     require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+                    before_write=budget.remaining_seconds,
                 )
                 publication = {
                     **publication,
@@ -981,7 +983,6 @@ class DeveloperDeliveryWorker:
         try:
             outcome, pull = github.reconcile_advanced_head(
                 role=AgentRole.DEVELOPER, expected_head_sha=record.base_revision, files=files, approved=True,
-                before_write=budget.remaining_seconds,
                 require_human_approval_for_repo_writes=require_human_approval_for_repo_writes, **push,
             )
             if outcome == "ours":

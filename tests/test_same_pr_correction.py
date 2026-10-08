@@ -302,6 +302,30 @@ def test_budget_aborted_during_the_advance_sends_no_write(correction_chain, monk
     assert worker.correction_releases_parent(correction)
 
 
+def test_push_that_landed_settles_as_published_even_after_the_budget_is_gone(correction_chain, monkeypatch):
+    """Reconcile is read-only, so a landed push is never stranded in publishing by an expired budget."""
+    worker, published_id, github, head, make = correction_chain
+    correction = make()
+    staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
+    budget = DeveloperTaskBudget(path=worker.budget_path(correction),
+                                 bundle=developer_task_bundle_from_payload(worker.get(correction).bundle_payload),
+                                 create=False)
+    advance = github.advance_draft_pull_request_head
+
+    def landed_then_expired(**kwargs):
+        advance(**kwargs)
+        budget.abort()
+        raise RuntimeError("response lost after the push applied")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(github, "advance_draft_pull_request_head", landed_then_expired)
+        record = _publish(worker, github, correction, staged["digest"])
+    assert record.state == "published" and record.publication["parent_head_sha"] == head
+    assert record.publication["head_sha"] == _pull(github, worker, published_id).head_sha != head
+    assert worker._approvals.get(correction).state == "consumed"
+    assert worker.superseded_by(published_id) == correction
+
+
 def test_moved_head_keeps_holding_and_cannot_be_retired(correction_chain, monkeypatch):
     worker, published_id, github, head, make = correction_chain
     correction = make()
@@ -550,3 +574,30 @@ def test_approval_store_is_single_use_and_tamper_evident(tmp_path):
         path.write_text(json.dumps(data))
         with pytest.raises(ValueError, match="Invalid persisted"):
             store.get("p1")
+
+
+@pytest.mark.parametrize("abort_during", ["upsert_branch_commit", "create_or_update_draft_pull_request"])
+def test_ordinary_publish_rechecks_the_budget_inside_each_adapter_write(
+        abort_during, implemented_delivery, verification_adapter, monkeypatch):
+    worker, preview_id, _, _ = implemented_delivery
+    monkeypatch.setattr("aitobuild.developer_delivery.shell_request", lambda *args, **kwargs: {
+        "ok": True, "status": "exited", "exit_code": 0, "output": "passed", "next_cursor": 1,
+    })
+    worker.verify(preview_id, adapter=verification_adapter)
+    github = MockGitHubAdapter(allowed_repositories=frozenset({"fixture/widgets"}), enforce_allowlist=True)
+    budget = DeveloperTaskBudget(path=worker.budget_path(preview_id),
+                                 bundle=developer_task_bundle_from_payload(worker.get(preview_id).bundle_payload),
+                                 create=False)
+    original = getattr(github, abort_during)
+
+    def aborted_mid_call(**kwargs):
+        budget.abort()  # the preflight already passed; the adapter must still refuse the write
+        return original(**kwargs)
+
+    monkeypatch.setattr(github, abort_during, aborted_mid_call)
+    record = worker.publish(preview_id, github=github, require_human_approval_for_repo_writes=True,
+                            allow_mock_publication=True)
+    assert record.state == "failed"
+    if abort_during == "upsert_branch_commit":
+        assert github.branch_commits == []
+    assert github.pull_requests.get("fixture/widgets", {}) == {}

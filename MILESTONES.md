@@ -459,7 +459,7 @@ nonce-bound exact approval, then staging the next Architect review at the new he
 chain tip may be offered or published; superseded IDs are refused with the tip. Push failures
 settle by the live head (reconcile, release, hold or resume), and an operator can retire a
 failed/abandoned correction while the live head still equals its parent, and re-offering
-after a release starts a new attempt with a new task ID. Gates: **764
+after a release starts a new attempt with a new task ID. Gates: **773
 passed/two optional Docker skips**, Ruff/mypy (47 sources). A live GitHub trial of the
 same-PR loop is still required before M3 acceptance.
 

@@ -233,6 +233,7 @@ class GitHubAdapter(Protocol):
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> str: ...
 
     def create_or_update_draft_pull_request(
@@ -248,6 +249,7 @@ class GitHubAdapter(Protocol):
         existing_pull_number: int | None = None,
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> GitHubPullRequest: ...
 
     def advance_draft_pull_request_head(
@@ -279,7 +281,6 @@ class GitHubAdapter(Protocol):
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
-        before_write: Callable[[], object] | None = None,
     ) -> tuple[AdvanceOutcome, GitHubPullRequest]: ...
 
 
@@ -529,6 +530,7 @@ class MockGitHubAdapter:
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> str:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -540,6 +542,7 @@ class MockGitHubAdapter:
             branch=branch, base_sha=base_sha, commit_message=commit_message, files=files
         )
         head_sha, payload = self._mock_commit(repo, branch.strip(), base_sha, commit_message, files)
+        _check_write_budget(before_write)
         self._record_mock_commit(repo, head_sha, payload, base_sha, files)
         self._branch_heads.setdefault(repo, {})[branch.strip()] = head_sha
         return head_sha
@@ -628,7 +631,6 @@ class MockGitHubAdapter:
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
-        before_write: Callable[[], object] | None = None,
     ) -> tuple[AdvanceOutcome, GitHubPullRequest]:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -642,8 +644,6 @@ class MockGitHubAdapter:
         )
         current = self.get_pull_request(repository=repo, pull_number=pull_number)
         remote_head = self._branch_heads.get(repo, {}).get(branch) or current.head_sha
-        if remote_head != expected:
-            _check_write_budget(before_write)
         ours, _ = self._mock_commit(repo, branch, expected, commit_message, files)
         outcome: AdvanceOutcome = "parent" if remote_head == expected else "ours" if remote_head == ours else "moved"
         return outcome, replace(current, head_sha=remote_head)
@@ -661,6 +661,7 @@ class MockGitHubAdapter:
         existing_pull_number: int | None = None,
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> GitHubPullRequest:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -681,6 +682,7 @@ class MockGitHubAdapter:
             type(existing_pull_number) is not int or existing_pull_number <= 0
         ):
             raise ValueError("existing_pull_number must be a positive integer when provided")
+        _check_write_budget(before_write)
         repo_prs = self.pull_requests.setdefault(repo, {})
         if existing_pull_number is None:
             matches = [pull for pull in repo_prs.values()
@@ -820,7 +822,8 @@ class GhCliGitHubAdapter:
         return json.loads(text)
 
     def _matching_publish_head(
-        self, *, repository: str, branch: str, base_sha: str, tree_sha: str, commit_message: str,
+        self, *, repository: str, branch: str, base_sha: str, commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
     ) -> str | None:
         try:
             reference = self._api(f"repos/{repository}/git/ref/heads/{branch}")
@@ -831,25 +834,51 @@ class GhCliGitHubAdapter:
         head = reference.get("object", {}).get("sha") if isinstance(reference, dict) else None
         if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
             raise RuntimeError("Unexpected GitHub task reference response")
-        if not self._commit_matches(
-            repository=repository, commit_sha=head, tree_sha=tree_sha,
-            parent_sha=base_sha, commit_message=commit_message,
+        if not self._commit_has_changes(
+            repository=repository, commit_sha=head, parent_sha=base_sha,
+            commit_message=commit_message, files=files,
         ):
             raise ValueError("Existing task branch differs from the approved publication")
         return head
 
-    def _commit_matches(
-        self, *, repository: str, commit_sha: str, tree_sha: str, parent_sha: str, commit_message: str,
+    def _commit_has_changes(
+        self, *, repository: str, commit_sha: str, parent_sha: str, commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
     ) -> bool:
-        """Exact identity rule for adopting a remote commit as ours: tree, sole parent and message."""
+        """The one identity rule for adopting a remote commit as ours, shared by ordinary publish,
+        correction advance and reconciliation: sole parent, same message, and tree == parent tree plus
+        exactly the pinned blob/mode changes. Read-only, so it never needs the task budget."""
         commit = self._api(f"repos/{repository}/git/commits/{commit_sha}")
-        if not isinstance(commit, dict):
-            raise RuntimeError("Unexpected GitHub task commit response")
-        tree, parents = commit.get("tree"), commit.get("parents")
-        return not (not isinstance(tree, dict) or tree.get("sha") != tree_sha
-                    or not isinstance(parents, list) or len(parents) != 1
-                    or not isinstance(parents[0], dict) or parents[0].get("sha") != parent_sha.lower()
-                    or str(commit.get("message", "")).strip() != commit_message.strip())
+        parent = self._api(f"repos/{repository}/git/commits/{parent_sha.lower()}")
+        if not isinstance(commit, dict) or not isinstance(parent, dict):
+            raise RuntimeError("Unexpected GitHub commit response")
+        parents = commit.get("parents")
+        if (not isinstance(parents, list) or len(parents) != 1 or not isinstance(parents[0], dict)
+                or parents[0].get("sha") != parent_sha.lower()
+                or str(commit.get("message", "")).strip() != commit_message.strip()):
+            return False
+        expected = self._tree_entries(repository, parent.get("tree"))
+        for path_name, change in files.items():
+            if change is None:
+                expected.pop(path_name, None)
+            else:
+                expected[path_name] = (change.mode, change.blob_sha)
+        return self._tree_entries(repository, commit.get("tree")) == expected
+
+    def _tree_entries(self, repository: str, tree: object) -> dict[str, tuple[str, str]]:
+        tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+        if not isinstance(tree_sha, str) or re.fullmatch(r"[0-9a-f]{40}", tree_sha) is None:
+            raise RuntimeError("Unexpected GitHub tree reference")
+        raw = self._api(f"repos/{repository}/git/trees/{tree_sha}?recursive=1")
+        if not isinstance(raw, dict) or not isinstance(raw.get("tree"), list) or raw.get("truncated") is True:
+            raise RuntimeError("GitHub tree listing is unreadable or truncated; cannot confirm the push")
+        entries: dict[str, tuple[str, str]] = {}
+        for entry in raw["tree"]:
+            if not isinstance(entry, dict) or not all(isinstance(entry.get(key), str) for key in ("path", "mode", "type", "sha")):
+                raise RuntimeError("Unexpected GitHub tree entry")
+            if entry["type"] != "tree":
+                entries[entry["path"]] = (entry["mode"], entry["sha"])
+        return entries
 
     def _read_branch_head(self, *, repository: str, branch: str) -> str:
         reference = self._api(f"repos/{repository}/git/ref/heads/{branch}")
@@ -1090,6 +1119,7 @@ class GhCliGitHubAdapter:
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> str:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -1100,15 +1130,16 @@ class GhCliGitHubAdapter:
         _validate_publish_commit_inputs(
             branch=branch, base_sha=base_sha, commit_message=commit_message, files=files
         )
-        tree_sha = self._create_publish_tree(repo, base_sha, files)
         existing_head = self._matching_publish_head(
             repository=repo, branch=branch.strip(), base_sha=base_sha,
-            tree_sha=tree_sha, commit_message=commit_message,
+            commit_message=commit_message, files=files,
         )
         if existing_head is not None:
             return existing_head
-        commit_sha = self._create_publish_commit(repo, base_sha, tree_sha, commit_message)
+        tree_sha = self._create_publish_tree(repo, base_sha, files, before_write)
+        commit_sha = self._create_publish_commit(repo, base_sha, tree_sha, commit_message, before_write)
         head_sha = commit_sha
+        _check_write_budget(before_write)
         try:
             self._api(
                 f"repos/{repo}/git/refs",
@@ -1118,7 +1149,7 @@ class GhCliGitHubAdapter:
         except RuntimeError:
             existing_head = self._matching_publish_head(
                 repository=repo, branch=branch.strip(), base_sha=base_sha,
-                tree_sha=tree_sha, commit_message=commit_message,
+                commit_message=commit_message, files=files,
             )
             if existing_head is None:
                 raise
@@ -1216,19 +1247,21 @@ class GhCliGitHubAdapter:
             expected_head_sha=expected_head_sha, commit_message=commit_message, files=files,
         )
         current = self._read_advance_target(repo, pull_number=pull_number, head_branch=branch, base_ref=base)
-        tree_sha = self._create_publish_tree(repo, expected, files, before_write)
+
+        def is_ours(remote_head: str) -> bool:
+            return self._commit_has_changes(repository=repo, commit_sha=remote_head, parent_sha=expected,
+                                            commit_message=commit_message, files=files)
 
         def ours_or_refuse(remote_head: str, target: GitHubPullRequest) -> GitHubPullRequest:
-            if not self._commit_matches(
-                repository=repo, commit_sha=remote_head, tree_sha=tree_sha,
-                parent_sha=expected, commit_message=commit_message,
-            ):
+            if not is_ours(remote_head):
                 raise ValueError("Pull request head moved from the pinned SHA; refusing stale correction")
             return replace(target, head_sha=remote_head)
 
+        # A retry after our push landed is decided read-only, before any upload.
         remote_head = self._read_branch_head(repository=repo, branch=branch)
         if remote_head != expected:
             return ours_or_refuse(remote_head, current)
+        tree_sha = self._create_publish_tree(repo, expected, files, before_write)
         commit_sha = self._create_publish_commit(repo, expected, tree_sha, commit_message, before_write)
         # Re-read the PR target and branch head right before the ref update: a competing update during
         # object creation must be refused here, not left to a stale PATCH.
@@ -1245,10 +1278,7 @@ class GhCliGitHubAdapter:
             )
         except RuntimeError:
             remote_head = self._read_branch_head(repository=repo, branch=branch)
-            if remote_head != commit_sha and not self._commit_matches(
-                repository=repo, commit_sha=remote_head, tree_sha=tree_sha,
-                parent_sha=expected, commit_message=commit_message,
-            ):
+            if remote_head != commit_sha and not is_ours(remote_head):
                 raise
             commit_sha = remote_head
         advanced = self._read_advance_target(repo, pull_number=pull_number, head_branch=branch, base_ref=base)
@@ -1271,12 +1301,12 @@ class GhCliGitHubAdapter:
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
-        before_write: Callable[[], object] | None = None,
     ) -> tuple[AdvanceOutcome, GitHubPullRequest]:
         """Classify the live branch head after an uncertain push: untouched parent, our exact commit, or moved.
 
-        Recreating the tree only writes content-addressed git objects (no ref changes) so the exact
-        tree/parent/message identity rule can be applied to the live head.
+        Read-only: the live commit counts as ours only when its sole parent is the pinned head, its
+        message matches, and its tree equals the parent tree with exactly the pinned blob/mode changes.
+        No GitHub writes happen here, so settlement never depends on the task budget.
         """
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -1292,9 +1322,8 @@ class GhCliGitHubAdapter:
         remote_head = self._read_branch_head(repository=repo, branch=branch)
         if remote_head == expected:
             return "parent", replace(pull, head_sha=remote_head)
-        tree_sha = self._create_publish_tree(repo, expected, files, before_write)
-        ours = self._commit_matches(repository=repo, commit_sha=remote_head, tree_sha=tree_sha,
-                                    parent_sha=expected, commit_message=commit_message)
+        ours = self._commit_has_changes(repository=repo, commit_sha=remote_head, parent_sha=expected,
+                                        commit_message=commit_message, files=files)
         return ("ours" if ours else "moved"), replace(pull, head_sha=remote_head)
 
     def _read_advance_target(
@@ -1321,6 +1350,7 @@ class GhCliGitHubAdapter:
         existing_pull_number: int | None = None,
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> GitHubPullRequest:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -1366,6 +1396,7 @@ class GhCliGitHubAdapter:
                 raise ValueError(
                     f"Pull request #{existing_pull_number} must remain an open draft; refusing update"
                 )
+            _check_write_budget(before_write)
             raw = self._api(
                 f"repos/{repo}/pulls/{existing_pull_number}",
                 method="PATCH",
@@ -1376,6 +1407,7 @@ class GhCliGitHubAdapter:
                 },
             )
             return _pull_request_from_api(raw, repository=repo, changed_files=())
+        _check_write_budget(before_write)
         raw = self._api(
             f"repos/{repo}/pulls",
             method="POST",

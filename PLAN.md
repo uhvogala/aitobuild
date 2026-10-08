@@ -334,13 +334,14 @@ snapshot (diff, PR, branch/base, parent head, chain, triggering review receipt) 
 nonce-bound approval stored as frozen validated records with checked transitions. Publication
 fast-forwards the pinned draft head (`force=false`, never a new PR or base change) and stages the
 next Architect review. Offers and publishes come only from the chain tip; the chain walk fails
-closed; superseded preview IDs are refused with the tip. The adapter checks the original budget before every GitHub write, re-reads target
-and head right before the ref update and the live ref after it. Failures past consume settle by the live
+closed; superseded preview IDs are refused with the tip. The adapter checks the original budget before every GitHub write (ordinary publish too),
+re-reads target and head right before the ref update and the live ref after it; reconciliation is
+read-only (sole parent, message, exact tree diff), so a landed push settles even after expiry. Failures past consume settle by the live
 head: ours reconciles to published, the unchanged parent releases the head (`not_applied`), a
 moved head fails and keeps holding it, an unreadable head stays resumable. Retire releases a
 failed/abandoned correction only while the live head equals its parent; re-offering after a
 release creates a new attempt with a new task ID. A landed push on a PR closed or marked ready
-before reconciliation stays publishing for operator inspection. Gates: **764 passed/two
+before reconciliation stays publishing for operator inspection. Gates: **773 passed/two
 optional Docker skips**, Ruff/mypy (47 sources). No live GitHub trial, hosted CI or automatic
 correction loop yet.
 
