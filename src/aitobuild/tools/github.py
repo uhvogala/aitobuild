@@ -909,21 +909,85 @@ class GhCliGitHubAdapter:
                 or parents[0].get("sha") != parent_sha.lower()
                 or str(commit.get("message", "")).strip() != commit_message.strip()):
             return False
-        expected = self._tree_entries(repository, parent.get("tree"))
+        parent_tree, live_tree = _tree_reference(parent.get("tree")), _tree_reference(commit.get("tree"))
+        try:
+            expected = self._tree_entries(repository, parent_tree)
+            live = self._tree_entries(repository, live_tree)
+        except _TruncatedTreeListing:
+            # Large repositories: walk only the subtrees whose SHAs differ, which is still an exact diff.
+            return self._tree_diff_has_changes(repository, parent_tree, live_tree, changes)
         for path_name, change in changes.items():
             if change is None:
                 expected.pop(path_name, None)
             else:
                 expected[path_name] = (change.mode, change.blob_sha)
-        return self._tree_entries(repository, commit.get("tree")) == expected
+        return live == expected
 
-    def _tree_entries(self, repository: str, tree: object) -> dict[str, tuple[str, str]]:
-        tree_sha = tree.get("sha") if isinstance(tree, dict) else None
-        if not isinstance(tree_sha, str) or re.fullmatch(r"[0-9a-f]{40}", tree_sha) is None:
-            raise RuntimeError("Unexpected GitHub tree reference")
-        raw = self._api(f"repos/{repository}/git/trees/{tree_sha}?recursive=1")
+    def _tree_diff_has_changes(
+        self, repository: str, parent_tree: str, live_tree: str, changes: Mapping[str, GitHubPinnedChange | None],
+    ) -> bool:
+        diff = self._tree_diff(repository, parent_tree, live_tree, prefix="")
+        for path_name, change in changes.items():
+            wanted = None if change is None else (change.mode, change.blob_sha)
+            if path_name in diff:
+                if diff.pop(path_name) != wanted:
+                    return False
+            elif self._tree_entry_at(repository, parent_tree, path_name) != wanted:
+                return False  # unchanged from the parent, so the parent must already hold the pinned value
+        return not diff
+
+    def _tree_diff(
+        self, repository: str, parent_tree: str | None, live_tree: str | None, *, prefix: str,
+    ) -> dict[str, tuple[str, str] | None]:
+        if parent_tree == live_tree:
+            return {}
+        parent = self._tree_level(repository, parent_tree) if parent_tree else {}
+        live = self._tree_level(repository, live_tree) if live_tree else {}
+        diff: dict[str, tuple[str, str] | None] = {}
+        for name in sorted(parent.keys() | live.keys()):
+            old, new = parent.get(name), live.get(name)
+            if old == new:
+                continue
+            path_name = prefix + name
+            old_subtree = old[2] if old is not None and old[0] == "tree" else None
+            new_subtree = new[2] if new is not None and new[0] == "tree" else None
+            if old_subtree or new_subtree:
+                diff |= self._tree_diff(repository, old_subtree, new_subtree, prefix=path_name + "/")
+            if old is not None and old[0] != "tree":
+                diff[path_name] = None
+            if new is not None and new[0] != "tree":
+                diff[path_name] = (new[1], new[2])
+        return diff
+
+    def _tree_entry_at(self, repository: str, tree_sha: str, path_name: str) -> tuple[str, str] | None:
+        *directories, name = path_name.split("/")
+        level = self._tree_level(repository, tree_sha)
+        for directory in directories:
+            entry = level.get(directory)
+            if entry is None or entry[0] != "tree":
+                return None
+            level = self._tree_level(repository, entry[2])
+        entry = level.get(name)
+        return None if entry is None or entry[0] == "tree" else (entry[1], entry[2])
+
+    def _tree_level(self, repository: str, tree_sha: str) -> dict[str, tuple[str, str, str]]:
+        raw = self._api(f"repos/{repository}/git/trees/{tree_sha}")
         if not isinstance(raw, dict) or not isinstance(raw.get("tree"), list) or raw.get("truncated") is True:
             raise RuntimeError("GitHub tree listing is unreadable or truncated; cannot confirm the push")
+        level: dict[str, tuple[str, str, str]] = {}
+        for entry in raw["tree"]:
+            if (not isinstance(entry, dict) or not all(isinstance(entry.get(key), str) for key in ("path", "mode", "type", "sha"))
+                    or "/" in entry["path"] or entry["path"] in level):
+                raise RuntimeError("Unexpected GitHub tree entry")
+            level[entry["path"]] = (entry["type"], entry["mode"], entry["sha"])
+        return level
+
+    def _tree_entries(self, repository: str, tree_sha: str) -> dict[str, tuple[str, str]]:
+        raw = self._api(f"repos/{repository}/git/trees/{tree_sha}?recursive=1")
+        if isinstance(raw, dict) and raw.get("truncated") is True:
+            raise _TruncatedTreeListing("GitHub recursive tree listing is truncated")
+        if not isinstance(raw, dict) or not isinstance(raw.get("tree"), list):
+            raise RuntimeError("GitHub tree listing is unreadable; cannot confirm the push")
         entries: dict[str, tuple[str, str]] = {}
         for entry in raw["tree"]:
             if not isinstance(entry, dict) or not all(isinstance(entry.get(key), str) for key in ("path", "mode", "type", "sha")):
@@ -1588,6 +1652,17 @@ def _validate_advance_inputs(
         branch=branch, base_sha=expected_head_sha, commit_message=commit_message, files=files,
     )
     return branch, base, expected_head_sha
+
+
+class _TruncatedTreeListing(RuntimeError):
+    """GitHub capped a recursive tree listing; callers fall back to an exact level-by-level diff."""
+
+
+def _tree_reference(tree: object) -> str:
+    tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+    if not isinstance(tree_sha, str) or re.fullmatch(r"[0-9a-f]{40}", tree_sha) is None:
+        raise RuntimeError("Unexpected GitHub tree reference")
+    return tree_sha
 
 
 def _validate_pinned_changes(changes: Mapping[str, GitHubPinnedChange | None]) -> None:

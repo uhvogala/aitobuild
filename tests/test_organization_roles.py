@@ -707,6 +707,26 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                             assert retry.source_payload["replaces_correction"] == correction.preview_id
                             assert retry.source_payload["correction_attempt"] == 2
                             assert await service().offer_correction(preview.preview_id) == retry
+                            journal_bytes = reviews._path.read_bytes()
+                            reviews._load()
+
+                            def tampered(edit):
+                                journal = json.loads(journal_bytes)
+                                attempt_two = next(item for item in journal["corrections"].values() if item["attempt"] == 2)
+                                edit(attempt_two)
+                                reviews._path.write_text(json.dumps(journal))
+                                with pytest.raises(ValueError, match="attempt chain is invalid"):
+                                    reviews._load()
+                                reviews._path.write_bytes(journal_bytes)
+
+                            tampered(lambda item: item.update(attempt=3))
+                            tampered(lambda item: item.update(predecessor_preview_id="forged-preview"))
+                            tampered(lambda item: item.update(predecessor_preview_id=None))
+                            with monkeypatch.context() as patched:  # attempt 1 no longer releases its head
+                                patched.setattr(worker, "correction_releases_parent", lambda preview_id: False)
+                                with pytest.raises(ValueError, match="attempt chain is invalid"):
+                                    reviews._load()
+                            reviews._load()
                             assert reviews.correction_route_for(retry.preview_id).event == "published.correction"
                             previews.approve(retry.preview_id)
                             assert (await service().consume(retry.preview_id)).state == "completed"

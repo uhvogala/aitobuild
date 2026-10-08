@@ -118,6 +118,22 @@ TREES: dict[str, dict[str, tuple[str, str]]] = {
 }
 
 
+def _tree_level(flat: dict[str, tuple[str, str]]) -> list[dict[str, str]]:
+    """One non-recursive level; subtrees are content-addressed so equal directories share a SHA."""
+    entries, directories = [], {}
+    for path, (mode, blob) in flat.items():
+        name, _, rest = path.partition("/")
+        if rest:
+            directories.setdefault(name, {})[rest] = (mode, blob)
+        else:
+            entries.append({"path": name, "mode": mode, "type": "blob", "sha": blob})
+    for name, sub in directories.items():
+        sha = sha256(json.dumps(sorted(sub.items())).encode()).hexdigest()[:40]
+        TREES[sha] = sub
+        entries.append({"path": name, "mode": "040000", "type": "tree", "sha": sha})
+    return entries
+
+
 class FakeGitHub:
     def __init__(self, *, head: str, draft: bool = True, state: str = "open", fork: bool = False) -> None:
         self.ref = head
@@ -128,6 +144,7 @@ class FakeGitHub:
         self.patch_mode = "apply"
         self.on_commit: Any = None
         self.truncated = False
+        self.level_truncated = False
 
     def pull(self) -> dict[str, Any]:
         return {"number": 1, "title": "Trial", "body": "Closes #7", "state": self.state, "draft": self.draft,
@@ -161,6 +178,11 @@ class FakeGitHub:
             return {"sha": sha, "truncated": self.truncated, "tree": [
                 {"path": "src", "mode": "040000", "type": "tree", "sha": "d" * 40},
                 *({"path": path, "mode": mode, "type": "blob", "sha": blob} for path, (mode, blob) in TREES[sha].items())]}
+        if endpoint.startswith(f"repos/{REPO}/git/trees/") and "?" not in endpoint and method == "GET":
+            sha = endpoint.rsplit("/", 1)[1]
+            if sha not in TREES:
+                raise RuntimeError("HTTP 404: tree not found")
+            return {"sha": sha, "truncated": self.level_truncated, "tree": _tree_level(TREES[sha])}
         if endpoint == f"repos/{REPO}/git/commits" and method == "POST":
             sha = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:40]
             self.commits[sha] = {"tree": {"sha": payload["tree"]}, "parents": [{"sha": p} for p in payload["parents"]],
@@ -342,15 +364,24 @@ def test_gh_advance_checks_the_budget_before_every_write(expire_at, monkeypatch)
     assert calls == [[], ["blobs"], ["blobs", "trees"], ["blobs", "trees", "commits"]]
 
 
-def test_reconcile_is_read_only_and_matches_exact_changes(monkeypatch) -> None:
-    """Settlement must never depend on the task budget, so reconcile performs no GitHub writes."""
+@pytest.mark.parametrize("truncated", [False, True], ids=["recursive", "truncated_walk"])
+def test_reconcile_is_read_only_and_matches_exact_changes(truncated, monkeypatch) -> None:
+    """Settlement must never depend on the task budget, so reconcile performs no GitHub writes.
+
+    A truncated recursive listing (large repos) falls back to an exact walk of differing subtrees."""
     head = "b" * 40
     ours = _our_commit(head, monkeypatch)
     fake = FakeGitHub(head=head)
     fake.ref = "e" * 40
     fake.commits[fake.ref] = ours
+    fake.truncated = truncated
     adapter = _gh(fake, monkeypatch)
     assert _reconcile(adapter, expected=head)[0] == "ours"
+    # Pinned paths left as the parent already had them still count as ours.
+    assert _reconcile(adapter, expected=head, files={"src/probe.py": _change("fixed = True\n"),
+                                                     "README.md": _change("readme\n"), "src/gone.py": None})[0] == "ours"
+    assert _reconcile(adapter, expected=head, files={"src/probe.py": _change("fixed = True\n"),
+                                                     "README.md": _change("changed\n")})[0] == "moved"
     assert _reconcile(adapter, expected=head, files={"src/probe.py": _change("fixed = False\n")})[0] == "moved"
     assert _reconcile(adapter, expected=head, files={"src/probe.py": _change("fixed = True\n"),
                                                      "README.md": None})[0] == "moved"
@@ -375,7 +406,9 @@ def test_reconcile_is_read_only_and_matches_exact_changes(monkeypatch) -> None:
 
     # A retry after our push landed is decided by the same read-only rule, so it needs no budget.
     assert _advance(adapter, expected=head, before_write=expired).head_sha == "e" * 40
-    fake.truncated = True
+    walked = any(method == "GET" and "/git/trees/" in endpoint and "?" not in endpoint for method, endpoint in fake.calls)
+    assert walked is truncated
+    fake.truncated = fake.level_truncated = True
     with pytest.raises(RuntimeError, match="truncated"):
         _reconcile(adapter, expected=head)
     assert _writes(fake) == []
