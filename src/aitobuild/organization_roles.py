@@ -7,7 +7,6 @@ from collections.abc import Callable, Mapping
 from hashlib import sha256
 import json
 import math
-import os
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
@@ -15,13 +14,13 @@ from agent_framework import Agent, AgentSession, FileSessionStore, FunctionInvoc
 from filelock import FileLock
 from pydantic import Field, JsonValue, StrictStr, model_validator
 
+from aitobuild.durable_files import atomic_write_text
 from aitobuild.developer_delivery import DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload, is_path_allowed
 from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot
 from aitobuild.organization_assignments import AssignmentProposal
 from aitobuild.organization_delivery import _delivery_call
-from aitobuild.organization import sync_directory
 from aitobuild.organization_runner import ManagedOperation, ManagedTaskContext, WorkflowInput
 from aitobuild.organization_runtime import OrganizationRuntime
 from aitobuild.organization_reviews import PublishedReviewTarget as PublishedReviewTarget
@@ -85,15 +84,7 @@ class NativeCoordinatorProposal:
             original = _CoordinatorReceipt.model_validate_json(path.read_text(encoding="utf-8"))
             if original.pins != receipt.pins or original.state != "running":
                 raise ValueError("Coordinator pins and terminal receipts are immutable")
-        temporary = path.with_suffix(".tmp")
-        if temporary.resolve() != temporary:
-            raise ValueError("Coordinator temporary receipts cannot follow symlinks")
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(receipt.model_dump_json())
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(path)
-        sync_directory(path.parent)
+        atomic_write_text(path, receipt.model_dump_json())
 
     async def __call__(self, snapshot: DefinitionSnapshot, preview: DeveloperPreview) -> AssignmentProposal:
         route = next((route for route in snapshot.definition.routes if self._event in route.events), None)
@@ -138,7 +129,8 @@ class NativeCoordinatorProposal:
                 if json.dumps(saved.pins, sort_keys=True) != json.dumps(pins, sort_keys=True):
                     raise PermissionError("Saved coordinator proposal scope/revision/approval/binding/deadline differs")
                 if saved.state == "proposed":
-                    assert saved.proposal is not None
+                    if saved.proposal is None:
+                        raise RuntimeError("Internal invariant violated: saved.proposal is not None")
                     if saved.proposal.agent_id not in route.delegation.eligible_agents:
                         raise PermissionError("Saved proposal is outside configured eligibility")
                     return saved.proposal
@@ -355,7 +347,8 @@ class NativeManagedRoles:
         async def read(kind: str, path: str, offset: int, max_bytes: int) -> dict[str, Any]:
             if await self._target(context) != target:
                 raise PermissionError("Review target pins changed during inspection")
-            assert self._worker is not None and self._github is not None
+            if not (self._worker is not None and self._github is not None):
+                raise RuntimeError("Internal invariant violated: self._worker is not None and self._github is not None")
             github = self._github
             key = kind + ":" + path
             prior = inspections.get(key, {"end": 0, "complete": False})
@@ -412,7 +405,8 @@ class NativeManagedRoles:
             guidance += " Optionally propose one scoped correction after inspection; this cannot assign, approve or execute a Developer task."
         text = await self._invoke(context, agent, session, tools, guidance + "\nTarget: " + json.dumps(target, sort_keys=True))
         self._require_inspections(target, inspections)
-        assert self._worker is not None
+        if self._worker is None:
+            raise RuntimeError("Internal invariant violated: self._worker is not None")
         text = text.replace("\x00", "").strip()
         self._worker._normalize_architect_review_body(text)
         if await self._target(context) != target:
@@ -449,7 +443,8 @@ class NativeManagedRoles:
         self._require_inspections(target, session.state.get("aitobuild_review_inspections"))
         session.state["aitobuild_comment_state"] = "submitting"
         await self._sessions.set(context.run.session_id, session)
-        assert self._worker is not None and self._github is not None
+        if not (self._worker is not None and self._github is not None):
+            raise RuntimeError("Internal invariant violated: self._worker is not None and self._github is not None")
         worker, github = self._worker, self._github
         record = await _delivery_call(lambda: worker.submit_architect_review(
             target["preview_id"], github=github, event="COMMENT", body=original["body"], expected_target=target,

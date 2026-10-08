@@ -13,7 +13,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from hashlib import sha256
 import json
-import os
 from pathlib import Path
 import secrets
 from typing import Annotated, Any, Literal, Self
@@ -21,7 +20,8 @@ from typing import Annotated, Any, Literal, Self
 from filelock import FileLock
 from pydantic import AwareDatetime, Field, JsonValue, StrictStr, ValidationError, model_validator
 
-from aitobuild.organization import DefinitionModel, sync_directory
+from aitobuild.durable_files import atomic_write_text, sync_directory
+from aitobuild.organization import DefinitionModel
 
 _Hex64 = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
 _IDENTITY = ("version", "preview_id", "snapshot", "content_digest", "nonce", "digest", "staged_at", "replaced_digest")
@@ -133,15 +133,9 @@ class PublishApprovalStore:
     def _save(self, path: Path, original: PublishApproval | None, updated: PublishApproval) -> PublishApproval:
         self._check_transition(original, updated)
         self._directory.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        if temporary.is_symlink():
-            raise ValueError("Publish approvals cannot follow symlinks")
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(updated.model_dump_json())
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(path)
-        sync_directory(self._directory)
+        atomic_write_text(path, updated.model_dump_json())
+        if path.parent != self._directory:
+            sync_directory(self._directory)
         return updated
 
     def get(self, preview_id: str) -> PublishApproval | None:

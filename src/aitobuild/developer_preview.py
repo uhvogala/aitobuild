@@ -7,7 +7,6 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
-import os
 from pathlib import Path
 import re
 from threading import RLock
@@ -16,6 +15,7 @@ from uuid import uuid4
 
 from filelock import FileLock
 
+from aitobuild.durable_files import atomic_write_text
 from aitobuild.developer_isolation import developer_task_bundle_from_payload
 
 
@@ -112,17 +112,7 @@ class DeveloperPreviewRegistry:
                 for preview in self._by_id.values()
             ],
         }
-        temporary = self._path.with_suffix(".tmp")
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(self._path)
-        directory_fd = os.open(self._path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        atomic_write_text(self._path, json.dumps(data))
 
     def create_or_get(
         self,

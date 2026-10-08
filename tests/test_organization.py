@@ -159,7 +159,7 @@ def test_interrupted_save_keeps_previous_revision_and_retries_safely(tmp_path, m
         raise OSError("Interrupted snapshot write")
 
     with monkeypatch.context() as patch:
-        patch.setattr("aitobuild.organization.os.fsync", fail_sync)
+        patch.setattr("aitobuild.durable_files.os.fsync", fail_sync)
         with pytest.raises(OSError, match="Interrupted"):
             store.save(updated)
     assert store.get("product", original.revision) == original

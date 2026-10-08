@@ -6,7 +6,6 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from hashlib import sha256
 import json
-import os
 from pathlib import Path
 from typing import Annotated, Literal, Protocol, Self
 from uuid import uuid4
@@ -14,6 +13,7 @@ from uuid import uuid4
 from filelock import FileLock
 from pydantic import AwareDatetime, Field, StrictInt, StrictStr, model_validator
 
+from aitobuild.durable_files import atomic_write_text
 from aitobuild.developer_isolation import (
     DeveloperTaskBudget, DeveloperTaskBundle, developer_task_bundle_from_payload,
 )
@@ -142,17 +142,7 @@ class FileAssignmentStore:
         return AssignmentJournal.model_validate_json(content)
 
     def _save(self, journal: AssignmentJournal) -> None:
-        temporary = self._path.with_suffix(".tmp")
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(journal.model_dump_json())
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(self._path)
-        directory_fd = os.open(self._path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        atomic_write_text(self._path, journal.model_dump_json())
 
     def get(self, assignment_id: str) -> TaskAssignment | None:
         with FileLock(self._lock_path, timeout=10):

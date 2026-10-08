@@ -5,18 +5,17 @@ from __future__ import annotations
 from hashlib import sha256
 from glob import escape
 import json
-import os
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
 from filelock import FileLock
 from pydantic import Field, StrictStr, model_validator
 
+from aitobuild.durable_files import atomic_write_text
 from aitobuild.developer_delivery import DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry
 from aitobuild.organization import DefinitionModel, DefinitionStore, EventName, Identifier
-from aitobuild.organization import sync_directory
 from aitobuild.organization_runner import ManagedRun
 from aitobuild.policy import AgentRole
 from aitobuild.tools.github import GitHubAdapter
@@ -177,15 +176,7 @@ class PublishedReviewAdmission:
                     updated_correction.model_dump(exclude={"state", "correction_preview_id"}) or
                     correction.state == "staged" and correction != updated_correction):
                 raise PermissionError("Correction pins and staged receipts are immutable")
-        temporary = self._path.with_suffix(".tmp")
-        if temporary.resolve() != temporary:
-            raise ValueError("Review temporary journals cannot follow symlinks")
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(journal.model_dump_json())
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(self._path)
-        sync_directory(self._directory)
+        atomic_write_text(self._path, journal.model_dump_json())
 
     def _publication(self, preview_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         record = self._worker.get(preview_id)
@@ -303,7 +294,8 @@ class PublishedReviewAdmission:
             raise PermissionError("Correction proposal differs from the completed reviewed target")
         self._worker.refuse_superseded(target.preview_id)
         published = self._worker.get(target.preview_id)
-        assert published is not None and published.publication is not None
+        if not (published is not None and published.publication is not None):
+            raise PermissionError("Correction requires the saved published delivery")
         if not published.architect_review or output.get("architect_review") != published.architect_review:
             raise PermissionError("Correction requires the saved approved COMMENT receipt")
         proposal = CorrectionProposal.model_validate(output["correction"])

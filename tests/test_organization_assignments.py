@@ -82,7 +82,7 @@ def test_interrupted_journal_write_keeps_existing_owner_and_can_retry(tmp_path, 
     first = store.claim(record(tmp_path))
     second = record(tmp_path, task="task-two", agent="developer_two")
     with monkeypatch.context() as patch:
-        patch.setattr("aitobuild.organization_assignments.os.fsync", lambda _: (_ for _ in ()).throw(OSError("Interrupted")))
+        patch.setattr("aitobuild.durable_files.os.fsync", lambda _: (_ for _ in ()).throw(OSError("Interrupted")))
         with pytest.raises(OSError, match="Interrupted"):
             store.claim(second)
     assert store.get(first.assignment_id) == first
@@ -341,7 +341,9 @@ def test_interrupted_terminal_write_preserves_abort_and_safe_retry(tmp_path, mon
     service, snapshot, previews, assignments = setup_service(tmp_path)
     first = assign(service, snapshot, approved_task(tmp_path, previews), **coordinator_proposal())
     with monkeypatch.context() as patch:
-        patch.setattr("aitobuild.organization_assignments.os.fsync", lambda _: (_ for _ in ()).throw(OSError("Interrupted")))
+        # Only the assignment journal write is interrupted; the budget abort before it is durable.
+        patch.setattr("aitobuild.organization_assignments.atomic_write_text",
+                      lambda *args, **kwargs: (_ for _ in ()).throw(OSError("Interrupted")))
         with pytest.raises(OSError, match="Interrupted"):
             service.finish(first.assignment_id, state="failed", outcome="Operator stopped task")
     assert assignments.get(first.assignment_id).state == "claimed"
