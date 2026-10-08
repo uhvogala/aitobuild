@@ -26,13 +26,13 @@ Team structure and lifecycle are not fixed in code.
 | --- | --- | --- |
 | Organization configuration | Immutable revisions, native graphs, durable assignments/runs, opt-in workers, native PM coordination and bounded correction follow-ups | Broader live configuration coverage and distributed controls |
 | Ingress and routing | Signed webhooks, internal auth, issue extraction, durable scope approval/dedupe and activated task queueing | Hosted GitHub webhook delivery and deployment activation |
-| Developer execution | Preview approval, scoped exact-text edits, independent verification and approval-gated draft/correction delivery | Live same-PR correction and stronger isolation |
+| Developer execution | Preview approval, scoped exact-text edits, independent verification and supervised live same-PR correction delivery | Stronger isolation and broader live coverage |
 | Native model runtime | Configured Developer, read-only PM proposals and scoped Architect operations with persistent approvals | Broader PM planning/writes and live model coverage |
-| GitHub integration | Verified draft publication, immutable source/base diff reads and head-pinned COMMENT reviews through allowlisted gh CLI | Live same-PR correction |
+| GitHub integration | Verified drafts, immutable source/base diff reads, head-pinned COMMENTs and recovered supervised correction/re-review | Hosted delivery and broader live coverage |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Current local gates after merged PRs #11/#13 at `69aa8d4` and bounded follow-ups: **853 tests pass**,
+Current local gates for the bounded follow-ups committed as `307b86a` over `69aa8d4`: **853 tests pass**,
 with two optional prepared-target Docker probes skipped; Ruff and mypy (48 source
 files) pass. Local bounded follow-ups are preserved. Issues #9/#10 are resolved:
 uncertain PR creation adopts only the exact draft, state writes share the durable
@@ -85,9 +85,22 @@ Restart/duplicate publication, exact remote snapshot, original ledger preservati
 one-round bound and cleanup passed. Earlier timeout/provider failures and a
 supervisor-rejected harmless `true` command remain recorded. Operator retirement
 now supports abandoned idle approvals and already-aborted original budgets;
-neither is replayed or reset. The corrected-head review failed closed on provider
+neither is replayed or reset. The first corrected-head review failed closed on provider
 `429 pd_decode_pushback`, so publication passed but the full correction/re-review
-cycle is not accepted. Evidence: `sim/.run-artifacts/example-correction-20261008/final-correction-report.json`.
+cycle was not accepted at that checkpoint. Evidence: `sim/.run-artifacts/example-correction-20261008/final-correction-report.json`.
+A subsequent fresh operator-bound native review completed four source/diff
+inspections and posted the exact final-only corrected-head COMMENT at review
+`5459666675`, with no remaining functional defect identified. Waiting/terminal
+restart, exact remote reviews and snapshot, original runs/ledgers, consumed
+publication approval, one-round limit and cleanup passed the independent audit.
+This completes the supervised correction/re-review sequence through operator
+recovery, not an uninterrupted configured-service run or a default retry endpoint.
+Reporter serialization and audit-schema errors were recovered without model or
+COMMENT replay; the failed harness audit remains saved and its timestamp check
+still needs repair. Authoritative recovery evidence:
+`sim/.run-artifacts/example-correction-20261008/final-correction-recovery-report.json`.
+The implementation is committed locally; no service push, merge or default
+activation occurred. Nineteen native review contract cases passed again.
 The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
 The original patch-repair

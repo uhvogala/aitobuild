@@ -5,7 +5,7 @@ describes the target architecture and [README.md](README.md) documents setup.
 Statuses below are evidence-based, not completion estimates or promised dates.
 
 Latest refresh: merged PRs #11/#13 pulled to `69aa8d4`, preserving local bounded
-follow-ups. Current gates: 853 tests pass/two optional Docker skips; Ruff/mypy (48 sources) pass.
+follow-ups, now committed locally as `307b86a`. Current gates: 853 tests pass/two optional Docker skips; Ruff/mypy (48 sources) pass.
 Issues #9/#10/#12 are resolved. Exact recovery is read-only; every actual remote
 write remains original-budget guarded. Older consolidation counts and blocker
 descriptions below are historical. Both real Docker probes and fresh Grok scoped
@@ -46,8 +46,19 @@ one-round ceiling and cleanup passed. Timeout/provider failures and a supervisor
 no-op refusal are retained; idle retirement/aborted-budget recovery were fixed with
 regressions, never by resetting or replaying tasks. The corrected-head Architect
 review failed on provider `429 pd_decode_pushback`; the full correction/re-review
-cycle remains pending. Evidence:
+cycle was pending at that checkpoint. Evidence:
 `sim/.run-artifacts/example-correction-20261008/final-correction-report.json`.
+Fresh operator-bound corrected-head review then completed four source/diff
+inspections and exact final-only COMMENT `5459666675`, finding no remaining
+functional defect. All 30 independent checks passed for original runs/ledgers,
+consumed publication approval, both exact reviews, remote snapshot, saved idle and
+terminal restart, one-round scope and cleanup. This accepts the supervised
+correction/re-review sequence through explicit operator recovery, not an
+uninterrupted configured-service run or automatic retry endpoint. Reporter and
+audit-schema errors are retained; metadata-only recovery never replayed the model
+or COMMENT. The trial helper's timestamp audit remains a follow-up. Evidence:
+`sim/.run-artifacts/example-correction-20261008/final-correction-recovery-report.json`.
+Nineteen native review contract cases passed again; no service push or merge.
 
 ## Direction
 
@@ -89,8 +100,8 @@ execute task code against the aitobuild service checkout.
 | Developer model/tool path | Foundry/v1 clients, private tools, terminal/process/browser and file memory | Live Grok/Kimi evaluations; strict zero-error acceptance pending |
 | Persistent Docker sessions | Private checkouts/home volumes, restart memory/history and scoped cleanup | Live integration evidence; prototype isolation only |
 | MCP shell/filesystem | Native stdio transport adapter, configurable names | Optional; compatibility validation pending |
-| GitHub output | Allowlisted gh CLI branch/commit/draft publication, immutable snapshot capture and exact remote reconciliation | Supervised local service live acceptance passed; hosted delivery/correction pending |
-| Architect/PM/meetings | Native PM delegation, saved COMMENT approvals, native correction/verification, same-PR updates and bounded re-review staging | Scoped live Architect review passed; live correction, managed PM writes and meetings pending |
+| GitHub output | Allowlisted gh CLI branch/commit/draft publication, immutable snapshots and exact reconciliation; supervised live same-PR correction | Hosted delivery and broader live coverage pending |
+| Architect/PM/meetings | Native PM delegation, saved COMMENT approvals and recovered supervised live correction/re-review | Managed PM planning/writes and meetings pending; no automatic failed-review retry |
 | Operations | Manual tick API, local durable managed worker and successful hosted CI baseline | M0 accepted; broader durable state/distributed controls and tracing missing |
 
 Current local gates with consolidated PR #11 and supervised correction cycles atop

@@ -4,8 +4,8 @@ This document describes the target architecture, not a fully implemented system.
 The implementation snapshot in section 7 distinguishes available capabilities
 from remaining work. Operational milestones are tracked in [MILESTONES.md](MILESTONES.md).
 
-Latest refresh (2026-10-08): master is `69aa8d4` after merged PRs #11/#13, with
-local bounded follow-ups preserved. Current gates: 853 tests pass/two optional Docker
+Merged baseline (2026-10-08): `69aa8d4` contains PRs #11/#13; the bounded
+follow-ups are now committed locally as `307b86a`. Current gates: 853 tests pass/two optional Docker
 skips, Ruff and mypy (48 sources). Issues #9/#10/#12 are resolved upstream.
 Read-only exact reconciliation supersedes older notes about recovery object
 uploads; write-time budget and pre/post-PATCH guards remain enforced. Historical
@@ -58,11 +58,26 @@ to advance the same PR from `a99e973116ebd31800af11de56c51e78c77ffbcb` to
 `9ddc9dcedacb70bb075bf2c3fd91f5444b36a3e8`. Exact remote pins, preserved tests,
 restart/duplicate publication, original ledgers, retired predecessor, one-round
 limit and cleanup passed. Corrected-head Architect review failed closed on provider
-`429 pd_decode_pushback`; full correction/re-review acceptance remains pending.
+`429 pd_decode_pushback`; full correction/re-review acceptance was pending at that checkpoint.
 Report: `sim/.run-artifacts/example-correction-20261008/final-correction-report.json`.
 Standing user authorization is consumed through scoped service approvals and exact
 publication digests, not approval bypass or default activation. No merge or service
 commit/push; hosted delivery and distributed operation remain unverified.
+Subsequent corrected-head recovery (2026-10-08): a fresh operator-bound native
+Architect task, revision, session and original zero-write 30-minute ledger
+completed four source/diff inspections and exact final-only COMMENT `5459666675`.
+It identified no remaining functional defect. Original failed task/aborted ledger,
+all prior runs/budgets and the one-round root scope remain unchanged. Idle and
+terminal restart, two exact head-pinned reviews, exact remote snapshot, consumed
+publication approval and cleanup passed all 30 independent audit checks.
+The supervised correction/re-review sequence passed through operator recovery;
+the original configured-service review remains failed, not silently retried.
+No production retry endpoint or default activation was added. Reporter datetime
+and audit-wrapper/timestamp errors were recovered metadata-only, with the failed
+harness report retained; its timestamp helper remains a follow-up. Report:
+`sim/.run-artifacts/example-correction-20261008/final-correction-recovery-report.json`.
+Nineteen native review contract cases passed again. No service push or merge;
+hosted delivery/distributed execution and managed PM planning remain separate.
 
 ## 1. Executive Summary
 This document outlines a supervised, configurable product-team framework using
