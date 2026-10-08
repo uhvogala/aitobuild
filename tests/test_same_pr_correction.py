@@ -301,6 +301,116 @@ def test_resume_settles_by_the_live_head_before_any_budget_check(live, correctio
     assert worker.correction_releases_parent(correction) is (live == "parent_expired")
 
 
+def _interrupted_correction(worker, github, make, monkeypatch, *, landed):
+    """A publish that stopped mid-push with GitHub unreadable: publishing, approval still consuming."""
+    correction = make()
+    staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
+    advance = github.advance_draft_pull_request_head
+
+    def crashed(**kwargs):
+        if landed:
+            advance(**kwargs)
+        raise KeyboardInterrupt("process stopped mid-push")
+
+    def unreadable(**kwargs):
+        raise RuntimeError("GitHub unreachable")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(github, "advance_draft_pull_request_head", crashed)
+        patched.setattr(github, "reconcile_advanced_head", unreadable)
+        with pytest.raises(KeyboardInterrupt):
+            _publish(worker, github, correction, staged["digest"])
+    assert worker.get(correction).state == "publishing"
+    return correction, staged["digest"]
+
+
+def _count_github_calls(github, monkeypatch):
+    calls = []
+    for name in ("reconcile_advanced_head", "advance_draft_pull_request_head"):
+        original = getattr(github, name)
+
+        def counted(*args, _name=name, _original=original, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(github, name, counted)
+    return calls
+
+
+@pytest.mark.parametrize("binding", ["digest", "operator", "receipt", "blob_shas", "file_modes", "repository",
+                                     "branch", "parent", "preview"])
+def test_resume_refuses_a_mismatched_binding_before_touching_github(binding, correction_chain, monkeypatch):
+    worker, _, github, _, make = correction_chain
+    correction, digest = _interrupted_correction(worker, github, make, monkeypatch, landed=True)
+    state_path = worker._task_dir(correction) / "state.json"
+    approval = worker._approvals.get(correction)
+    arguments = dict(approval_digest=digest, review_receipt_digest=RECEIPT, actor_id="operator")
+    if binding == "digest":
+        arguments["approval_digest"] = "f" * 64
+    elif binding == "operator":
+        arguments["actor_id"] = "someone-else"
+    elif binding == "receipt":
+        arguments["review_receipt_digest"] = "b" * 64
+    else:
+        raw = json.loads(state_path.read_text())
+        publication = raw["record"]["publication"]
+        if binding == "blob_shas":
+            path = next(iter(publication["blob_shas"]))
+            publication["blob_shas"][path] = "0" * 40
+        elif binding == "file_modes":
+            path = next(iter(publication["file_modes"]))
+            publication["file_modes"][path] = "100755"
+        elif binding == "repository":
+            publication["repository"] = "fixture/elsewhere"
+        if binding in {"parent", "preview", "branch"}:
+            # Bind the in-flight approval to a different parent/preview/branch than the saved record.
+            key, value = {"parent": ("parent_head_sha", "c" * 40), "preview": ("preview_id", "forged-preview"),
+                          "branch": ("head_branch", approval.snapshot["head_branch"] + "-forged")}[binding]
+            snapshot = {**approval.snapshot, key: value}
+            monkeypatch.setattr(worker._approvals, "get",
+                                lambda preview_id: approval.model_copy(update={"snapshot": snapshot}))
+        else:
+            state_path.write_text(json.dumps(raw))
+    before = state_path.read_bytes()
+    calls = _count_github_calls(github, monkeypatch)
+    with pytest.raises(PermissionError):
+        worker.approve_and_publish_correction(
+            correction, github=github, require_human_approval_for_repo_writes=True, allow_mock_publication=True,
+            **arguments)
+    assert calls == []
+    assert state_path.read_bytes() == before
+    assert approval.state == "consuming"
+    if binding not in {"parent", "preview", "branch"}:
+        assert worker._approvals.get(correction).state == "consuming"
+
+
+@pytest.mark.parametrize("pull_change", [{"draft": False}, {"state": "closed"}], ids=["undrafted", "closed"])
+def test_resume_that_finds_our_push_on_a_closed_or_ready_pr_stays_publishing(pull_change, correction_chain, monkeypatch):
+    worker, published_id, github, head, make = correction_chain
+    correction, digest = _interrupted_correction(worker, github, make, monkeypatch, landed=True)
+    publication = worker.get(published_id).publication
+    pulls = github.pull_requests[publication["repository"]]
+    pulls[publication["pull_number"]] = replace(pulls[publication["pull_number"]], **pull_change)
+    calls = _count_github_calls(github, monkeypatch)
+    with pytest.raises(RuntimeError, match="pinned open draft"):
+        _publish(worker, github, correction, digest)
+    assert calls == ["reconcile_advanced_head"]
+    assert worker.get(correction).state == "publishing"
+    assert worker._approvals.get(correction).state == "consuming"
+
+
+def test_resume_with_a_missing_budget_file_still_ends_not_applied(correction_chain, monkeypatch):
+    worker, published_id, github, head, make = correction_chain
+    correction, digest = _interrupted_correction(worker, github, make, monkeypatch, landed=False)
+    worker.budget_path(correction).unlink()
+    with pytest.raises(PermissionError, match="budget is gone"):
+        _publish(worker, github, correction, digest)
+    failed = worker.get(correction)
+    assert failed.state == "failed" and failed.publication["push_outcome"] == "not_applied"
+    assert worker._approvals.get(correction).state == "consumed"
+    assert worker.correction_releases_parent(correction)
+
+
 def test_push_that_did_not_apply_releases_the_parent_head(correction_chain, monkeypatch):
     worker, published_id, github, head, make = correction_chain
     correction = make()

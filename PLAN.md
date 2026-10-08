@@ -343,7 +343,7 @@ from the snapshot's pinned blob SHAs/modes before any budget check; only an unto
 needs a valid budget to push again (else `not_applied`). Retire releases a
 failed/abandoned correction only while the live head equals its parent; re-offering after a
 release creates a new attempt with a new task ID. A landed push on a PR closed or marked ready
-before reconciliation stays publishing for operator inspection. Gates: **780 passed/two
+before reconciliation stays publishing for operator inspection. Gates: **792 passed/two
 optional Docker skips**, Ruff/mypy (47 sources). No live GitHub trial, hosted CI or automatic
 correction loop yet.
 

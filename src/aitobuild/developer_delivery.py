@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from difflib import unified_diff
 from hashlib import sha256
 import json
+from contextlib import suppress
 import os
 from pathlib import Path
 import re
@@ -1009,12 +1010,14 @@ class DeveloperDeliveryWorker:
         if outcome == "ours":
             self._require_advanced_pull(pull, record=record, snapshot=push)
             return self._finish_correction_publication(directory, record, pull, approval_digest=approval_digest)
-        # Only read for terminal bookkeeping: an aborted budget may still be marked aborted again.
-        budget = DeveloperTaskBudget(path=self.budget_path(record.preview_id),
-                                     bundle=developer_task_bundle_from_payload(record.bundle_payload), create=False,
-                                     allow_aborted=True)
+        # Only read for terminal bookkeeping: an aborted budget may still be marked aborted again. A missing or
+        # damaged budget must still end terminally (releasing an untouched parent), never stick in publishing.
+        budget: DeveloperTaskBudget | None = None
         if outcome == "parent":
             try:
+                budget = DeveloperTaskBudget(path=self.budget_path(record.preview_id),
+                                             bundle=developer_task_bundle_from_payload(record.bundle_payload),
+                                             create=False, allow_aborted=True)
                 budget.remaining_seconds()
             except Exception as expired:
                 error = f"Push did not apply and the approved budget is gone: {expired}"
@@ -1022,17 +1025,22 @@ class DeveloperDeliveryWorker:
                                            approval_digest=approval_digest, budget=budget)
                 raise PermissionError(error) from expired
             return None
+        with suppress(Exception):
+            budget = DeveloperTaskBudget(path=self.budget_path(record.preview_id),
+                                         bundle=developer_task_bundle_from_payload(record.bundle_payload),
+                                         create=False, allow_aborted=True)
         error = "Pull request head moved while the correction was interrupted"
         self._fail_correction_push(directory, record, "moved", pull, error, approval_digest=approval_digest, budget=budget)
         raise PermissionError(error)
 
     def _fail_correction_push(
         self, directory: Path, record: DeliveryPreparation, verdict: str, pull: Any, error: str, *,
-        approval_digest: str, budget: DeveloperTaskBudget,
+        approval_digest: str, budget: DeveloperTaskBudget | None,
     ) -> None:
         """Terminal push failure: `not_applied` releases the parent head, `moved` keeps holding it."""
         assert record.publication is not None
-        budget.abort()
+        if budget is not None:
+            budget.abort()
         self._save(directory, replace(
             record, state="failed", error=error,
             publication={**record.publication, "push_outcome": verdict, "live_head_sha": (pull.head_sha or "").lower()},
