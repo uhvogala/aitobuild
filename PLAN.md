@@ -337,7 +337,9 @@ next Architect review. Offers and publishes come only from the chain tip; the ch
 closed; superseded preview IDs are refused with the tip. Failures past consume settle by the live
 head: ours reconciles to published, the unchanged parent releases the head (`not_applied`), a
 moved head fails and keeps holding it, an unreadable head stays resumable. Retire releases a
-failed/abandoned correction only while the live head equals its parent. Gates: **752 passed/two
+failed/abandoned correction only while the live head equals its parent; re-offering after a
+release creates a new attempt with a new task ID. A landed push on a PR closed or marked ready
+before reconciliation stays publishing for operator inspection. Gates: **754 passed/two
 optional Docker skips**, Ruff/mypy (47 sources). No live GitHub trial, hosted CI or automatic
 correction loop yet.
 

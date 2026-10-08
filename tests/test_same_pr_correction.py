@@ -9,7 +9,7 @@ import subprocess
 import pytest
 
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
-from aitobuild.publish_approvals import PublishApprovalStore, approval_digest, snapshot_digest
+from aitobuild.publish_approvals import PublishApproval, PublishApprovalStore, approval_digest, snapshot_digest
 from aitobuild.tools.github import MockGitHubAdapter
 from test_dispatcher import (
     approved_delivery as approved_delivery, implemented_delivery as implemented_delivery,
@@ -500,6 +500,16 @@ def test_approval_store_is_single_use_and_tamper_evident(tmp_path):
     with pytest.raises(PermissionError, match="already consumed"):
         store.begin_consume("p1", digest=digest, recomputed_content_digest=content, actor_id="op")
     path = next((tmp_path / "approvals").glob("*.json"))
+    # Backstop under every public method: consumed is final, and states never skip or go back.
+    revived = PublishApproval.model_validate({
+        "preview_id": "p1", "snapshot": consumed.snapshot, "content_digest": content, "nonce": "1" * 32,
+        "digest": approval_digest(content, "1" * 32), "state": "pending", "staged_at": consumed.staged_at,
+        "replaced_digest": consumed.digest})
+    for original, updated in ((consumed, revived), (consumed, consumed), (again, consumed),
+                              (store.get("p1"), revived)):
+        with pytest.raises(PermissionError, match="only moves forward"):
+            store._save(path, original, updated)
+    assert store.get("p1") == consumed
     pristine = path.read_text()
     for tamper in (
         lambda data: data["snapshot"].__setitem__("diff", "tampered"),

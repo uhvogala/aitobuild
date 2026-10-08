@@ -26,7 +26,7 @@ class DefinitionModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-def _sync_directory(directory: Path) -> None:
+def sync_directory(directory: Path) -> None:
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)
@@ -316,5 +316,5 @@ class FileDefinitionStore:
                 os.fsync(handle.fileno())
             temporary.replace(path)
             for directory in (path.parent, self._root):
-                _sync_directory(directory)
+                sync_directory(directory)
         return snapshot

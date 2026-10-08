@@ -406,8 +406,9 @@ def test_publication_stages_unapproved_head_pinned_review_once(tmp_path, publish
 @pytest.mark.parametrize("detached", [False, True])
 @pytest.mark.parametrize("outcome", ["approve", "cancel_corrupt_preview", "correction", "correction_missing_seed",
                                      "correction_partial", "correction_scope", "correction_journal_loss", "correction_head_drift",
-                                     "correction_revision", "correction_missing_budget", "correction_sibling"])
-def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, published_delivery, detached, outcome, monkeypatch, test_config):
+                                     "correction_revision", "correction_missing_budget", "correction_sibling", "correction_retry"])
+def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, published_delivery, detached, outcome, monkeypatch, test_config,
+                                                                     verification_adapter):
     from aitobuild.organization_reviews import PublishedReviewAdmission, PublishedReviewRoute
     from aitobuild.organization_service import ManagedOrganizationService
     from aitobuild.organization_worker import FileWorkerStore, ManagedOrganizationWorker
@@ -432,6 +433,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
         number, repository = published.publication["pull_number"], published.publication["repository"]
         github.pull_requests[repository][number] = replace(github.pull_requests[repository][number], head_sha=head)
         github.commit_files[(repository, head)] = github.commit_files[(repository, old_head)]
+        github._branch_heads.setdefault(repository, {})[published.branch] = head
         git(Path(published.source_path), "fetch", "--no-tags", "--no-write-fetch-head", str(checkout), head)
         git(Path(published.source_path), "update-ref", "refs/heads/" + published.branch, head)
     reviews = PublishedReviewAdmission(
@@ -562,6 +564,12 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         assert previews.list_previews(pending_only=True, limit=10) == pending_before
                         assert [receipt.task_id for receipt in reviews._load().corrections.values()] == ["published-correction-sibling"]
                         assert developer_budget.read_bytes() == before_developer
+                        holds = worker.correction_releases_parent
+                        monkeypatch.setattr(worker, "correction_releases_parent",
+                                            lambda preview_id: preview_id == "sibling-correction" or holds(preview_id))
+                        released = await service().offer_correction(preview.preview_id)
+                        assert released is not None and released.preview_id != "sibling-correction" and not released.approved
+                        assert developer_budget.read_bytes() == before_developer
                         return
                     correction = await service().offer_correction(preview.preview_id)
                     assert correction is not None and not correction.approved
@@ -665,6 +673,54 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         assert {repo: dict(prs) for repo, prs in github.pull_requests.items()} == pulls_before
                         assert worker.get(correction.preview_id).state == prepared.state
                         assert json.loads(budget.path.read_text())["reserved_paths"] == []
+                        if outcome == "correction_retry":
+                            corrected_path = done.outputs[0]["correction"]["paths"][0]
+
+                            def implement_and_verify(preview_id):
+                                record = worker.get(preview_id)
+                                parsed = developer_task_bundle_from_payload(record.bundle_payload)
+                                ledger = DeveloperTaskBudget(path=worker.budget_path(preview_id), bundle=parsed, create=False)
+                                with worker.implementation_lock(preview_id):
+                                    worker.begin_implementation(preview_id, bundle=parsed, session_id="correction-developer", resume=False)
+                                    ledger.reserve_paths((corrected_path,))
+                                    (Path(record.checkout_path) / corrected_path).write_text("corrected = True\n")
+                                    worker.finish_implementation(preview_id, session_id="correction-developer")
+                                verified = worker.verify(preview_id, adapter=verification_adapter)
+                                assert verified.state == "verified", verified.error
+
+                            implement_and_verify(correction.preview_id)
+                            staged_push = await service().stage_correction_publication(correction.preview_id)
+                            advance = github.advance_draft_pull_request_head
+
+                            def rejected(**kwargs):
+                                raise RuntimeError("GitHub rejected the ref update")
+
+                            monkeypatch.setattr(github, "advance_draft_pull_request_head", rejected)
+                            with pytest.raises(RuntimeError, match="rejected"):
+                                await service().publish_correction(correction.preview_id, approval_digest=staged_push["digest"],
+                                                                   github=github, allow_mock_publication=True)
+                            monkeypatch.setattr(github, "advance_draft_pull_request_head", advance)
+                            assert worker.get(correction.preview_id).publication["push_outcome"] == "not_applied"
+                            retry = await service().offer_correction(preview.preview_id)
+                            assert retry is not None and retry.preview_id != correction.preview_id and not retry.approved
+                            assert retry.bundle_payload["task_id"] != correction.bundle_payload["task_id"]
+                            assert retry.source_payload["replaces_correction"] == correction.preview_id
+                            assert retry.source_payload["correction_attempt"] == 2
+                            assert await service().offer_correction(preview.preview_id) == retry
+                            assert reviews.correction_route_for(retry.preview_id).event == "published.correction"
+                            previews.approve(retry.preview_id)
+                            assert (await service().consume(retry.preview_id)).state == "completed"
+                            implement_and_verify(retry.preview_id)
+                            staged_retry = await service().stage_correction_publication(retry.preview_id)
+                            published_retry, _ = await service().publish_correction(
+                                retry.preview_id, approval_digest=staged_retry["digest"], github=github, allow_mock_publication=True)
+                            assert published_retry.state == "published"
+                            assert published_retry.publication["parent_head_sha"] == prepared.base_revision
+                            assert github.pull_requests[repository][number].head_sha == published_retry.publication["head_sha"]
+                            assert worker.superseded_by(published_id) == retry.preview_id
+                            with pytest.raises(PermissionError, match="superseded"):
+                                await service().offer_correction(preview.preview_id)
+                            return
                         if outcome == "correction_missing_budget":
                             budget.path.unlink()
                             assert worker.prepare(correction.preview_id).state == "failed"

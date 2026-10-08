@@ -32,7 +32,7 @@ Team structure and lifecycle are not fixed in code.
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **752 tests pass**, with two optional prepared-target Docker
+Verified locally: **754 tests pass**, with two optional prepared-target Docker
 probes skipped; Ruff and mypy (47 source files) and the mock fixture simulation pass.
 The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
@@ -574,9 +574,15 @@ fails terminally with `push_outcome: moved` and keeps holding it; an unreadable 
 /internal/organization/corrections/retire {correction_preview_id}` (live adapter only) retires a
 failed or abandoned unpublished correction only while the live PR head still equals its parent,
 invalidating any pending approval; both sibling checks skip released and retired corrections.
+Offering the same review again after its correction released the head (`not_applied` or retired)
+creates a new attempt with its own task ID, recording `correction_attempt` and the preview it
+replaces; offering while the latest attempt still holds the head returns that same preview.
+If our push landed but the PR was then closed or marked ready before reconciliation, the record
+stays `publishing` and cannot be retired; that case needs operator inspection.
 An Architect COMMENT that GitHub binds to another commit is recorded, so a retry refuses instead
 of posting a duplicate. Only correction records related to the checked PR or parent head can
-block those checks; files that cannot be parsed at all still fail closed.
+block those checks, but any delivery file that cannot be parsed at all, even an unrelated one,
+fails every correction check closed until it is repaired or removed.
 Managed `delivery_publish` and the legacy publish endpoint refuse correction tasks.
 
 Twenty correction regressions cover actual native Architect mocked transports,

@@ -21,7 +21,7 @@ from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegist
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot
 from aitobuild.organization_assignments import AssignmentProposal
 from aitobuild.organization_delivery import _delivery_call
-from aitobuild.organization_runner import ManagedOperation, ManagedTaskContext, WorkflowInput, _sync_directory
+from aitobuild.organization_runner import ManagedOperation, ManagedTaskContext, WorkflowInput, sync_directory
 from aitobuild.organization_runtime import OrganizationRuntime
 from aitobuild.organization_reviews import PublishedReviewTarget as PublishedReviewTarget
 from aitobuild.organization_reviews import CorrectionProposal
@@ -92,7 +92,7 @@ class NativeCoordinatorProposal:
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(path)
-        _sync_directory(path.parent)
+        sync_directory(path.parent)
 
     async def __call__(self, snapshot: DefinitionSnapshot, preview: DeveloperPreview) -> AssignmentProposal:
         route = next((route for route in snapshot.definition.routes if self._event in route.events), None)

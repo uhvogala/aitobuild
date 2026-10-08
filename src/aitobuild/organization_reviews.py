@@ -16,7 +16,7 @@ from aitobuild.developer_delivery import DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry
 from aitobuild.organization import DefinitionModel, DefinitionStore, EventName, Identifier
-from aitobuild.organization_runner import ManagedRun, _sync_directory
+from aitobuild.organization_runner import ManagedRun, sync_directory
 from aitobuild.policy import AgentRole
 from aitobuild.tools.github import GitHubAdapter
 
@@ -69,6 +69,8 @@ class _CorrectionReceipt(DefinitionModel):
     bundle_content: StrictStr
     state: Literal["staging", "staged"] = "staging"
     correction_preview_id: StrictStr | None = None
+    attempt: Annotated[int, Field(strict=True, ge=1)] = 1
+    predecessor_preview_id: StrictStr | None = None
 
 
 class _ReviewJournal(DefinitionModel):
@@ -139,6 +141,19 @@ class PublishedReviewAdmission:
             if (not isinstance(payload, dict) or correction.task_id != task_id or payload.get("task_id") != task_id or
                     (correction.state == "staged") != (correction.correction_preview_id is not None)):
                 raise ValueError("Correction journal task identity/state is invalid")
+        attempts: dict[str, list[_CorrectionReceipt]] = {}
+        for correction in journal.corrections.values():
+            attempts.setdefault(correction.review_preview_id, []).append(correction)
+        for chain in attempts.values():
+            chain.sort(key=lambda item: item.attempt)
+            for index, correction in enumerate(chain):
+                predecessor = chain[index - 1] if index else None
+                if (correction.attempt != index + 1
+                        or (predecessor is None) != (correction.predecessor_preview_id is None)
+                        or predecessor is not None and (predecessor.state != "staged"
+                                                        or predecessor.correction_preview_id != correction.predecessor_preview_id
+                                                        or predecessor.target != correction.target)):
+                    raise ValueError("Correction journal attempt chain is invalid")
         return journal
 
     def _save(self, journal: _ReviewJournal) -> None:
@@ -166,7 +181,7 @@ class PublishedReviewAdmission:
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(self._path)
-        _sync_directory(self._directory)
+        sync_directory(self._directory)
 
     def _publication(self, preview_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         record = self._worker.get(preview_id)
@@ -298,9 +313,13 @@ class PublishedReviewAdmission:
         run_content = run.model_dump_json()
         with FileLock(str(self._path) + ".lock", timeout=10):
             journal = self._load()
-            saved = [receipt for receipt in journal.corrections.values() if receipt.review_preview_id == review_preview_id]
-            if len(saved) > 1:
-                raise PermissionError("Review has ambiguous correction receipts")
+            saved = sorted((receipt for receipt in journal.corrections.values() if receipt.review_preview_id == review_preview_id),
+                           key=lambda receipt: receipt.attempt)
+            latest = saved[-1] if saved else None
+            # A correction whose push did not apply, or that an operator retired, released its parent head;
+            # offering the same review again starts a fresh attempt instead of returning the dead preview.
+            retry = (latest is not None and latest.state == "staged"
+                     and self._worker.correction_releases_parent(latest.correction_preview_id))
             siblings = [receipt for receipt in journal.corrections.values()
                         if receipt.target.head_sha == target.head_sha and receipt.review_preview_id != review_preview_id
                         and not self._worker.correction_releases_parent(receipt.correction_preview_id)]
@@ -309,14 +328,17 @@ class PublishedReviewAdmission:
                     f"Correction {siblings[0].correction_preview_id or siblings[0].task_id} already targets "
                     f"head {target.head_sha}; offer corrections only from the chain tip"
                 )
-            if saved:
-                original = saved[0]
-                if original.run_content != run_content or original.target != target or original.route.organization_id != route.organization_id:
+            if latest is not None:
+                if latest.run_content != run_content or latest.target != target or latest.route.organization_id != route.organization_id:
                     raise PermissionError("Correction source/target/activation changed")
-                route = original.route
+                route = latest.route
             self._validate_route(route, role=AgentRole.DEVELOPER)
-            task_id = "published-correction-" + sha256(json.dumps({"review": review_preview_id, "run": run_content,
-                                                                  "route": route.model_dump()}, sort_keys=True).encode()).hexdigest()
+            attempt = (latest.attempt + 1 if retry else latest.attempt) if latest is not None else 1
+            predecessor = (latest.correction_preview_id if retry else latest.predecessor_preview_id) if latest is not None else None
+            identity: dict[str, Any] = {"review": review_preview_id, "run": run_content, "route": route.model_dump()}
+            if attempt > 1:
+                identity |= {"attempt": attempt, "predecessor": predecessor}
+            task_id = "published-correction-" + sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
             bundle = json.loads(json.dumps(published.bundle_payload))
             bundle["task_id"] = task_id
             bundle["objective"] = proposal.objective
@@ -329,13 +351,16 @@ class PublishedReviewAdmission:
             receipt = journal.corrections.get(task_id)
             if receipt is None:
                 receipt = _CorrectionReceipt(task_id=task_id, review_preview_id=review_preview_id, target=target,
-                                             route=route, run_content=run_content, bundle_content=content)
+                                             route=route, run_content=run_content, bundle_content=content,
+                                             attempt=attempt, predecessor_preview_id=predecessor)
                 journal.corrections[task_id] = receipt
                 self._save(journal)
             elif receipt.bundle_content != content:
                 raise PermissionError("Correction scope cannot replace its staging receipt")
-            staged = self._previews.create_or_get(dedupe_key=task_id, bundle_payload=bundle,
-                                                  source_payload={"correction_from_review": review_preview_id, "published_review": target.model_dump(mode="json")})
+            source_payload: dict[str, Any] = {"correction_from_review": review_preview_id, "published_review": target.model_dump(mode="json")}
+            if attempt > 1:
+                source_payload |= {"correction_attempt": attempt, "replaces_correction": predecessor}
+            staged = self._previews.create_or_get(dedupe_key=task_id, bundle_payload=bundle, source_payload=source_payload)
             if receipt.state == "staged":
                 if receipt.correction_preview_id != staged.preview_id:
                     raise PermissionError("Correction preview identity changed")

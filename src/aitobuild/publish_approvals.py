@@ -21,7 +21,7 @@ from typing import Annotated, Any, Literal, Self
 from filelock import FileLock
 from pydantic import AwareDatetime, Field, JsonValue, StrictStr, ValidationError, model_validator
 
-from aitobuild.organization import DefinitionModel, _sync_directory
+from aitobuild.organization import DefinitionModel, sync_directory
 
 _Hex64 = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
 _IDENTITY = ("version", "preview_id", "snapshot", "content_digest", "nonce", "digest", "staged_at", "replaced_digest")
@@ -141,7 +141,7 @@ class PublishApprovalStore:
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(path)
-        _sync_directory(self._directory)
+        sync_directory(self._directory)
         return updated
 
     def get(self, preview_id: str) -> PublishApproval | None:
