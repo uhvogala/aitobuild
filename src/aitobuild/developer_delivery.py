@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from difflib import unified_diff
 from hashlib import sha256
 import json
+from contextlib import suppress
 import os
 from pathlib import Path
 import re
@@ -25,11 +26,14 @@ from aitobuild.developer_isolation import (
     DeveloperTaskBudget, DeveloperTaskBundle, developer_task_bundle_from_payload, is_command_allowed, is_path_allowed,
 )
 from aitobuild.developer_preview import DeveloperPreviewRegistry
+from aitobuild.publish_approvals import PublishApprovalStore, snapshot_digest
 from aitobuild.policy import AgentRole
 from aitobuild.tools.github import (
     GitHubAdapter,
     GitHubBlobChange,
     MockGitHubAdapter,
+    pinned_changes,
+    pinned_changes_from_snapshot,
     _git_blob_sha,
     _tree_fingerprint,
 )
@@ -40,6 +44,27 @@ from aitobuild.tools.shell import shell_request
 ARCHITECT_REVIEW_BODY_MAX = 2000
 ARCHITECT_REVIEW_BODY_PREFIX = "aitobuild Architect review\n\n"
 _ARCHITECT_REVIEW_EVENTS = frozenset({"COMMENT"})
+
+
+CORRECTION_TASK_PREFIX = "published-correction-"
+
+
+_UNBOUND_REVIEW_PREFIX = "Architect COMMENT already posted for head "
+_RETIRABLE_STATES = frozenset({"failed", "prepared", "implemented", "verified"})
+
+
+def _is_correction_record(record: Any) -> bool:
+    return isinstance(getattr(record, "task_id", None), str) and record.task_id.startswith(CORRECTION_TASK_PREFIX)
+
+
+def _refuse_correction_publication(item: Any) -> None:
+    """Scoped corrections must update their pinned PR, never open a new one."""
+    payload = getattr(item, "bundle_payload", None)
+    if isinstance(payload, dict) and str(payload.get("task_id", "")).startswith(CORRECTION_TASK_PREFIX):
+        raise PermissionError(
+            "Scoped correction tasks cannot publish a new pull request; "
+            "same-PR correction publication through the operator stage/publish endpoints is required"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +94,7 @@ class DeliveryPreparation:
     verification: dict[str, Any] | None = None
     publication: dict[str, Any] | None = None
     architect_review: dict[str, Any] | None = None
+    retirement: dict[str, Any] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -82,6 +108,7 @@ class DeveloperDeliveryWorker:
     ) -> None:
         self._previews = preview_registry
         self._state_dir = state_dir.resolve()
+        self._approvals = PublishApprovalStore(self._state_dir / "publish-approvals")
         self._service_root = service_root.resolve()
         self._sources = repository_sources
         self._command_timeout = command_timeout_seconds
@@ -192,7 +219,7 @@ class DeveloperDeliveryWorker:
                 if (record.bundle_payload != preview.bundle_payload or record.source_path != str(source_path)
                     or record.verification_commands != list(matches[0].verification_commands)):
                     raise ValueError("Delivery identity/source differs from the immutable approved task")
-                if record.state == "failed":
+                if record.state in {"failed", "retired"}:
                     return record
                 if record.state in {"implementing", "awaiting_tool_approval", "implemented", "verifying", "verified", "publishing", "published"}:
                     return record
@@ -387,12 +414,14 @@ class DeveloperDeliveryWorker:
             raise ValueError(
                 "Publication requires a live GitHub adapter; mock publication is refused"
             )
+        _refuse_correction_publication(self._previews.get(preview_id))
         directory = self._task_dir(preview_id)
         with self.implementation_lock(preview_id):
             with FileLock(str(directory) + ".lock", timeout=10):
                 record = self._load(directory)
             if record is None:
                 raise ValueError("Delivery not found")
+            _refuse_correction_publication(record)
             if record.state == "failed":
                 return record
             if record.state == "published":
@@ -425,36 +454,7 @@ class DeveloperDeliveryWorker:
             error: str | None = None
             try:
                 budget.remaining_seconds()
-                self._verify_checkout(directory, record, budget, pristine=False)
-                changed = set(
-                    self._git(
-                        directory, budget, "-C", record.checkout_path,
-                        "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
-                        "--name-only", "-z", record.base_revision, "--",
-                    ).split("\x00")
-                )
-                changed.update(
-                    self._git(
-                        directory, budget, "-C", record.checkout_path,
-                        "ls-files", "--others", "-z",
-                    ).split("\x00")
-                )
-                changed.discard("")
-                reservations = set(json.loads(budget.path.read_text())["reserved_paths"])
-                if (
-                    not changed
-                    or not changed <= reservations
-                    or not all(is_path_allowed(path, policy=bundle.policy) for path in changed)
-                ):
-                    raise ValueError(
-                        "Publication changes must be nonempty, within approved paths and reserved file budgets"
-                    )
-                files: dict[str, GitHubBlobChange | None] = {relative: None for relative in sorted(changed)}
-                checkout = Path(record.checkout_path)
-                digest = self._checkout_digest(checkout, budget, capture=files)
-                if digest != record.verification["checkout_digest"]:
-                    raise ValueError("Verified checkout changed; publication is blocked")
-                tree_fingerprint = _tree_fingerprint(files)
+                files, digest, tree_fingerprint = self._capture_publication(directory, record, bundle, budget)
                 prior = record.publication if isinstance(record.publication, dict) else {}
                 if prior.get("tree_fingerprint") not in (None, tree_fingerprint):
                     raise ValueError("Publication tree fingerprint changed; renew verification")
@@ -503,6 +503,7 @@ class DeveloperDeliveryWorker:
                         files=files,
                         approved=True,
                         require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+                        before_write=budget.remaining_seconds,
                     )
                     if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
                         raise RuntimeError("GitHub adapter returned an invalid head SHA")
@@ -527,6 +528,7 @@ class DeveloperDeliveryWorker:
                     existing_pull_number=existing,
                     approved=True,
                     require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+                    before_write=budget.remaining_seconds,
                 )
                 publication = {
                     **publication,
@@ -573,10 +575,561 @@ class DeveloperDeliveryWorker:
             self._save(directory, record)
             return record
 
+    def _capture_publication(
+        self, directory: Path, record: DeliveryPreparation, bundle: DeveloperTaskBundle, budget: DeveloperTaskBudget,
+    ) -> tuple[dict[str, GitHubBlobChange | None], str, str]:
+        """Capture the verified, scoped checkout changes exactly as they would be pushed."""
+        budget.remaining_seconds()
+        self._verify_checkout(directory, record, budget, pristine=False)
+        changed = set(
+            self._git(
+                directory, budget, "-C", record.checkout_path,
+                "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                "--name-only", "-z", record.base_revision, "--",
+            ).split("\x00")
+        )
+        changed.update(
+            self._git(
+                directory, budget, "-C", record.checkout_path,
+                "ls-files", "--others", "-z",
+            ).split("\x00")
+        )
+        changed.discard("")
+        reservations = set(json.loads(budget.path.read_text())["reserved_paths"])
+        if (
+            not changed
+            or not changed <= reservations
+            or not all(is_path_allowed(path, policy=bundle.policy) for path in changed)
+        ):
+            raise ValueError(
+                "Publication changes must be nonempty, within approved paths and reserved file budgets"
+            )
+        files: dict[str, GitHubBlobChange | None] = {relative: None for relative in sorted(changed)}
+        checkout = Path(record.checkout_path)
+        digest = self._checkout_digest(checkout, budget, capture=files)
+        if record.verification is None or digest != record.verification["checkout_digest"]:
+            raise ValueError("Verified checkout changed; publication is blocked")
+        tree_fingerprint = _tree_fingerprint(files)
+        return files, digest, tree_fingerprint
+
+    # ---- Same-PR correction publication -------------------------------------------------
+
+    def _correction_link(self, record: DeliveryPreparation) -> tuple[str, str]:
+        """Return (target delivery preview id, triggering review preview id) for a correction record."""
+        preview = self._previews.get(record.preview_id)
+        source = preview.source_payload if preview is not None else None
+        target = source.get("published_review") if isinstance(source, dict) else None
+        review_id = source.get("correction_from_review") if isinstance(source, dict) else None
+        if (preview is None or preview.bundle_payload != record.bundle_payload or not isinstance(target, dict)
+                or not isinstance(target.get("preview_id"), str) or not target["preview_id"]
+                or target["preview_id"] == record.preview_id
+                or target.get("head_sha") != record.base_revision
+                or not isinstance(review_id, str) or not review_id):
+            raise PermissionError("Correction chain link is missing or invalid; publication is refused")
+        return target["preview_id"], review_id
+
+    def _load_preview_record(self, preview_id: str) -> DeliveryPreparation | None:
+        directory = self._task_dir(preview_id)
+        with FileLock(str(directory) + ".lock", timeout=10):
+            return self._load(directory)
+
+    def correction_target(self, preview_id: str) -> dict[str, Any]:
+        """Walk the correction chain back to the original publication, failing closed on any mismatch."""
+        try:
+            record = self._load_preview_record(preview_id)
+        except ValueError as error:
+            raise PermissionError("Correction delivery failed validation") from error
+        if record is None or not _is_correction_record(record):
+            raise PermissionError("Same-PR publication requires a scoped correction delivery")
+        issue = developer_task_bundle_from_payload(record.bundle_payload).issue_context
+        if issue is None:
+            raise PermissionError("Correction delivery lacks repository identity")
+        target_id, review_id = self._correction_link(record)
+        expected_head = record.base_revision
+        current_id = target_id
+        pull_number: int | None = None
+        base_ref: str | None = None
+        seen = {preview_id}
+        chain: list[str] = []
+        while True:
+            if current_id in seen or len(seen) > 64:
+                raise PermissionError("Correction chain is cyclic or too long")
+            seen.add(current_id)
+            try:
+                link = self._load_preview_record(current_id)
+            except ValueError as error:
+                raise PermissionError("Correction chain link failed validation") from error
+            if link is None or link.state != "published" or not isinstance(link.publication, dict):
+                raise PermissionError("Correction chain link is missing or unpublished")
+            publication = link.publication
+            link_issue = developer_task_bundle_from_payload(link.bundle_payload).issue_context
+            if (link_issue is None or publication.get("head_sha") != expected_head
+                    or publication.get("repository") != issue.repository
+                    or link_issue.repository != issue.repository or link_issue.repository_id != issue.repository_id
+                    or publication.get("branch") != issue.base_branch
+                    or pull_number is not None and publication.get("pull_number") != pull_number
+                    or base_ref is not None and publication.get("base_ref") != base_ref):
+                raise PermissionError("Correction chain link repository/PR/branch/head mismatch")
+            pull_number, base_ref = publication["pull_number"], publication["base_ref"]
+            chain.append(current_id)
+            if not _is_correction_record(link):
+                break
+            if publication.get("mode") != "advance" or publication.get("parent_head_sha") != link.base_revision:
+                raise PermissionError("Correction chain link lacks its pinned parent head")
+            expected_head = link.base_revision
+            current_id, _ = self._correction_link(link)
+        if type(pull_number) is not int or not isinstance(base_ref, str):
+            raise PermissionError("Correction chain lacks a pinned pull request")
+        return {"repository": issue.repository, "pull_number": pull_number, "head_branch": issue.base_branch,
+                "base_ref": base_ref, "parent_head_sha": record.base_revision, "target_preview_id": target_id,
+                "review_preview_id": review_id, "chain": chain}
+
+    def _correction_records(self, relevant: Callable[[dict[str, Any]], bool]) -> list[DeliveryPreparation]:
+        """Correction records a check depends on; only those (or unreadable files) fail the check closed.
+
+        `relevant` sees the raw persisted record, so one corrupt record about another PR or parent
+        head cannot block unrelated reviews, while anything that might belong to this chain does.
+        """
+        root = self._state_dir / "deliveries"
+        records = []
+        for state in sorted(root.glob("*/state.json")) if root.exists() else ():
+            try:
+                raw = json.loads(state.read_text(encoding="utf-8"))["record"]
+                if not isinstance(raw, dict):
+                    raise ValueError("Invalid persisted delivery preparation")
+            except (ValueError, KeyError, TypeError, OSError) as error:
+                raise PermissionError("An unreadable delivery record blocks correction checks; they fail closed") from error
+            if not str(raw.get("task_id", "")).startswith(CORRECTION_TASK_PREFIX) or not relevant(raw):
+                continue
+            try:
+                record = self._load(state.parent)
+            except ValueError as error:
+                raise PermissionError("A related correction record failed validation; correction checks fail closed") from error
+            if record is not None and _is_correction_record(record):
+                records.append(record)
+        return records
+
+    @staticmethod
+    def correction_holds_parent(record: DeliveryPreparation | None) -> bool:
+        """Whether a correction still claims its parent head.
+
+        Retired corrections and failed ones whose push is known not to have landed release it;
+        a failed push whose outcome is unknown or that pushed keeps holding the head.
+        """
+        if record is None:
+            return True
+        if record.state == "retired":
+            return False
+        if record.state == "failed":
+            publication = record.publication
+            return isinstance(publication, dict) and publication.get("mode") == "advance" and \
+                publication.get("push_outcome") != "not_applied"
+        return True
+
+    def correction_releases_parent(self, preview_id: str | None) -> bool:
+        """Offer-time sibling check: True only when a saved correction delivery provably released its head."""
+        if preview_id is None:
+            return False
+        try:
+            record = self._load_preview_record(preview_id)
+        except ValueError as error:
+            raise PermissionError("Sibling correction delivery failed validation; offering fails closed") from error
+        return record is not None and _is_correction_record(record) and not self.correction_holds_parent(record)
+
+    def competing_corrections(self, preview_id: str, *, repository: str, parent_head_sha: str) -> list[str]:
+        """Other corrections on the same parent head that already staged an approval or pushed (first stage wins)."""
+        competing = []
+        for other in self._correction_records(lambda raw: raw.get("base_revision") == parent_head_sha):
+            if other.preview_id == preview_id or other.base_revision != parent_head_sha:
+                continue
+            issue = developer_task_bundle_from_payload(other.bundle_payload).issue_context
+            if issue is None or issue.repository != repository or not self.correction_holds_parent(other):
+                continue
+            pushed = isinstance(other.publication, dict) and other.publication.get("mode") == "advance"
+            approval = self._approvals.get(other.preview_id)
+            staged = approval is not None and approval.state != "invalidated" and other.state != "failed"
+            if pushed or staged:
+                competing.append(other.preview_id)
+        return competing
+
+    def superseded_by(self, preview_id: str) -> str | None:
+        """Return the chain tip preview id when a correction has advanced past this delivery."""
+        try:
+            anchor = self._load_preview_record(preview_id)
+        except ValueError as error:
+            raise PermissionError("Published review target failed validation") from error
+        anchor_publication = anchor.publication if anchor is not None and isinstance(anchor.publication, dict) else {}
+        repository, pull_number = anchor_publication.get("repository"), anchor_publication.get("pull_number")
+
+        def related(raw: dict[str, Any]) -> bool:
+            publication = raw.get("publication")
+            return isinstance(publication, dict) and publication.get("mode") == "advance" and (repository is None or (
+                publication.get("repository") == repository and publication.get("pull_number") == pull_number))
+
+        current, tip, seen = preview_id, None, {preview_id}
+        records = self._correction_records(related)
+        while True:
+            successors = [
+                other.preview_id for other in records
+                if other.state in {"publishing", "published"} and isinstance(other.publication, dict)
+                and other.publication.get("mode") == "advance" and other.publication.get("target_preview_id") == current
+            ]
+            if not successors:
+                return tip
+            if len(successors) > 1:
+                raise PermissionError(f"Correction chain forked after {current}; review is refused")
+            current = successors[0]
+            if current in seen:
+                raise PermissionError("Correction chain is cyclic")
+            seen.add(current)
+            tip = current
+
+    def refuse_superseded(self, preview_id: str) -> None:
+        tip = self.superseded_by(preview_id)
+        if tip is not None:
+            raise PermissionError(f"Published review target {preview_id} is superseded by {tip}; use the chain tip")
+
+    def _correction_diff(
+        self, directory: Path, record: DeliveryPreparation, files: dict[str, GitHubBlobChange | None],
+        budget: DeveloperTaskBudget,
+    ) -> str:
+        listing = self._git(directory, budget, "-C", record.checkout_path, "ls-tree", "-z", record.base_revision,
+                            "--", *sorted(files)).split("\x00")
+        before: dict[str, tuple[str, str]] = {}
+        for entry in filter(None, listing):
+            meta, path = entry.split("\t", 1)
+            mode, kind, blob = meta.split(" ")
+            if kind == "blob":
+                before[path] = (mode, blob)
+        parts: list[str] = []
+        for path, change in sorted(files.items()):
+            old_mode, old_blob = before.get(path, (None, None))
+            header = (f"diff --aitobuild a/{path} b/{path}\nmode {old_mode} -> {change.mode if change else None}\n"
+                      f"blob {old_blob} -> {change.blob_sha if change else None}\n")
+            try:
+                old = self._git(directory, budget, "-C", record.checkout_path, "cat-file", "blob",
+                                old_blob) if old_blob else ""
+                new = change.content.decode("utf-8") if change is not None else ""
+            except UnicodeDecodeError:
+                parts.append(header + "Binary content changed\n")
+                continue
+            lines = unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True),
+                                 fromfile=f"a/{path}", tofile=f"b/{path}")
+            parts.append(header + "".join(
+                line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in lines))
+        return "".join(parts)
+
+    def _correction_snapshot(
+        self, preview_id: str, *, review_receipt_digest: str, resuming: bool,
+    ) -> tuple[DeliveryPreparation, dict[str, Any], dict[str, GitHubBlobChange | None], DeveloperTaskBudget]:
+        if not isinstance(review_receipt_digest, str) or re.fullmatch(r"[0-9a-f]{64}", review_receipt_digest) is None:
+            raise PermissionError("Correction publication requires the triggering review receipt digest")
+        directory = self._task_dir(preview_id)
+        record = self._load_preview_record(preview_id)
+        if record is None:
+            raise ValueError("Delivery not found")
+        if not _is_correction_record(record):
+            raise PermissionError("Same-PR publication requires a scoped correction delivery")
+        if record.state not in ({"verified", "publishing"} if resuming else {"verified"}):
+            raise ValueError("Correction publication requires a verified correction delivery")
+        preview = self._previews.get(preview_id)
+        if preview is None or not preview.approved or preview.approved_at is None:
+            raise ValueError("Publication requires an existing human approval")
+        if preview.bundle_payload != record.bundle_payload:
+            raise ValueError("Delivery scope differs from the immutable approved task")
+        bundle = developer_task_bundle_from_payload(record.bundle_payload)
+        issue = bundle.issue_context
+        if issue is None or issue.base_revision != record.base_revision:
+            raise ValueError("Publication requires the approved repository issue identity")
+        if not any(source.repository == issue.repository and source.repository_id == issue.repository_id
+                   and str(source.path.resolve()) == record.source_path for source in self._sources):
+            raise ValueError("Publication requires its operator-configured target source")
+        if record.verification is None or record.verification.get("cleanup_succeeded") is not True:
+            raise ValueError("Publication requires successful verification evidence")
+        target = self.correction_target(preview_id)
+        budget = DeveloperTaskBudget(path=self.budget_path(preview_id), bundle=bundle, create=False)
+        competing = self.competing_corrections(preview_id, repository=issue.repository,
+                                               parent_head_sha=record.base_revision)
+        tip = self.superseded_by(target["target_preview_id"])
+        stale = None
+        if competing:
+            stale = f"Correction {competing[0]} already uses parent head {record.base_revision}; this correction is stale"
+        elif tip is not None and tip != preview_id:
+            stale = f"Correction target is superseded by {tip}; this correction is stale"
+        if stale is not None:
+            if record.state == "verified":
+                budget.abort()
+                self._save(directory, replace(record, state="failed", error=stale,
+                                              updated_at=datetime.now(tz=UTC).isoformat()))
+            raise PermissionError(stale)
+        files, checkout_digest, fingerprint = self._capture_publication(directory, record, bundle, budget)
+        title, body, commit_message = self._publication_metadata(bundle, record)
+        diff = self._correction_diff(directory, record, files, budget)
+        snapshot = {
+            "kind": "same-pr-correction", "preview_id": preview_id, "task_id": record.task_id,
+            **{key: target[key] for key in ("repository", "pull_number", "head_branch", "base_ref",
+                                            "parent_head_sha", "target_preview_id", "review_preview_id", "chain")},
+            "review_receipt_digest": review_receipt_digest, "title": title, "body": body,
+            "commit_message": commit_message, "checkout_digest": checkout_digest, "tree_fingerprint": fingerprint,
+            "changed_paths": sorted(files),
+            "blob_shas": {path: None if change is None else change.blob_sha for path, change in sorted(files.items())},
+            "file_modes": {path: None if change is None else change.mode for path, change in sorted(files.items())},
+            "diff": diff, "diff_sha256": sha256(diff.encode("utf-8")).hexdigest(),
+            "issue_number": issue.issue_number,
+        }
+        return record, snapshot, files, budget
+
+    def stage_correction_publication(self, preview_id: str, *, review_receipt_digest: str) -> dict[str, Any]:
+        """Stage one exact same-PR push snapshot for a single-use operator approval."""
+        with self.implementation_lock(preview_id), FileLock(str(self._state_dir / "corrections.lock"), timeout=30):
+            _, snapshot, _, _ = self._correction_snapshot(
+                preview_id, review_receipt_digest=review_receipt_digest, resuming=False)
+            staged = self._approvals.stage(preview_id, snapshot)
+            return {"digest": staged.digest, "content_digest": staged.content_digest, "state": staged.state,
+                    "snapshot": staged.snapshot}
+
+    def approve_and_publish_correction(
+        self,
+        preview_id: str,
+        *,
+        approval_digest: str,
+        review_receipt_digest: str,
+        actor_id: str,
+        github: GitHubAdapter,
+        require_human_approval_for_repo_writes: bool,
+        allow_mock_publication: bool = False,
+    ) -> DeliveryPreparation:
+        """Consume the exact approval and fast-forward the pinned PR head; never creates a PR or changes base."""
+        if isinstance(github, MockGitHubAdapter) and not allow_mock_publication:
+            raise ValueError("Publication requires a live GitHub adapter; mock publication is refused")
+        directory = self._task_dir(preview_id)
+        with self.implementation_lock(preview_id), FileLock(str(self._state_dir / "corrections.lock"), timeout=30):
+            current = self._load_preview_record(preview_id)
+            if current is not None and current.state == "published":
+                approval = self._approvals.get(preview_id)
+                if approval is None or approval.digest != approval_digest or approval.state != "consumed":
+                    raise PermissionError("Correction was published under a different approval")
+                return current
+            resuming = current is not None and current.state == "publishing"
+            if resuming:
+                assert current is not None
+                settled = self._resume_by_live_head(
+                    directory, current, approval_digest=approval_digest, review_receipt_digest=review_receipt_digest,
+                    actor_id=actor_id, github=github,
+                    require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+                )
+                if settled is not None:
+                    return settled
+                # The parent head is untouched and the budget is still valid: push again under the same approval.
+            record, snapshot, files, budget = self._correction_snapshot(
+                preview_id, review_receipt_digest=review_receipt_digest, resuming=resuming)
+            self._approvals.begin_consume(preview_id, digest=approval_digest,
+                                          recomputed_content_digest=snapshot_digest(snapshot), actor_id=actor_id)
+            publication = {
+                **{key: snapshot[key] for key in ("title", "body", "commit_message", "checkout_digest",
+                                                  "tree_fingerprint", "changed_paths", "blob_shas", "file_modes",
+                                                  "base_ref", "repository", "issue_number", "pull_number",
+                                                  "parent_head_sha", "target_preview_id", "review_preview_id")},
+                "mode": "advance", "branch": snapshot["head_branch"], "base_sha": record.base_revision,
+                "approval_digest": approval_digest, "approved_by": actor_id.strip(),
+            }
+            record = replace(record, state="publishing", publication=publication, error=None,
+                             updated_at=datetime.now(tz=UTC).isoformat())
+            self._save(directory, record)
+            push = {key: snapshot[key] for key in ("repository", "pull_number", "head_branch", "base_ref", "commit_message")}
+            try:
+                budget.remaining_seconds()
+                pull = github.advance_draft_pull_request_head(
+                    role=AgentRole.DEVELOPER, expected_head_sha=record.base_revision, files=files, approved=True,
+                    before_write=budget.remaining_seconds,
+                    require_human_approval_for_repo_writes=require_human_approval_for_repo_writes, **push,
+                )
+                self._require_advanced_pull(pull, record=record, snapshot=snapshot)
+            except BaseException as failure:
+                # Decide by the live outcome, never by the exception alone (88720aa convention).
+                return self._settle_correction_push(
+                    directory, record, failure, approval_digest=approval_digest, budget=budget, github=github,
+                    files=files, push=push,
+                    require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+                )
+            return self._finish_correction_publication(directory, record, pull, approval_digest=approval_digest)
+
+    @staticmethod
+    def _require_advanced_pull(pull: Any, *, record: DeliveryPreparation, snapshot: dict[str, Any]) -> str:
+        head_sha = (pull.head_sha or "").lower()
+        if (re.fullmatch(r"[0-9a-f]{40}", head_sha) is None or head_sha == record.base_revision
+                or pull.number != snapshot["pull_number"] or pull.repository != snapshot["repository"]
+                or pull.head_ref != snapshot["head_branch"] or pull.base_ref != snapshot["base_ref"]
+                or not pull.draft or pull.state != "open"):
+            raise RuntimeError("Correction push did not leave the pinned open draft at a new head")
+        return head_sha
+
+    def _finish_correction_publication(
+        self, directory: Path, record: DeliveryPreparation, pull: Any, *, approval_digest: str,
+    ) -> DeliveryPreparation:
+        assert record.publication is not None
+        head_sha = (pull.head_sha or "").lower()
+        publication = {**record.publication, "head_sha": head_sha, "html_url": pull.html_url, "draft": True,
+                       "pull_head_sha": head_sha, "published_at": datetime.now(tz=UTC).isoformat()}
+        record = replace(record, state="published", head_revision=head_sha, publication=publication,
+                         error=None, updated_at=datetime.now(tz=UTC).isoformat())
+        self._save(directory, record)
+        self._approvals.finish_consume(record.preview_id, digest=approval_digest, head_sha=head_sha)
+        return record
+
+    def _resume_by_live_head(
+        self, directory: Path, record: DeliveryPreparation, *, approval_digest: str, review_receipt_digest: str,
+        actor_id: str, github: GitHubAdapter, require_human_approval_for_repo_writes: bool,
+    ) -> DeliveryPreparation | None:
+        """Settle an interrupted correction from GitHub first, before any budget or checkout check.
+
+        Uses only the approved snapshot's pinned blob SHAs/modes, so a crash after the ref landed
+        reconciles to published even after the budget expired. Returns None only when the parent
+        head is untouched and the budget is still valid, meaning the caller may push again.
+        """
+        approval = self._approvals.get(record.preview_id)
+        if approval is None or approval.digest != approval_digest or approval.state != "consuming":
+            raise PermissionError("Interrupted correction publication requires its exact in-flight approval")
+        if approval.approved_by != actor_id.strip():
+            raise PermissionError("Interrupted publish approval belongs to another operator")
+        snapshot = approval.snapshot
+        publication = record.publication or {}
+        if (snapshot.get("review_receipt_digest") != review_receipt_digest
+                or snapshot.get("preview_id") != record.preview_id
+                or snapshot.get("parent_head_sha") != record.base_revision
+                or publication.get("branch") != snapshot.get("head_branch")
+                or any(publication.get(key) != snapshot.get(key) for key in (
+                    "blob_shas", "file_modes", "commit_message", "repository", "pull_number", "base_ref"))):
+            raise PermissionError("Interrupted correction publication differs from its approved snapshot")
+        changes = pinned_changes_from_snapshot(snapshot)
+        push: dict[str, Any] = {key: snapshot[key] for key in ("repository", "pull_number", "head_branch", "base_ref", "commit_message")}
+        outcome, pull = github.reconcile_advanced_head(  # unreadable: raises and the record stays publishing
+            role=AgentRole.DEVELOPER, expected_head_sha=record.base_revision, changes=changes, approved=True,
+            require_human_approval_for_repo_writes=require_human_approval_for_repo_writes, **push,
+        )
+        if outcome == "ours":
+            self._require_advanced_pull(pull, record=record, snapshot=push)
+            return self._finish_correction_publication(directory, record, pull, approval_digest=approval_digest)
+        # Only read for terminal bookkeeping: an aborted budget may still be marked aborted again. A missing or
+        # damaged budget must still end terminally (releasing an untouched parent), never stick in publishing.
+        budget: DeveloperTaskBudget | None = None
+        if outcome == "parent":
+            try:
+                budget = DeveloperTaskBudget(path=self.budget_path(record.preview_id),
+                                             bundle=developer_task_bundle_from_payload(record.bundle_payload),
+                                             create=False, allow_aborted=True)
+                budget.remaining_seconds()
+            except Exception as expired:
+                error = f"Push did not apply and the approved budget is gone: {expired}"
+                self._fail_correction_push(directory, record, "not_applied", pull, error,
+                                           approval_digest=approval_digest, budget=budget)
+                raise PermissionError(error) from expired
+            return None
+        with suppress(Exception):
+            budget = DeveloperTaskBudget(path=self.budget_path(record.preview_id),
+                                         bundle=developer_task_bundle_from_payload(record.bundle_payload),
+                                         create=False, allow_aborted=True)
+        error = "Pull request head moved while the correction was interrupted"
+        self._fail_correction_push(directory, record, "moved", pull, error, approval_digest=approval_digest, budget=budget)
+        raise PermissionError(error)
+
+    def _fail_correction_push(
+        self, directory: Path, record: DeliveryPreparation, verdict: str, pull: Any, error: str, *,
+        approval_digest: str, budget: DeveloperTaskBudget | None,
+    ) -> None:
+        """Terminal push failure: `not_applied` releases the parent head, `moved` keeps holding it."""
+        assert record.publication is not None
+        if budget is not None:
+            budget.abort()
+        self._save(directory, replace(
+            record, state="failed", error=error,
+            publication={**record.publication, "push_outcome": verdict, "live_head_sha": (pull.head_sha or "").lower()},
+            updated_at=datetime.now(tz=UTC).isoformat()))
+        self._approvals.finish_consume(record.preview_id, digest=approval_digest, head_sha=None, error=error)
+
+    def _settle_correction_push(
+        self, directory: Path, record: DeliveryPreparation, failure: BaseException, *, approval_digest: str,
+        budget: DeveloperTaskBudget, github: GitHubAdapter, files: dict[str, GitHubBlobChange | None],
+        push: dict[str, Any], require_human_approval_for_repo_writes: bool,
+    ) -> DeliveryPreparation:
+        """Re-read the branch after any failure past begin_consume and settle by what actually happened.
+
+        - head is our exact commit on the pinned open draft: the push landed, reconcile to published;
+        - head is still the parent: the push did not apply, fail terminally and release the parent head;
+        - head moved elsewhere: fail terminally, keep holding the parent (our commit may be underneath);
+        - head cannot be read (or the PR is no longer an open draft at our head): stay publishing,
+          resumable only under the same approval and operator.
+        The original exception is always re-raised unless the push is reconciled as published.
+        """
+        assert record.publication is not None
+        error = str(failure) or type(failure).__name__
+        try:
+            outcome, pull = github.reconcile_advanced_head(
+                role=AgentRole.DEVELOPER, expected_head_sha=record.base_revision, changes=pinned_changes(files),
+                approved=True,
+                require_human_approval_for_repo_writes=require_human_approval_for_repo_writes, **push,
+            )
+            if outcome == "ours":
+                self._require_advanced_pull(pull, record=record, snapshot=push)
+        except Exception:
+            raise failure from None
+        if outcome == "ours":
+            published = self._finish_correction_publication(directory, record, pull, approval_digest=approval_digest)
+            if not isinstance(failure, Exception):
+                raise failure  # records now match GitHub; still honour the interrupt or exit
+            return published
+        self._fail_correction_push(directory, record, "not_applied" if outcome == "parent" else "moved", pull, error,
+                                   approval_digest=approval_digest, budget=budget)
+        raise failure
+
+    def retire_correction(
+        self, preview_id: str, *, actor_id: str, github: GitHubAdapter, allow_mock_publication: bool = False,
+    ) -> DeliveryPreparation:
+        """Operator retire for an abandoned or failed correction so its parent head can take a new one.
+
+        Only allowed while the live PR head still equals this correction's parent head, and never for
+        a correction that is publishing or published (those must reconcile instead).
+        """
+        if isinstance(github, MockGitHubAdapter) and not allow_mock_publication:
+            raise ValueError("Retiring a correction requires a live GitHub adapter; mock reads are refused")
+        if not isinstance(actor_id, str) or not actor_id.strip():
+            raise PermissionError("Retiring a correction requires an operator identity")
+        directory = self._task_dir(preview_id)
+        with self.implementation_lock(preview_id), FileLock(str(self._state_dir / "corrections.lock"), timeout=30):
+            try:
+                record = self._load_preview_record(preview_id)
+            except ValueError as error:
+                raise PermissionError("Correction delivery failed validation") from error
+            if record is None or not _is_correction_record(record):
+                raise PermissionError("Retiring requires a saved correction delivery")
+            if record.state == "retired":
+                return record
+            if record.state not in _RETIRABLE_STATES:
+                raise PermissionError(f"A {record.state} correction cannot be retired; reconcile or wait for it instead")
+            target = self.correction_target(preview_id)
+            pull = github.get_pull_request(repository=target["repository"], pull_number=target["pull_number"])
+            live_head = (pull.head_sha or "").lower()
+            if pull.head_ref != target["head_branch"] or live_head != record.base_revision:
+                raise PermissionError("Retiring requires the live PR head to equal this correction's parent head")
+            if record.state != "failed":
+                self._approvals.invalidate(preview_id, reason="retired")
+                budget_path = self.budget_path(preview_id)
+                if budget_path.exists():
+                    bundle = developer_task_bundle_from_payload(record.bundle_payload)
+                    DeveloperTaskBudget(path=budget_path, bundle=bundle, create=False).abort()
+            now = datetime.now(tz=UTC).isoformat()
+            record = replace(record, state="retired", error=record.error or "Retired by operator",
+                             retirement={"actor_id": actor_id.strip(), "retired_at": now,
+                                         "previous_state": record.state, "live_head_sha": live_head},
+                             updated_at=now)
+            self._save(directory, record)
+            return record
+
     def get_published_pull_request(
         self, preview_id: str, *, github: GitHubAdapter,
     ) -> dict[str, Any]:
         """Resolve a published draft PR from delivery publication only."""
+        self.refuse_superseded(preview_id)
         directory = self._task_dir(preview_id)
         with FileLock(str(directory) + ".lock", timeout=10):
             record = self._load(directory)
@@ -700,12 +1253,16 @@ class DeveloperDeliveryWorker:
         REQUEST_CHANGES stays disabled until a distinct reviewer GitHub identity
         is configured (same-token self-reviews 422 on GitHub).
         """
+        self.refuse_superseded(preview_id)
         directory = self._task_dir(preview_id)
         with FileLock(str(directory) + ".lock", timeout=10):
             record = self._load(directory)
             if record is None:
                 raise ValueError("Delivery not found")
             publication = dict(self._require_published_publication(record))
+            if isinstance(record.error, str) and record.error.startswith(
+                    _UNBOUND_REVIEW_PREFIX + str(publication["head_sha"]).lower()):
+                raise PermissionError(record.error)
             if expected_target is not None and expected_target != {
                 "preview_id": record.preview_id,
                 **{key: publication.get(key) for key in ("head_sha", "repository", "pull_number", "base_sha",
@@ -749,12 +1306,23 @@ class DeveloperDeliveryWorker:
             body=review_body,
             commit_id=expected_head,
         )
+        bound_commit = (review.commit_id or "").lower()
+        if bound_commit != expected_head:
+            # The COMMENT is already on GitHub: persist that fact so a retry refuses instead of reposting.
+            unbound = (f"{_UNBOUND_REVIEW_PREFIX}{expected_head}: review {review.review_id} was bound to "
+                       f"{bound_commit or 'no commit'}; inspect the pull request before any retry")
+            with FileLock(str(directory) + ".lock", timeout=10):
+                record = self._load(directory)
+                if record is not None and record.state == "published":
+                    self._save(directory, replace(record, error=unbound, updated_at=datetime.now(tz=UTC).isoformat()))
+            raise RuntimeError("GitHub bound the Architect review to a different commit than the pinned head")
         architect_review = {
             "event": "COMMENT",
             "body": review_body,
             "review_id": review.review_id,
             "html_url": review.html_url,
             "head_sha": expected_head,
+            "commit_id": bound_commit,
             "pull_number": int(publication["pull_number"]),
             "repository": str(publication["repository"]),
             "reviewed_at": datetime.now(tz=UTC).isoformat(),
@@ -990,8 +1558,20 @@ class DeveloperDeliveryWorker:
         if not isinstance(record.bundle_payload, dict):
             raise ValueError("Invalid persisted delivery scope")
         bundle = developer_task_bundle_from_payload(record.bundle_payload)
-        if record.state not in {"preparing", "prepared", "failed", "implementing", "awaiting_tool_approval", "implemented", "verifying", "verified", "publishing", "published"} or bundle.issue_context is None:
+        if record.state not in {"preparing", "prepared", "failed", "implementing", "awaiting_tool_approval", "implemented", "verifying", "verified", "publishing", "published", "retired"} or bundle.issue_context is None:
             raise ValueError("Invalid persisted delivery preparation state")
+        if record.state == "retired":
+            retirement = record.retirement
+            if (not _is_correction_record(record) or not isinstance(retirement, dict)
+                    or set(retirement) != {"actor_id", "retired_at", "previous_state", "live_head_sha"}
+                    or not isinstance(retirement["actor_id"], str) or not retirement["actor_id"]
+                    or retirement["previous_state"] not in _RETIRABLE_STATES
+                    or retirement["live_head_sha"] != record.base_revision
+                    or not isinstance(retirement["retired_at"], str)):
+                raise ValueError("Invalid persisted correction retirement")
+            datetime.fromisoformat(retirement["retired_at"])
+        elif record.retirement is not None:
+            raise ValueError("Only retired corrections may carry a retirement receipt")
         self._validate_verification_commands(record.verification_commands, bundle)
         if record.session_id is not None:
             if not isinstance(record.session_id, str):
@@ -1023,7 +1603,7 @@ class DeveloperDeliveryWorker:
             ):
                 raise ValueError("Persisted verification lacks successful command/cleanup evidence")
         if record.state in {"publishing", "published"} or (
-            record.state == "failed"
+            record.state in {"failed", "retired"}
             and isinstance(record.publication, dict)
             and isinstance(record.publication.get("pull_number"), int)
         ):
@@ -1036,7 +1616,24 @@ class DeveloperDeliveryWorker:
             ):
                 if not isinstance(publication.get(key), str) or not publication[key]:
                     raise ValueError("Invalid persisted publication field")
-            if publication["base_sha"] != record.base_revision or publication["branch"] != record.branch:
+            if publication.get("mode") == "advance" or _is_correction_record(record):
+                parent = publication.get("parent_head_sha")
+                digest = publication.get("approval_digest")
+                if (publication.get("mode") != "advance" or not _is_correction_record(record)
+                        or publication["branch"] != bundle.issue_context.base_branch
+                        or publication["base_sha"] != record.base_revision or parent != record.base_revision
+                        or type(publication.get("pull_number")) is not int or publication["pull_number"] <= 0
+                        or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                        or not isinstance(publication.get("target_preview_id"), str)
+                        or not isinstance(publication.get("review_preview_id"), str)
+                        or record.state == "published" and publication.get("head_sha") == parent
+                        or "push_outcome" in publication and (
+                            record.state not in {"failed", "retired"}
+                            or publication["push_outcome"] not in {"not_applied", "moved"}
+                            or not isinstance(publication.get("live_head_sha"), str)
+                            or (publication["push_outcome"] == "not_applied") != (publication["live_head_sha"] == parent))):
+                    raise ValueError("Correction publication identity differs from the pinned pull request")
+            elif publication["base_sha"] != record.base_revision or publication["branch"] != record.branch:
                 raise ValueError("Publication identity differs from the approved delivery")
             if record.verification is None:
                 raise ValueError("Publication requires persisted verification evidence")
@@ -1075,7 +1672,7 @@ class DeveloperDeliveryWorker:
                     or record.publication.get("pull_number") is None
                     or record.publication.get("draft") is not True
                 )
-                or record.state == "failed" and (not isinstance(record.error, str) or not record.error)):
+                or record.state in {"failed", "retired"} and (not isinstance(record.error, str) or not record.error)):
             raise ValueError("Invalid persisted delivery outcome")
         if record.architect_review is not None:
             review = record.architect_review
@@ -1093,6 +1690,8 @@ class DeveloperDeliveryWorker:
                 raise ValueError("Architect review requires a published delivery")
             if review["head_sha"] != record.publication.get("head_sha"):
                 raise ValueError("Architect review head SHA differs from publication")
+            if "commit_id" in review and review["commit_id"] != review["head_sha"]:
+                raise ValueError("Architect review commit differs from its pinned head")
             if review["pull_number"] != record.publication.get("pull_number"):
                 raise ValueError("Architect review pull number differs from publication")
         datetime.fromisoformat(record.approved_at)

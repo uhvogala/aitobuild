@@ -6,12 +6,12 @@ import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 
 from pydantic import Field, JsonValue, StrictInt, StrictStr
 
 from aitobuild.agent_tools import DeveloperToolContext
-from aitobuild.developer_delivery import DeveloperDeliveryWorker
+from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, EventName, Identifier
@@ -22,6 +22,7 @@ from aitobuild.organization_runner import (
 )
 from aitobuild.organization_runtime import WorkflowLimits, WorkflowPredicate
 from aitobuild.organization_reviews import PublishedReviewAdmission
+from aitobuild.tools.github import GitHubAdapter
 
 
 class ManagedRoute(DefinitionModel):
@@ -163,6 +164,43 @@ class ManagedOrganizationService:
         if run is None:
             raise PermissionError("Correction requires a completed managed review")
         return await _delivery_call(lambda: reviews.offer_correction(review_preview_id, run))
+
+    def _correction_reviews(self) -> PublishedReviewAdmission:
+        if self._reviews is None:
+            raise PermissionError("Same-PR correction publication requires the trusted review admission binding")
+        return self._reviews
+
+    async def stage_correction_publication(self, correction_preview_id: str) -> dict[str, Any]:
+        """Stage the exact same-PR push (diff, pinned head, PR number) for one-use operator approval."""
+        reviews = self._correction_reviews()
+        binding = await _delivery_call(lambda: reviews.correction_publication_binding(correction_preview_id))
+        return await _delivery_call(lambda: self._worker.stage_correction_publication(
+            correction_preview_id, review_receipt_digest=binding))
+
+    async def publish_correction(
+        self, correction_preview_id: str, *, approval_digest: str, github: GitHubAdapter,
+        allow_mock_publication: bool = False,
+    ) -> tuple[DeliveryPreparation, DeveloperPreview | None]:
+        """Consume the operator's exact approval, fast-forward the pinned PR, then stage the next Architect review."""
+        reviews = self._correction_reviews()
+        binding = await _delivery_call(lambda: reviews.correction_publication_binding(correction_preview_id))
+        record = await _delivery_call(lambda: self._worker.approve_and_publish_correction(
+            correction_preview_id, approval_digest=approval_digest, review_receipt_digest=binding,
+            actor_id=self.operator_id, github=github, require_human_approval_for_repo_writes=True,
+            allow_mock_publication=allow_mock_publication,
+        ))
+        review = await _delivery_call(lambda: reviews.offer(correction_preview_id))
+        return record, review
+
+    async def retire_correction(
+        self, correction_preview_id: str, *, github: GitHubAdapter, allow_mock_publication: bool = False,
+    ) -> DeliveryPreparation:
+        """Operator retire of a failed/abandoned correction while the live PR head still equals its parent."""
+        reviews = self._correction_reviews()
+        await _delivery_call(lambda: reviews.correction_publication_binding(correction_preview_id))
+        return await _delivery_call(lambda: self._worker.retire_correction(
+            correction_preview_id, actor_id=self.operator_id, github=github,
+            allow_mock_publication=allow_mock_publication))
 
     def approved_previews(self, *, limit: int) -> tuple[DeveloperPreview, ...]:
         return tuple(preview for preview in self._previews.list_previews(pending_only=False, limit=limit) if preview.approved)

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 from hashlib import sha1, sha256
 import json
 from pathlib import PurePosixPath
@@ -20,6 +20,8 @@ from aitobuild.policy import (
     assert_repo_write_approval,
     assert_role_action_allowed,
 )
+
+AdvanceOutcome = Literal["parent", "ours", "moved"]
 
 
 def normalize_repository_name(repository: str) -> str:
@@ -144,6 +146,36 @@ class GitHubBlobChange:
         }
 
 
+@dataclass(frozen=True)
+class GitHubPinnedChange:
+    """A pinned file change by identity only (mode + git blob SHA), as saved in an approval snapshot."""
+
+    mode: Literal["100644", "100755"]
+    blob_sha: str
+
+
+def pinned_changes(
+    files: Mapping[str, GitHubBlobChange | None],
+) -> dict[str, GitHubPinnedChange | None]:
+    return {path: None if change is None else GitHubPinnedChange(mode=change.mode, blob_sha=change.blob_sha)
+            for path, change in files.items()}
+
+
+def pinned_changes_from_snapshot(snapshot: Mapping[str, Any]) -> dict[str, GitHubPinnedChange | None]:
+    """Rebuild pinned changes from a snapshot's `blob_shas`/`file_modes` without touching the checkout."""
+    blob_shas, file_modes = snapshot.get("blob_shas"), snapshot.get("file_modes")
+    if not isinstance(blob_shas, dict) or not isinstance(file_modes, dict) or set(blob_shas) != set(file_modes):
+        raise ValueError("Snapshot pinned changes are malformed")
+    changes: dict[str, GitHubPinnedChange | None] = {}
+    for path, blob_sha in blob_shas.items():
+        mode = file_modes[path]
+        if (blob_sha is None) != (mode is None):
+            raise ValueError("Snapshot pinned changes are malformed")
+        changes[path] = None if blob_sha is None else GitHubPinnedChange(mode=mode, blob_sha=blob_sha)
+    _validate_pinned_changes(changes)
+    return changes
+
+
 class GitHubAdapter(Protocol):
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue: ...
 
@@ -231,6 +263,7 @@ class GitHubAdapter(Protocol):
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> str: ...
 
     def create_or_update_draft_pull_request(
@@ -246,7 +279,39 @@ class GitHubAdapter(Protocol):
         existing_pull_number: int | None = None,
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> GitHubPullRequest: ...
+
+    def advance_draft_pull_request_head(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        pull_number: int,
+        head_branch: str,
+        base_ref: str,
+        expected_head_sha: str,
+        commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
+    ) -> GitHubPullRequest: ...
+
+    def reconcile_advanced_head(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        pull_number: int,
+        head_branch: str,
+        base_ref: str,
+        expected_head_sha: str,
+        commit_message: str,
+        changes: Mapping[str, GitHubPinnedChange | None],
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+    ) -> tuple[AdvanceOutcome, GitHubPullRequest]: ...
 
 
 @dataclass
@@ -495,6 +560,7 @@ class MockGitHubAdapter:
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> str:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -505,19 +571,34 @@ class MockGitHubAdapter:
         _validate_publish_commit_inputs(
             branch=branch, base_sha=base_sha, commit_message=commit_message, files=files
         )
+        head_sha, payload = self._mock_commit(repo, branch.strip(), base_sha, commit_message, files)
+        _check_write_budget(before_write)
+        self._record_mock_commit(repo, head_sha, payload, base_sha, files)
+        self._branch_heads.setdefault(repo, {})[branch.strip()] = head_sha
+        return head_sha
+
+    def _mock_commit(
+        self, repo: str, branch: str, base_sha: str, commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
+    ) -> tuple[str, dict[str, Any]]:
         encoded_files = {
             path: None if change is None else change.to_dict()
             for path, change in sorted(files.items())
         }
         payload = {
             "repository": repo,
-            "branch": branch.strip(),
+            "branch": branch,
             "base_sha": base_sha.lower(),
             "commit_message": commit_message.strip(),
             "files": encoded_files,
             "tree_fingerprint": _tree_fingerprint(files),
         }
-        head_sha = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:40]
+        return sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:40], payload
+
+    def _record_mock_commit(
+        self, repo: str, head_sha: str, payload: dict[str, Any], base_sha: str,
+        files: Mapping[str, GitHubBlobChange | None],
+    ) -> None:
         base_files = self.commit_files.setdefault((repo, base_sha), {})
         head_files = dict(base_files)
         for path, change in files.items():
@@ -527,8 +608,97 @@ class MockGitHubAdapter:
                 head_files[path] = change
         self.commit_files[(repo, head_sha)] = head_files
         self.branch_commits.append({**payload, "head_sha": head_sha})
-        self._branch_heads.setdefault(repo, {})[branch.strip()] = head_sha
-        return head_sha
+
+    def advance_draft_pull_request_head(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        pull_number: int,
+        head_branch: str,
+        base_ref: str,
+        expected_head_sha: str,
+        commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
+    ) -> GitHubPullRequest:
+        assert_role_action_allowed(role, ActionClass.REPO_WRITE)
+        assert_repo_write_approval(
+            require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+            approved=approved,
+        )
+        repo = self._resolve_repository(repository)
+        branch, base, expected = _validate_advance_inputs(
+            pull_number=pull_number, head_branch=head_branch, base_ref=base_ref,
+            expected_head_sha=expected_head_sha, commit_message=commit_message, files=files,
+        )
+        current = self.get_pull_request(repository=repo, pull_number=pull_number)
+        _validate_advance_target(current, pull_number=pull_number, head_branch=branch, base_ref=base)
+        head_sha, payload = self._mock_commit(repo, branch, expected, commit_message, files)
+        remote_head = self._branch_heads.get(repo, {}).get(branch) or current.head_sha
+        if remote_head != head_sha:
+            if remote_head != expected:
+                raise ValueError("Pull request head moved from the pinned SHA; refusing stale correction")
+            _check_write_budget(before_write)
+            self._record_mock_commit(repo, head_sha, payload, expected, files)
+            self._branch_heads.setdefault(repo, {})[branch] = head_sha
+        advanced = replace(current, head_sha=head_sha)
+        self.pull_requests[repo][pull_number] = advanced
+        return advanced
+
+    def reconcile_advanced_head(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        pull_number: int,
+        head_branch: str,
+        base_ref: str,
+        expected_head_sha: str,
+        commit_message: str,
+        changes: Mapping[str, GitHubPinnedChange | None],
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+    ) -> tuple[AdvanceOutcome, GitHubPullRequest]:
+        assert_role_action_allowed(role, ActionClass.REPO_WRITE)
+        assert_repo_write_approval(
+            require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+            approved=approved,
+        )
+        repo = self._resolve_repository(repository)
+        branch, _, expected = _validate_reconcile_inputs(
+            pull_number=pull_number, head_branch=head_branch, base_ref=base_ref,
+            expected_head_sha=expected_head_sha, commit_message=commit_message, changes=changes,
+        )
+        current = self.get_pull_request(repository=repo, pull_number=pull_number)
+        remote_head = self._branch_heads.get(repo, {}).get(branch) or current.head_sha
+        if remote_head == expected:
+            return "parent", replace(current, head_sha=remote_head)
+        return ("ours" if remote_head is not None
+                and self._mock_commit_has_changes(repo, remote_head, expected, commit_message, changes)
+                else "moved"), replace(current, head_sha=remote_head)
+
+    def _mock_commit_has_changes(
+        self, repo: str, commit_sha: str, parent_sha: str, commit_message: str,
+        changes: Mapping[str, GitHubPinnedChange | None],
+    ) -> bool:
+        """Same identity rule as the live adapter: sole parent, message, exact tree by mode + blob SHA."""
+        commit = next((item for item in self.branch_commits if item.get("head_sha") == commit_sha), None)
+        if commit is None or commit.get("base_sha") != parent_sha.lower() or commit.get("commit_message") != commit_message.strip():
+            return False
+
+        def tree(sha: str) -> dict[str, tuple[str, str]]:
+            return {path: (change.mode, change.blob_sha) for path, change in self.commit_files.get((repo, sha), {}).items()}
+
+        expected = tree(parent_sha)
+        for path, change in changes.items():
+            if change is None:
+                expected.pop(path, None)
+            else:
+                expected[path] = (change.mode, change.blob_sha)
+        return tree(commit_sha) == expected
 
     def create_or_update_draft_pull_request(
         self,
@@ -543,6 +713,7 @@ class MockGitHubAdapter:
         existing_pull_number: int | None = None,
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> GitHubPullRequest:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -563,6 +734,7 @@ class MockGitHubAdapter:
             type(existing_pull_number) is not int or existing_pull_number <= 0
         ):
             raise ValueError("existing_pull_number must be a positive integer when provided")
+        _check_write_budget(before_write)
         repo_prs = self.pull_requests.setdefault(repo, {})
         if existing_pull_number is None:
             matches = [pull for pull in repo_prs.values()
@@ -702,7 +874,8 @@ class GhCliGitHubAdapter:
         return json.loads(text)
 
     def _matching_publish_head(
-        self, *, repository: str, branch: str, base_sha: str, tree_sha: str, commit_message: str,
+        self, *, repository: str, branch: str, base_sha: str, commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
     ) -> str | None:
         try:
             reference = self._api(f"repos/{repository}/git/ref/heads/{branch}")
@@ -713,15 +886,57 @@ class GhCliGitHubAdapter:
         head = reference.get("object", {}).get("sha") if isinstance(reference, dict) else None
         if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
             raise RuntimeError("Unexpected GitHub task reference response")
-        commit = self._api(f"repos/{repository}/git/commits/{head}")
-        if not isinstance(commit, dict):
-            raise RuntimeError("Unexpected GitHub task commit response")
-        tree, parents = commit.get("tree"), commit.get("parents")
-        if (not isinstance(tree, dict) or tree.get("sha") != tree_sha
-                or not isinstance(parents, list) or len(parents) != 1
-                or not isinstance(parents[0], dict) or parents[0].get("sha") != base_sha
-                or str(commit.get("message", "")).strip() != commit_message.strip()):
+        if not self._commit_has_changes(
+            repository=repository, commit_sha=head, parent_sha=base_sha,
+            commit_message=commit_message, changes=pinned_changes(files),
+        ):
             raise ValueError("Existing task branch differs from the approved publication")
+        return head
+
+    def _commit_has_changes(
+        self, *, repository: str, commit_sha: str, parent_sha: str, commit_message: str,
+        changes: Mapping[str, GitHubPinnedChange | None],
+    ) -> bool:
+        """The one identity rule for adopting a remote commit as ours, shared by ordinary publish,
+        correction advance and reconciliation: sole parent, same message, and tree == parent tree plus
+        exactly the pinned blob/mode changes. Read-only, so it never needs the task budget."""
+        commit = self._api(f"repos/{repository}/git/commits/{commit_sha}")
+        parent = self._api(f"repos/{repository}/git/commits/{parent_sha.lower()}")
+        if not isinstance(commit, dict) or not isinstance(parent, dict):
+            raise RuntimeError("Unexpected GitHub commit response")
+        parents = commit.get("parents")
+        if (not isinstance(parents, list) or len(parents) != 1 or not isinstance(parents[0], dict)
+                or parents[0].get("sha") != parent_sha.lower()
+                or str(commit.get("message", "")).strip() != commit_message.strip()):
+            return False
+        expected = self._tree_entries(repository, parent.get("tree"))
+        for path_name, change in changes.items():
+            if change is None:
+                expected.pop(path_name, None)
+            else:
+                expected[path_name] = (change.mode, change.blob_sha)
+        return self._tree_entries(repository, commit.get("tree")) == expected
+
+    def _tree_entries(self, repository: str, tree: object) -> dict[str, tuple[str, str]]:
+        tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+        if not isinstance(tree_sha, str) or re.fullmatch(r"[0-9a-f]{40}", tree_sha) is None:
+            raise RuntimeError("Unexpected GitHub tree reference")
+        raw = self._api(f"repos/{repository}/git/trees/{tree_sha}?recursive=1")
+        if not isinstance(raw, dict) or not isinstance(raw.get("tree"), list) or raw.get("truncated") is True:
+            raise RuntimeError("GitHub tree listing is unreadable or truncated; cannot confirm the push")
+        entries: dict[str, tuple[str, str]] = {}
+        for entry in raw["tree"]:
+            if not isinstance(entry, dict) or not all(isinstance(entry.get(key), str) for key in ("path", "mode", "type", "sha")):
+                raise RuntimeError("Unexpected GitHub tree entry")
+            if entry["type"] != "tree":
+                entries[entry["path"]] = (entry["mode"], entry["sha"])
+        return entries
+
+    def _read_branch_head(self, *, repository: str, branch: str) -> str:
+        reference = self._api(f"repos/{repository}/git/ref/heads/{branch}")
+        head = reference.get("object", {}).get("sha") if isinstance(reference, dict) else None
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+            raise RuntimeError("Unexpected GitHub task reference response")
         return head
 
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue:
@@ -956,6 +1171,7 @@ class GhCliGitHubAdapter:
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> str:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -966,6 +1182,36 @@ class GhCliGitHubAdapter:
         _validate_publish_commit_inputs(
             branch=branch, base_sha=base_sha, commit_message=commit_message, files=files
         )
+        existing_head = self._matching_publish_head(
+            repository=repo, branch=branch.strip(), base_sha=base_sha,
+            commit_message=commit_message, files=files,
+        )
+        if existing_head is not None:
+            return existing_head
+        tree_sha = self._create_publish_tree(repo, base_sha, files, before_write)
+        commit_sha = self._create_publish_commit(repo, base_sha, tree_sha, commit_message, before_write)
+        head_sha = commit_sha
+        _check_write_budget(before_write)
+        try:
+            self._api(
+                f"repos/{repo}/git/refs",
+                method="POST",
+                payload={"ref": f"refs/heads/{branch.strip()}", "sha": head_sha},
+            )
+        except RuntimeError:
+            existing_head = self._matching_publish_head(
+                repository=repo, branch=branch.strip(), base_sha=base_sha,
+                commit_message=commit_message, files=files,
+            )
+            if existing_head is None:
+                raise
+            return existing_head
+        return head_sha
+
+    def _create_publish_tree(
+        self, repo: str, base_sha: str, files: Mapping[str, GitHubBlobChange | None],
+        before_write: Callable[[], object] | None = None,
+    ) -> str:
         base = self._api(f"repos/{repo}/git/commits/{base_sha.lower()}")
         if not isinstance(base, dict) or not isinstance(base.get("tree"), dict):
             raise RuntimeError("Unexpected GitHub base commit response")
@@ -978,6 +1224,7 @@ class GhCliGitHubAdapter:
             if change is None:
                 tree_entries.append({"path": path_name, "mode": "100644", "type": "blob", "sha": None})
                 continue
+            _check_write_budget(before_write)
             blob = self._api(
                 f"repos/{repo}/git/blobs",
                 method="POST",
@@ -996,6 +1243,7 @@ class GhCliGitHubAdapter:
             tree_entries.append(
                 {"path": path_name, "mode": change.mode, "type": "blob", "sha": blob["sha"]}
             )
+        _check_write_budget(before_write)
         tree = self._api(
             f"repos/{repo}/git/trees",
             method="POST",
@@ -1003,41 +1251,143 @@ class GhCliGitHubAdapter:
         )
         if not isinstance(tree, dict) or not isinstance(tree.get("sha"), str):
             raise RuntimeError("Failed to create GitHub tree")
-        existing_head = self._matching_publish_head(
-            repository=repo, branch=branch.strip(), base_sha=base_sha,
-            tree_sha=tree["sha"], commit_message=commit_message,
-        )
-        if existing_head is not None:
-            return existing_head
+        return str(tree["sha"])
+
+    def _create_publish_commit(
+        self, repo: str, base_sha: str, tree_sha: str, commit_message: str,
+        before_write: Callable[[], object] | None = None,
+    ) -> str:
+        _check_write_budget(before_write)
         commit = self._api(
             f"repos/{repo}/git/commits",
             method="POST",
             payload={
                 "message": commit_message.strip(),
-                "tree": tree["sha"],
+                "tree": tree_sha,
                 "parents": [base_sha.lower()],
             },
         )
         if not isinstance(commit, dict) or not isinstance(commit.get("sha"), str):
             raise RuntimeError("Failed to create GitHub commit")
-        if not isinstance(commit.get("tree"), dict) or commit["tree"].get("sha") != tree["sha"]:
+        if not isinstance(commit.get("tree"), dict) or commit["tree"].get("sha") != tree_sha:
             raise RuntimeError("Published commit tree SHA does not match the uploaded tree")
-        head_sha = commit["sha"]
+        return str(commit["sha"])
+
+    def advance_draft_pull_request_head(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        pull_number: int,
+        head_branch: str,
+        base_ref: str,
+        expected_head_sha: str,
+        commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
+    ) -> GitHubPullRequest:
+        assert_role_action_allowed(role, ActionClass.REPO_WRITE)
+        assert_repo_write_approval(
+            require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+            approved=approved,
+        )
+        repo = self._resolve_repository(repository)
+        branch, base, expected = _validate_advance_inputs(
+            pull_number=pull_number, head_branch=head_branch, base_ref=base_ref,
+            expected_head_sha=expected_head_sha, commit_message=commit_message, files=files,
+        )
+        current = self._read_advance_target(repo, pull_number=pull_number, head_branch=branch, base_ref=base)
+
+        def is_ours(remote_head: str) -> bool:
+            return self._commit_has_changes(repository=repo, commit_sha=remote_head, parent_sha=expected,
+                                            commit_message=commit_message, changes=pinned_changes(files))
+
+        def ours_or_refuse(remote_head: str, target: GitHubPullRequest) -> GitHubPullRequest:
+            if not is_ours(remote_head):
+                raise ValueError("Pull request head moved from the pinned SHA; refusing stale correction")
+            return replace(target, head_sha=remote_head)
+
+        # A retry after our push landed is decided read-only, before any upload.
+        remote_head = self._read_branch_head(repository=repo, branch=branch)
+        if remote_head != expected:
+            return ours_or_refuse(remote_head, current)
+        tree_sha = self._create_publish_tree(repo, expected, files, before_write)
+        commit_sha = self._create_publish_commit(repo, expected, tree_sha, commit_message, before_write)
+        # Re-read the PR target and branch head right before the ref update: a competing update during
+        # object creation must be refused here, not left to a stale PATCH.
+        current = self._read_advance_target(repo, pull_number=pull_number, head_branch=branch, base_ref=base)
+        remote_head = self._read_branch_head(repository=repo, branch=branch)
+        if remote_head != expected:
+            return ours_or_refuse(remote_head, current)
+        _check_write_budget(before_write)
         try:
             self._api(
-                f"repos/{repo}/git/refs",
-                method="POST",
-                payload={"ref": f"refs/heads/{branch.strip()}", "sha": head_sha},
+                f"repos/{repo}/git/refs/heads/{branch}",
+                method="PATCH",
+                payload={"sha": commit_sha, "force": False},
             )
         except RuntimeError:
-            existing_head = self._matching_publish_head(
-                repository=repo, branch=branch.strip(), base_sha=base_sha,
-                tree_sha=tree["sha"], commit_message=commit_message,
-            )
-            if existing_head is None:
+            remote_head = self._read_branch_head(repository=repo, branch=branch)
+            if remote_head != commit_sha and not is_ours(remote_head):
                 raise
-            return existing_head
-        return head_sha
+            commit_sha = remote_head
+        advanced = self._read_advance_target(repo, pull_number=pull_number, head_branch=branch, base_ref=base)
+        live_head = self._read_branch_head(repository=repo, branch=branch)
+        if live_head != commit_sha:
+            # Never report our SHA as current when the live ref says otherwise; settlement decides.
+            raise RuntimeError("Branch head moved after the correction push; refusing to report success")
+        return replace(advanced, head_sha=live_head)
+
+    def reconcile_advanced_head(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        pull_number: int,
+        head_branch: str,
+        base_ref: str,
+        expected_head_sha: str,
+        commit_message: str,
+        changes: Mapping[str, GitHubPinnedChange | None],
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+    ) -> tuple[AdvanceOutcome, GitHubPullRequest]:
+        """Classify the live branch head after an uncertain push: untouched parent, our exact commit, or moved.
+
+        Read-only: the live commit counts as ours only when its sole parent is the pinned head, its
+        message matches, and its tree equals the parent tree with exactly the pinned blob/mode changes.
+        No GitHub writes happen here, so settlement never depends on the task budget.
+        """
+        assert_role_action_allowed(role, ActionClass.REPO_WRITE)
+        assert_repo_write_approval(
+            require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+            approved=approved,
+        )
+        repo = self._resolve_repository(repository)
+        branch, _, expected = _validate_reconcile_inputs(
+            pull_number=pull_number, head_branch=head_branch, base_ref=base_ref,
+            expected_head_sha=expected_head_sha, commit_message=commit_message, changes=changes,
+        )
+        pull = _pull_request_from_api(self._api(f"repos/{repo}/pulls/{pull_number}"), repository=repo)
+        remote_head = self._read_branch_head(repository=repo, branch=branch)
+        if remote_head == expected:
+            return "parent", replace(pull, head_sha=remote_head)
+        ours = self._commit_has_changes(repository=repo, commit_sha=remote_head, parent_sha=expected,
+                                        commit_message=commit_message, changes=changes)
+        return ("ours" if ours else "moved"), replace(pull, head_sha=remote_head)
+
+    def _read_advance_target(
+        self, repo: str, *, pull_number: int, head_branch: str, base_ref: str,
+    ) -> GitHubPullRequest:
+        raw = self._api(f"repos/{repo}/pulls/{pull_number}")
+        pull = _pull_request_from_api(raw, repository=repo)
+        head_repo = raw.get("head", {}).get("repo") if isinstance(raw, dict) and isinstance(raw.get("head"), dict) else None
+        if not isinstance(head_repo, dict) or str(head_repo.get("full_name", "")).lower() != repo.lower():
+            raise ValueError("Correction target pull request head must live in the base repository")
+        _validate_advance_target(pull, pull_number=pull_number, head_branch=head_branch, base_ref=base_ref)
+        return pull
 
     def create_or_update_draft_pull_request(
         self,
@@ -1052,6 +1402,7 @@ class GhCliGitHubAdapter:
         existing_pull_number: int | None = None,
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> GitHubPullRequest:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -1097,6 +1448,7 @@ class GhCliGitHubAdapter:
                 raise ValueError(
                     f"Pull request #{existing_pull_number} must remain an open draft; refusing update"
                 )
+            _check_write_budget(before_write)
             raw = self._api(
                 f"repos/{repo}/pulls/{existing_pull_number}",
                 method="PATCH",
@@ -1107,6 +1459,7 @@ class GhCliGitHubAdapter:
                 },
             )
             return _pull_request_from_api(raw, repository=repo, changed_files=())
+        _check_write_budget(before_write)
         raw = self._api(
             f"repos/{repo}/pulls",
             method="POST",
@@ -1178,30 +1531,107 @@ def _tree_fingerprint(files: Mapping[str, GitHubBlobChange | None]) -> str:
     return sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()
 
 
-def _validate_aitobuild_branch_name(branch: str, *, field_name: str = "branch") -> str:
-    cleaned_branch = branch.strip() if isinstance(branch, str) else ""
+def _validate_ref_name(name: Any, *, field_name: str) -> str:
+    """Shared git ref-name check for task heads and PR bases (no refs/ prefix)."""
+    cleaned = name.strip() if isinstance(name, str) else ""
     if (
-        not cleaned_branch
-        or not cleaned_branch.startswith("aitobuild/")
-        or cleaned_branch.endswith("/")
-        or ".." in cleaned_branch
-        or re.fullmatch(r"[A-Za-z0-9._/-]+", cleaned_branch) is None
+        not cleaned
+        or re.fullmatch(r"[A-Za-z0-9._/-]+", cleaned) is None
+        or cleaned.startswith(("/", "-", ".", "refs/"))
+        or cleaned.endswith(("/", ".", ".lock"))
+        or ".." in cleaned
+        or "//" in cleaned
+        or "@{" in cleaned
+        or any(part.startswith(".") or part.endswith(".lock") for part in cleaned.split("/"))
     ):
+        raise ValueError(f"{field_name} must be a plain branch name")
+    return cleaned
+
+
+def _validate_aitobuild_branch_name(branch: str, *, field_name: str = "branch") -> str:
+    try:
+        cleaned_branch = _validate_ref_name(branch, field_name=field_name)
+    except ValueError:
+        cleaned_branch = ""
+    if not cleaned_branch.startswith("aitobuild/") or cleaned_branch == "aitobuild/":
         raise ValueError(f"{field_name} must be an aitobuild/ task ref name")
     return cleaned_branch
 
 
-def _validate_base_ref_name(base_ref: str, *, head_branch: str) -> None:
-    if (
-        base_ref.startswith(("/", "-", "refs/"))
-        or base_ref.endswith(("/", ".lock"))
-        or ".." in base_ref
-        or "//" in base_ref
-        or re.fullmatch(r"[A-Za-z0-9._/-]+", base_ref) is None
-    ):
-        raise ValueError("base_ref must be a plain branch name")
-    if base_ref == head_branch:
+def _validate_base_ref_name(base_ref: str, *, head_branch: str) -> str:
+    cleaned = _validate_ref_name(base_ref, field_name="base_ref")
+    if cleaned == head_branch:
         raise ValueError("base_ref must differ from head_branch")
+    return cleaned
+
+
+def _check_write_budget(before_write: Callable[[], object] | None) -> None:
+    """Run the caller's budget check (raises on expiry/abort) right before a GitHub write."""
+    if before_write is not None:
+        before_write()
+
+
+def _validate_advance_inputs(
+    *,
+    pull_number: int,
+    head_branch: str,
+    base_ref: str,
+    expected_head_sha: str,
+    commit_message: str,
+    files: Mapping[str, GitHubBlobChange | None],
+) -> tuple[str, str, str]:
+    if type(pull_number) is not int or pull_number <= 0:
+        raise ValueError("pull_number must be a positive integer")
+    branch = _validate_aitobuild_branch_name(head_branch, field_name="head_branch")
+    base = _validate_base_ref_name(base_ref, head_branch=branch)
+    _validate_publish_commit_inputs(
+        branch=branch, base_sha=expected_head_sha, commit_message=commit_message, files=files,
+    )
+    return branch, base, expected_head_sha
+
+
+def _validate_pinned_changes(changes: Mapping[str, GitHubPinnedChange | None]) -> None:
+    if not isinstance(changes, Mapping) or not changes:
+        raise ValueError("reconcile requires a non-empty pinned change map")
+    for path_name, change in changes.items():
+        if (not isinstance(path_name, str) or not path_name.strip() or path_name.startswith("/")
+                or any(part == ".." for part in path_name.split("/"))):
+            raise ValueError("publish file paths must be relative and scoped")
+        if change is None:
+            continue
+        if not isinstance(change, GitHubPinnedChange) or change.mode not in {"100644", "100755"}:
+            raise ValueError("pinned changes must be GitHubPinnedChange values with mode 100644 or 100755")
+        if not isinstance(change.blob_sha, str) or re.fullmatch(r"[0-9a-f]{40}", change.blob_sha) is None:
+            raise ValueError(f"pinned blob SHA for {path_name} must be a lowercase git SHA")
+
+
+def _validate_reconcile_inputs(
+    *, pull_number: int, head_branch: str, base_ref: str, expected_head_sha: str, commit_message: str,
+    changes: Mapping[str, GitHubPinnedChange | None],
+) -> tuple[str, str, str]:
+    if type(pull_number) is not int or pull_number <= 0:
+        raise ValueError("pull_number must be a positive integer")
+    branch = _validate_aitobuild_branch_name(head_branch, field_name="head_branch")
+    base = _validate_base_ref_name(base_ref, head_branch=branch)
+    if not isinstance(expected_head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", expected_head_sha) is None:
+        raise ValueError("base_sha must be a resolved lowercase commit SHA")
+    if not isinstance(commit_message, str) or not commit_message.strip():
+        raise ValueError("commit_message must be non-empty")
+    _validate_pinned_changes(changes)
+    return branch, base, expected_head_sha
+
+
+def _validate_advance_target(
+    pull: GitHubPullRequest, *, pull_number: int, head_branch: str, base_ref: str,
+) -> None:
+    if pull.number != pull_number:
+        raise ValueError("Correction target pull request identity changed")
+    if pull.state != "open" or not pull.draft:
+        raise ValueError(f"Pull request #{pull_number} must remain an open draft; refusing correction")
+    if pull.head_ref != head_branch:
+        raise ValueError(f"Pull request #{pull_number} head ref differs from the pinned correction branch")
+    if pull.base_ref != base_ref:
+        raise ValueError(f"Pull request #{pull_number} base differs from the pinned correction base")
 
 
 def _validate_publish_commit_inputs(

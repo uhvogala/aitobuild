@@ -21,7 +21,7 @@ from filelock import FileLock
 from pydantic import AwareDatetime, JsonValue, StrictBool, StrictStr, TypeAdapter, model_validator
 
 from aitobuild.developer_isolation import DeveloperTaskBudget
-from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, Identifier
+from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, Identifier, sync_directory
 from aitobuild.organization_assignments import (
     AssignmentProposal, AssignmentService, AssignmentStore, Digest, TaskAssignment,
 )
@@ -184,16 +184,8 @@ class FileRunStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             temporary.replace(path)
-            _sync_directory(directory)
-            _sync_directory(self._directory)
-
-
-def _sync_directory(directory: Path) -> None:
-    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+            sync_directory(directory)
+            sync_directory(self._directory)
 
 
 def _assignment_digest(assignment: TaskAssignment) -> str:
@@ -286,8 +278,8 @@ class _RunCheckpoints(FileCheckpointStorage):
         checkpoint_id = await super().save(checkpoint)
         with (self.path / (checkpoint_id + ".json")).open("rb") as handle:
             os.fsync(handle.fileno())
-        _sync_directory(self.path)
-        _sync_directory(self.path.parent)
+        sync_directory(self.path)
+        sync_directory(self.path.parent)
         self.latest = checkpoint_id
         return checkpoint_id
 

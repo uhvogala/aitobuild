@@ -724,6 +724,63 @@ def create_app(
                 raise HTTPException(status_code=409, detail=str(error)) from error
             return {"correction_preview": {"preview_id": preview.preview_id, "approved": preview.approved, "bundle": preview.bundle_payload} if preview else None}
 
+        @app.post("/internal/organization/corrections/stage-publication")
+        async def stage_correction_publication(
+            payload: dict[str, Any],
+            x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        ) -> dict[str, Any]:
+            _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+            if (set(payload) != {"correction_preview_id"} or not isinstance(payload["correction_preview_id"], str)
+                    or not payload["correction_preview_id"].strip()):
+                raise HTTPException(status_code=400, detail="Correction publication staging accepts only correction_preview_id")
+            assert managed_service is not None
+            try:
+                staged = await managed_service.stage_correction_publication(payload["correction_preview_id"].strip())
+            except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return {"publish_approval": staged}
+
+        @app.post("/internal/organization/corrections/publish")
+        async def publish_scoped_correction(
+            payload: dict[str, Any],
+            x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        ) -> dict[str, Any]:
+            _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+            if (set(payload) != {"correction_preview_id", "approval_digest"}
+                    or not all(isinstance(payload[key], str) and payload[key].strip() for key in payload)):
+                raise HTTPException(status_code=400, detail="Correction publish accepts only correction_preview_id and approval_digest")
+            if isinstance(github_adapter, MockGitHubAdapter):
+                raise HTTPException(status_code=409, detail="Publication requires a live GitHub adapter (gh_cli); mock publication is refused")
+            assert managed_service is not None
+            try:
+                record, review = await managed_service.publish_correction(
+                    payload["correction_preview_id"].strip(), approval_digest=payload["approval_digest"].strip(),
+                    github=github_adapter,
+                )
+            except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return {"accepted": record.state == "published", "delivery": record.to_payload(),
+                    "review_preview": {"preview_id": review.preview_id, "approved": review.approved,
+                                       "bundle": review.bundle_payload} if review else None}
+
+        @app.post("/internal/organization/corrections/retire")
+        async def retire_scoped_correction(
+            payload: dict[str, Any],
+            x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        ) -> dict[str, Any]:
+            _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+            if (set(payload) != {"correction_preview_id"} or not isinstance(payload["correction_preview_id"], str)
+                    or not payload["correction_preview_id"].strip()):
+                raise HTTPException(status_code=400, detail="Correction retire accepts only correction_preview_id")
+            if isinstance(github_adapter, MockGitHubAdapter):
+                raise HTTPException(status_code=409, detail="Retiring requires a live GitHub adapter (gh_cli); mock reads are refused")
+            assert managed_service is not None
+            try:
+                record = await managed_service.retire_correction(payload["correction_preview_id"].strip(), github=github_adapter)
+            except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return {"retired": record.state == "retired", "delivery": record.to_payload()}
+
         @app.post("/internal/organization/reviews/offer")
         async def offer_published_review(
             payload: dict[str, Any],

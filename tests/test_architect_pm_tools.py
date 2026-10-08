@@ -610,6 +610,11 @@ def test_ghcli_recovers_only_the_exact_remote_commit(monkeypatch, remote) -> Non
             return {"sha": _git_blob_sha(content)}
         if endpoint.endswith("/git/trees"):
             return {"sha": tree}
+        if endpoint.endswith("?recursive=1"):  # base tree "e": README only; tree "d": README + probe
+            entries = [{"path": "README.md", "mode": "100644", "type": "blob", "sha": "9" * 40}]
+            if f"/git/trees/{tree}?" in endpoint:
+                entries.append({"path": "src/probe.py", "mode": "100644", "type": "blob", "sha": _git_blob_sha(content)})
+            return {"tree": entries, "truncated": False}
         if endpoint.endswith("/git/commits"):
             return {"sha": new_head, "tree": {"sha": tree}}
         if endpoint.endswith("/git/refs"):
@@ -750,6 +755,9 @@ def test_mock_publish_commit_and_draft_pr_respect_allowlist() -> None:
         ("feature/not-scoped", "main", "head_branch must be an aitobuild/"),
         ("aitobuild/", "main", "head_branch must be an aitobuild/"),
         ("aitobuild/../main", "main", "head_branch must be an aitobuild/"),
+        ("aitobuild/x//y", "main", "head_branch must be an aitobuild/"),
+        ("aitobuild/x.lock", "main", "head_branch must be an aitobuild/"),
+        ("aitobuild/issue-1-task", "main.lock", "base_ref must be a plain branch"),
         ("aitobuild/issue-1-task", "aitobuild/issue-1-task", "base_ref must differ"),
         ("aitobuild/issue-1-task", "refs/heads/main", "base_ref must be a plain branch"),
         ("aitobuild/issue-1-task", "main..x", "base_ref must be a plain branch"),
