@@ -113,6 +113,7 @@ class FakeGitHub:
         self.draft, self.state, self.fork = draft, state, fork
         self.calls: list[tuple[str, str]] = []
         self.patch_mode = "apply"
+        self.on_commit: Any = None
 
     def pull(self) -> dict[str, Any]:
         return {"number": 1, "title": "Trial", "body": "Closes #7", "state": self.state, "draft": self.draft,
@@ -135,6 +136,8 @@ class FakeGitHub:
             sha = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:40]
             self.commits[sha] = {"tree": {"sha": payload["tree"]}, "parents": [{"sha": p} for p in payload["parents"]],
                                  "message": payload["message"]}
+            if self.on_commit is not None:
+                self.on_commit(self)
             return {"sha": sha, "tree": {"sha": payload["tree"]}}
         if endpoint == f"repos/{REPO}/git/ref/heads/{BRANCH}" and method == "GET":
             return {"object": {"sha": self.ref}}
@@ -148,6 +151,10 @@ class FakeGitHub:
             if parent != self.ref:
                 raise RuntimeError("HTTP 422: Update is not a fast forward")
             self.ref = payload["sha"]
+            if self.patch_mode == "moved_after":
+                self.ref = "f" * 40
+                self.commits[self.ref] = {"tree": {"sha": "1" * 40}, "parents": [{"sha": payload["sha"]}],
+                                          "message": "someone else"}
             if self.patch_mode == "timeout":
                 raise RuntimeError("gh: timed out")
             return {"object": {"sha": self.ref}}
@@ -274,3 +281,85 @@ def test_reconcile_reports_parent_ours_and_moved(monkeypatch) -> None:
     _advance(mock, expected=mock_head)
     assert _reconcile(mock, expected=mock_head)[0] == "ours"
     assert _reconcile(mock, expected=mock_head, commit_message="other")[0] == "moved"
+
+
+def _writes(fake: FakeGitHub) -> list[str]:
+    return [endpoint.rsplit("/git/", 1)[1].split("/")[0] for method, endpoint in fake.calls
+            if method in {"POST", "PATCH"}]
+
+
+@pytest.mark.parametrize("expire_at", [1, 2, 3, 4])
+def test_gh_advance_checks_the_budget_before_every_write(expire_at, monkeypatch) -> None:
+    """Writes run blob, tree, commit, ref PATCH; expiry at the nth check sends nothing from there on."""
+    head = "b" * 40
+    fake = FakeGitHub(head=head)
+    checks: list[list[str]] = []
+
+    def budget() -> float:
+        checks.append(_writes(fake))
+        if len(checks) == expire_at:
+            raise TimeoutError("Approved task runtime budget has expired")
+        return 60.0
+
+    with pytest.raises(TimeoutError, match="expired"):
+        _advance(_gh(fake, monkeypatch), expected=head, before_write=budget)
+    assert _writes(fake) == ["blobs", "trees", "commits", "refs"][: expire_at - 1]
+    assert checks == [["blobs", "trees", "commits"][:n] for n in range(expire_at)]
+    assert fake.ref == head
+    full = FakeGitHub(head=head)
+    calls: list[list[str]] = []
+    _advance(_gh(full, monkeypatch), expected=head, before_write=lambda: calls.append(_writes(full)))
+    assert calls == [[], ["blobs"], ["blobs", "trees"], ["blobs", "trees", "commits"]]
+
+
+def test_reconcile_and_mock_check_the_budget_before_writes(monkeypatch) -> None:
+    head = "b" * 40
+    fake = FakeGitHub(head=head)
+    adapter = _gh(fake, monkeypatch)
+
+    def expired() -> float:
+        raise TimeoutError("expired")
+
+    assert _reconcile(adapter, expected=head, before_write=expired)[0] == "parent"  # read-only, no write needed
+    fake.ref = "e" * 40
+    fake.commits[fake.ref] = {"tree": {"sha": "9" * 40}, "parents": [{"sha": head}], "message": "x"}
+    with pytest.raises(TimeoutError):
+        _reconcile(adapter, expected=head, before_write=expired)
+    assert _writes(fake) == []
+    mock, mock_head = _published_mock()
+    commits = len(mock.branch_commits)
+    with pytest.raises(TimeoutError):
+        _advance(mock, expected=mock_head, before_write=expired)
+    assert len(mock.branch_commits) == commits
+    assert mock.get_pull_request(repository=REPO, pull_number=1).head_sha == mock_head
+
+
+@pytest.mark.parametrize("race", ["foreign_head", "marked_ready", "closed"])
+def test_gh_advance_rechecks_target_and_head_right_before_patch(race, monkeypatch) -> None:
+    head = "b" * 40
+    fake = FakeGitHub(head=head)
+
+    def compete(github: FakeGitHub) -> None:
+        if race == "foreign_head":
+            github.ref = "e" * 40
+            github.commits[github.ref] = {"tree": {"sha": "9" * 40}, "parents": [{"sha": head}], "message": "other"}
+        elif race == "marked_ready":
+            github.draft = False
+        else:
+            github.state = "closed"
+
+    fake.on_commit = compete
+    with pytest.raises(ValueError, match="moved from the pinned SHA" if race == "foreign_head" else "open draft"):
+        _advance(_gh(fake, monkeypatch), expected=head)
+    assert "refs" not in _writes(fake)
+
+
+def test_gh_advance_never_reports_our_sha_when_the_ref_moved_after_patch(monkeypatch) -> None:
+    head = "b" * 40
+    fake = FakeGitHub(head=head)
+    fake.patch_mode = "moved_after"
+    adapter = _gh(fake, monkeypatch)
+    with pytest.raises(RuntimeError, match="moved after the correction push"):
+        _advance(adapter, expected=head)
+    assert fake.ref == "f" * 40
+    assert _reconcile(adapter, expected=head)[0] == "moved"

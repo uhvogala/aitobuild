@@ -926,6 +926,7 @@ class DeveloperDeliveryWorker:
                 budget.remaining_seconds()
                 pull = github.advance_draft_pull_request_head(
                     role=AgentRole.DEVELOPER, expected_head_sha=record.base_revision, files=files, approved=True,
+                    before_write=budget.remaining_seconds,
                     require_human_approval_for_repo_writes=require_human_approval_for_repo_writes, **push,
                 )
                 self._require_advanced_pull(pull, record=record, snapshot=snapshot)
@@ -980,6 +981,7 @@ class DeveloperDeliveryWorker:
         try:
             outcome, pull = github.reconcile_advanced_head(
                 role=AgentRole.DEVELOPER, expected_head_sha=record.base_revision, files=files, approved=True,
+                before_write=budget.remaining_seconds,
                 require_human_approval_for_repo_writes=require_human_approval_for_repo_writes, **push,
             )
             if outcome == "ours":

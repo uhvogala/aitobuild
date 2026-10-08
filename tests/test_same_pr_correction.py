@@ -275,6 +275,33 @@ def test_push_that_did_not_apply_releases_the_parent_head(correction_chain, monk
     assert worker.superseded_by(published_id) == sibling
 
 
+def test_budget_aborted_during_the_advance_sends_no_write(correction_chain, monkeypatch):
+    """The adapter re-checks the original ledger before every write, not only at the preflight."""
+    worker, published_id, github, head, make = correction_chain
+    correction = make()
+    staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
+    record = worker.get(correction)
+    budget = DeveloperTaskBudget(path=worker.budget_path(correction),
+                                 bundle=developer_task_bundle_from_payload(record.bundle_payload), create=False)
+    advance, commits = github.advance_draft_pull_request_head, len(github.branch_commits)
+    hooks = []
+
+    def aborted_mid_call(**kwargs):
+        hooks.append(kwargs["before_write"])
+        budget.abort()  # e.g. an operator abort or expiry after the preflight check passed
+        return advance(**kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(github, "advance_draft_pull_request_head", aborted_mid_call)
+        with pytest.raises((TimeoutError, PermissionError, ValueError)):
+            _publish(worker, github, correction, staged["digest"])
+    assert hooks and hooks[0].__self__.path == budget.path  # the original ledger, not a copy of its deadline
+    assert len(github.branch_commits) == commits and _pull(github, worker, published_id).head_sha == head
+    failed = worker.get(correction)
+    assert failed.state == "failed" and failed.publication["push_outcome"] == "not_applied"
+    assert worker.correction_releases_parent(correction)
+
+
 def test_moved_head_keeps_holding_and_cannot_be_retired(correction_chain, monkeypatch):
     worker, published_id, github, head, make = correction_chain
     correction = make()

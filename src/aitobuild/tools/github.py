@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from hashlib import sha1, sha256
 import json
@@ -263,6 +263,7 @@ class GitHubAdapter(Protocol):
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> GitHubPullRequest: ...
 
     def reconcile_advanced_head(
@@ -278,6 +279,7 @@ class GitHubAdapter(Protocol):
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> tuple[AdvanceOutcome, GitHubPullRequest]: ...
 
 
@@ -587,6 +589,7 @@ class MockGitHubAdapter:
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> GitHubPullRequest:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -605,6 +608,7 @@ class MockGitHubAdapter:
         if remote_head != head_sha:
             if remote_head != expected:
                 raise ValueError("Pull request head moved from the pinned SHA; refusing stale correction")
+            _check_write_budget(before_write)
             self._record_mock_commit(repo, head_sha, payload, expected, files)
             self._branch_heads.setdefault(repo, {})[branch] = head_sha
         advanced = replace(current, head_sha=head_sha)
@@ -624,6 +628,7 @@ class MockGitHubAdapter:
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> tuple[AdvanceOutcome, GitHubPullRequest]:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -637,6 +642,8 @@ class MockGitHubAdapter:
         )
         current = self.get_pull_request(repository=repo, pull_number=pull_number)
         remote_head = self._branch_heads.get(repo, {}).get(branch) or current.head_sha
+        if remote_head != expected:
+            _check_write_budget(before_write)
         ours, _ = self._mock_commit(repo, branch, expected, commit_message, files)
         outcome: AdvanceOutcome = "parent" if remote_head == expected else "ours" if remote_head == ours else "moved"
         return outcome, replace(current, head_sha=remote_head)
@@ -1120,6 +1127,7 @@ class GhCliGitHubAdapter:
 
     def _create_publish_tree(
         self, repo: str, base_sha: str, files: Mapping[str, GitHubBlobChange | None],
+        before_write: Callable[[], object] | None = None,
     ) -> str:
         base = self._api(f"repos/{repo}/git/commits/{base_sha.lower()}")
         if not isinstance(base, dict) or not isinstance(base.get("tree"), dict):
@@ -1133,6 +1141,7 @@ class GhCliGitHubAdapter:
             if change is None:
                 tree_entries.append({"path": path_name, "mode": "100644", "type": "blob", "sha": None})
                 continue
+            _check_write_budget(before_write)
             blob = self._api(
                 f"repos/{repo}/git/blobs",
                 method="POST",
@@ -1151,6 +1160,7 @@ class GhCliGitHubAdapter:
             tree_entries.append(
                 {"path": path_name, "mode": change.mode, "type": "blob", "sha": blob["sha"]}
             )
+        _check_write_budget(before_write)
         tree = self._api(
             f"repos/{repo}/git/trees",
             method="POST",
@@ -1160,7 +1170,11 @@ class GhCliGitHubAdapter:
             raise RuntimeError("Failed to create GitHub tree")
         return str(tree["sha"])
 
-    def _create_publish_commit(self, repo: str, base_sha: str, tree_sha: str, commit_message: str) -> str:
+    def _create_publish_commit(
+        self, repo: str, base_sha: str, tree_sha: str, commit_message: str,
+        before_write: Callable[[], object] | None = None,
+    ) -> str:
+        _check_write_budget(before_write)
         commit = self._api(
             f"repos/{repo}/git/commits",
             method="POST",
@@ -1189,6 +1203,7 @@ class GhCliGitHubAdapter:
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> GitHubPullRequest:
         assert_role_action_allowed(role, ActionClass.REPO_WRITE)
         assert_repo_write_approval(
@@ -1201,16 +1216,27 @@ class GhCliGitHubAdapter:
             expected_head_sha=expected_head_sha, commit_message=commit_message, files=files,
         )
         current = self._read_advance_target(repo, pull_number=pull_number, head_branch=branch, base_ref=base)
-        tree_sha = self._create_publish_tree(repo, expected, files)
-        remote_head = self._read_branch_head(repository=repo, branch=branch)
-        if remote_head != expected:
+        tree_sha = self._create_publish_tree(repo, expected, files, before_write)
+
+        def ours_or_refuse(remote_head: str, target: GitHubPullRequest) -> GitHubPullRequest:
             if not self._commit_matches(
                 repository=repo, commit_sha=remote_head, tree_sha=tree_sha,
                 parent_sha=expected, commit_message=commit_message,
             ):
                 raise ValueError("Pull request head moved from the pinned SHA; refusing stale correction")
-            return replace(current, head_sha=remote_head)
-        commit_sha = self._create_publish_commit(repo, expected, tree_sha, commit_message)
+            return replace(target, head_sha=remote_head)
+
+        remote_head = self._read_branch_head(repository=repo, branch=branch)
+        if remote_head != expected:
+            return ours_or_refuse(remote_head, current)
+        commit_sha = self._create_publish_commit(repo, expected, tree_sha, commit_message, before_write)
+        # Re-read the PR target and branch head right before the ref update: a competing update during
+        # object creation must be refused here, not left to a stale PATCH.
+        current = self._read_advance_target(repo, pull_number=pull_number, head_branch=branch, base_ref=base)
+        remote_head = self._read_branch_head(repository=repo, branch=branch)
+        if remote_head != expected:
+            return ours_or_refuse(remote_head, current)
+        _check_write_budget(before_write)
         try:
             self._api(
                 f"repos/{repo}/git/refs/heads/{branch}",
@@ -1226,7 +1252,11 @@ class GhCliGitHubAdapter:
                 raise
             commit_sha = remote_head
         advanced = self._read_advance_target(repo, pull_number=pull_number, head_branch=branch, base_ref=base)
-        return replace(advanced, head_sha=commit_sha)
+        live_head = self._read_branch_head(repository=repo, branch=branch)
+        if live_head != commit_sha:
+            # Never report our SHA as current when the live ref says otherwise; settlement decides.
+            raise RuntimeError("Branch head moved after the correction push; refusing to report success")
+        return replace(advanced, head_sha=live_head)
 
     def reconcile_advanced_head(
         self,
@@ -1241,6 +1271,7 @@ class GhCliGitHubAdapter:
         files: Mapping[str, GitHubBlobChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], object] | None = None,
     ) -> tuple[AdvanceOutcome, GitHubPullRequest]:
         """Classify the live branch head after an uncertain push: untouched parent, our exact commit, or moved.
 
@@ -1261,7 +1292,7 @@ class GhCliGitHubAdapter:
         remote_head = self._read_branch_head(repository=repo, branch=branch)
         if remote_head == expected:
             return "parent", replace(pull, head_sha=remote_head)
-        tree_sha = self._create_publish_tree(repo, expected, files)
+        tree_sha = self._create_publish_tree(repo, expected, files, before_write)
         ours = self._commit_matches(repository=repo, commit_sha=remote_head, tree_sha=tree_sha,
                                     parent_sha=expected, commit_message=commit_message)
         return ("ours" if ours else "moved"), replace(pull, head_sha=remote_head)
@@ -1448,6 +1479,12 @@ def _validate_base_ref_name(base_ref: str, *, head_branch: str) -> str:
     if cleaned == head_branch:
         raise ValueError("base_ref must differ from head_branch")
     return cleaned
+
+
+def _check_write_budget(before_write: Callable[[], object] | None) -> None:
+    """Run the caller's budget check (raises on expiry/abort) right before a GitHub write."""
+    if before_write is not None:
+        before_write()
 
 
 def _validate_advance_inputs(

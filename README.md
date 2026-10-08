@@ -32,7 +32,7 @@ Team structure and lifecycle are not fixed in code.
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **754 tests pass**, with two optional prepared-target Docker
+Verified locally: **764 tests pass**, with two optional prepared-target Docker
 probes skipped; Ruff and mypy (47 source files) and the mock fixture simulation pass.
 The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
@@ -566,7 +566,10 @@ draft head with `force=false`; it never creates a PR or changes base, then stage
 Architect review at the new head. The chain walk fails closed on a missing/invalid link or a
 repo/PR/branch/head mismatch; only the first staged correction on a parent head may proceed (later
 siblings fail as terminal stale) and older preview IDs are refused as "superseded by <tip>".
-After any failure past consume, the live branch head decides the outcome: our exact commit
+The adapter re-checks the original task budget before every blob, tree, commit and ref write
+(reconciliation uploads included), re-reads the PR target and branch head right before the ref
+update, and re-reads the live ref after it, so a head moved by someone else is never reported
+as our success. After any failure past consume, the live branch head decides the outcome: our exact commit
 (tree, sole parent and message) on the open draft reconciles to `published`; the unchanged parent
 fails terminally with `push_outcome: not_applied` and releases that parent head; a different head
 fails terminally with `push_outcome: moved` and keeps holding it; an unreadable head stays
