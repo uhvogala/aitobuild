@@ -32,8 +32,8 @@ Team structure and lifecycle are not fixed in code.
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **684 tests pass**, with two optional prepared-target Docker
-probes skipped; Ruff and mypy (46 source files) and the mock fixture simulation pass.
+Verified locally: **737 tests pass**, with two optional prepared-target Docker
+probes skipped; Ruff and mypy (47 source files) and the mock fixture simulation pass.
 The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
 The original patch-repair
@@ -552,7 +552,20 @@ published branch; preparation does not fetch, and missing heads fail closed.
 Deleted initialized budgets cannot be recreated by replaying preparation.
 Register the existing delivery operations for implementation and independent
 verification; a completed metadata graph is neither an implemented correction
-nor a verified/publishable artifact. Same-PR update/reconciliation is not added.
+nor a verified/publishable artifact.
+
+Same-PR correction publication (operator-only): each verified `published-correction-*`
+delivery is its own record holding one round and never rewrites the original. Authenticated
+`POST /internal/organization/corrections/stage-publication {correction_preview_id}` returns one
+exact snapshot (unified diff, PR number, pinned branch/base, pinned parent head, chain and the
+triggering Architect review receipt digest) and its SHA-256 digest. `POST
+/internal/organization/corrections/publish {correction_preview_id, approval_digest}` consumes that
+one-use approval, recomputes the snapshot (any drift invalidates it) and fast-forwards the pinned
+draft head with `force=false`; it never creates a PR or changes base, then stages the next
+Architect review at the new head. The chain walk fails closed on a missing/invalid link or a
+repo/PR/branch/head mismatch; only the first staged correction on a parent head may proceed (later
+siblings fail as terminal stale) and older preview IDs are refused as "superseded by <tip>".
+Managed `delivery_publish` and the legacy publish endpoint refuse correction tasks.
 
 Twenty correction regressions cover actual native Architect mocked transports,
 exact approval and refusals, request/detached handoff, authenticated HTTP offers,

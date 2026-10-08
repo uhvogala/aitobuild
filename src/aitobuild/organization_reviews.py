@@ -282,6 +282,7 @@ class PublishedReviewAdmission:
         target = PublishedReviewTarget.model_validate({key: target_payload.get(key) for key in ("preview_id", "head_sha")})
         if target != self.target_for(review_preview_id) or output.get("metadata_only") is not True:
             raise PermissionError("Correction proposal differs from the completed reviewed target")
+        self._worker.refuse_superseded(target.preview_id)
         published = self._worker.get(target.preview_id)
         assert published is not None and published.publication is not None
         if not published.architect_review or output.get("architect_review") != published.architect_review:
@@ -300,6 +301,13 @@ class PublishedReviewAdmission:
             saved = [receipt for receipt in journal.corrections.values() if receipt.review_preview_id == review_preview_id]
             if len(saved) > 1:
                 raise PermissionError("Review has ambiguous correction receipts")
+            siblings = [receipt for receipt in journal.corrections.values()
+                        if receipt.target.head_sha == target.head_sha and receipt.review_preview_id != review_preview_id]
+            if siblings:
+                raise PermissionError(
+                    f"Correction {siblings[0].correction_preview_id or siblings[0].task_id} already targets "
+                    f"head {target.head_sha}; offer corrections only from the chain tip"
+                )
             if saved:
                 original = saved[0]
                 if original.run_content != run_content or original.target != target or original.route.organization_id != route.organization_id:
@@ -312,7 +320,7 @@ class PublishedReviewAdmission:
             bundle["task_id"] = task_id
             bundle["objective"] = proposal.objective
             bundle["issue_context"]["base_revision"] = target.head_sha
-            bundle["issue_context"]["base_branch"] = published.branch
+            bundle["issue_context"]["base_branch"] = published.publication["branch"]
             bundle["policy"]["allowed_paths"] = [escape(path) for path in proposal.paths]
             bundle["policy"]["max_file_changes"] = min(len(proposal.paths), bundle["policy"]["max_file_changes"])
             developer_task_bundle_from_payload(bundle)
@@ -336,6 +344,31 @@ class PublishedReviewAdmission:
             return staged
 
     def correction_route_for(self, preview_id: str) -> PublishedReviewRoute | None:
+        receipt = self._correction_receipt(preview_id)
+        if receipt is None:
+            return None
+        if self.target_for(receipt.review_preview_id) != receipt.target:
+            raise PermissionError("Correction reviewed head is stale")
+        return receipt.route
+
+    def correction_publication_binding(self, preview_id: str) -> str:
+        """Digest of the trusted correction and triggering review receipts (the reviewed head need not stay live)."""
+        receipt = self._correction_receipt(preview_id)
+        if receipt is None:
+            raise PermissionError("Same-PR publication requires a trusted correction receipt")
+        review = self._receipt(receipt.review_preview_id)
+        if review is None or review.target != receipt.target:
+            raise PermissionError("Correction receipt differs from its triggering review")
+        stable = {
+            "correction": receipt.model_dump(mode="json", include={"task_id", "review_preview_id", "target", "route",
+                                                                   "run_content", "bundle_content",
+                                                                   "correction_preview_id"}),
+            "review": review.model_dump(mode="json", include={"task_id", "target", "route", "publication_content",
+                                                              "bundle_content", "review_preview_id"}),
+        }
+        return sha256(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _correction_receipt(self, preview_id: str) -> _CorrectionReceipt | None:
         preview = self._previews.get(preview_id)
         if preview is None:
             raise ValueError("Correction preview not found")
@@ -352,9 +385,7 @@ class PublishedReviewAdmission:
                    (receipt.route.repository, receipt.route.repository_id, receipt.route.organization_id) for route in self._correction_routes):
             raise PermissionError("Correction is outside this operator activation")
         self._validate_route(receipt.route, role=AgentRole.DEVELOPER)
-        if self.target_for(receipt.review_preview_id) != receipt.target:
-            raise PermissionError("Correction reviewed head is stale")
-        return receipt.route
+        return receipt
 
     def budget_path(self, preview_id: str) -> Path:
         path = self._directory / "budgets" / (sha256(preview_id.encode()).hexdigest() + ".json")
