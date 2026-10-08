@@ -538,3 +538,51 @@ def test_mock_matcher_compares_modes_inside_and_outside_the_pinned_set() -> None
     tree["README.md"] = GitHubBlobChange(mode="100755", content=b"r\n", blob_sha=_git_blob_sha(b"r\n"))
     mock.commit_files[(REPO, head)]["README.md"] = replace(tree["README.md"], mode="100644")
     assert _reconcile(mock, expected=head)[0] == "moved"
+
+
+class TimedOutCreateGitHub(FreshBranchGitHub):
+    """`gh` times out on the PR POST; `created` says whether GitHub accepted it anyway."""
+
+    def __init__(self, *, created: list[dict[str, Any]]) -> None:
+        super().__init__(head="b" * 40)
+        self.created = created
+        self.posted = False
+
+    def __call__(self, endpoint: str, *, method: str = "GET", payload: dict | None = None) -> Any:
+        if endpoint.startswith(f"repos/{REPO}/pulls?") and method == "GET":
+            self.calls.append((method, endpoint))
+            return self.created if self.posted else []
+        if endpoint == f"repos/{REPO}/pulls" and method == "POST":
+            self.calls.append((method, endpoint))
+            self.posted = True
+            raise RuntimeError("gh: context deadline exceeded")
+        return super().__call__(endpoint, method=method, payload=payload)
+
+
+def _created_pull(**overrides: Any) -> dict[str, Any]:
+    pull = {"number": 2, "title": "T", "body": "Closes #8", "state": "open", "draft": True,
+            "head": {"ref": "aitobuild/issue-8-task", "sha": "c" * 40, "repo": {"full_name": REPO}},
+            "base": {"ref": "main"}}
+    pull.update(overrides)
+    return pull
+
+
+@pytest.mark.parametrize("created, adopted", [
+    ([_created_pull()], True),
+    ([], False),
+    ([_created_pull(), _created_pull(number=3)], False),
+    ([_created_pull(title="Someone else's PR")], False),
+    ([_created_pull(draft=False)], False),
+], ids=["accepted", "not_created", "ambiguous", "other_title", "not_draft"])
+def test_gh_pr_create_timeout_adopts_only_the_exact_created_draft(created, adopted, monkeypatch) -> None:
+    fake = TimedOutCreateGitHub(created=created)
+    arguments = dict(role=AgentRole.DEVELOPER, repository=REPO, title="T", body="Closes #8",
+                     head_branch="aitobuild/issue-8-task", base_ref="main", issue_number=8, approved=True,
+                     require_human_approval_for_repo_writes=True)
+    if adopted:
+        pull = _gh(fake, monkeypatch).create_or_update_draft_pull_request(**arguments)
+        assert pull.number == 2 and pull.draft and pull.head_sha == "c" * 40
+    else:
+        with pytest.raises(RuntimeError, match="deadline exceeded"):
+            _gh(fake, monkeypatch).create_or_update_draft_pull_request(**arguments)
+    assert [call for call in fake.calls if call[0] != "GET"] == [("POST", f"repos/{REPO}/pulls")]

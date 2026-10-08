@@ -764,3 +764,32 @@ def test_ordinary_publish_rechecks_the_budget_inside_each_adapter_write(
     if abort_during == "upsert_branch_commit":
         assert github.branch_commits == []
     assert github.pull_requests.get("fixture/widgets", {}) == {}
+
+
+def test_budget_gone_after_the_branch_landed_reports_the_orphan_branch(
+        implemented_delivery, verification_adapter, monkeypatch):
+    worker, preview_id, _, _ = implemented_delivery
+    monkeypatch.setattr("aitobuild.developer_delivery.shell_request", lambda *args, **kwargs: {
+        "ok": True, "status": "exited", "exit_code": 0, "output": "passed", "next_cursor": 1,
+    })
+    worker.verify(preview_id, adapter=verification_adapter)
+    github = MockGitHubAdapter(allowed_repositories=frozenset({"fixture/widgets"}), enforce_allowlist=True)
+    budget = DeveloperTaskBudget(path=worker.budget_path(preview_id),
+                                 bundle=developer_task_bundle_from_payload(worker.get(preview_id).bundle_payload),
+                                 create=False)
+    upsert = github.upsert_branch_commit
+
+    def landed_then_budget_gone(**kwargs):
+        head = upsert(**kwargs)
+        budget.abort()
+        return head
+
+    monkeypatch.setattr(github, "upsert_branch_commit", landed_then_budget_gone)
+    record = worker.publish(preview_id, github=github, require_human_approval_for_repo_writes=True,
+                            allow_mock_publication=True)
+    assert record.state == "failed"
+    assert github.branch_commits and github.pull_requests.get("fixture/widgets", {}) == {}
+    assert record.publication["orphan_branch"] == record.branch
+    assert record.publication["head_sha"] == github.branch_commits[-1]["head_sha"]
+    assert "has no saved pull request" in record.error
+    assert worker.get(preview_id) == record

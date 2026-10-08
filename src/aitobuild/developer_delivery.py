@@ -100,6 +100,18 @@ class DeliveryPreparation:
         return asdict(self)
 
 
+def _failed_publication(record: DeliveryPreparation, error: str) -> DeliveryPreparation:
+    """Terminal ordinary-publish failure; a pushed branch without a saved PR is reported, never deleted."""
+    publication = record.publication
+    if (publication is not None and isinstance(publication.get("head_sha"), str)
+            and type(publication.get("pull_number")) is not int):
+        publication = {**publication, "orphan_branch": record.branch}
+        error = (f"{error} (branch {record.branch} was pushed at {publication['head_sha']} but has no saved pull "
+                 "request; an operator must delete or adopt it)")
+    return replace(record, state="failed", error=error, publication=publication,
+                   updated_at=datetime.now(tz=UTC).isoformat())
+
+
 class DeveloperDeliveryWorker:
     def __init__(
         self, *, preview_registry: DeveloperPreviewRegistry, state_dir: Path,
@@ -558,20 +570,11 @@ class DeveloperDeliveryWorker:
                 error = str(failure) or type(failure).__name__
                 if not isinstance(failure, Exception):
                     budget.abort()
-                    self._save(
-                        directory,
-                        replace(
-                            record, state="failed", error=error,
-                            updated_at=datetime.now(tz=UTC).isoformat(),
-                        ),
-                    )
+                    self._save(directory, _failed_publication(record, error))
                     raise
             if error is not None:
                 budget.abort()
-                record = replace(
-                    record, state="failed", error=error,
-                    updated_at=datetime.now(tz=UTC).isoformat(),
-                )
+                record = _failed_publication(record, error)
             self._save(directory, record)
             return record
 
