@@ -114,6 +114,7 @@ class GitHubPullRequestReview:
     body: str
     review_id: str | None = None
     html_url: str | None = None
+    commit_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -122,6 +123,7 @@ class GitHubPullRequestReview:
             "body": self.body,
             "review_id": self.review_id,
             "html_url": self.html_url,
+            "commit_id": self.commit_id,
         }
 
 
@@ -463,6 +465,7 @@ class MockGitHubAdapter:
             raise ValueError("event must be APPROVE, REQUEST_CHANGES, or COMMENT")
         if not body.strip():
             raise ValueError("review body must be non-empty")
+        cleaned_commit: str | None = None
         if commit_id is not None:
             cleaned_commit = commit_id.strip().lower()
             if re.fullmatch(r"[0-9a-f]{40}", cleaned_commit) is None:
@@ -475,6 +478,7 @@ class MockGitHubAdapter:
             body=body.strip(),
             review_id=f"mock-review-{uuid4().hex[:8]}",
             html_url=f"https://github.com/{repository}/pull/{pull_number}#pullrequestreview",
+            commit_id=cleaned_commit,
         )
         self.reviews.append(review)
         return review
@@ -548,10 +552,11 @@ class MockGitHubAdapter:
         repo = self._resolve_repository(repository)
         cleaned_title = title.strip()
         cleaned_body = body.strip()
-        cleaned_head = head_branch.strip()
+        cleaned_head = _validate_aitobuild_branch_name(head_branch, field_name="head_branch")
         cleaned_base = base_ref.strip()
-        if not cleaned_title or not cleaned_body or not cleaned_head or not cleaned_base:
+        if not cleaned_title or not cleaned_body or not cleaned_base:
             raise ValueError("draft PR title, body, head_branch, and base_ref must be non-empty")
+        _validate_base_ref_name(cleaned_base, head_branch=cleaned_head)
         if type(issue_number) is not int or issue_number <= 0:
             raise ValueError("issue_number must be a positive integer")
         if existing_pull_number is not None and (
@@ -919,6 +924,7 @@ class GhCliGitHubAdapter:
             raise ValueError("review body must be non-empty")
         repo = self._resolve_repository(repository)
         payload: dict[str, Any] = {"event": event, "body": body.strip()}
+        cleaned_commit: str | None = None
         if commit_id is not None:
             cleaned_commit = commit_id.strip().lower()
             if re.fullmatch(r"[0-9a-f]{40}", cleaned_commit) is None:
@@ -935,6 +941,7 @@ class GhCliGitHubAdapter:
             body=body.strip(),
             review_id=str(raw.get("id")) if isinstance(raw, dict) and raw.get("id") is not None else None,
             html_url=str(raw.get("html_url")) if isinstance(raw, dict) and raw.get("html_url") else None,
+            commit_id=cleaned_commit,
         )
 
 
@@ -1054,10 +1061,11 @@ class GhCliGitHubAdapter:
         repo = self._resolve_repository(repository)
         cleaned_title = title.strip()
         cleaned_body = body.strip()
-        cleaned_head = head_branch.strip()
+        cleaned_head = _validate_aitobuild_branch_name(head_branch, field_name="head_branch")
         cleaned_base = base_ref.strip()
-        if not cleaned_title or not cleaned_body or not cleaned_head or not cleaned_base:
+        if not cleaned_title or not cleaned_body or not cleaned_base:
             raise ValueError("draft PR title, body, head_branch, and base_ref must be non-empty")
+        _validate_base_ref_name(cleaned_base, head_branch=cleaned_head)
         if type(issue_number) is not int or issue_number <= 0:
             raise ValueError("issue_number must be a positive integer")
         if existing_pull_number is not None and (
@@ -1170,13 +1178,7 @@ def _tree_fingerprint(files: Mapping[str, GitHubBlobChange | None]) -> str:
     return sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()
 
 
-def _validate_publish_commit_inputs(
-    *,
-    branch: str,
-    base_sha: str,
-    commit_message: str,
-    files: Mapping[str, GitHubBlobChange | None],
-) -> None:
+def _validate_aitobuild_branch_name(branch: str, *, field_name: str = "branch") -> str:
     cleaned_branch = branch.strip() if isinstance(branch, str) else ""
     if (
         not cleaned_branch
@@ -1185,7 +1187,31 @@ def _validate_publish_commit_inputs(
         or ".." in cleaned_branch
         or re.fullmatch(r"[A-Za-z0-9._/-]+", cleaned_branch) is None
     ):
-        raise ValueError("branch must be an aitobuild/ task ref name")
+        raise ValueError(f"{field_name} must be an aitobuild/ task ref name")
+    return cleaned_branch
+
+
+def _validate_base_ref_name(base_ref: str, *, head_branch: str) -> None:
+    if (
+        base_ref.startswith(("/", "-", "refs/"))
+        or base_ref.endswith(("/", ".lock"))
+        or ".." in base_ref
+        or "//" in base_ref
+        or re.fullmatch(r"[A-Za-z0-9._/-]+", base_ref) is None
+    ):
+        raise ValueError("base_ref must be a plain branch name")
+    if base_ref == head_branch:
+        raise ValueError("base_ref must differ from head_branch")
+
+
+def _validate_publish_commit_inputs(
+    *,
+    branch: str,
+    base_sha: str,
+    commit_message: str,
+    files: Mapping[str, GitHubBlobChange | None],
+) -> None:
+    _validate_aitobuild_branch_name(branch)
     if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
         raise ValueError("base_sha must be a resolved lowercase commit SHA")
     if not isinstance(commit_message, str) or not commit_message.strip():

@@ -511,7 +511,7 @@ are 664 passed/two optional Docker skips, Ruff/mypy (46 sources), diagnostics,
 six-call-site service compatibility and successful mock simulation. Access counters
 still do not certify semantic review. No default activation, live trial, remote
 write or dependency change accompanied those checks. The role/coordinator/review
-baseline was subsequently committed locally at `823ea98`, without a push. Scoped
+baseline was subsequently committed as `823ea98` and is on `master`. Scoped
 correction handoff is described below; managed PM writes and bounded meetings remain pending.
 
 ### Scoped Correction Handoff
@@ -560,7 +560,7 @@ staging recovery, scope/head/revision pins and fresh/missing-seed preparation.
 They prove handoff/preparation, not a live Developer correction or semantic review.
 Current gates: 684 passed/two optional Docker skips, Ruff/mypy (46 sources), clean
 diagnostics, constructor compatibility and successful mock fixture simulation.
-This continuation is uncommitted; no dependencies, push, remote writes, live model,
+This continuation is committed as `7d7ea13`; no dependencies, remote writes, live model,
 GitHub/Docker trial or hosted CI were added. Native correction artifact acceptance,
 same-PR update, managed PM planning/writes and bounded meetings remain pending.
 
@@ -712,8 +712,6 @@ export AITOBUILD_GITHUB_DEFAULT_REPOSITORY="uhvogala/aitobuild"
 # Comma-separated owner/name allowlist required for gh_cli (also auto-includes default + developer repository sources).
 export AITOBUILD_GITHUB_ALLOWED_REPOS="uhvogala/aitobuild"
 export AITOBUILD_WEB_SEARCH_ADAPTER="mock"
-# Architect APPROVE PR reviews are off by default (COMMENT / REQUEST_CHANGES still allowed).
-export AITOBUILD_ARCHITECT_ALLOW_PR_APPROVE="false"
 ```
 
 For Azure OpenAI v1, set `AITOBUILD_FOUNDRY_ENDPOINT` to the resource URL ending

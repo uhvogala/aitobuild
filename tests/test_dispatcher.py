@@ -1300,6 +1300,7 @@ def test_architect_review_published_draft_from_publication_only(
     assert reviewed.architect_review["body"].startswith(ARCHITECT_REVIEW_BODY_PREFIX)
     assert reviewed.architect_review["head_sha"] == published.publication["head_sha"]
     assert len(github.reviews) == 1
+    assert github.reviews[0].commit_id == published.publication["head_sha"]
     again = worker.get_published_pull_request(preview_id, github=github)
     assert again["architect_review"]["event"] == "COMMENT"
     with pytest.raises(ValueError, match="distinct Architect reviewer|COMMENT only"):

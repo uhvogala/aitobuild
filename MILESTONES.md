@@ -437,7 +437,7 @@ No default activation, external trial or remote write. Counters/metadata do not
 certify semantic review; live review plus an approved scoped correction and bounded
 meeting execution are still required for M3 acceptance.
 
-Scoped correction handoff (2026-10-07, baseline committed locally at `823ea98`):
+Scoped correction handoff (2026-10-07, baseline committed as `823ea98`):
 an opt-in native Architect tool saves one bounded objective/explicit published-path
 proposal inside the exact COMMENT approval. A completed approved review with its
 saved COMMENT/target can be offered as a separate unapproved Developer task through
@@ -448,7 +448,7 @@ prepares a separate checkout/branch/budget from the reviewed head in an explicit
 provisioned local seed; no fetch or old approval/deadline reset. Twenty new native
 Architect mock/request/detached/HTTP/recovery/preparation cases pass. Full gates:
 **684 passed/two optional Docker skips**, Ruff/mypy (46 sources), diagnostics,
-constructor compatibility and mock simulation. This continuation is uncommitted;
+constructor compatibility and mock simulation. This continuation is committed as `7d7ea13`;
 no external trial or remote write. Handoff/preparation is not a native corrected
 artifact or independent verification. Same-PR update, useful live review/correction
 and bounded meeting execution remain required before M3 acceptance.

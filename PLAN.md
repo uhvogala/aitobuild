@@ -324,7 +324,7 @@ Docker skips**, Ruff/mypy (46 sources), diagnostics, role/admission/service cons
 compatibility and successful mock fixture simulation. Twenty new parameterized
 cases include actual native Architect mocked transport and request/detached/HTTP
 handoff/recovery. No dependency/live model/GitHub/Docker/hosted CI/push/remote write.
-This continuation is uncommitted; native correction artifact acceptance, managed
+This continuation is committed as `7d7ea13`; native correction artifact acceptance, managed
 PM planning/writes, bounded meetings and live review remain pending.
 
 ### Current Limits
