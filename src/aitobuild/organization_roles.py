@@ -21,7 +21,8 @@ from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegist
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot
 from aitobuild.organization_assignments import AssignmentProposal
 from aitobuild.organization_delivery import _delivery_call
-from aitobuild.organization_runner import ManagedOperation, ManagedTaskContext, WorkflowInput, sync_directory
+from aitobuild.organization import sync_directory
+from aitobuild.organization_runner import ManagedOperation, ManagedTaskContext, WorkflowInput
 from aitobuild.organization_runtime import OrganizationRuntime
 from aitobuild.organization_reviews import PublishedReviewTarget as PublishedReviewTarget
 from aitobuild.organization_reviews import CorrectionProposal

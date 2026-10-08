@@ -16,7 +16,8 @@ from aitobuild.developer_delivery import DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry
 from aitobuild.organization import DefinitionModel, DefinitionStore, EventName, Identifier
-from aitobuild.organization_runner import ManagedRun, sync_directory
+from aitobuild.organization import sync_directory
+from aitobuild.organization_runner import ManagedRun
 from aitobuild.policy import AgentRole
 from aitobuild.tools.github import GitHubAdapter
 
@@ -152,7 +153,10 @@ class PublishedReviewAdmission:
                         or (predecessor is None) != (correction.predecessor_preview_id is None)
                         or predecessor is not None and (predecessor.state != "staged"
                                                         or predecessor.correction_preview_id != correction.predecessor_preview_id
-                                                        or predecessor.target != correction.target)):
+                                                        or predecessor.target != correction.target
+                                                        # attempt n+1 exists only because attempt n released its head
+                                                        or not self._worker.correction_releases_parent(
+                                                            predecessor.correction_preview_id))):
                     raise ValueError("Correction journal attempt chain is invalid")
         return journal
 
