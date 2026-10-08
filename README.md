@@ -32,7 +32,7 @@ Team structure and lifecycle are not fixed in code.
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **740 tests pass**, with two optional prepared-target Docker
+Verified locally: **752 tests pass**, with two optional prepared-target Docker
 probes skipped; Ruff and mypy (47 source files) and the mock fixture simulation pass.
 The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
@@ -558,16 +558,25 @@ Same-PR correction publication (operator-only): each verified `published-correct
 delivery is its own record holding one round and never rewrites the original. Authenticated
 `POST /internal/organization/corrections/stage-publication {correction_preview_id}` returns one
 exact snapshot (unified diff, PR number, pinned branch/base, pinned parent head, chain and the
-triggering Architect review receipt digest) and its SHA-256 digest. `POST
+triggering Architect review receipt digest), its content digest and a one-use approval digest
+bound to a fresh nonce, so re-staging after drift never revives an invalidated digest. `POST
 /internal/organization/corrections/publish {correction_preview_id, approval_digest}` consumes that
 one-use approval, recomputes the snapshot (any drift invalidates it) and fast-forwards the pinned
 draft head with `force=false`; it never creates a PR or changes base, then stages the next
 Architect review at the new head. The chain walk fails closed on a missing/invalid link or a
 repo/PR/branch/head mismatch; only the first staged correction on a parent head may proceed (later
 siblings fail as terminal stale) and older preview IDs are refused as "superseded by <tip>".
-An interrupted push (record left `publishing`) resumes and reconciles under the same approval
-and operator; an actual push failure is terminal, consumes the approval and still blocks that
-parent head, so a fresh correction and approval are required.
+After any failure past consume, the live branch head decides the outcome: our exact commit
+(tree, sole parent and message) on the open draft reconciles to `published`; the unchanged parent
+fails terminally with `push_outcome: not_applied` and releases that parent head; a different head
+fails terminally with `push_outcome: moved` and keeps holding it; an unreadable head stays
+`publishing`, resumable only under the same approval and operator. Authenticated `POST
+/internal/organization/corrections/retire {correction_preview_id}` (live adapter only) retires a
+failed or abandoned unpublished correction only while the live PR head still equals its parent,
+invalidating any pending approval; both sibling checks skip released and retired corrections.
+An Architect COMMENT that GitHub binds to another commit is recorded, so a retry refuses instead
+of posting a duplicate. Only correction records related to the checked PR or parent head can
+block those checks; files that cannot be parsed at all still fail closed.
 Managed `delivery_publish` and the legacy publish endpoint refuse correction tasks.
 
 Twenty correction regressions cover actual native Architect mocked transports,
@@ -577,8 +586,9 @@ They prove handoff/preparation, not a live Developer correction or semantic revi
 Current gates: 684 passed/two optional Docker skips, Ruff/mypy (46 sources), clean
 diagnostics, constructor compatibility and successful mock fixture simulation.
 This continuation is committed as `7d7ea13`; no dependencies, remote writes, live model,
-GitHub/Docker trial or hosted CI were added. Native correction artifact acceptance,
-same-PR update, managed PM planning/writes and bounded meetings remain pending.
+GitHub/Docker trial or hosted CI were added. Same-PR correction publication is implemented
+(above) but has no live GitHub trial yet; native correction artifact acceptance, managed PM
+planning/writes and bounded meetings remain pending.
 
 ### API setup
 

@@ -319,7 +319,7 @@ original ledger reset or preparation replay after ledger loss. Existing register
 delivery operations remain responsible for native implementation/verification.
 The correction-specific tests prove staging/preparation, not a corrected native
 artifact, semantic review or live delivery. Same-PR update/reconciliation and
-automatic correction loops are not introduced. Gates: **684 passed/two optional
+automatic correction loops were not introduced in that slice (same-PR update follows below). Gates: **684 passed/two optional
 Docker skips**, Ruff/mypy (46 sources), diagnostics, role/admission/service constructor
 compatibility and successful mock fixture simulation. Twenty new parameterized
 cases include actual native Architect mocked transport and request/detached/HTTP
@@ -327,13 +327,27 @@ handoff/recovery. No dependency/live model/GitHub/Docker/hosted CI/push/remote w
 This continuation is committed as `7d7ea13`; native correction artifact acceptance, managed
 PM planning/writes, bounded meetings and live review remain pending.
 
+Same-PR correction publication (2026-10-08, PR #11, branch `feat/same-pr-correction`):
+each verified correction is its own immutable delivery record holding one round; the original
+is never rewritten. Operator-only `stage-publication`/`publish`/`retire` endpoints pin one exact
+snapshot (diff, PR, branch/base, parent head, chain, triggering review receipt) behind a one-use,
+nonce-bound approval stored as frozen validated records with checked transitions. Publication
+fast-forwards the pinned draft head (`force=false`, never a new PR or base change) and stages the
+next Architect review. Offers and publishes come only from the chain tip; the chain walk fails
+closed; superseded preview IDs are refused with the tip. Failures past consume settle by the live
+head: ours reconciles to published, the unchanged parent releases the head (`not_applied`), a
+moved head fails and keeps holding it, an unreadable head stays resumable. Retire releases a
+failed/abandoned correction only while the live head equals its parent. Gates: **752 passed/two
+optional Docker skips**, Ruff/mypy (47 sources). No live GitHub trial, hosted CI or automatic
+correction loop yet.
+
 ### Current Limits
 
 - Configured factories/native admission/assignment/runner libraries have opt-in app integration through operator-owned service/worker factories; the default server still uses legacy handles and metadata dispatch. Service-only activation awaits execution in the request; optional workers durably enqueue with lifespan-owned execution and explicit bounded unowned-task startup discovery. Explicit repository/revision/event and actor/binding registries cannot be selected by HTTP callers. Internal shared-token identity is not multi-user authentication. Journal capacity does not govern unmanaged HTTP runs. Managed operation graphs pin active revisions; direct agent nodes remain denied. Scoped Developer delivery, PM proposals and Architect review operations are explicit libraries, not automatically activated orchestration. Trusted read-only coordinator callbacks are original-deadline bounded, not arbitrary-code isolation. Run/assignment/admission completion is metadata, not verification/publication approval; native input is distinct from service approval. Only saved waiting checkpoints resume; interrupted running effects cannot be blindly replayed. Busy controls return 409; mandatory cleanup/thread draining and original budgets remain enforced. Cross-process cancellation is polling-based; failed worker slots require inspection/restart. Local locks/state are not distributed execution or hostile-tenant certification. Live delivery/hosted CI acceptance remains pending.
 - `developer.async.webhook` returns task metadata by default. Detached consumption exists only for explicitly service/worker-factory-activated approved repository routes, not default startup.
 - Supported repository issue events produce target-specific bundles and require approval-time base SHA pinning. Checkout preparation validates membership in the explicitly configured local seed/base branch, not live GitHub repository identity or remote freshness. No automatic remote lookup/fetch occurs. Legacy fixture payloads without repository context retain prototype routing; unsupported repository webhook events and missing issue criteria are rejected.
 - GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions at `88720aa`. Live acceptance remains pending. The operator installed checksum-verified `gh` 2.102.0 locally for the fresh trial and verified `uhvogala` on github.com; this is not a default image dependency. No live task-result publication has been tested.
-- General PM draft/write-approval stores remain in memory. Explicit native PM coordinator bindings now feed saved read-only proposals into trusted service assignments; managed PM planning/issue writes remain pending. Opt-in publication-to-Architect staging/routing and scoped correction handoff retain separate task and exact COMMENT approvals. Native correction artifact acceptance, same-PR update, automatic correction/meeting orchestration and live semantic acceptance remain pending. Reads support regular UTF-8 files up to 1 MiB; binary/link/submodule review needs another approved adapter, not a bypass.
+- General PM draft/write-approval stores remain in memory. Explicit native PM coordinator bindings now feed saved read-only proposals into trusted service assignments; managed PM planning/issue writes remain pending. Opt-in publication-to-Architect staging/routing and scoped correction handoff retain separate task and exact COMMENT approvals. Native correction artifact acceptance, live same-PR update acceptance, automatic correction/meeting orchestration and live semantic acceptance remain pending. Reads support regular UTF-8 files up to 1 MiB; binary/link/submodule review needs another approved adapter, not a bypass.
 - Meetings construct workflows without executing them, and proactive scans interpret supplied metadata rather than inspecting a repository.
 - Scheduler ticks require an external caller; meeting/scheduler state and non-repository trigger dedupe remain in memory. Previews, approvals and repository issue task/delivery identities persist locally. `dispatched` records metadata routing, not worker completion; inspect the saved queue after restart. Distributed coordination and full lifecycle auditing remain pending.
 - Native runs without a bound preview and unbound legacy runs remain prototypes. Approved native tasks persist unique-path reservations and an absolute deadline, fail closed after abort, and use offline read-only repository execution. Browser/arbitrary MCP adapters are excluded; native memory has a separate scoped SDK store. Distributed coordination, durable auditing and scratch/disk quotas remain pending.

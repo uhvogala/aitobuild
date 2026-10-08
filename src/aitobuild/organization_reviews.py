@@ -302,7 +302,8 @@ class PublishedReviewAdmission:
             if len(saved) > 1:
                 raise PermissionError("Review has ambiguous correction receipts")
             siblings = [receipt for receipt in journal.corrections.values()
-                        if receipt.target.head_sha == target.head_sha and receipt.review_preview_id != review_preview_id]
+                        if receipt.target.head_sha == target.head_sha and receipt.review_preview_id != review_preview_id
+                        and not self._worker.correction_releases_parent(receipt.correction_preview_id)]
             if siblings:
                 raise PermissionError(
                     f"Correction {siblings[0].correction_preview_id or siblings[0].task_id} already targets "

@@ -21,7 +21,7 @@ from filelock import FileLock
 from pydantic import AwareDatetime, JsonValue, StrictBool, StrictStr, TypeAdapter, model_validator
 
 from aitobuild.developer_isolation import DeveloperTaskBudget
-from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, Identifier
+from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, Identifier, _sync_directory
 from aitobuild.organization_assignments import (
     AssignmentProposal, AssignmentService, AssignmentStore, Digest, TaskAssignment,
 )
@@ -186,14 +186,6 @@ class FileRunStore:
             temporary.replace(path)
             _sync_directory(directory)
             _sync_directory(self._directory)
-
-
-def _sync_directory(directory: Path) -> None:
-    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _assignment_digest(assignment: TaskAssignment) -> str:

@@ -9,7 +9,7 @@ import subprocess
 import pytest
 
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
-from aitobuild.publish_approvals import PublishApprovalStore, snapshot_digest
+from aitobuild.publish_approvals import PublishApprovalStore, approval_digest, snapshot_digest
 from aitobuild.tools.github import MockGitHubAdapter
 from test_dispatcher import (
     approved_delivery as approved_delivery, implemented_delivery as implemented_delivery,
@@ -90,7 +90,8 @@ def test_correction_fast_forwards_the_pinned_pr_once(correction_chain):
     pulls_before = {number: pull for number, pull in github.pull_requests["fixture/widgets"].items()}
     staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
     snapshot = staged["snapshot"]
-    assert staged["state"] == "pending" and staged["digest"] == snapshot_digest(snapshot)
+    assert staged["state"] == "pending" and staged["content_digest"] == snapshot_digest(snapshot)
+    assert staged["digest"] == approval_digest(staged["content_digest"], worker._approvals.get(correction).nonce)
     assert (snapshot["pull_number"], snapshot["head_branch"], snapshot["base_ref"], snapshot["parent_head_sha"]) == (
         original["pull_number"], original["branch"], original["base_ref"], head)
     assert snapshot["chain"] == [published_id] and snapshot["review_receipt_digest"] == RECEIPT
@@ -112,7 +113,7 @@ def test_correction_fast_forwards_the_pinned_pr_once(correction_chain):
     assert set(pulls) == set(pulls_before)
     assert pulls[original["pull_number"]].head_sha == new_head
     assert pulls[original["pull_number"]].base_ref == pulls_before[original["pull_number"]].base_ref
-    assert worker._approvals.get(correction)["state"] == "consumed"
+    assert worker._approvals.get(correction).state == "consumed"
     assert _publish(worker, github, correction, staged["digest"]) == record
     with pytest.raises(ValueError):
         worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
@@ -142,7 +143,10 @@ def test_digest_drift_invalidates_the_one_use_approval(correction_chain, monkeyp
         _publish(worker, github, correction, staged["digest"])
     assert worker.get(correction).state == "verified"
     restaged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
-    assert restaged["state"] == "pending" and restaged["digest"] == staged["digest"]
+    assert restaged["state"] == "pending" and restaged["content_digest"] == staged["content_digest"]
+    assert restaged["digest"] != staged["digest"]  # fresh nonce: the invalidated digest never comes back
+    with pytest.raises(PermissionError):
+        _publish(worker, github, correction, staged["digest"])
     assert _publish(worker, github, correction, restaged["digest"]).state == "published"
 
 
@@ -159,8 +163,42 @@ def test_sibling_on_the_same_parent_head_is_terminal_stale(correction_chain):
     assert _publish(worker, github, first, staged["digest"]).state == "published"
 
 
-def test_interrupted_push_resumes_under_the_same_approval(correction_chain, monkeypatch):
+def _pull(github, worker, preview_id):
+    publication = worker.get(preview_id).publication
+    return github.pull_requests[publication["repository"]][publication["pull_number"]]
+
+
+def _move_head(github, worker, preview_id, sha):
+    publication = worker.get(preview_id).publication
+    repository, number = publication["repository"], publication["pull_number"]
+    github.pull_requests[repository][number] = replace(github.pull_requests[repository][number], head_sha=sha)
+    github._branch_heads[repository][publication["branch"]] = sha
+
+
+def test_failure_after_the_push_applied_reconciles_to_published(correction_chain, monkeypatch):
     worker, published_id, github, head, make = correction_chain
+    correction = make()
+    staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
+    advance = github.advance_draft_pull_request_head
+    for failure in (RuntimeError("response lost after the push applied"), KeyboardInterrupt("stopped after push")):
+        if worker.get(correction).state == "published":
+            break
+
+        def applied(failure=failure, **kwargs):
+            advance(**kwargs)
+            raise failure
+
+        with monkeypatch.context() as patched:
+            patched.setattr(github, "advance_draft_pull_request_head", applied)
+            record = _publish(worker, github, correction, staged["digest"])
+    assert record.state == "published" and record.publication["parent_head_sha"] == head
+    assert record.publication["head_sha"] == _pull(github, worker, published_id).head_sha != head
+    assert worker._approvals.get(correction).state == "consumed"
+    assert worker.superseded_by(published_id) == correction
+
+
+def test_interrupt_after_push_still_raises_once_reconciled(correction_chain, monkeypatch):
+    worker, published_id, github, _, make = correction_chain
     correction = make()
     staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
     advance = github.advance_draft_pull_request_head
@@ -173,20 +211,44 @@ def test_interrupted_push_resumes_under_the_same_approval(correction_chain, monk
         patched.setattr(github, "advance_draft_pull_request_head", interrupted)
         with pytest.raises(KeyboardInterrupt):
             _publish(worker, github, correction, staged["digest"])
+    assert worker.get(correction).state == "published"
+    assert worker._approvals.get(correction).state == "consumed"
+
+
+def test_unreadable_head_stays_publishing_and_resumes(correction_chain, monkeypatch):
+    worker, published_id, github, head, make = correction_chain
+    correction = make()
+    staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
+    advance = github.advance_draft_pull_request_head
+
+    def interrupted(**kwargs):
+        advance(**kwargs)
+        raise KeyboardInterrupt("process stopped after the push applied")
+
+    def unreadable(**kwargs):
+        raise RuntimeError("GitHub unreachable")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(github, "advance_draft_pull_request_head", interrupted)
+        patched.setattr(github, "reconcile_advanced_head", unreadable)
+        with pytest.raises(KeyboardInterrupt):
+            _publish(worker, github, correction, staged["digest"])
     assert worker.get(correction).state == "publishing"
-    assert worker._approvals.get(correction)["state"] == "consuming"
+    assert worker._approvals.get(correction).state == "consuming"
     with pytest.raises(PermissionError, match=f"superseded by {correction}"):
         worker.get_published_pull_request(published_id, github=github)
     with pytest.raises(PermissionError, match="another operator"):
         worker.approve_and_publish_correction(
             correction, approval_digest=staged["digest"], review_receipt_digest=RECEIPT, actor_id="intruder",
             github=github, require_human_approval_for_repo_writes=True, allow_mock_publication=True)
+    with pytest.raises(PermissionError, match="publishing"):
+        worker.retire_correction(correction, actor_id="operator", github=github, allow_mock_publication=True)
     record = _publish(worker, github, correction, staged["digest"])
     assert record.state == "published" and record.publication["parent_head_sha"] == head
-    assert worker._approvals.get(correction)["state"] == "consumed"
+    assert worker._approvals.get(correction).state == "consumed"
 
 
-def test_failed_push_is_terminal_and_blocks_the_parent_head(correction_chain, monkeypatch):
+def test_push_that_did_not_apply_releases_the_parent_head(correction_chain, monkeypatch):
     worker, published_id, github, head, make = correction_chain
     correction = make()
     staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
@@ -196,18 +258,80 @@ def test_failed_push_is_terminal_and_blocks_the_parent_head(correction_chain, mo
 
     with monkeypatch.context() as patched:
         patched.setattr(github, "advance_draft_pull_request_head", refused)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="rejected"):
             _publish(worker, github, correction, staged["digest"])
     failed = worker.get(correction)
     assert failed.state == "failed" and failed.error == "GitHub rejected the ref update"
+    assert failed.publication["push_outcome"] == "not_applied" and failed.publication["live_head_sha"] == head
     approval = worker._approvals.get(correction)
-    assert approval["state"] == "consumed" and approval["error"] == "GitHub rejected the ref update"
+    assert approval.state == "consumed" and approval.error == "GitHub rejected the ref update"
     with pytest.raises((ValueError, PermissionError)):
         _publish(worker, github, correction, staged["digest"])
     assert worker.superseded_by(published_id) is None
+    assert worker.correction_releases_parent(correction)
+    sibling = make("review-two", "def probe():\n    return 3\n")
+    sibling_staged = worker.stage_correction_publication(sibling, review_receipt_digest=RECEIPT)
+    assert _publish(worker, github, sibling, sibling_staged["digest"]).state == "published"
+    assert worker.superseded_by(published_id) == sibling
+
+
+def test_moved_head_keeps_holding_and_cannot_be_retired(correction_chain, monkeypatch):
+    worker, published_id, github, head, make = correction_chain
+    correction = make()
+    staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
+
+    def raced(**kwargs):
+        _move_head(github, worker, published_id, "f" * 40)
+        raise RuntimeError("someone else pushed first")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(github, "advance_draft_pull_request_head", raced)
+        with pytest.raises(RuntimeError, match="pushed first"):
+            _publish(worker, github, correction, staged["digest"])
+    failed = worker.get(correction)
+    assert failed.state == "failed" and failed.publication["push_outcome"] == "moved"
+    assert failed.publication["live_head_sha"] == "f" * 40
+    assert not worker.correction_releases_parent(correction)
+    with pytest.raises(PermissionError, match="parent head"):
+        worker.retire_correction(correction, actor_id="operator", github=github, allow_mock_publication=True)
     sibling = make("review-two", "def probe():\n    return 3\n")
     with pytest.raises(PermissionError, match=f"{correction} already uses parent head {head}"):
         worker.stage_correction_publication(sibling, review_receipt_digest=RECEIPT)
+
+
+def test_retire_releases_an_abandoned_correction_only_at_the_parent_head(correction_chain):
+    worker, published_id, github, head, make = correction_chain
+    abandoned = make()
+    staged = worker.stage_correction_publication(abandoned, review_receipt_digest=RECEIPT)
+    with pytest.raises(ValueError, match="live GitHub adapter"):
+        worker.retire_correction(abandoned, actor_id="operator", github=github)
+    with pytest.raises(PermissionError, match="operator identity"):
+        worker.retire_correction(abandoned, actor_id=" ", github=github, allow_mock_publication=True)
+    _move_head(github, worker, published_id, "f" * 40)
+    with pytest.raises(PermissionError, match="parent head"):
+        worker.retire_correction(abandoned, actor_id="operator", github=github, allow_mock_publication=True)
+    assert worker.get(abandoned).state == "verified" and worker._approvals.get(abandoned).state == "pending"
+    _move_head(github, worker, published_id, head)
+    retired = worker.retire_correction(abandoned, actor_id="operator", github=github, allow_mock_publication=True)
+    assert retired.state == "retired" and retired.retirement["previous_state"] == "verified"
+    assert retired.retirement["actor_id"] == "operator" and retired.retirement["live_head_sha"] == head
+    assert worker.get(abandoned) == retired
+    assert worker.retire_correction(abandoned, actor_id="operator", github=github, allow_mock_publication=True) == retired
+    assert worker._approvals.get(abandoned).state == "invalidated"
+    with pytest.raises(ValueError, match="verified"):
+        _publish(worker, github, abandoned, staged["digest"])
+    assert worker.correction_releases_parent(abandoned)
+    sibling = make("review-two", "def probe():\n    return 3\n")
+    sibling_staged = worker.stage_correction_publication(sibling, review_receipt_digest=RECEIPT)
+    assert _publish(worker, github, sibling, sibling_staged["digest"]).state == "published"
+    with pytest.raises(PermissionError, match="published correction cannot be retired"):
+        worker.retire_correction(sibling, actor_id="operator", github=github, allow_mock_publication=True)
+    with pytest.raises(PermissionError, match="saved correction"):
+        worker.retire_correction(published_id, actor_id="operator", github=github, allow_mock_publication=True)
+    directory = worker._task_dir(abandoned)
+    worker._save(directory, replace(retired, retirement=retired.retirement | {"live_head_sha": "e" * 40}))
+    with pytest.raises(ValueError, match="retirement"):
+        worker.get(abandoned)
 
 
 def test_broken_chain_link_fails_closed(correction_chain, monkeypatch):
@@ -246,30 +370,146 @@ def test_forked_chain_refuses_review_and_staging(correction_chain, monkeypatch):
     staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
     published = _publish(worker, github, correction, staged["digest"])
     records = worker._correction_records
-    monkeypatch.setattr(worker, "_correction_records", lambda: [*records(), replace(published, preview_id="forked-copy")])
+    monkeypatch.setattr(worker, "_correction_records", lambda relevant: [*records(relevant), replace(published, preview_id="forked-copy")])
     with pytest.raises(PermissionError, match="forked"):
         worker.superseded_by(published_id)
     with pytest.raises(PermissionError, match="forked"):
         worker.get_published_pull_request(published_id, github=github)
 
 
+def test_chain_walk_refuses_a_mismatched_link(correction_chain, monkeypatch):
+    worker, published_id, github, head, make = correction_chain
+    correction = make()
+    real_load = worker._load_preview_record
+    original = worker.get(published_id)
+    other_issue = json.loads(json.dumps(original.bundle_payload))
+    other_issue["issue_context"]["repository_id"] = 999
+    forgeries = (
+        replace(original, publication=original.publication | {"head_sha": "e" * 40}),
+        replace(original, publication=original.publication | {"repository": "fixture/other"}),
+        replace(original, publication=original.publication | {"branch": "aitobuild/other"}),
+        replace(original, bundle_payload=other_issue),
+    )
+    for forged in forgeries:
+        with monkeypatch.context() as patched:
+            patched.setattr(worker, "_load_preview_record",
+                            lambda preview_id, forged=forged: forged if preview_id == published_id else real_load(preview_id))
+            with pytest.raises(PermissionError, match="repository/PR/branch/head mismatch"):
+                worker.correction_target(correction)
+    assert worker.correction_target(correction)["chain"] == [published_id]
+
+
+def test_unbound_architect_review_is_never_reposted(correction_chain, monkeypatch):
+    worker, published_id, github, _, _ = correction_chain
+    submit = github.submit_pr_review
+    calls = []
+
+    def misbound(**kwargs):
+        calls.append(kwargs)
+        return replace(submit(**kwargs), commit_id="d" * 40)
+
+    monkeypatch.setattr(github, "submit_pr_review", misbound)
+    with pytest.raises(RuntimeError, match="different commit"):
+        worker.submit_architect_review(published_id, github=github, event="COMMENT", body="first")
+    with pytest.raises(PermissionError, match="already posted"):
+        worker.submit_architect_review(published_id, github=github, event="COMMENT", body="first")
+    assert len(calls) == 1 and worker.get(published_id).architect_review is None
+
+
+def _forge_correction_file(worker, source_id, name, mutate):
+    raw = json.loads((worker._task_dir(source_id) / "state.json").read_text())
+    mutate(raw["record"])
+    directory = worker._state_dir / "deliveries" / name
+    directory.mkdir()
+    (directory / "state.json").write_text(json.dumps(raw))
+    return directory
+
+
+def test_only_related_corrupt_records_block_correction_checks(correction_chain):
+    worker, published_id, github, _, make = correction_chain
+    correction = make()
+    staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
+    _publish(worker, github, correction, staged["digest"])
+
+    def unrelated(record):
+        record["publication"] = record["publication"] | {"repository": "fixture/other"}
+        del record["publication"]["title"]
+
+    _forge_correction_file(worker, correction, "unrelated-corrupt", unrelated)
+    assert worker.superseded_by(published_id) == correction
+    assert worker.get_published_pull_request(correction, github=github)["head_matches_publication"]
+
+    def related(record):
+        del record["publication"]["title"]
+
+    related_dir = _forge_correction_file(worker, correction, "related-corrupt", related)
+    with pytest.raises(PermissionError, match="failed validation"):
+        worker.superseded_by(published_id)
+    (related_dir / "state.json").write_text("not json")
+    with pytest.raises(PermissionError, match="unreadable"):
+        worker.superseded_by(published_id)
+
+
+def test_correction_without_issue_context_fails_validation(correction_chain):
+    worker, published_id, github, _, make = correction_chain
+    correction = make()
+    directory = worker._task_dir(correction)
+    raw = json.loads((directory / "state.json").read_text())
+    raw["record"]["bundle_payload"].pop("issue_context")
+    (directory / "state.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError):
+        worker.get(correction)
+    with pytest.raises(PermissionError, match="failed validation"):
+        worker.correction_target(correction)
+    with pytest.raises((ValueError, PermissionError)):
+        worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
+    with pytest.raises((ValueError, PermissionError)):
+        worker.retire_correction(correction, actor_id="operator", github=github, allow_mock_publication=True)
+
+
 def test_approval_store_is_single_use_and_tamper_evident(tmp_path):
     store = PublishApprovalStore(tmp_path / "approvals")
     snapshot = {"preview_id": "p1", "diff": "x"}
-    digest = store.stage("p1", snapshot)["digest"]
+    first = store.stage("p1", snapshot)
+    assert store.stage("p1", snapshot) == first
     with pytest.raises(ValueError):
         store.stage("p2", snapshot)
+    changed = store.stage("p1", {"preview_id": "p1", "diff": "y"})
+    assert changed.replaced_digest == first.digest and changed.digest != first.digest
+    with pytest.raises(PermissionError):
+        store.begin_consume("p1", digest=first.digest, recomputed_content_digest=first.content_digest, actor_id="op")
+    store.invalidate("p1", reason="drift")
+    assert store.get("p1").state == "invalidated"
+    again = store.stage("p1", {"preview_id": "p1", "diff": "y"})
+    assert again.content_digest == changed.content_digest and again.digest != changed.digest
+    digest, content = again.digest, again.content_digest
     with pytest.raises(PermissionError, match="operator identity"):
-        store.begin_consume("p1", digest=digest, recomputed_digest=digest, actor_id=" ")
-    assert store.begin_consume("p1", digest=digest, recomputed_digest=digest, actor_id="op")["state"] == "consuming"
+        store.begin_consume("p1", digest=digest, recomputed_content_digest=content, actor_id=" ")
+    with pytest.raises(PermissionError, match="drifted"):
+        store.begin_consume("p1", digest=digest, recomputed_content_digest="0" * 64, actor_id="op")
+    assert store.get("p1").state == "invalidated"
+    again = store.stage("p1", {"preview_id": "p1", "diff": "y"})
+    digest, content = again.digest, again.content_digest
+    assert store.begin_consume("p1", digest=digest, recomputed_content_digest=content, actor_id="op").state == "consuming"
     with pytest.raises(PermissionError, match="already consumed"):
-        store.stage("p1", {"preview_id": "p1", "diff": "y"})
-    store.finish_consume("p1", digest=digest, head_sha="c" * 40)
+        store.stage("p1", {"preview_id": "p1", "diff": "z"})
+    with pytest.raises(PermissionError):
+        store.invalidate("p1", reason="late")
+    consumed = store.finish_consume("p1", digest=digest, head_sha="c" * 40)
+    assert consumed.state == "consumed" and consumed.approved_by == "op" and consumed.error is None
     with pytest.raises(PermissionError, match="already consumed"):
-        store.begin_consume("p1", digest=digest, recomputed_digest=digest, actor_id="op")
+        store.begin_consume("p1", digest=digest, recomputed_content_digest=content, actor_id="op")
     path = next((tmp_path / "approvals").glob("*.json"))
-    data = json.loads(path.read_text())
-    data["snapshot"]["diff"] = "tampered"
-    path.write_text(json.dumps(data))
-    with pytest.raises(ValueError, match="Invalid persisted"):
-        store.get("p1")
+    pristine = path.read_text()
+    for tamper in (
+        lambda data: data["snapshot"].__setitem__("diff", "tampered"),
+        lambda data: data.__setitem__("nonce", "0" * 32),
+        lambda data: data.__setitem__("extra", True),
+        lambda data: data.__setitem__("state", "pending"),
+        lambda data: data.__setitem__("error", "and a head"),
+    ):
+        data = json.loads(pristine)
+        tamper(data)
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="Invalid persisted"):
+            store.get("p1")

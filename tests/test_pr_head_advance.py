@@ -212,3 +212,65 @@ def test_gh_advance_refuses_non_draft_closed_or_fork(kwargs, message, monkeypatc
     with pytest.raises(ValueError, match=message):
         _advance(_gh(fake, monkeypatch), expected="b" * 40)
     assert all(method == "GET" for method, _ in fake.calls)
+
+
+def _reconcile(adapter: Any, *, expected: str, **overrides: Any):
+    arguments: dict[str, Any] = dict(
+        role=AgentRole.DEVELOPER, repository=REPO, pull_number=1, head_branch=BRANCH, base_ref="main",
+        expected_head_sha=expected, commit_message="aitobuild: correct #7",
+        files={"src/probe.py": _change("fixed = True\n")}, approved=True, require_human_approval_for_repo_writes=True,
+    )
+    arguments.update(overrides)
+    return adapter.reconcile_advanced_head(**arguments)
+
+
+def _our_commit(head: str, monkeypatch) -> dict[str, Any]:
+    """The exact commit a successful advance from `head` creates, learned from a throwaway fake."""
+    fake = FakeGitHub(head=head)
+    advanced = _advance(_gh(fake, monkeypatch), expected=head)
+    return fake.commits[advanced.head_sha]
+
+
+@pytest.mark.parametrize("forgery", ["wrong_parent", "wrong_message", "wrong_tree"])
+def test_gh_retry_treats_a_head_as_ours_only_on_exact_tree_parent_and_message(forgery, monkeypatch) -> None:
+    head = "b" * 40
+    ours = _our_commit(head, monkeypatch)
+    forged = json.loads(json.dumps(ours))
+    if forgery == "wrong_parent":
+        forged["parents"] = [{"sha": "c" * 40}]
+    elif forgery == "wrong_message":
+        forged["message"] = "aitobuild: correct #7 (edited)"
+    else:
+        forged["tree"] = {"sha": "9" * 40}
+    fake = FakeGitHub(head=head)
+    fake.ref = "e" * 40
+    fake.commits[fake.ref] = forged
+    with pytest.raises(ValueError, match="moved from the pinned SHA"):
+        _advance(_gh(fake, monkeypatch), expected=head)
+    assert not any(method == "PATCH" for method, _ in fake.calls)
+    assert _reconcile(_gh(fake, monkeypatch), expected=head)[0] == "moved"
+    exact = FakeGitHub(head=head)
+    exact.ref = "e" * 40
+    exact.commits[exact.ref] = ours
+    assert _advance(_gh(exact, monkeypatch), expected=head).head_sha == "e" * 40
+    assert _reconcile(_gh(exact, monkeypatch), expected=head)[0] == "ours"
+
+
+def test_reconcile_reports_parent_ours_and_moved(monkeypatch) -> None:
+    head = "b" * 40
+    fake = FakeGitHub(head=head)
+    adapter = _gh(fake, monkeypatch)
+    outcome, pull = _reconcile(adapter, expected=head)
+    assert outcome == "parent" and pull.head_sha == head
+    _advance(adapter, expected=head)
+    outcome, pull = _reconcile(adapter, expected=head)
+    assert outcome == "ours" and pull.head_sha == fake.ref != head
+    fake.ref = "f" * 40
+    fake.commits[fake.ref] = {"tree": {"sha": "1" * 40}, "parents": [{"sha": head}], "message": "other"}
+    assert _reconcile(adapter, expected=head)[0] == "moved"
+    _never_creates_or_rebases(fake)
+    mock, mock_head = _published_mock()
+    assert _reconcile(mock, expected=mock_head)[0] == "parent"
+    _advance(mock, expected=mock_head)
+    assert _reconcile(mock, expected=mock_head)[0] == "ours"
+    assert _reconcile(mock, expected=mock_head, commit_message="other")[0] == "moved"

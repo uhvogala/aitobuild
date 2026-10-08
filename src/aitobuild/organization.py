@@ -26,6 +26,14 @@ class DefinitionModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+def _sync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class AgentDefinition(DefinitionModel):
     id: Identifier
     role: AgentRole
@@ -308,9 +316,5 @@ class FileDefinitionStore:
                 os.fsync(handle.fileno())
             temporary.replace(path)
             for directory in (path.parent, self._root):
-                directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
+                _sync_directory(directory)
         return snapshot

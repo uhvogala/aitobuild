@@ -192,6 +192,16 @@ class ManagedOrganizationService:
         review = await _delivery_call(lambda: reviews.offer(correction_preview_id))
         return record, review
 
+    async def retire_correction(
+        self, correction_preview_id: str, *, github: GitHubAdapter, allow_mock_publication: bool = False,
+    ) -> DeliveryPreparation:
+        """Operator retire of a failed/abandoned correction while the live PR head still equals its parent."""
+        reviews = self._correction_reviews()
+        await _delivery_call(lambda: reviews.correction_publication_binding(correction_preview_id))
+        return await _delivery_call(lambda: self._worker.retire_correction(
+            correction_preview_id, actor_id=self.operator_id, github=github,
+            allow_mock_publication=allow_mock_publication))
+
     def approved_previews(self, *, limit: int) -> tuple[DeveloperPreview, ...]:
         return tuple(preview for preview in self._previews.list_previews(pending_only=False, limit=limit) if preview.approved)
 

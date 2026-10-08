@@ -450,8 +450,17 @@ Architect mock/request/detached/HTTP/recovery/preparation cases pass. Full gates
 **684 passed/two optional Docker skips**, Ruff/mypy (46 sources), diagnostics,
 constructor compatibility and mock simulation. This continuation is committed as `7d7ea13`;
 no external trial or remote write. Handoff/preparation is not a native corrected
-artifact or independent verification. Same-PR update, useful live review/correction
-and bounded meeting execution remain required before M3 acceptance.
+artifact or independent verification. Useful live review/correction and bounded meeting
+execution remain required before M3 acceptance.
+
+Same-PR correction publication (2026-10-08, PR #11): verified corrections become a chain of
+immutable records, each fast-forwarding the pinned draft PR once behind an operator's one-use,
+nonce-bound exact approval, then staging the next Architect review at the new head. Only the
+chain tip may be offered or published; superseded IDs are refused with the tip. Push failures
+settle by the live head (reconcile, release, hold or resume), and an operator can retire a
+failed/abandoned correction while the live head still equals its parent. Gates: **752
+passed/two optional Docker skips**, Ruff/mypy (47 sources). A live GitHub trial of the
+same-PR loop is still required before M3 acceptance.
 
 
 Deliverables:

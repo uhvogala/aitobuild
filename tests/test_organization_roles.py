@@ -625,6 +625,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         operator_calls = (
                             ("/internal/organization/corrections/stage-publication", {"correction_preview_id": correction.preview_id}),
                             ("/internal/organization/corrections/publish", {"correction_preview_id": correction.preview_id, "approval_digest": "0" * 64}),
+                            ("/internal/organization/corrections/retire", {"correction_preview_id": correction.preview_id}),
                         )
                         for path, body in operator_calls:
                             assert client.post(path, json=body).status_code == 401
@@ -634,6 +635,8 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         assert staged_publication.status_code == 409
                         refused_publish = client.post(operator_calls[1][0], headers=headers, json=operator_calls[1][1])
                         assert refused_publish.status_code == 409 and "mock publication is refused" in refused_publish.json()["detail"]
+                        refused_retire = client.post(operator_calls[2][0], headers=headers, json=operator_calls[2][1])
+                        assert refused_retire.status_code == 409 and "mock reads are refused" in refused_retire.json()["detail"]
                         assert worker._approvals.get(correction.preview_id) is None
                     previews.approve(correction.preview_id)
                     if outcome == "correction_missing_seed":

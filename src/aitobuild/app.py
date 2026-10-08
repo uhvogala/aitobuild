@@ -763,6 +763,24 @@ def create_app(
                     "review_preview": {"preview_id": review.preview_id, "approved": review.approved,
                                        "bundle": review.bundle_payload} if review else None}
 
+        @app.post("/internal/organization/corrections/retire")
+        async def retire_scoped_correction(
+            payload: dict[str, Any],
+            x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        ) -> dict[str, Any]:
+            _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+            if (set(payload) != {"correction_preview_id"} or not isinstance(payload["correction_preview_id"], str)
+                    or not payload["correction_preview_id"].strip()):
+                raise HTTPException(status_code=400, detail="Correction retire accepts only correction_preview_id")
+            if isinstance(github_adapter, MockGitHubAdapter):
+                raise HTTPException(status_code=409, detail="Retiring requires a live GitHub adapter (gh_cli); mock reads are refused")
+            assert managed_service is not None
+            try:
+                record = await managed_service.retire_correction(payload["correction_preview_id"].strip(), github=github_adapter)
+            except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return {"retired": record.state == "retired", "delivery": record.to_payload()}
+
         @app.post("/internal/organization/reviews/offer")
         async def offer_published_review(
             payload: dict[str, Any],

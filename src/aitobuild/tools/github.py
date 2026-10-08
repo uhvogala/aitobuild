@@ -21,6 +21,8 @@ from aitobuild.policy import (
     assert_role_action_allowed,
 )
 
+AdvanceOutcome = Literal["parent", "ours", "moved"]
+
 
 def normalize_repository_name(repository: str) -> str:
     cleaned = repository.strip().lower()
@@ -262,6 +264,21 @@ class GitHubAdapter(Protocol):
         approved: bool,
         require_human_approval_for_repo_writes: bool,
     ) -> GitHubPullRequest: ...
+
+    def reconcile_advanced_head(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        pull_number: int,
+        head_branch: str,
+        base_ref: str,
+        expected_head_sha: str,
+        commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+    ) -> tuple[AdvanceOutcome, GitHubPullRequest]: ...
 
 
 @dataclass
@@ -593,6 +610,36 @@ class MockGitHubAdapter:
         advanced = replace(current, head_sha=head_sha)
         self.pull_requests[repo][pull_number] = advanced
         return advanced
+
+    def reconcile_advanced_head(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        pull_number: int,
+        head_branch: str,
+        base_ref: str,
+        expected_head_sha: str,
+        commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+    ) -> tuple[AdvanceOutcome, GitHubPullRequest]:
+        assert_role_action_allowed(role, ActionClass.REPO_WRITE)
+        assert_repo_write_approval(
+            require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+            approved=approved,
+        )
+        repo = self._resolve_repository(repository)
+        branch, _, expected = _validate_advance_inputs(
+            pull_number=pull_number, head_branch=head_branch, base_ref=base_ref,
+            expected_head_sha=expected_head_sha, commit_message=commit_message, files=files,
+        )
+        current = self.get_pull_request(repository=repo, pull_number=pull_number)
+        remote_head = self._branch_heads.get(repo, {}).get(branch) or current.head_sha
+        ours, _ = self._mock_commit(repo, branch, expected, commit_message, files)
+        outcome: AdvanceOutcome = "parent" if remote_head == expected else "ours" if remote_head == ours else "moved"
+        return outcome, replace(current, head_sha=remote_head)
 
     def create_or_update_draft_pull_request(
         self,
@@ -1180,6 +1227,44 @@ class GhCliGitHubAdapter:
             commit_sha = remote_head
         advanced = self._read_advance_target(repo, pull_number=pull_number, head_branch=branch, base_ref=base)
         return replace(advanced, head_sha=commit_sha)
+
+    def reconcile_advanced_head(
+        self,
+        *,
+        role: AgentRole,
+        repository: str,
+        pull_number: int,
+        head_branch: str,
+        base_ref: str,
+        expected_head_sha: str,
+        commit_message: str,
+        files: Mapping[str, GitHubBlobChange | None],
+        approved: bool,
+        require_human_approval_for_repo_writes: bool,
+    ) -> tuple[AdvanceOutcome, GitHubPullRequest]:
+        """Classify the live branch head after an uncertain push: untouched parent, our exact commit, or moved.
+
+        Recreating the tree only writes content-addressed git objects (no ref changes) so the exact
+        tree/parent/message identity rule can be applied to the live head.
+        """
+        assert_role_action_allowed(role, ActionClass.REPO_WRITE)
+        assert_repo_write_approval(
+            require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+            approved=approved,
+        )
+        repo = self._resolve_repository(repository)
+        branch, _, expected = _validate_advance_inputs(
+            pull_number=pull_number, head_branch=head_branch, base_ref=base_ref,
+            expected_head_sha=expected_head_sha, commit_message=commit_message, files=files,
+        )
+        pull = _pull_request_from_api(self._api(f"repos/{repo}/pulls/{pull_number}"), repository=repo)
+        remote_head = self._read_branch_head(repository=repo, branch=branch)
+        if remote_head == expected:
+            return "parent", replace(pull, head_sha=remote_head)
+        tree_sha = self._create_publish_tree(repo, expected, files)
+        ours = self._commit_matches(repository=repo, commit_sha=remote_head, tree_sha=tree_sha,
+                                    parent_sha=expected, commit_message=commit_message)
+        return ("ours" if ours else "moved"), replace(pull, head_sha=remote_head)
 
     def _read_advance_target(
         self, repo: str, *, pull_number: int, head_branch: str, base_ref: str,
