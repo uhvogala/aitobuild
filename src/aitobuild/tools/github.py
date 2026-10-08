@@ -146,6 +146,36 @@ class GitHubBlobChange:
         }
 
 
+@dataclass(frozen=True)
+class GitHubPinnedChange:
+    """A pinned file change by identity only (mode + git blob SHA), as saved in an approval snapshot."""
+
+    mode: Literal["100644", "100755"]
+    blob_sha: str
+
+
+def pinned_changes(
+    files: Mapping[str, GitHubBlobChange | None],
+) -> dict[str, GitHubPinnedChange | None]:
+    return {path: None if change is None else GitHubPinnedChange(mode=change.mode, blob_sha=change.blob_sha)
+            for path, change in files.items()}
+
+
+def pinned_changes_from_snapshot(snapshot: Mapping[str, Any]) -> dict[str, GitHubPinnedChange | None]:
+    """Rebuild pinned changes from a snapshot's `blob_shas`/`file_modes` without touching the checkout."""
+    blob_shas, file_modes = snapshot.get("blob_shas"), snapshot.get("file_modes")
+    if not isinstance(blob_shas, dict) or not isinstance(file_modes, dict) or set(blob_shas) != set(file_modes):
+        raise ValueError("Snapshot pinned changes are malformed")
+    changes: dict[str, GitHubPinnedChange | None] = {}
+    for path, blob_sha in blob_shas.items():
+        mode = file_modes[path]
+        if (blob_sha is None) != (mode is None):
+            raise ValueError("Snapshot pinned changes are malformed")
+        changes[path] = None if blob_sha is None else GitHubPinnedChange(mode=mode, blob_sha=blob_sha)
+    _validate_pinned_changes(changes)
+    return changes
+
+
 class GitHubAdapter(Protocol):
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue: ...
 
@@ -278,7 +308,7 @@ class GitHubAdapter(Protocol):
         base_ref: str,
         expected_head_sha: str,
         commit_message: str,
-        files: Mapping[str, GitHubBlobChange | None],
+        changes: Mapping[str, GitHubPinnedChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
     ) -> tuple[AdvanceOutcome, GitHubPullRequest]: ...
@@ -628,7 +658,7 @@ class MockGitHubAdapter:
         base_ref: str,
         expected_head_sha: str,
         commit_message: str,
-        files: Mapping[str, GitHubBlobChange | None],
+        changes: Mapping[str, GitHubPinnedChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
     ) -> tuple[AdvanceOutcome, GitHubPullRequest]:
@@ -638,15 +668,37 @@ class MockGitHubAdapter:
             approved=approved,
         )
         repo = self._resolve_repository(repository)
-        branch, _, expected = _validate_advance_inputs(
+        branch, _, expected = _validate_reconcile_inputs(
             pull_number=pull_number, head_branch=head_branch, base_ref=base_ref,
-            expected_head_sha=expected_head_sha, commit_message=commit_message, files=files,
+            expected_head_sha=expected_head_sha, commit_message=commit_message, changes=changes,
         )
         current = self.get_pull_request(repository=repo, pull_number=pull_number)
         remote_head = self._branch_heads.get(repo, {}).get(branch) or current.head_sha
-        ours, _ = self._mock_commit(repo, branch, expected, commit_message, files)
-        outcome: AdvanceOutcome = "parent" if remote_head == expected else "ours" if remote_head == ours else "moved"
-        return outcome, replace(current, head_sha=remote_head)
+        if remote_head == expected:
+            return "parent", replace(current, head_sha=remote_head)
+        return ("ours" if remote_head is not None
+                and self._mock_commit_has_changes(repo, remote_head, expected, commit_message, changes)
+                else "moved"), replace(current, head_sha=remote_head)
+
+    def _mock_commit_has_changes(
+        self, repo: str, commit_sha: str, parent_sha: str, commit_message: str,
+        changes: Mapping[str, GitHubPinnedChange | None],
+    ) -> bool:
+        """Same identity rule as the live adapter: sole parent, message, exact tree by mode + blob SHA."""
+        commit = next((item for item in self.branch_commits if item.get("head_sha") == commit_sha), None)
+        if commit is None or commit.get("base_sha") != parent_sha.lower() or commit.get("commit_message") != commit_message.strip():
+            return False
+
+        def tree(sha: str) -> dict[str, tuple[str, str]]:
+            return {path: (change.mode, change.blob_sha) for path, change in self.commit_files.get((repo, sha), {}).items()}
+
+        expected = tree(parent_sha)
+        for path, change in changes.items():
+            if change is None:
+                expected.pop(path, None)
+            else:
+                expected[path] = (change.mode, change.blob_sha)
+        return tree(commit_sha) == expected
 
     def create_or_update_draft_pull_request(
         self,
@@ -836,14 +888,14 @@ class GhCliGitHubAdapter:
             raise RuntimeError("Unexpected GitHub task reference response")
         if not self._commit_has_changes(
             repository=repository, commit_sha=head, parent_sha=base_sha,
-            commit_message=commit_message, files=files,
+            commit_message=commit_message, changes=pinned_changes(files),
         ):
             raise ValueError("Existing task branch differs from the approved publication")
         return head
 
     def _commit_has_changes(
         self, *, repository: str, commit_sha: str, parent_sha: str, commit_message: str,
-        files: Mapping[str, GitHubBlobChange | None],
+        changes: Mapping[str, GitHubPinnedChange | None],
     ) -> bool:
         """The one identity rule for adopting a remote commit as ours, shared by ordinary publish,
         correction advance and reconciliation: sole parent, same message, and tree == parent tree plus
@@ -858,7 +910,7 @@ class GhCliGitHubAdapter:
                 or str(commit.get("message", "")).strip() != commit_message.strip()):
             return False
         expected = self._tree_entries(repository, parent.get("tree"))
-        for path_name, change in files.items():
+        for path_name, change in changes.items():
             if change is None:
                 expected.pop(path_name, None)
             else:
@@ -1250,7 +1302,7 @@ class GhCliGitHubAdapter:
 
         def is_ours(remote_head: str) -> bool:
             return self._commit_has_changes(repository=repo, commit_sha=remote_head, parent_sha=expected,
-                                            commit_message=commit_message, files=files)
+                                            commit_message=commit_message, changes=pinned_changes(files))
 
         def ours_or_refuse(remote_head: str, target: GitHubPullRequest) -> GitHubPullRequest:
             if not is_ours(remote_head):
@@ -1298,7 +1350,7 @@ class GhCliGitHubAdapter:
         base_ref: str,
         expected_head_sha: str,
         commit_message: str,
-        files: Mapping[str, GitHubBlobChange | None],
+        changes: Mapping[str, GitHubPinnedChange | None],
         approved: bool,
         require_human_approval_for_repo_writes: bool,
     ) -> tuple[AdvanceOutcome, GitHubPullRequest]:
@@ -1314,16 +1366,16 @@ class GhCliGitHubAdapter:
             approved=approved,
         )
         repo = self._resolve_repository(repository)
-        branch, _, expected = _validate_advance_inputs(
+        branch, _, expected = _validate_reconcile_inputs(
             pull_number=pull_number, head_branch=head_branch, base_ref=base_ref,
-            expected_head_sha=expected_head_sha, commit_message=commit_message, files=files,
+            expected_head_sha=expected_head_sha, commit_message=commit_message, changes=changes,
         )
         pull = _pull_request_from_api(self._api(f"repos/{repo}/pulls/{pull_number}"), repository=repo)
         remote_head = self._read_branch_head(repository=repo, branch=branch)
         if remote_head == expected:
             return "parent", replace(pull, head_sha=remote_head)
         ours = self._commit_has_changes(repository=repo, commit_sha=remote_head, parent_sha=expected,
-                                        commit_message=commit_message, files=files)
+                                        commit_message=commit_message, changes=changes)
         return ("ours" if ours else "moved"), replace(pull, head_sha=remote_head)
 
     def _read_advance_target(
@@ -1535,6 +1587,37 @@ def _validate_advance_inputs(
     _validate_publish_commit_inputs(
         branch=branch, base_sha=expected_head_sha, commit_message=commit_message, files=files,
     )
+    return branch, base, expected_head_sha
+
+
+def _validate_pinned_changes(changes: Mapping[str, GitHubPinnedChange | None]) -> None:
+    if not isinstance(changes, Mapping) or not changes:
+        raise ValueError("reconcile requires a non-empty pinned change map")
+    for path_name, change in changes.items():
+        if (not isinstance(path_name, str) or not path_name.strip() or path_name.startswith("/")
+                or any(part == ".." for part in path_name.split("/"))):
+            raise ValueError("publish file paths must be relative and scoped")
+        if change is None:
+            continue
+        if not isinstance(change, GitHubPinnedChange) or change.mode not in {"100644", "100755"}:
+            raise ValueError("pinned changes must be GitHubPinnedChange values with mode 100644 or 100755")
+        if not isinstance(change.blob_sha, str) or re.fullmatch(r"[0-9a-f]{40}", change.blob_sha) is None:
+            raise ValueError(f"pinned blob SHA for {path_name} must be a lowercase git SHA")
+
+
+def _validate_reconcile_inputs(
+    *, pull_number: int, head_branch: str, base_ref: str, expected_head_sha: str, commit_message: str,
+    changes: Mapping[str, GitHubPinnedChange | None],
+) -> tuple[str, str, str]:
+    if type(pull_number) is not int or pull_number <= 0:
+        raise ValueError("pull_number must be a positive integer")
+    branch = _validate_aitobuild_branch_name(head_branch, field_name="head_branch")
+    base = _validate_base_ref_name(base_ref, head_branch=branch)
+    if not isinstance(expected_head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", expected_head_sha) is None:
+        raise ValueError("base_sha must be a resolved lowercase commit SHA")
+    if not isinstance(commit_message, str) or not commit_message.strip():
+        raise ValueError("commit_message must be non-empty")
+    _validate_pinned_changes(changes)
     return branch, base, expected_head_sha
 
 

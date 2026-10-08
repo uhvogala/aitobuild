@@ -32,7 +32,7 @@ Team structure and lifecycle are not fixed in code.
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **773 tests pass**, with two optional prepared-target Docker
+Verified locally: **780 tests pass**, with two optional prepared-target Docker
 probes skipped; Ruff and mypy (47 source files) and the mock fixture simulation pass.
 The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
@@ -577,7 +577,11 @@ gone (a truncated tree listing stays `publishing`). After any failure past consu
 (tree, sole parent and message) on the open draft reconciles to `published`; the unchanged parent
 fails terminally with `push_outcome: not_applied` and releases that parent head; a different head
 fails terminally with `push_outcome: moved` and keeps holding it; an unreadable head stays
-`publishing`, resumable only under the same approval and operator. Authenticated `POST
+`publishing`, resumable only under the same approval and operator. A resume settles from GitHub
+first, using only the approved snapshot's blob SHAs and modes and no budget or checkout check:
+ours ends `published`, an untouched parent pushes again only while the budget is still valid
+(otherwise it fails as `not_applied` and releases the head), a moved head fails and holds, and an
+unreadable head stays `publishing`. Authenticated `POST
 /internal/organization/corrections/retire {correction_preview_id}` (live adapter only) retires a
 failed or abandoned unpublished correction only while the live PR head still equals its parent,
 invalidating any pending approval; both sibling checks skip released and retired corrections.

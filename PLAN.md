@@ -338,10 +338,12 @@ closed; superseded preview IDs are refused with the tip. The adapter checks the 
 re-reads target and head right before the ref update and the live ref after it; reconciliation is
 read-only (sole parent, message, exact tree diff), so a landed push settles even after expiry. Failures past consume settle by the live
 head: ours reconciles to published, the unchanged parent releases the head (`not_applied`), a
-moved head fails and keeps holding it, an unreadable head stays resumable. Retire releases a
+moved head fails and keeps holding it, an unreadable head stays resumable. A resume reconciles
+from the snapshot's pinned blob SHAs/modes before any budget check; only an untouched parent
+needs a valid budget to push again (else `not_applied`). Retire releases a
 failed/abandoned correction only while the live head equals its parent; re-offering after a
 release creates a new attempt with a new task ID. A landed push on a PR closed or marked ready
-before reconciliation stays publishing for operator inspection. Gates: **773 passed/two
+before reconciliation stays publishing for operator inspection. Gates: **780 passed/two
 optional Docker skips**, Ruff/mypy (47 sources). No live GitHub trial, hosted CI or automatic
 correction loop yet.
 

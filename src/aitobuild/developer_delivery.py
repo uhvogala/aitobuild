@@ -31,6 +31,8 @@ from aitobuild.tools.github import (
     GitHubAdapter,
     GitHubBlobChange,
     MockGitHubAdapter,
+    pinned_changes,
+    pinned_changes_from_snapshot,
     _git_blob_sha,
     _tree_fingerprint,
 )
@@ -908,6 +910,16 @@ class DeveloperDeliveryWorker:
                     raise PermissionError("Correction was published under a different approval")
                 return current
             resuming = current is not None and current.state == "publishing"
+            if resuming:
+                assert current is not None
+                settled = self._resume_by_live_head(
+                    directory, current, approval_digest=approval_digest, review_receipt_digest=review_receipt_digest,
+                    actor_id=actor_id, github=github,
+                    require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
+                )
+                if settled is not None:
+                    return settled
+                # The parent head is untouched and the budget is still valid: push again under the same approval.
             record, snapshot, files, budget = self._correction_snapshot(
                 preview_id, review_receipt_digest=review_receipt_digest, resuming=resuming)
             self._approvals.begin_consume(preview_id, digest=approval_digest,
@@ -964,6 +976,69 @@ class DeveloperDeliveryWorker:
         self._approvals.finish_consume(record.preview_id, digest=approval_digest, head_sha=head_sha)
         return record
 
+    def _resume_by_live_head(
+        self, directory: Path, record: DeliveryPreparation, *, approval_digest: str, review_receipt_digest: str,
+        actor_id: str, github: GitHubAdapter, require_human_approval_for_repo_writes: bool,
+    ) -> DeliveryPreparation | None:
+        """Settle an interrupted correction from GitHub first, before any budget or checkout check.
+
+        Uses only the approved snapshot's pinned blob SHAs/modes, so a crash after the ref landed
+        reconciles to published even after the budget expired. Returns None only when the parent
+        head is untouched and the budget is still valid, meaning the caller may push again.
+        """
+        approval = self._approvals.get(record.preview_id)
+        if approval is None or approval.digest != approval_digest or approval.state != "consuming":
+            raise PermissionError("Interrupted correction publication requires its exact in-flight approval")
+        if approval.approved_by != actor_id.strip():
+            raise PermissionError("Interrupted publish approval belongs to another operator")
+        snapshot = approval.snapshot
+        publication = record.publication or {}
+        if (snapshot.get("review_receipt_digest") != review_receipt_digest
+                or snapshot.get("preview_id") != record.preview_id
+                or snapshot.get("parent_head_sha") != record.base_revision
+                or publication.get("branch") != snapshot.get("head_branch")
+                or any(publication.get(key) != snapshot.get(key) for key in (
+                    "blob_shas", "file_modes", "commit_message", "repository", "pull_number", "base_ref"))):
+            raise PermissionError("Interrupted correction publication differs from its approved snapshot")
+        changes = pinned_changes_from_snapshot(snapshot)
+        push: dict[str, Any] = {key: snapshot[key] for key in ("repository", "pull_number", "head_branch", "base_ref", "commit_message")}
+        outcome, pull = github.reconcile_advanced_head(  # unreadable: raises and the record stays publishing
+            role=AgentRole.DEVELOPER, expected_head_sha=record.base_revision, changes=changes, approved=True,
+            require_human_approval_for_repo_writes=require_human_approval_for_repo_writes, **push,
+        )
+        if outcome == "ours":
+            self._require_advanced_pull(pull, record=record, snapshot=push)
+            return self._finish_correction_publication(directory, record, pull, approval_digest=approval_digest)
+        # Only read for terminal bookkeeping: an aborted budget may still be marked aborted again.
+        budget = DeveloperTaskBudget(path=self.budget_path(record.preview_id),
+                                     bundle=developer_task_bundle_from_payload(record.bundle_payload), create=False,
+                                     allow_aborted=True)
+        if outcome == "parent":
+            try:
+                budget.remaining_seconds()
+            except Exception as expired:
+                error = f"Push did not apply and the approved budget is gone: {expired}"
+                self._fail_correction_push(directory, record, "not_applied", pull, error,
+                                           approval_digest=approval_digest, budget=budget)
+                raise PermissionError(error) from expired
+            return None
+        error = "Pull request head moved while the correction was interrupted"
+        self._fail_correction_push(directory, record, "moved", pull, error, approval_digest=approval_digest, budget=budget)
+        raise PermissionError(error)
+
+    def _fail_correction_push(
+        self, directory: Path, record: DeliveryPreparation, verdict: str, pull: Any, error: str, *,
+        approval_digest: str, budget: DeveloperTaskBudget,
+    ) -> None:
+        """Terminal push failure: `not_applied` releases the parent head, `moved` keeps holding it."""
+        assert record.publication is not None
+        budget.abort()
+        self._save(directory, replace(
+            record, state="failed", error=error,
+            publication={**record.publication, "push_outcome": verdict, "live_head_sha": (pull.head_sha or "").lower()},
+            updated_at=datetime.now(tz=UTC).isoformat()))
+        self._approvals.finish_consume(record.preview_id, digest=approval_digest, head_sha=None, error=error)
+
     def _settle_correction_push(
         self, directory: Path, record: DeliveryPreparation, failure: BaseException, *, approval_digest: str,
         budget: DeveloperTaskBudget, github: GitHubAdapter, files: dict[str, GitHubBlobChange | None],
@@ -982,7 +1057,8 @@ class DeveloperDeliveryWorker:
         error = str(failure) or type(failure).__name__
         try:
             outcome, pull = github.reconcile_advanced_head(
-                role=AgentRole.DEVELOPER, expected_head_sha=record.base_revision, files=files, approved=True,
+                role=AgentRole.DEVELOPER, expected_head_sha=record.base_revision, changes=pinned_changes(files),
+                approved=True,
                 require_human_approval_for_repo_writes=require_human_approval_for_repo_writes, **push,
             )
             if outcome == "ours":
@@ -994,13 +1070,8 @@ class DeveloperDeliveryWorker:
             if not isinstance(failure, Exception):
                 raise failure  # records now match GitHub; still honour the interrupt or exit
             return published
-        verdict = "not_applied" if outcome == "parent" else "moved"
-        budget.abort()
-        self._save(directory, replace(
-            record, state="failed", error=error,
-            publication={**record.publication, "push_outcome": verdict, "live_head_sha": (pull.head_sha or "").lower()},
-            updated_at=datetime.now(tz=UTC).isoformat()))
-        self._approvals.finish_consume(record.preview_id, digest=approval_digest, head_sha=None, error=error)
+        self._fail_correction_push(directory, record, "not_applied" if outcome == "parent" else "moved", pull, error,
+                                   approval_digest=approval_digest, budget=budget)
         raise failure
 
     def retire_correction(

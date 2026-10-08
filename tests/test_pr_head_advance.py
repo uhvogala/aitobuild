@@ -14,6 +14,7 @@ from aitobuild.tools.github import (
     GitHubBlobChange,
     MockGitHubAdapter,
     _git_blob_sha,
+    pinned_changes,
 )
 
 REPO = "fixture/widgets"
@@ -256,6 +257,7 @@ def _reconcile(adapter: Any, *, expected: str, **overrides: Any):
         files={"src/probe.py": _change("fixed = True\n")}, approved=True, require_human_approval_for_repo_writes=True,
     )
     arguments.update(overrides)
+    arguments["changes"] = pinned_changes(arguments.pop("files"))
     return adapter.reconcile_advanced_head(**arguments)
 
 
@@ -352,6 +354,13 @@ def test_reconcile_is_read_only_and_matches_exact_changes(monkeypatch) -> None:
     assert _reconcile(adapter, expected=head, files={"src/probe.py": _change("fixed = False\n")})[0] == "moved"
     assert _reconcile(adapter, expected=head, files={"src/probe.py": _change("fixed = True\n"),
                                                      "README.md": None})[0] == "moved"
+    mode_only = json.loads(json.dumps(ours))  # README.md made executable outside the pinned set
+    readme_mode, readme_blob = TREES[ours["tree"]["sha"]]["README.md"]
+    TREES["6" * 40] = {**TREES[ours["tree"]["sha"]], "README.md": ("100755", readme_blob)}
+    mode_only["tree"] = {"sha": "6" * 40}
+    fake.commits[fake.ref] = mode_only
+    assert readme_mode == "100644" and _reconcile(adapter, expected=head)[0] == "moved"
+    fake.commits[fake.ref] = ours
     executable = GitHubBlobChange(mode="100755", content=b"fixed = True\n", blob_sha=_git_blob_sha(b"fixed = True\n"))
     assert _reconcile(adapter, expected=head, files={"src/probe.py": executable})[0] == "moved"
     extra = json.loads(json.dumps(ours))
@@ -470,3 +479,29 @@ def test_gh_ordinary_publish_checks_the_budget_before_every_write(expire_at, mon
             require_human_approval_for_repo_writes=True, before_write=budget)
         assert head
     assert _writes(fake) == ["blobs", "trees", "commits", "refs", "pulls"][: expire_at - 1]
+
+
+def test_gh_existing_pr_update_checks_the_budget_before_patch(monkeypatch) -> None:
+    fake = FakeGitHub(head="b" * 40)
+
+    def expired() -> float:
+        raise TimeoutError("expired")
+
+    with pytest.raises(TimeoutError):
+        _gh(fake, monkeypatch).create_or_update_draft_pull_request(
+            role=AgentRole.DEVELOPER, repository=REPO, title="Trial", body="Closes #7", head_branch=BRANCH,
+            base_ref="main", issue_number=7, existing_pull_number=1, approved=True,
+            require_human_approval_for_repo_writes=True, before_write=expired)
+    assert fake.calls and all(method == "GET" for method, _ in fake.calls)
+
+
+def test_mock_matcher_compares_modes_inside_and_outside_the_pinned_set() -> None:
+    mock, head = _published_mock()
+    advanced = _advance(mock, expected=head)
+    assert _reconcile(mock, expected=head)[0] == "ours"
+    executable = GitHubBlobChange(mode="100755", content=b"fixed = True\n", blob_sha=_git_blob_sha(b"fixed = True\n"))
+    assert _reconcile(mock, expected=head, files={"src/probe.py": executable})[0] == "moved"
+    tree = mock.commit_files[(REPO, advanced.head_sha)]
+    tree["README.md"] = GitHubBlobChange(mode="100755", content=b"r\n", blob_sha=_git_blob_sha(b"r\n"))
+    mock.commit_files[(REPO, head)]["README.md"] = replace(tree["README.md"], mode="100644")
+    assert _reconcile(mock, expected=head)[0] == "moved"

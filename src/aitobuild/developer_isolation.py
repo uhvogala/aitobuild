@@ -62,7 +62,8 @@ class DeveloperTaskBundle:
 
 
 class DeveloperTaskBudget:
-    def __init__(self, *, path: Path, bundle: DeveloperTaskBundle, create: bool = True) -> None:
+    def __init__(self, *, path: Path, bundle: DeveloperTaskBundle, create: bool = True,
+                 allow_aborted: bool = False) -> None:
         self.path = path
         self.bundle = bundle
         self._snapshot = json.loads(json.dumps(bundle.to_payload()))
@@ -76,7 +77,7 @@ class DeveloperTaskBudget:
                     raise ValueError("Persisted task budget is missing; a new approved task is required")
                 self._save({"task_id": bundle.task_id, "bundle": bundle.to_payload(), "deadline": time() + bundle.policy.max_runtime_minutes * 60,
                             "reserved_paths": []})
-            self._load()
+            self._load(allow_aborted=allow_aborted)
 
     def _load(self, *, allow_aborted: bool = False) -> dict[str, Any]:
         state = json.loads(self.path.read_text(encoding="utf-8"))

@@ -248,6 +248,59 @@ def test_unreadable_head_stays_publishing_and_resumes(correction_chain, monkeypa
     assert worker._approvals.get(correction).state == "consumed"
 
 
+@pytest.mark.parametrize("live", ["landed", "parent_expired", "parent_valid", "moved", "unreadable"])
+def test_resume_settles_by_the_live_head_before_any_budget_check(live, correction_chain, monkeypatch):
+    """Crash mid-push, restart later: GitHub decides first, the budget only gates a fresh push."""
+    worker, published_id, github, head, make = correction_chain
+    correction = make()
+    staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
+    budget = DeveloperTaskBudget(path=worker.budget_path(correction),
+                                 bundle=developer_task_bundle_from_payload(worker.get(correction).bundle_payload),
+                                 create=False)
+    advance = github.advance_draft_pull_request_head
+
+    def crashed(**kwargs):
+        if live == "landed":
+            advance(**kwargs)
+        raise KeyboardInterrupt("process stopped mid-push")
+
+    def unreadable(**kwargs):
+        raise RuntimeError("GitHub unreachable")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(github, "advance_draft_pull_request_head", crashed)
+        patched.setattr(github, "reconcile_advanced_head", unreadable)
+        with pytest.raises(KeyboardInterrupt):
+            _publish(worker, github, correction, staged["digest"])
+    assert worker.get(correction).state == "publishing"
+    if live != "parent_valid":
+        budget.abort()  # restarted after the deadline
+    if live == "moved":
+        _move_head(github, worker, published_id, "f" * 40)
+    if live == "unreadable":
+        with monkeypatch.context() as patched:
+            patched.setattr(github, "reconcile_advanced_head", unreadable)
+            with pytest.raises(RuntimeError, match="unreachable"):
+                _publish(worker, github, correction, staged["digest"])
+        assert worker.get(correction).state == "publishing"
+        assert worker._approvals.get(correction).state == "consuming"
+        return
+    if live in {"landed", "parent_valid"}:
+        record = _publish(worker, github, correction, staged["digest"])
+        assert record.state == "published" and record.publication["parent_head_sha"] == head
+        assert record.publication["head_sha"] == _pull(github, worker, published_id).head_sha != head
+        assert worker._approvals.get(correction).state == "consumed"
+        assert worker.superseded_by(published_id) == correction
+        return
+    with pytest.raises(PermissionError, match="budget is gone" if live == "parent_expired" else "head moved"):
+        _publish(worker, github, correction, staged["digest"])
+    failed = worker.get(correction)
+    assert failed.state == "failed"
+    assert failed.publication["push_outcome"] == ("not_applied" if live == "parent_expired" else "moved")
+    assert worker._approvals.get(correction).state == "consumed"
+    assert worker.correction_releases_parent(correction) is (live == "parent_expired")
+
+
 def test_push_that_did_not_apply_releases_the_parent_head(correction_chain, monkeypatch):
     worker, published_id, github, head, make = correction_chain
     correction = make()
