@@ -1524,18 +1524,43 @@ class GhCliGitHubAdapter:
             )
             return _pull_request_from_api(raw, repository=repo, changed_files=())
         _check_write_budget(before_write)
-        raw = self._api(
-            f"repos/{repo}/pulls",
-            method="POST",
-            payload={
-                "title": cleaned_title,
-                "body": cleaned_body,
-                "head": cleaned_head,
-                "base": cleaned_base,
-                "draft": True,
-            },
-        )
+        try:
+            raw = self._api(
+                f"repos/{repo}/pulls",
+                method="POST",
+                payload={
+                    "title": cleaned_title,
+                    "body": cleaned_body,
+                    "head": cleaned_head,
+                    "base": cleaned_base,
+                    "draft": True,
+                },
+            )
+        except Exception:
+            # GitHub may have accepted the create before `gh` timed out; adopt that exact PR (read-only)
+            # so its number is saved instead of leaving an open PR with no receipt.
+            adopted = self._created_pull_after_failure(repo, head=cleaned_head, base=cleaned_base, title=cleaned_title)
+            if adopted is None:
+                raise
+            return adopted
         return _pull_request_from_api(raw, repository=repo, changed_files=())
+
+    def _created_pull_after_failure(self, repo: str, *, head: str, base: str, title: str) -> GitHubPullRequest | None:
+        try:
+            query = urlencode({"state": "open", "head": f"{repo.split('/')[0]}:{head}", "base": base, "per_page": 100})
+            raw_matches = self._api(f"repos/{repo}/pulls?{query}")
+        except Exception:
+            return None
+        if not isinstance(raw_matches, list):
+            return None
+        matches = [raw for raw in raw_matches if isinstance(raw, dict) and raw.get("state") == "open"
+                   and raw.get("draft") is True and raw.get("title") == title
+                   and raw.get("head", {}).get("ref") == head
+                   and raw.get("head", {}).get("repo", {}).get("full_name", "").lower() == repo
+                   and raw.get("base", {}).get("ref") == base]
+        if len(matches) != 1:
+            return None
+        return _pull_request_from_api(matches[0], repository=repo, changed_files=())
 
     def create_issue_proposal(
         self,
