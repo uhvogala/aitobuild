@@ -42,6 +42,19 @@ ARCHITECT_REVIEW_BODY_PREFIX = "aitobuild Architect review\n\n"
 _ARCHITECT_REVIEW_EVENTS = frozenset({"COMMENT"})
 
 
+CORRECTION_TASK_PREFIX = "published-correction-"
+
+
+def _refuse_correction_publication(item: Any) -> None:
+    """Scoped corrections must update their pinned PR, never open a new one."""
+    payload = getattr(item, "bundle_payload", None)
+    if isinstance(payload, dict) and str(payload.get("task_id", "")).startswith(CORRECTION_TASK_PREFIX):
+        raise PermissionError(
+            "Scoped correction tasks cannot publish a new pull request; "
+            "same-PR correction publication is required"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class LocalRepositorySource:
     repository: str
@@ -387,12 +400,14 @@ class DeveloperDeliveryWorker:
             raise ValueError(
                 "Publication requires a live GitHub adapter; mock publication is refused"
             )
+        _refuse_correction_publication(self._previews.get(preview_id))
         directory = self._task_dir(preview_id)
         with self.implementation_lock(preview_id):
             with FileLock(str(directory) + ".lock", timeout=10):
                 record = self._load(directory)
             if record is None:
                 raise ValueError("Delivery not found")
+            _refuse_correction_publication(record)
             if record.state == "failed":
                 return record
             if record.state == "published":

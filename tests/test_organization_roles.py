@@ -623,6 +623,12 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         assert not is_path_allowed("outside.py", policy=bundle.policy)
                         with pytest.raises(PermissionError):
                             budget.reserve_paths(tuple(done.outputs[0]["correction"]["paths"]) + ("outside.py",))
+                        pulls_before = {repo: dict(prs) for repo, prs in github.pull_requests.items()}
+                        with pytest.raises(PermissionError, match="cannot publish a new pull request"):
+                            worker.publish(correction.preview_id, github=github,
+                                           require_human_approval_for_repo_writes=True, allow_mock_publication=True)
+                        assert {repo: dict(prs) for repo, prs in github.pull_requests.items()} == pulls_before
+                        assert worker.get(correction.preview_id).state == prepared.state
                         assert json.loads(budget.path.read_text())["reserved_paths"] == []
                         if outcome == "correction_missing_budget":
                             budget.path.unlink()
