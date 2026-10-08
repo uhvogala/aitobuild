@@ -32,7 +32,7 @@ Team structure and lifecycle are not fixed in code.
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Verified locally: **737 tests pass**, with two optional prepared-target Docker
+Verified locally: **738 tests pass**, with two optional prepared-target Docker
 probes skipped; Ruff and mypy (47 source files) and the mock fixture simulation pass.
 The prior 325-test baseline
 included both real Docker probes for independent pytest success/failure and cleanup.
@@ -565,6 +565,9 @@ draft head with `force=false`; it never creates a PR or changes base, then stage
 Architect review at the new head. The chain walk fails closed on a missing/invalid link or a
 repo/PR/branch/head mismatch; only the first staged correction on a parent head may proceed (later
 siblings fail as terminal stale) and older preview IDs are refused as "superseded by <tip>".
+An interrupted push (record left `publishing`) resumes and reconciles under the same approval
+and operator; an actual push failure is terminal, consumes the approval and still blocks that
+parent head, so a fresh correction and approval are required.
 Managed `delivery_publish` and the legacy publish endpoint refuse correction tasks.
 
 Twenty correction regressions cover actual native Architect mocked transports,

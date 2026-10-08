@@ -134,10 +134,10 @@ def test_digest_drift_invalidates_the_one_use_approval(correction_chain, monkeyp
     correction = make()
     staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
     metadata = worker._publication_metadata
-    monkeypatch.setattr(worker, "_publication_metadata", lambda bundle, record: (*metadata(bundle, record)[:2], "changed message"))
-    with pytest.raises(PermissionError, match="drifted"):
-        _publish(worker, github, correction, staged["digest"])
-    monkeypatch.undo()
+    with monkeypatch.context() as patched:
+        patched.setattr(worker, "_publication_metadata", lambda bundle, record: (*metadata(bundle, record)[:2], "changed message"))
+        with pytest.raises(PermissionError, match="drifted"):
+            _publish(worker, github, correction, staged["digest"])
     with pytest.raises(PermissionError, match="invalidated"):
         _publish(worker, github, correction, staged["digest"])
     assert worker.get(correction).state == "verified"
@@ -159,31 +159,55 @@ def test_sibling_on_the_same_parent_head_is_terminal_stale(correction_chain):
     assert _publish(worker, github, first, staged["digest"]).state == "published"
 
 
-def test_resume_after_lost_response_reuses_the_exact_push(correction_chain, monkeypatch):
+def test_interrupted_push_resumes_under_the_same_approval(correction_chain, monkeypatch):
     worker, published_id, github, head, make = correction_chain
     correction = make()
     staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
     advance = github.advance_draft_pull_request_head
 
-    def lost(**kwargs):
+    def interrupted(**kwargs):
         advance(**kwargs)
-        raise RuntimeError("gh timed out after applying")
+        raise KeyboardInterrupt("process stopped after the push applied")
 
-    monkeypatch.setattr(github, "advance_draft_pull_request_head", lost)
-    with pytest.raises(RuntimeError):
-        _publish(worker, github, correction, staged["digest"])
-    pending = worker.get(correction)
-    assert pending.state == "publishing" and pending.error == "gh timed out after applying"
+    with monkeypatch.context() as patched:
+        patched.setattr(github, "advance_draft_pull_request_head", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            _publish(worker, github, correction, staged["digest"])
+    assert worker.get(correction).state == "publishing"
     assert worker._approvals.get(correction)["state"] == "consuming"
     with pytest.raises(PermissionError, match=f"superseded by {correction}"):
         worker.get_published_pull_request(published_id, github=github)
-    monkeypatch.undo()
     with pytest.raises(PermissionError, match="another operator"):
         worker.approve_and_publish_correction(
             correction, approval_digest=staged["digest"], review_receipt_digest=RECEIPT, actor_id="intruder",
             github=github, require_human_approval_for_repo_writes=True, allow_mock_publication=True)
     record = _publish(worker, github, correction, staged["digest"])
     assert record.state == "published" and record.publication["parent_head_sha"] == head
+    assert worker._approvals.get(correction)["state"] == "consumed"
+
+
+def test_failed_push_is_terminal_and_blocks_the_parent_head(correction_chain, monkeypatch):
+    worker, published_id, github, head, make = correction_chain
+    correction = make()
+    staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
+
+    def refused(**kwargs):
+        raise RuntimeError("GitHub rejected the ref update")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(github, "advance_draft_pull_request_head", refused)
+        with pytest.raises(RuntimeError):
+            _publish(worker, github, correction, staged["digest"])
+    failed = worker.get(correction)
+    assert failed.state == "failed" and failed.error == "GitHub rejected the ref update"
+    approval = worker._approvals.get(correction)
+    assert approval["state"] == "consumed" and approval["error"] == "GitHub rejected the ref update"
+    with pytest.raises((ValueError, PermissionError)):
+        _publish(worker, github, correction, staged["digest"])
+    assert worker.superseded_by(published_id) is None
+    sibling = make("review-two", "def probe():\n    return 3\n")
+    with pytest.raises(PermissionError, match=f"{correction} already uses parent head {head}"):
+        worker.stage_correction_publication(sibling, review_receipt_digest=RECEIPT)
 
 
 def test_broken_chain_link_fails_closed(correction_chain, monkeypatch):
@@ -199,11 +223,11 @@ def test_broken_chain_link_fails_closed(correction_chain, monkeypatch):
 
     head = worker.get(published_id).publication["head_sha"]
     for target in ({"preview_id": "missing-delivery", "head_sha": head}, {"preview_id": published_id, "head_sha": "e" * 40}, None):
-        monkeypatch.setattr(worker._previews, "get", lambda preview_id, target=target: broken(preview_id, target))
-        with pytest.raises(PermissionError, match="Correction chain"):
-            worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
+        with monkeypatch.context() as patched:
+            patched.setattr(worker._previews, "get", lambda preview_id, target=target: broken(preview_id, target))
+            with pytest.raises(PermissionError, match="Correction chain"):
+                worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
         assert worker._approvals.get(correction) is None and worker.get(correction).state == "verified"
-    monkeypatch.undo()
     original_dir = worker._task_dir(published_id)
     original = worker.get(published_id)
     worker._save(original_dir, replace(original, publication=original.publication | {"branch": "aitobuild/other"}))

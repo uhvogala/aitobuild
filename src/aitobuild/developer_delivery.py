@@ -709,8 +709,8 @@ class DeveloperDeliveryWorker:
         while True:
             successors = [
                 other.preview_id for other in records
-                if isinstance(other.publication, dict) and other.publication.get("mode") == "advance"
-                and other.publication.get("target_preview_id") == current
+                if other.state in {"publishing", "published"} and isinstance(other.publication, dict)
+                and other.publication.get("mode") == "advance" and other.publication.get("target_preview_id") == current
             ]
             if not successors:
                 return tip
@@ -879,9 +879,13 @@ class DeveloperDeliveryWorker:
                         or not pull.draft or pull.state != "open"):
                     raise RuntimeError("Correction push did not leave the pinned open draft at a new head")
             except Exception as failure:
-                # Stay resumable: the same approval digest may retry; the adapter treats an exact match as ours.
+                # 88720aa convention: an actual failure is terminal and needs a fresh approval; only an
+                # interruption (crash/BaseException, record left "publishing") resumes under the same digest.
                 error = str(failure) or type(failure).__name__
-                self._save(directory, replace(record, error=error, updated_at=datetime.now(tz=UTC).isoformat()))
+                budget.abort()
+                self._save(directory, replace(record, state="failed", error=error,
+                                              updated_at=datetime.now(tz=UTC).isoformat()))
+                self._approvals.finish_consume(preview_id, digest=approval_digest, head_sha=None, error=error)
                 raise
             publication = {**publication, "head_sha": head_sha, "html_url": pull.html_url, "draft": True,
                            "pull_head_sha": head_sha, "published_at": datetime.now(tz=UTC).isoformat()}
