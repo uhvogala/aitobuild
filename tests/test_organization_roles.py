@@ -406,7 +406,7 @@ def test_publication_stages_unapproved_head_pinned_review_once(tmp_path, publish
 @pytest.mark.parametrize("detached", [False, True])
 @pytest.mark.parametrize("outcome", ["approve", "cancel_corrupt_preview", "correction", "correction_missing_seed",
                                      "correction_partial", "correction_scope", "correction_journal_loss", "correction_head_drift",
-                                     "correction_revision", "correction_missing_budget"])
+                                     "correction_revision", "correction_missing_budget", "correction_sibling"])
 def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, published_delivery, detached, outcome, monkeypatch, test_config):
     from aitobuild.organization_reviews import PublishedReviewAdmission, PublishedReviewRoute
     from aitobuild.organization_service import ManagedOrganizationService
@@ -544,6 +544,25 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         with pytest.raises(PermissionError):
                             reviews.correction_route_for(partial.preview_id)
                         monkeypatch.setattr(reviews, "_save", save)
+                    if outcome == "correction_sibling":
+                        from aitobuild.organization_reviews import _CorrectionReceipt
+                        from filelock import FileLock
+
+                        reviewed = reviews.target_for(preview.preview_id)
+                        with FileLock(str(reviews._path) + ".lock", timeout=10):
+                            journal = reviews._load()
+                            journal.corrections["published-correction-sibling"] = _CorrectionReceipt(
+                                task_id="published-correction-sibling", review_preview_id="published-review-other",
+                                target=reviewed, route=reviews.correction_routes[0], run_content="{}", bundle_content=json.dumps({"task_id": "published-correction-sibling"}),
+                                state="staged", correction_preview_id="sibling-correction")
+                            reviews._save(journal)
+                        pending_before = previews.list_previews(pending_only=True, limit=10)
+                        with pytest.raises(PermissionError, match="offer corrections only from the chain tip"):
+                            await service().offer_correction(preview.preview_id)
+                        assert previews.list_previews(pending_only=True, limit=10) == pending_before
+                        assert [receipt.task_id for receipt in reviews._load().corrections.values()] == ["published-correction-sibling"]
+                        assert developer_budget.read_bytes() == before_developer
+                        return
                     correction = await service().offer_correction(preview.preview_id)
                     assert correction is not None and not correction.approved
                     assert correction.bundle_payload["issue_context"]["base_revision"] == worker.get(published_id).publication["head_sha"]
@@ -603,6 +622,19 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         offered = client.post("/internal/organization/corrections/offer", headers=headers, json={"review_preview_id": preview.preview_id})
                         assert offered.status_code == 200 and offered.json()["correction_preview"]["preview_id"] == correction.preview_id
                         assert not offered.json()["correction_preview"]["approved"]
+                        operator_calls = (
+                            ("/internal/organization/corrections/stage-publication", {"correction_preview_id": correction.preview_id}),
+                            ("/internal/organization/corrections/publish", {"correction_preview_id": correction.preview_id, "approval_digest": "0" * 64}),
+                        )
+                        for path, body in operator_calls:
+                            assert client.post(path, json=body).status_code == 401
+                            assert client.post(path, headers={"X-Internal-Token": "wrong-token"}, json=body).status_code == 401
+                            assert client.post(path, headers=headers, json=body | {"actor_id": "model"}).status_code == 400
+                        staged_publication = client.post(operator_calls[0][0], headers=headers, json=operator_calls[0][1])
+                        assert staged_publication.status_code == 409
+                        refused_publish = client.post(operator_calls[1][0], headers=headers, json=operator_calls[1][1])
+                        assert refused_publish.status_code == 409 and "mock publication is refused" in refused_publish.json()["detail"]
+                        assert worker._approvals.get(correction.preview_id) is None
                     previews.approve(correction.preview_id)
                     if outcome == "correction_missing_seed":
                         with pytest.raises(ValueError, match="not prepared"):
