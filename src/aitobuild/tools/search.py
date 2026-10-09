@@ -29,7 +29,7 @@ def _scopes(workspace: Path, path: str, policy: DeveloperIsolationPolicy) -> lis
         if not is_path_allowed(normalized, policy=policy):
             raise ValueError("Search path is outside allowed policy paths")
         return [relative.as_posix()]
-    return [allowed.rstrip("/") for allowed in policy.allowed_paths
+    return [Path(allowed).as_posix() for allowed in policy.allowed_paths
             if (workspace / allowed).exists() and not (workspace / allowed.rstrip("/")).is_symlink()
             and (workspace / allowed).resolve().is_relative_to(workspace)]
 

@@ -11,6 +11,85 @@ and supervised recovery. Earlier counts, pending work and commit status describe
 their checkpoint, not the current system. Current setup and usage belong in
 [README.md](README.md); contributor rules belong in [agents.md](agents.md).
 
+Whole-repository Architect context and dependency live acceptance (2026-10-09):
+the operator independently merged prerequisite PR 36. Native GET-only waiting and
+exact human-merge/ancestry checks were accepted at new base
+`4b0900bb2a1fc496101ab79c55b8d75373229936`. Dependency bindings now accept up to
+eight explicitly configured historical receipt readers; new execution remains on
+the active worker, without reopening old ledgers. Direct/detached/archived fixture
+coverage preserves approvals/budgets and refuses ambiguous receipt ownership.
+
+The first live preparation correctly refused a seed inside the service checkout;
+its failed worker record and aborted original ledger remain intact. A new explicit
+task/revision with an external pinned seed used native `DeepSeek-V4.1-Flash`, nine
+saved tool decisions, README-only exact edits, independent constrained Docker
+pytest (two tests, integer exit 0, cleanup) and exact inspected publication intent
+to produce draft PR 37 at `8ba834fecdf9ea40e94707edca3f82eed3e587c4`. A separate
+zero-write Architect task posted exact COMMENT 5470318145 after complete README
+source/diff inspection and restart. Its changed-files-only context restriction was
+a genuine review capability gap identified by the user, not an agent choice.
+
+Native Architect tools now discover/search/read the whole immutable repository at
+the review head, independent of Developer edit paths, with bounded pages and no
+host checkout access. Context evidence remains separate from mandatory complete
+changed-file source/diff receipts. Native SDK regressions cover unchanged files
+outside Developer policy, zero-write access, discovery/search pagination,
+context-only refusal, head drift and corrupt blobs. Read-only Git tree metadata
+does not widen publication-write pin types or allow symlink/submodule traversal.
+
+The legacy workspace Architect default also contained a fixed path whitelist.
+Its read-only policy now covers the repository through the existing literal
+empty-prefix contract; search normalizes that root to `.` rather than passing an
+empty path to ripgrep. Regression checks read/discover/search docs, config and
+hidden CI files while preserving runtime exclusions, workspace escape checks,
+explicit operator policies and Developer write scope. Focused adjacent gates:
+134 passed and Ruff clean.
+
+A fresh separately approved review under explicit binding `whole-repository-review-v1`
+read the implementation, both test files, package initializer and project config
+at the exact published head, as well as complete README source/diff. The agent
+recovered two requests above the existing 1,000-byte published-reader limit; these
+diagnostics remain saved. The supervisor initially misapplied a zero-tool-error
+criterion to the qualified review; additive metadata-only continuation preserved
+that report and the original idle checkpoint/ledger, without model/effect replay.
+Exact COMMENT 5470648081 was approved after restart and added once; the earlier
+COMMENT stayed unchanged. Independent read-only audits accepted actual remote
+base/parent/bytes/modes, real context blob identities, exact decisions, original
+separate deadlines/reservations, terminal idempotency, unchanged old evidence,
+draft/default branch and cleanup with no retained containers.
+
+Final full gates: 1,005 passed, two optional Docker skips, three existing SDK warnings;
+Ruff clean and mypy clean across 51 source files. Generated evidence stays outside
+Git. PR 37 remains draft/unmerged. This is recovered supervised local live
+acceptance, not uninterrupted first-attempt success, zero-error tool usability,
+automatic dependency scheduling, hosted/distributed deployment, a full measured
+product-team pilot or generic semantic certification. No dependencies, default
+activation or service push were added.
+
+Dependency handoff implementation (2026-10-09): opt-in `ManagedDependencies`
+reconciles exact saved PM issue/link receipts and qualified prerequisite delivery
+publications through read-only GitHub merge/ancestry evidence. It stages a separate
+unapproved task at a current operator-pinned base; original previews, approvals and
+ledgers are untouched. Bounded handoff lineage supports later dependent issues.
+Service and authenticated staging/approval/preparation controls reject bypass,
+stale evidence, ambiguous publications, missing/tampered receipts, operator/route
+drift and symlinks. Exact interrupted local staging recovers metadata only;
+owned terminal runs recover frozen state without effect replay. Focused coverage
+includes native mocked PM publication, strict CLI read fixtures, authenticated
+ASGI controls, chained/all-parent readiness and direct/detached admission from a
+real copied Git seed with production saved verification/publication records.
+Verifier and merge responses remain fixtures: no new live merge, dependent delivery
+trial, automatic scheduler or hosted/distributed acceptance is claimed. Live
+positive handoff acceptance requires an independently human-merged prerequisite;
+existing trial drafts are not merged by this feature. Corrected/otherwise advanced
+PR heads stop rather than guessing a replacement publication lineage.
+Full local gates: 977 passed, two optional Docker skips, three existing SDK
+warnings; Ruff clean and mypy clean across 51 source files. Editor diagnostics and
+diff checks pass. The mock-only copied-fixture simulation returned `succeeded=true`
+and integer command exit 0 with no persistent session allocated. Generated reports
+remain outside Git. No dependencies, default activation, commits, pushes or remote
+merges were added by this slice.
+
 Managed meeting live acceptance (2026-10-09): `DeepSeek-V4.1-Flash` executed a
 fresh supervised PM -> bounded three-role meeting -> Developer -> Architect
 sequence through authenticated local ASGI and detached workers, real GitHub and

@@ -23,6 +23,7 @@ from aitobuild.organization_runner import (
 from aitobuild.organization_runtime import WorkflowLimits, WorkflowPredicate
 from aitobuild.organization_reviews import PublishedReviewAdmission
 from aitobuild.organization_planning import PlanningAdmission
+from aitobuild.organization_dependencies import ManagedDependencies
 from aitobuild.tools.github import GitHubAdapter
 
 
@@ -69,6 +70,7 @@ class ManagedOrganizationService:
         reviews: PublishedReviewAdmission | None = None,
         automatic_review_followups: bool = False,
         planning: PlanningAdmission | None = None,
+        dependencies: ManagedDependencies | None = None,
     ) -> None:
         self._definitions = definitions
         self._assignments = assignments
@@ -80,6 +82,11 @@ class ManagedOrganizationService:
             raise PermissionError("Planning must use service-owned definitions, previews and operator identity")
         self._planning = planning
         self._planning_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in planning.routes) if planning else ()
+        if dependencies is not None and (
+                dependencies.planning.admission is not planning or dependencies.worker is not worker):
+            raise PermissionError("Dependencies must use the exact service-owned planning and worker bindings")
+        self._dependencies = dependencies
+        self._dependency_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in dependencies.routes) if dependencies else ()
         if reviews is not None:
             reviews.validate_binding(definitions=definitions, previews=previews, worker=worker)
         self._reviews = reviews
@@ -92,7 +99,7 @@ class ManagedOrganizationService:
         targets = [(route.repository, route.repository_id) for route in self._routes]
         if len(targets) != len(set(targets)):
             raise ValueError("Managed repository routes must be unambiguous")
-        for route in (*self._routes, *self._review_routes, *self._correction_routes, *self._planning_routes):
+        for route in (*self._routes, *self._review_routes, *self._correction_routes, *self._planning_routes, *self._dependency_routes):
             snapshot = definitions.get(route.organization_id, route.revision)
             if snapshot is None or not any(route.event in item.events for item in snapshot.definition.routes):
                 raise ValueError("Managed activation requires an existing explicit revision/event")
@@ -111,6 +118,14 @@ class ManagedOrganizationService:
         )
 
     def _route(self, preview: DeveloperPreview) -> ManagedRoute | None:
+        task_id = str(preview.bundle_payload.get("task_id", ""))
+        if self._dependencies is None and task_id.startswith("dependent-issue-"):
+            raise PermissionError("Dependent handoffs require their trusted admission binding")
+        if self._dependencies is not None:
+            owned = self._assignments.for_task(task_id)
+            handoff_route = self._dependencies.route_for(preview, recheck=owned is None)
+            if handoff_route is not None:
+                return ManagedRoute.model_validate(handoff_route.model_dump())
         if str(preview.bundle_payload.get("task_id", "")).startswith("pm-planning-"):
             if self._planning is None:
                 raise PermissionError("Planning tasks require their trusted admission binding")
@@ -175,6 +190,18 @@ class ManagedOrganizationService:
             return None
         reviews = self._reviews
         return await _delivery_call(lambda: reviews.offer(published_preview_id))
+
+    async def check_preview_approval(self, preview_id: str) -> None:
+        preview = self._previews.get(preview_id)
+        if preview is not None:
+            await _delivery_call(lambda: self._route(preview))
+
+    async def offer_dependency_handoff(self, *, planning_assignment_id: str, issue_key: str, base_revision: str) -> dict[str, Any]:
+        dependencies = self._dependencies
+        if dependencies is None:
+            raise PermissionError("Dependency readiness requires an explicit operator binding")
+        return await _delivery_call(lambda: dependencies.offer(
+            planning_assignment_id=planning_assignment_id, issue_key=issue_key, base_revision=base_revision))
 
     async def offer_correction(self, review_preview_id: str) -> DeveloperPreview | None:
         reviews = self._reviews
@@ -273,6 +300,8 @@ class ManagedOrganizationService:
         if route is None or not preview.approved:
             return None
         if activation is not None:
+            if str(preview.bundle_payload.get("task_id", "")).startswith("dependent-issue-") and activation != route:
+                raise PermissionError("Saved dependency activation must retain the exact staged revision/event")
             if ((self._planning is not None and self._planning.route_for(preview_id) is not None) or
                     self._reviews is not None and (self._reviews.route_for(preview_id) is not None or self._reviews.correction_route_for(preview_id) is not None)) and activation != route:
                 raise PermissionError("Saved planning/review activation must retain the exact staged revision/event")
@@ -300,6 +329,10 @@ class ManagedOrganizationService:
                     raise PermissionError("Operator selection is not eligible for the activated route")
                 if strategy == "human" and proposal is None:
                     return None
+                if str(preview.bundle_payload.get("task_id", "")).startswith("dependent-issue-"):
+                    checked_route = await _delivery_call(lambda: self._route(preview))
+                    if checked_route != route:
+                        raise PermissionError("Dependency activation changed before task preparation")
                 coordinator: CoordinatorProposal | None = None
                 if strategy == "coordinator":
                     team = next(team for team in snapshot.definition.teams if team.id == configured.team)
@@ -354,7 +387,7 @@ class ManagedOrganizationService:
             if (planning_route.organization_id != assignment.organization_id or self._assignments.for_task(assignment.task_id) != assignment):
                 raise PermissionError("Planning assignment is outside this managed activation")
             return assignment
-        route = next((route for route in (*self._routes, *self._review_routes, *self._correction_routes) if issue is not None and
+        route = next((route for route in (*self._routes, *self._review_routes, *self._correction_routes, *self._dependency_routes) if issue is not None and
                       (route.repository, route.repository_id, route.organization_id) ==
                       (issue.repository, issue.repository_id, assignment.organization_id)), None)
         if route is None or self._assignments.for_task(assignment.task_id) != assignment:

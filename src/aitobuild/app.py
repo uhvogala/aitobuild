@@ -690,7 +690,15 @@ def create_app(
         if base_revision is not None and (not isinstance(base_revision, str) or not base_revision):
             raise HTTPException(status_code=400, detail="base_revision must be a non-empty commit SHA")
         try:
+            candidate = dispatcher.developer_preview_registry.get(preview_id_raw.strip())
+            if (candidate is not None and str(candidate.bundle_payload.get("task_id", "")).startswith("dependent-issue-")
+                    and managed_service is None):
+                raise PermissionError("Dependent handoffs require their trusted managed service binding")
+            if managed_service is not None:
+                await managed_service.check_preview_approval(preview_id_raw.strip())
             approved = dispatcher.approve_developer_preview(preview_id_raw.strip(), base_revision=base_revision)
+        except (OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         if approved is None:
@@ -816,6 +824,22 @@ def create_app(
             except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
             return {"retired": record.state == "retired", "delivery": record.to_payload()}
+
+        @app.post("/internal/organization/dependencies/offer")
+        async def offer_dependency_handoff(
+            payload: dict[str, Any],
+            x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        ) -> dict[str, Any]:
+            _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+            fields = {"planning_assignment_id", "issue_key", "base_revision"}
+            if set(payload) != fields or any(not isinstance(payload[key], str) or not payload[key].strip() for key in fields):
+                raise HTTPException(status_code=400, detail="Dependency staging accepts only planning_assignment_id, issue_key and base_revision")
+            if managed_service is None:
+                raise RuntimeError("Internal invariant violated: managed_service is not None")
+            try:
+                return await managed_service.offer_dependency_handoff(**{key: payload[key].strip() for key in fields})
+            except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
 
         @app.post("/internal/organization/reviews/offer")
         async def offer_published_review(
@@ -1014,7 +1038,7 @@ def create_app(
         }
 
     @app.post("/internal/developer/delivery/prepare")
-    def prepare_developer_delivery(
+    async def prepare_developer_delivery(
         payload: dict[str, Any],
         x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
     ) -> dict[str, Any]:
@@ -1028,8 +1052,14 @@ def create_app(
         if dispatcher.developer_preview_registry.get(preview_id) is None:
             raise HTTPException(status_code=404, detail="preview_id not found")
         try:
-            record = delivery_worker.prepare(preview_id)
-        except ValueError as error:
+            candidate = dispatcher.developer_preview_registry.get(preview_id)
+            if (candidate is not None and str(candidate.bundle_payload.get("task_id", "")).startswith("dependent-issue-")
+                    and managed_service is None):
+                raise PermissionError("Dependent handoffs require their trusted managed service binding")
+            if managed_service is not None:
+                await managed_service.check_preview_approval(preview_id)
+            record = await _delivery_call(lambda: delivery_worker.prepare(preview_id))
+        except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"accepted": record.state == "prepared", "delivery": record.to_payload()}
 

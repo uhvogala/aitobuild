@@ -20,7 +20,7 @@ from aitobuild.organization_runner import FileRunStore, ManagedWorkflowRunner, R
 from aitobuild.organization_runtime import ModelProfile, bootstrap_organization
 from test_organization_assignments import approved_task
 from aitobuild.developer_preview import DeveloperPreviewRegistry
-from aitobuild.tools.github import GitHubBlobChange, MockGitHubAdapter, _git_blob_sha
+from aitobuild.tools.github import GhCliGitHubAdapter, GitHubBlobChange, MockGitHubAdapter, _git_blob_sha
 from test_dispatcher import (
     approved_delivery as approved_delivery, implemented_delivery as implemented_delivery,
     verification_adapter as verification_adapter,
@@ -1253,7 +1253,8 @@ def test_published_review_http_hook_and_metadata_only_retry(tmp_path, published_
 
 @pytest.mark.parametrize("scenario", ["approved", "preamble", "empty_final", "rejected", "metadata_only", "head_drift", "recovered", "publication_race",
                                       "partial_page", "skip_page", "oversized_output", "body_drift", "evidence_drift", "uncertain_submit", "expired_at_write",
-                                      "correction", "correction_outside", "correction_partial", "correction_drift", "body_at_limit", "body_over_limit"])
+                                      "correction", "correction_outside", "correction_partial", "correction_drift", "body_at_limit", "body_over_limit",
+                                      "repository_context", "context_only", "context_head_drift", "context_corrupt"])
 def test_native_architect_review_requires_inspection_and_exact_saved_approval(
     tmp_path, published_delivery, monkeypatch, scenario,
 ):
@@ -1263,6 +1264,28 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
     payload = json.loads(json.dumps(publication.bundle_payload))
     payload["task_id"] = "fresh-architect-review"
     payload["objective"] = "Inspect this published head and propose a COMMENT for human approval"
+    context_case = scenario in {"repository_context", "context_only", "context_head_drift", "context_corrupt"}
+    context_path = "architecture/existing_patterns.py"
+    context_content = b"pattern first\npattern second\n"
+    if context_case:
+        payload["policy"]["max_file_changes"] = 0
+        payload["policy"]["allowed_command_prefixes"] = []
+        repo, head = publication.publication["repository"], publication.publication["head_sha"]
+        context_sha = _git_blob_sha(context_content)
+        github.commit_files[(repo, head)] |= {context_path: GitHubBlobChange("100644", context_content, context_sha)}
+        if scenario in {"context_head_drift", "context_corrupt"}:
+            original_blob = github.get_blob
+
+            def context_blob(**kwargs):
+                result = original_blob(**kwargs)
+                if kwargs["blob_sha"] == context_sha:
+                    if scenario == "context_corrupt":
+                        return b"incorrect search content"
+                    number = publication.publication["pull_number"]
+                    github.pull_requests[repo][number] = replace(github.pull_requests[repo][number], head_sha="f" * 40)
+                return result
+
+            monkeypatch.setattr(github, "get_blob", context_blob)
     previews = DeveloperPreviewRegistry(tmp_path / "review-previews.json")
     preview = previews.create_or_get(dedupe_key="review", bundle_payload=payload, source_payload={})
     preview = previews.approve(preview.preview_id, base_revision=publication.base_revision)
@@ -1285,7 +1308,25 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
         assert f"at most {max_body} characters including whitespace" in json.dumps(body["messages"])
         bodies.append(body)
         step = len(bodies) - (1 if scenario == "recovered" else 0)
-        if correction_case and step == 3:
+        context_calls = [
+            ("architect_find_repository_files", {"max_results": 1}),
+            ("architect_find_repository_files", {"offset": 1}),
+            ("architect_search_repository_files", {"pattern": "pattern", "glob": "architecture/**", "max_results": 1}),
+            ("architect_search_repository_files", {"pattern": "pattern", "glob": "architecture/**", "max_results": 1, "line_offset": 1}),
+            ("architect_read_repository_source", {"path": context_path}),
+        ] + ([] if scenario == "context_only" else [
+            ("architect_read_published_source", {"path": path}), ("architect_read_published_diff", {"path": path}),
+        ])
+        if context_case and step <= len(context_calls):
+            name, arguments = context_calls[step - 1]
+            message = {"role": "assistant", "content": None, "tool_calls": [{"id": "context-" + str(step), "type": "function", "function": {
+                "name": name, "arguments": json.dumps(arguments),
+            }}]}
+            finish = "tool_calls"
+        elif context_case:
+            message = {"role": "assistant", "content": expected_comment}
+            finish = "stop"
+        elif correction_case and step == 3:
             message = {"role": "assistant", "content": None, "tool_calls": [{"id": "correction", "type": "function", "function": {
                 "name": "architect_propose_correction", "arguments": json.dumps({"paths": ["outside.py" if scenario == "correction_outside" else path],
                                                                                 "objective": "Correct the inspected edge case and retain passing tests"}),
@@ -1332,13 +1373,23 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                     assert waiting.state == "failed" and "final assistant response" in waiting.error
                     assert not waiting.pending and not github.reviews
                     assert json.loads(Path(assignment.budget_path).read_text()) == before | {"aborted": True}
-                elif scenario in {"metadata_only", "partial_page", "skip_page", "oversized_output", "correction_partial"}:
+                elif scenario in {"metadata_only", "partial_page", "skip_page", "oversized_output", "correction_partial", "context_only", "context_head_drift"}:
                     assert waiting.state == "failed" and "complete source and diff" in waiting.error
                 else:
                     assert waiting.state == "waiting", waiting.error
                     assert waiting.pending[0].kind == "service_approval"
                     assert waiting.pending[0].data["body"] == expected_comment
                     assert github.reviews == []
+                    if context_case:
+                        saved_context = await adapter()._sessions.get(waiting.session_id)
+                        context_evidence = saved_context.state["aitobuild_review_context"]
+                        assert context_evidence["source:" + context_path + ":0"]["blob_sha"] == context_sha
+                        assert all(item["head_sha"] == target.head_sha for item in context_evidence.values())
+                        assert before["reserved_paths"] == [] and payload["policy"]["max_file_changes"] == 0
+                        if scenario == "repository_context":
+                            searches = [json.loads(entry["content"]) for entry in bodies[-1]["messages"]
+                                        if entry["role"] == "tool" and '"matches"' in entry["content"]]
+                            assert [result["matches"][0]["line"] for result in searches] == [1, 2]
                     if scenario == "correction":
                         assert waiting.pending[0].data["correction"] == {"paths": [path], "objective": "Correct the inspected edge case and retain passing tests"}
                     if scenario == "correction_outside":
@@ -1385,7 +1436,7 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                         monkeypatch.setattr(worker, "submit_architect_review", expired)
                     done = await make_runner(adapter()).approve(assignment.assignment_id, request_id=waiting.pending[0].request_id,
                                                                approved=scenario != "rejected")
-                    if scenario in {"approved", "preamble", "recovered", "correction", "correction_outside", "body_at_limit"}:
+                    if scenario in {"approved", "preamble", "recovered", "correction", "correction_outside", "body_at_limit", "repository_context", "context_corrupt"}:
                         assert done.state == "completed", done.error
                         assert github.reviews[0].body == ARCHITECT_REVIEW_BODY_PREFIX + expected_comment
                         assert len(github.reviews) == 1
@@ -1399,14 +1450,101 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                         assert done.state == "failed" and not github.reviews
                         assert json.loads(Path(assignment.budget_path).read_text()) == before | {"aborted": True}
                 assert developer_budget.read_bytes() == before_developer
-                if scenario in {"recovered", "correction_outside"}:
+                if scenario in {"recovered", "correction_outside", "context_corrupt"}:
                     session = await adapter()._sessions.get(waiting.session_id)
                     assert session.state["aitobuild_role_diagnostics"]
 
     asyncio.run(exercise())
     assert {entry["function"]["name"] for entry in bodies[0]["tools"]} == {
-        "architect_read_published_source", "architect_read_published_diff",
+        "architect_read_published_source", "architect_read_published_diff", "architect_find_repository_files",
+        "architect_read_repository_source", "architect_search_repository_files",
     } | ({"architect_propose_correction"} if correction_case else set())
+
+
+@pytest.mark.parametrize("scenario", ["valid", "truncated", "wrong_commit", "wrong_tree", "unsafe_path", "duplicate", "bad_sha", "bad_mode"])
+def test_review_repository_tree_is_complete_immutable_and_get_only(monkeypatch, scenario):
+    github = GhCliGitHubAdapter(allowed_repositories=("fixture/widgets",))
+    head, tree_sha = "a" * 40, "b" * 40
+    entry = {"path": "architecture/pattern.py", "mode": "100644", "type": "blob", "sha": "c" * 40}
+    tree = {"sha": tree_sha, "truncated": False, "tree": [entry]}
+    commit = {"sha": head, "tree": {"sha": tree_sha}}
+    if scenario == "truncated":
+        tree["truncated"] = True
+    elif scenario == "wrong_commit":
+        commit["sha"] = "d" * 40
+    elif scenario == "wrong_tree":
+        tree["sha"] = "d" * 40
+    elif scenario == "unsafe_path":
+        entry["path"] = "../outside.py"
+    elif scenario == "duplicate":
+        tree["tree"].append(dict(entry))
+    elif scenario == "bad_sha":
+        entry["sha"] = "main"
+    elif scenario == "bad_mode":
+        entry["mode"] = "040000"
+    reads = []
+
+    def api(endpoint, **kwargs):
+        assert kwargs.get("method", "GET") == "GET"
+        reads.append(endpoint)
+        return commit if "/git/commits/" in endpoint else tree
+
+    monkeypatch.setattr(github, "_api", api)
+    if scenario == "valid":
+        result = github.get_tree_at_commit(repository="fixture/widgets", commit_sha=head)
+        assert result[entry["path"]].object_sha == entry["sha"]
+        assert reads == [f"repos/fixture/widgets/git/commits/{head}", f"repos/fixture/widgets/git/trees/{tree_sha}?recursive=1"]
+    else:
+        with pytest.raises(ValueError):
+            github.get_tree_at_commit(repository="fixture/widgets", commit_sha=head)
+
+
+@pytest.mark.parametrize("scenario", ["immutable", "unicode", "missing", "unsafe_path", "binary", "corrupt_blob", "head_drift"])
+def test_architect_repository_context_is_not_limited_to_developer_paths(published_delivery, monkeypatch, scenario):
+    worker, preview_id, budget_path, github, record = published_delivery
+    before_budget = budget_path.read_bytes()
+    repo, head = record.publication["repository"], record.publication["head_sha"]
+    path = "architecture/existing_patterns.py"
+    content = "def existing_pattern():\n    return 'caf\u00e9'\n".encode()
+    if scenario == "binary":
+        content = b"\xff"
+    change = GitHubBlobChange("100644", content, _git_blob_sha(content))
+    github.commit_files[(repo, head)] |= {path: change}
+    assert path not in record.publication["changed_paths"]
+    assert path not in record.bundle_payload["policy"]["allowed_paths"]
+    if scenario == "immutable":
+        local = Path(record.checkout_path) / path
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_text("untrusted mutable local content")
+    if scenario == "corrupt_blob":
+        monkeypatch.setattr(github, "get_file_at_commit", lambda **kwargs: replace(change, content=b"wrong bytes"))
+    if scenario == "head_drift":
+        original = github.get_file_at_commit
+
+        def drift(**kwargs):
+            result = original(**kwargs)
+            number = record.publication["pull_number"]
+            github.pull_requests[repo][number] = replace(github.pull_requests[repo][number], head_sha="f" * 40)
+            return result
+
+        monkeypatch.setattr(github, "get_file_at_commit", drift)
+    if scenario in {"missing", "unsafe_path", "binary", "corrupt_blob", "head_drift"}:
+        with pytest.raises((ValueError, PermissionError)):
+            worker.get_review_repository_source(preview_id, github=github,
+                path="missing.py" if scenario == "missing" else "../outside.py" if scenario == "unsafe_path" else path)
+    else:
+        tree = worker.get_review_repository_tree(preview_id, github=github)
+        assert {item["path"] for item in tree["files"]} == set(github.commit_files[(repo, head)])
+        assert path in {item["path"] for item in tree["files"]}
+        source = worker.get_review_repository_source(preview_id, github=github, path=path)
+        assert source["content"].encode() == content and source["head_sha"] == head
+        if scenario == "unicode":
+            page = worker.get_review_repository_source(preview_id, github=github, path=path, max_bytes=len(content) - 4)
+            tail = worker.get_review_repository_source(preview_id, github=github, path=path, offset=page["next_offset"])
+            assert (page["content"] + tail["content"]).encode() == content
+        with pytest.raises(PermissionError):
+            worker.get_published_source(preview_id, github=github, path=path)
+    assert budget_path.read_bytes() == before_budget
 
 
 @pytest.mark.parametrize("scenario", ["immutable", "unicode", "deleted", "mode_only", "binary", "corrupt_blob",

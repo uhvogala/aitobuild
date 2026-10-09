@@ -152,10 +152,10 @@ def default_developer_isolation_policy() -> DeveloperIsolationPolicy:
 
 
 def default_architect_isolation_policy() -> DeveloperIsolationPolicy:
-    """Stricter read-only analysis policy for Architect workspace tools."""
+    """Read-only Architect policy; the empty prefix covers the repository root."""
     return DeveloperIsolationPolicy(
         allowed_tools=(IsolationTool.GITHUB, IsolationTool.FILESYSTEM, IsolationTool.BASH),
-        allowed_paths=("src/", "tests/", "README.md", "pyproject.toml", "PLAN.md", "MILESTONES.md"),
+        allowed_paths=("",),
         blocked_paths=(".git/", ".venv/", "secrets/", ".aitobuild/"),
         allowed_command_prefixes=(
             "uv", "python", "python3", "pytest", "ruff", "mypy", "coverage",

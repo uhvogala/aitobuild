@@ -27,7 +27,7 @@ Team structure and lifecycle are not fixed in code.
 | Organization configuration | Immutable revisions, native graphs, durable assignments/runs, opt-in workers, native PM coordination and bounded correction follow-ups | Broader live configuration coverage and distributed controls |
 | Ingress and routing | Signed webhooks, internal auth, issue extraction, durable scope approval/dedupe and activated task queueing | Hosted GitHub webhook delivery and deployment activation |
 | Developer execution | Preview approval, scoped exact-text edits, independent verification and supervised live same-PR correction delivery | Stronger isolation and broader live coverage |
-| Native model runtime | Native PM planning, approved Developer delivery and head-pinned Architect review | Broader PM semantics, dependency scheduling and hosted model execution |
+| Native model runtime | Native PM planning, operator-triggered merged-prerequisite handoffs, approved Developer delivery and head-pinned Architect review | Broader PM semantics, automatic dependency scheduling and hosted model execution |
 | GitHub integration | Verified drafts, immutable reads, head-pinned COMMENTs and durable exact-approved PM issue publication | Hosted delivery and broader live coverage |
 | Meetings and proactive scans | Opt-in bounded native blocker meetings, durable transcripts/proposals, exact-approved continuation through supervised local delivery/review and deterministic scans | Automatic blocker detection, repeated meetings, hosted/distributed acceptance and real repository scans |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state and CI quality gates | Background tick driver, broader durable state, tracing, stronger isolation |
@@ -40,6 +40,9 @@ and publication approvals. Automatic dependency scheduling, hosted webhook deliv
 distributed execution and automatic blocker detection remain outside the supported flow.
 Explicit managed graphs can resolve reported blockers through bounded read-only
 meetings before continuing the unchanged approved task.
+An explicitly bound dependency handoff can inspect merged prerequisites read-only
+and stage a fresh unapproved dependent at a new operator-pinned base. It does not
+approve work, start a scheduler or merge PRs.
 
 GitHub defaults to mock mode. Real-repository trials use
 [uhvogala/aitobuild_example](https://github.com/uhvogala/aitobuild_example) with
@@ -372,13 +375,35 @@ Register the adapter's `cleanup`, operations and binding revision with the runne
 selected roles must use configured native agents without persistent tool profiles.
 No default bootstrap, route or universal contribution loop is installed.
 
-The Architect receives only publication-bound source/diff reads, paged inline at
-up to 1,000 bytes. Reads use hash-verified immutable blobs and the pinned base commit,
-not the mutable checkout or truncated PR patches. Regular UTF-8 files up to 1 MiB
-are supported; binary files, symlinks and submodules fail closed. Mode-only changes
-are reported in before/after mode fields even when the text diff is empty.
+The native Architect has read-only access to the whole repository at the pinned
+review head, independent of the Developer's allowed edit paths. It chooses context
+needed to assess architecture, style, existing patterns, reuse and compatibility:
+`architect_find_repository_files` discovers tracked paths, `architect_search_repository_files`
+searches literal text with file/line continuation offsets, and
+`architect_read_repository_source` reads any regular UTF-8 repository file.
+Repository reads are hash-verified and commit-pinned, never taken from a mutable
+checkout. They cannot select another repository/head or access host files.
+
+Discovery supports complete trees up to 10,000 entries and pages of at most 50 paths;
+truncated/ambiguous trees fail closed rather than silently hiding context. Source
+files support up to 1 MiB, with context pages up to 4,000 bytes. Search scans at most
+10 files per call, returns at most 20 matches and explicitly identifies skipped
+binary files. Symlinks/submodules are discoverable but not traversed. Original task
+deadlines and inline result limits still apply; smaller pages may be needed.
+
+Publication-bound source/diff reads remain separate, paged at up to 1,000 bytes,
+using immutable head blobs and the pinned base commit rather than truncated PR
+patches. Mode-only changes are reported even when the text diff is empty.
 Complete contiguous source AND diff access for every changed path is required
-before a proposal, but access counters do not certify semantic understanding.
+before a proposal. Context reads do not replace that minimum, and access counters
+do not certify semantic understanding. Whole-repository reads do not expand write,
+command, correction or publication permissions.
+
+Legacy workspace Architect tools also default to repository-wide read scope.
+Runtime paths `.git/`, `.venv/`, `secrets/` and `.aitobuild/` remain excluded;
+traversal and symlinks escaping the workspace are rejected. Explicit operator
+policy restrictions still apply. These workspace tools are not the immutable,
+GitHub-bound native review tools described above.
 
 The exact saved target/body requires a separate one-shot service approval. Resume
 does not rerun the model; it rechecks saved evidence, head/scope and the original
@@ -539,6 +564,84 @@ GitHub list visibility can lag new writes: a temporary reconciliation refusal is
 not authority to repeat a POST/PATCH. Inspect later via remote reads under the same receipts;
 never reset the original ledger. Legacy `PlanDraftStore` and
 `IssueWriteApprovalStore` remain separate in-memory prototype tools.
+
+### Managed Dependency Handoffs
+
+[src/aitobuild/organization_dependencies.py](src/aitobuild/organization_dependencies.py)
+provides `ManagedDependencies`. Inside the same operator-owned factory used for PM
+planning, configure a Developer-only event route and pass the binding to the service:
+
+```python
+from aitobuild.organization_dependencies import ManagedDependencies
+
+dependencies = ManagedDependencies(
+	planning=planning, worker=context.worker,
+	state_dir=context.state_dir / "dependency-handoffs",
+	routes=(PlanningRoute(
+		repository=target_repository, repository_id=target_repository_id,
+		organization_id=snapshot.organization_id, revision=snapshot.revision,
+		event=developer_event,
+	),),
+	lookup_max_receipts=100,
+)
+# Pass planning=admission and dependencies=dependencies to ManagedOrganizationService.
+```
+
+No default activation changes. The binding must share the service-owned planning
+admission, previews, definitions, worker and operator. Configured delegation and
+native graph operations still decide execution; readiness does not select a team
+or replace a contribution workflow. Change the operator binding revision when
+registered behavior changes.
+
+For prerequisites published by earlier worker instances, explicitly pass their
+trusted receipt owners as `prerequisite_workers=(archived_worker,)`. At most eight
+historical owners are supported, for saved delivery reads only; ambiguous receipt
+ownership fails closed. Preserve their immutable preview/publication metadata.
+This does not reopen old execution ledgers or reuse implementation approvals.
+New preparation/execution always uses the active service-owned worker and a fresh
+task budget; never copy expired ledgers into fresh execution storage.
+
+Call the authenticated operator endpoint with only these fields:
+
+```json
+{
+  "planning_assignment_id": "<saved PM assignment>",
+  "issue_key": "<dependent plan key>",
+  "base_revision": "<40-character current base-branch SHA>"
+}
+```
+
+`POST /internal/organization/dependencies/offer` inspects exact saved issue/link
+receipts and all prerequisite deliveries using GitHub reads only. Missing or
+unpublished prerequisites and unmerged PRs return `state=waiting` without a new
+preview. A ready prerequisite requires a saved approved, independently verified
+publication; exact repository/issue/PR/head/branches; GitHub-reported `merged_by`
+of type `User`; and merge ancestry in the proposed current base-branch head.
+Closed prerequisite issues are allowed only with unchanged published content.
+The dependent issue must remain open. Missing, ambiguous, malformed or drifted
+evidence refuses staging; an altered PR head, including a correction advance,
+does not silently replace the original publication evidence.
+
+When all prerequisites qualify, the response contains `state=staged` and a fresh
+`handoff_preview`. Original plan, issue content, dependent preview, approvals and
+ledgers remain unchanged. The handoff preserves objective, criteria and policy,
+changes only task identity and pinned base, and persists its evidence before local
+preview staging. Exact interrupted local staging can recover without remote writes
+or model/effect replay; lost completed receipts/previews cannot be recreated.
+Published handoffs can be prerequisites for later plan issues, with bounded receipt
+lookup and acyclic transitive inspection. Competing publications fail closed.
+
+Approve the fresh preview separately through `/internal/developer/preview/approve`
+and use the existing configured request/direct/detached admission flow. Readiness
+is rechecked before approval and preparation, including standalone preparation;
+stale branch/head/issue evidence cannot start work. With this binding enabled, the
+original dependency-bearing preview is not an alternate execution route. Admission
+uses a fresh ledger and a private trusted seed that already contains the new base.
+The seed must be outside both the service checkout and delivery state. Nested or
+linked service checkouts are refused before target execution.
+Owned/terminal runs retain frozen recovery rather than depending on a mutable live
+branch. Verification, publication and review remain separate gates. No automatic
+approval, merge, background tick driver or distributed locking is provided.
 
 ### Native PM Coordinator Binding
 

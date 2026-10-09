@@ -1214,6 +1214,46 @@ class DeveloperDeliveryWorker:
                 "deleted": blob_sha is None, "content": page, "offset": offset, "total_bytes": len(content),
                 "truncated": truncated, "next_offset": offset + consumed if truncated else None}
 
+    def get_review_repository_tree(self, preview_id: str, *, github: GitHubAdapter) -> dict[str, Any]:
+        pull = self.get_published_pull_request(preview_id, github=github)
+        if not pull["head_matches_publication"]:
+            raise ValueError("Published draft head SHA no longer matches the review target")
+        files = github.get_tree_at_commit(repository=pull["repository"], commit_sha=pull["expected_head_sha"])
+        current = self.get_published_pull_request(preview_id, github=github)
+        if not current["head_matches_publication"] or current["expected_head_sha"] != pull["expected_head_sha"]:
+            raise ValueError("Published draft head SHA changed during repository discovery")
+        return {"preview_id": preview_id, "repository": pull["repository"], "head_sha": pull["expected_head_sha"],
+                "files": [{"path": path, "mode": files[path].mode, "object_sha": files[path].object_sha} for path in sorted(files)]}
+
+    def get_review_repository_source(
+        self, preview_id: str, *, github: GitHubAdapter, path: str, offset: int = 0,
+        max_bytes: int = 24000,
+    ) -> dict[str, Any]:
+        if type(offset) is not int or offset < 0 or type(max_bytes) is not int or not 1 <= max_bytes <= 24000:
+            raise ValueError("Review paging must use bounded integer byte offsets/limits")
+        pull = self.get_published_pull_request(preview_id, github=github)
+        if not pull["head_matches_publication"]:
+            raise ValueError("Published draft head SHA no longer matches the review target")
+        source = github.get_file_at_commit(repository=pull["repository"], commit_sha=pull["expected_head_sha"], path=path)
+        if source is None:
+            raise ValueError("Repository context file does not exist at the pinned review head")
+        content = source.content
+        if (source.mode not in {"100644", "100755"} or len(content) > 1048576 or offset > len(content)
+                or _git_blob_sha(content) != source.blob_sha):
+            raise ValueError("Repository context blob identity/mode/size/offset is invalid")
+        content.decode("utf-8")
+        page = content[offset:offset + max_bytes].decode("utf-8", errors="ignore")
+        consumed = len(page.encode("utf-8"))
+        if offset < len(content) and (not consumed or content[offset] & 0xC0 == 0x80):
+            raise ValueError("Review byte page must end/advance on a UTF-8 boundary")
+        current = self.get_published_pull_request(preview_id, github=github)
+        if not current["head_matches_publication"] or current["expected_head_sha"] != pull["expected_head_sha"]:
+            raise ValueError("Published draft head SHA changed during repository context inspection")
+        truncated = offset + consumed < len(content)
+        return {"preview_id": preview_id, "repository": pull["repository"], "head_sha": pull["expected_head_sha"],
+                "path": path, "blob_sha": source.blob_sha, "mode": source.mode, "content": page, "offset": offset,
+                "total_bytes": len(content), "truncated": truncated, "next_offset": offset + consumed if truncated else None}
+
     def get_published_diff(
         self, preview_id: str, *, github: GitHubAdapter, path: str, offset: int = 0,
         max_bytes: int = 24000,

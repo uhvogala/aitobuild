@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from hashlib import sha256
 import json
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, Self
 
 from agent_framework import Agent, AgentSession, FileSessionStore, FunctionInvocationContext, function_middleware, tool
@@ -29,7 +29,7 @@ from aitobuild.organization_reviews import CorrectionProposal
 from aitobuild.organization_service import CoordinatorBinding
 from aitobuild.policy import ActionClass, AgentRole
 from aitobuild.tool_outputs import MAX_PROMPT_BYTES, MAX_TOOL_RESULT_BYTES, build_output_guard
-from aitobuild.tools.github import GitHubAdapter
+from aitobuild.tools.github import GitHubAdapter, _git_blob_sha
 
 
 class _CoordinatorReceipt(DefinitionModel):
@@ -447,6 +447,112 @@ class NativeManagedRoles:
                             max_bytes: Annotated[int, Field(ge=1, le=1000)] = 1000) -> dict[str, Any]:
             return await read("diff", path, offset, max_bytes)
 
+        repository_tree: dict[str, Any] | None = None
+
+        async def context_result(key: str, result: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+            context.revalidate()
+            if await self._target(context) != target or result.get("head_sha") != target["head_sha"]:
+                raise PermissionError("Repository context must retain the pinned review target")
+            if len(json.dumps(result).encode("utf-8")) > MAX_TOOL_RESULT_BYTES - 256:
+                raise ValueError("Repository context page must fit inline; reduce the requested page size")
+            session.state.setdefault("aitobuild_review_context", {})[key] = {"head_sha": target["head_sha"], **evidence}
+            await self._sessions.set(context.run.session_id, session)
+            return result
+
+        async def repository_files(glob: str) -> list[dict[str, Any]]:
+            nonlocal repository_tree
+            context.revalidate()
+            if not glob or len(glob) > 256 or "\x00" in glob or "\\" in glob or ".." in PurePosixPath(glob).parts or glob.startswith("/"):
+                raise ValueError("Repository discovery requires a bounded repository-relative glob")
+            if await self._target(context) != target:
+                raise PermissionError("Review target changed before repository context inspection")
+            if repository_tree is None:
+                if self._worker is None or self._github is None:
+                    raise RuntimeError("Repository context requires a bound published delivery")
+                worker, github = self._worker, self._github
+                repository_tree = await _delivery_call(lambda: worker.get_review_repository_tree(target["preview_id"], github=github))
+            return [item for item in repository_tree["files"] if PurePosixPath(item["path"]).full_match(glob)]
+
+        @tool(name="architect_find_repository_files", approval_mode="never_require")
+        async def find_files(glob: str = "**", offset: Annotated[int, Field(ge=0)] = 0,
+                             max_results: Annotated[int, Field(ge=1, le=50)] = 20) -> dict[str, Any]:
+            """Discover tracked paths throughout the pinned repository, including unchanged files."""
+            files = await repository_files(glob)
+            if offset > len(files):
+                raise ValueError("Repository discovery offset exceeds the matching file count")
+            page = files[offset:offset + max_results]
+            end = offset + len(page)
+            return await context_result("find:" + glob + ":" + str(offset), {
+                "repository": target["repository"], "head_sha": target["head_sha"], "files": page,
+                "total_files": len(files), "truncated": end < len(files), "next_offset": end if end < len(files) else None,
+            }, {"kind": "find", "paths": [item["path"] for item in page]})
+
+        @tool(name="architect_read_repository_source", approval_mode="never_require")
+        async def read_context(path: str, offset: Annotated[int, Field(ge=0)] = 0,
+                               max_bytes: Annotated[int, Field(ge=1, le=4000)] = 1000) -> dict[str, Any]:
+            """Read any regular UTF-8 file at the review head, independently of Developer write scope."""
+            if await self._target(context) != target or self._worker is None or self._github is None:
+                raise PermissionError("Repository context requires the exact bound review head")
+            worker, github = self._worker, self._github
+            result = await _delivery_call(lambda: worker.get_review_repository_source(
+                target["preview_id"], github=github, path=path, offset=offset, max_bytes=max_bytes))
+            return await context_result("source:" + path + ":" + str(offset), result, {
+                "kind": "source", "path": path, "blob_sha": result["blob_sha"], "offset": offset,
+                "end": result["next_offset"] if result["truncated"] else result["total_bytes"], "complete": not result["truncated"],
+            })
+
+        @tool(name="architect_search_repository_files", approval_mode="never_require")
+        async def search_files(pattern: str, glob: str = "**", file_offset: Annotated[int, Field(ge=0)] = 0,
+                               line_offset: Annotated[int, Field(ge=0)] = 0,
+                               max_results: Annotated[int, Field(ge=1, le=20)] = 10,
+                               max_files: Annotated[int, Field(ge=1, le=10)] = 5) -> dict[str, Any]:
+            """Search literal text across pinned repository files; page with the returned file/line offsets."""
+            if not pattern or len(pattern) > 256 or "\x00" in pattern:
+                raise ValueError("Repository search requires bounded nonempty literal text")
+            files = [item for item in await repository_files(glob) if item["mode"] in {"100644", "100755"}]
+            if file_offset > len(files) or file_offset == len(files) and line_offset:
+                raise ValueError("Repository search offset exceeds matching files")
+            matches: list[dict[str, Any]] = []
+            skipped: list[str] = []
+            scanned: list[str] = []
+            next_file, next_line = file_offset, 0
+            for index in range(file_offset, min(len(files), file_offset + max_files)):
+                context.revalidate()
+                item = files[index]
+                if self._github is None:
+                    raise RuntimeError("Repository search requires its bound GitHub reader")
+                github = self._github
+                content = await _delivery_call(lambda: github.get_blob(repository=target["repository"], blob_sha=item["object_sha"]))
+                if len(content) > 1048576 or _git_blob_sha(content) != item["object_sha"]:
+                    raise ValueError("Repository search blob identity/size is invalid")
+                scanned.append(item["path"])
+                try:
+                    lines = content.decode("utf-8").splitlines()
+                except UnicodeDecodeError:
+                    skipped.append(item["path"])
+                    next_file = index + 1
+                    continue
+                start = line_offset if index == file_offset else 0
+                if start > len(lines):
+                    raise ValueError("Repository search line offset exceeds the file")
+                for line_index in range(start, len(lines)):
+                    if pattern in lines[line_index]:
+                        matches.append({"path": item["path"], "line": line_index + 1, "text": lines[line_index][:400],
+                                        "text_truncated": len(lines[line_index]) > 400, "blob_sha": item["object_sha"]})
+                        if len(matches) == max_results:
+                            next_file, next_line = (index, line_index + 1) if line_index + 1 < len(lines) else (index + 1, 0)
+                            break
+                else:
+                    next_file, next_line = index + 1, 0
+                    continue
+                break
+            more = next_file < len(files)
+            return await context_result("search:" + pattern + ":" + glob + ":" + str(file_offset) + ":" + str(line_offset), {
+                "repository": target["repository"], "head_sha": target["head_sha"], "matches": matches,
+                "scanned_paths": scanned, "skipped_binary_paths": skipped, "truncated": more,
+                "next_file_offset": next_file if more else None, "next_line_offset": next_line if more else None,
+            }, {"kind": "search", "paths": scanned, "pattern": pattern})
+
         @tool(name="architect_propose_correction", approval_mode="never_require")
         async def propose_correction(paths: list[str], objective: str) -> dict[str, Any]:
             context.revalidate()
@@ -467,10 +573,13 @@ class NativeManagedRoles:
 
         max_body = ARCHITECT_REVIEW_BODY_MAX - len(ARCHITECT_REVIEW_BODY_PREFIX)
         guidance = ("Inspect complete source AND diff for each approved changed path at the pinned target below. "
+            "Use repository discovery, literal search and source readers for any relevant unchanged files across the whole repository. "
+            "Choose enough context to assess architecture, style, established patterns, reuse and behavioral compatibility; "
+            "Developer write paths do not limit these immutable repository reads. Context reads do not replace changed-file source/diff inspection. "
                 f"Return COMMENT review text only, at most {max_body} characters including whitespace. "
                 "Be concise; never claim metadata alone proves semantic correctness. "
                     "Publication requires a separate operator approval.")
-        tools: tuple[Any, ...] = (read_source, read_diff)
+        tools: tuple[Any, ...] = (read_source, read_diff, find_files, read_context, search_files)
         if self._allow_corrections:
             tools += (propose_correction,)
             guidance += " Optionally propose one scoped correction after inspection; this cannot assign, approve or execute a Developer task."

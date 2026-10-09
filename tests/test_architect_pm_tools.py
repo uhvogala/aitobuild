@@ -147,18 +147,43 @@ def test_architect_cannot_stop_developer_session(tmp_path: Path) -> None:
         tools["architect_start_session"]("dev-hijack")
 
 
-def test_architect_read_file_roundtrip(tmp_path: Path) -> None:
-    target = tmp_path / "src"
-    target.mkdir()
-    (target / "mod.py").write_text("value = 1\n", encoding="utf-8")
+@pytest.mark.parametrize("path", ["src/mod.py", "docs/architecture.md", "config/settings.toml", ".github/workflows/check.yml"])
+def test_architect_read_file_roundtrip(tmp_path: Path, path: str) -> None:
+    target = tmp_path / path
+    target.parent.mkdir(parents=True)
+    target.write_text("value = 1\n", encoding="utf-8")
     tools = _tool_map(build_role_tools(context=_context(tmp_path))["architect"])
-    assert tools["architect_read_file"]("src/mod.py") == "value = 1\n"
-    found = tools["architect_find_files"]("**/*.py", "src")
-    assert (
-        "src/mod.py" in found["results"]
-        or any(item.get("path") == "src/mod.py" for item in found.get("results", []))
-        or "src/mod.py" in str(found)
-    )
+    assert tools["architect_read_file"](path) == "value = 1\n"
+    found = tools["architect_find_files"]("**/*", ".", include_hidden=True)
+    assert path in {item["path"] for item in found["results"]}
+    matches = tools["architect_search_files"]("value = 1", include_hidden=True)
+    assert path in {item["path"] for item in matches["results"]}
+
+
+@pytest.mark.parametrize("path", [".git/config", ".venv/config", "secrets/token.txt", ".aitobuild/runtime.json"])
+def test_architect_repository_context_keeps_runtime_exclusions(tmp_path: Path, path: str) -> None:
+    target = tmp_path / path
+    target.parent.mkdir(parents=True)
+    target.write_text("excluded context\n", encoding="utf-8")
+    tools = _tool_map(build_role_tools(context=_context(tmp_path))["architect"])
+    with pytest.raises(ValueError, match="outside allowed"):
+        tools["architect_read_file"](path)
+    found = tools["architect_find_files"]("**/*", ".", include_hidden=True, include_ignored=True)
+    assert path not in {item["path"] for item in found["results"]}
+    matches = tools["architect_search_files"]("excluded context", include_hidden=True, include_ignored=True)
+    assert not matches["results"]
+
+
+def test_architect_repository_context_cannot_escape_workspace(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside.py"
+    outside.write_text("outside context\n", encoding="utf-8")
+    (tmp_path / "escape.py").symlink_to(outside)
+    tools = _tool_map(build_role_tools(context=_context(tmp_path))["architect"])
+    for path in ("../outside.py", str(outside), "escape.py"):
+        with pytest.raises(ValueError, match="traverse|workspace-relative|outside"):
+            tools["architect_read_file"](path)
+    found = tools["architect_find_files"]("**/*", ".", include_hidden=True, include_ignored=True)
+    assert "escape.py" not in {item["path"] for item in found["results"]}
 
 
 def test_pm_plan_approval_requires_operator_store_not_agent_flag(tmp_path: Path) -> None:

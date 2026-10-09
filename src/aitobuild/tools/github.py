@@ -148,6 +148,12 @@ class GitHubBlobChange:
 
 
 @dataclass(frozen=True)
+class GitHubTreeEntry:
+    mode: str
+    object_sha: str
+
+
+@dataclass(frozen=True)
 class GitHubPinnedChange:
     """A pinned file change by identity only (mode + git blob SHA), as saved in an approval snapshot."""
 
@@ -179,6 +185,9 @@ def pinned_changes_from_snapshot(snapshot: Mapping[str, Any]) -> dict[str, GitHu
 
 class GitHubAdapter(Protocol):
     def inspect_planning_target(self, *, repository: str, repository_id: int, base_revision: str) -> dict[str, Any]: ...
+
+    def inspect_dependency_merge(self, *, repository: str, repository_id: int, pull_number: int,
+                                 head_sha: str, head_branch: str, base_branch: str, base_revision: str) -> dict[str, Any]: ...
 
     def find_issue_publication(self, *, repository: str, marker: str, max_pages: int = 10) -> tuple[GitHubIssue, ...]: ...
 
@@ -238,6 +247,8 @@ class GitHubAdapter(Protocol):
     def get_blob(self, *, repository: str, blob_sha: str) -> bytes: ...
 
     def get_file_at_commit(self, *, repository: str, commit_sha: str, path: str) -> GitHubBlobChange | None: ...
+
+    def get_tree_at_commit(self, *, repository: str, commit_sha: str) -> dict[str, GitHubTreeEntry]: ...
 
     def submit_pr_review(
         self,
@@ -339,6 +350,20 @@ class MockGitHubAdapter:
     _branch_heads: dict[str, dict[str, str]] = field(default_factory=dict)
     commit_files: dict[tuple[str, str], dict[str, GitHubBlobChange]] = field(default_factory=dict)
     repository_ids: dict[str, int] = field(default_factory=dict)
+    dependency_merges: dict[tuple[str, int, str], dict[str, Any]] = field(default_factory=dict)
+
+    def inspect_dependency_merge(self, *, repository: str, repository_id: int, pull_number: int,
+                                 head_sha: str, head_branch: str, base_branch: str, base_revision: str) -> dict[str, Any]:
+        self.inspect_planning_target(repository=repository, repository_id=repository_id, base_revision=base_revision)
+        evidence = self.dependency_merges.get((repository, pull_number, base_revision))
+        if evidence is None:
+            pull = self.get_pull_request(repository=repository, pull_number=pull_number)
+            if (pull.repository, pull.head_sha, pull.head_ref, pull.base_ref) != (repository, head_sha, head_branch, base_branch):
+                raise PermissionError("Dependency pull request target changed")
+            return {"ready": False, "reason": "merge_unproven"}
+        return _dependency_merge_evidence(evidence["pull"], evidence["branch_sha"], evidence.get("comparison"),
+            repository=repository, repository_id=repository_id, pull_number=pull_number, head_sha=head_sha,
+            head_branch=head_branch, base_branch=base_branch, base_revision=base_revision)
 
     def inspect_planning_target(self, *, repository: str, repository_id: int, base_revision: str) -> dict[str, Any]:
         repo = self._resolve_repository(repository)
@@ -543,6 +568,18 @@ class MockGitHubAdapter:
         if (repo, commit_sha) not in self.commit_files:
             raise LookupError("Commit not found")
         return self.commit_files[(repo, commit_sha)].get(path)
+
+    def get_tree_at_commit(self, *, repository: str, commit_sha: str) -> dict[str, GitHubTreeEntry]:
+        repo = self._resolve_repository(repository)
+        _validate_blob_sha(commit_sha)
+        if (repo, commit_sha) not in self.commit_files:
+            raise LookupError("Commit not found")
+        files = self.commit_files[(repo, commit_sha)]
+        if len(files) > 10000:
+            raise ValueError("Review repository tree exceeds the discovery limit")
+        for path in files:
+            _validate_read_path(commit_sha, path)
+        return {path: GitHubTreeEntry(mode=change.mode, object_sha=change.blob_sha) for path, change in files.items()}
 
     def submit_pr_review(
         self,
@@ -1208,6 +1245,23 @@ class GhCliGitHubAdapter:
             )
         return _pull_request_from_api(raw, repository=repo, changed_files=changed_files)
 
+    def inspect_dependency_merge(self, *, repository: str, repository_id: int, pull_number: int,
+                                 head_sha: str, head_branch: str, base_branch: str, base_revision: str) -> dict[str, Any]:
+        repo = self._resolve_repository(repository)
+        _validate_blob_sha(head_sha)
+        self.inspect_planning_target(repository=repo, repository_id=repository_id, base_revision=base_revision)
+        raw = self._api(f"repos/{repo}/pulls/{pull_number}")
+        branch_sha = self._read_branch_head(repository=repo, branch=base_branch)
+        comparison = None
+        if isinstance(raw, dict) and raw.get("merged") is True:
+            merge_sha = raw.get("merge_commit_sha")
+            if not isinstance(merge_sha, str):
+                raise ValueError("Dependency merge commit SHA is missing or malformed")
+            _validate_blob_sha(merge_sha)
+            comparison = self._api(f"repos/{repo}/compare/{merge_sha}...{base_revision}")
+        return _dependency_merge_evidence(raw, branch_sha, comparison, repository=repo, repository_id=repository_id,
+            pull_number=pull_number, head_sha=head_sha, head_branch=head_branch, base_branch=base_branch, base_revision=base_revision)
+
     def get_blob(self, *, repository: str, blob_sha: str) -> bytes:
         repo = self._resolve_repository(repository)
         _validate_blob_sha(blob_sha)
@@ -1219,6 +1273,36 @@ class GhCliGitHubAdapter:
         if len(content) != raw["size"]:
             raise ValueError("GitHub blob size differs from its content")
         return content
+
+    def get_tree_at_commit(self, *, repository: str, commit_sha: str) -> dict[str, GitHubTreeEntry]:
+        repo = self._resolve_repository(repository)
+        _validate_blob_sha(commit_sha)
+        commit = self._api(f"repos/{repo}/git/commits/{commit_sha}")
+        if not isinstance(commit, dict) or commit.get("sha") != commit_sha or not isinstance(commit.get("tree"), dict):
+            raise ValueError("Review commit identity is invalid")
+        tree_sha = commit["tree"].get("sha")
+        _validate_blob_sha(tree_sha)
+        raw = self._api(f"repos/{repo}/git/trees/{tree_sha}?recursive=1")
+        if (not isinstance(raw, dict) or raw.get("sha") != tree_sha or raw.get("truncated") is not False
+                or not isinstance(raw.get("tree"), list) or len(raw["tree"]) > 10000):
+            raise ValueError("Review repository tree identity is invalid, incomplete or exceeds the discovery limit")
+        files: dict[str, GitHubTreeEntry] = {}
+        seen: set[str] = set()
+        for entry in raw["tree"]:
+            if not isinstance(entry, dict):
+                raise ValueError("Review repository tree entry is invalid")
+            path, mode, kind, blob_sha = (entry.get(key) for key in ("path", "mode", "type", "sha"))
+            if not isinstance(path, str) or not isinstance(mode, str) or not isinstance(blob_sha, str):
+                raise ValueError("Review repository tree entry identity is invalid")
+            _validate_read_path(commit_sha, path)
+            _validate_blob_sha(blob_sha)
+            if path in seen or (kind, mode) not in {("tree", "040000"), ("blob", "100644"), ("blob", "100755"),
+                                                    ("blob", "120000"), ("commit", "160000")}:
+                raise ValueError("Review repository tree contains ambiguous or unsupported entries")
+            seen.add(path)
+            if kind != "tree":
+                files[path] = GitHubTreeEntry(mode=mode, object_sha=blob_sha)
+        return files
 
     def get_file_at_commit(self, *, repository: str, commit_sha: str, path: str) -> GitHubBlobChange | None:
         repo = self._resolve_repository(repository)
@@ -1648,6 +1732,47 @@ class GhCliGitHubAdapter:
         # Callers that need a live issue must invoke create_issue explicitly.
         self.proposals.append(proposal)
 
+
+
+def _dependency_merge_evidence(raw: Any, branch_sha: str, comparison: Any, *, repository: str, repository_id: int,
+                               pull_number: int, head_sha: str, head_branch: str, base_branch: str,
+                               base_revision: str) -> dict[str, Any]:
+    _validate_blob_sha(head_sha)
+    _validate_blob_sha(base_revision)
+    if not isinstance(raw, dict) or type(raw.get("number")) is not int or raw["number"] != pull_number:
+        raise PermissionError("Dependency pull request identity changed")
+    head, base = raw.get("head"), raw.get("base")
+    if (not isinstance(head, dict) or not isinstance(base, dict) or
+            not isinstance(head.get("repo"), dict) or not isinstance(base.get("repo"), dict) or
+            any(item["repo"].get("full_name") != repository or type(item["repo"].get("id")) is not int or
+                item["repo"]["id"] != repository_id for item in (head, base)) or
+            (head.get("sha"), head.get("ref"), base.get("ref")) != (head_sha, head_branch, base_branch)):
+        raise PermissionError("Dependency pull request repository/head/base changed")
+    if branch_sha != base_revision:
+        raise PermissionError("Dependency handoff base is not the current pinned branch head")
+    if type(raw.get("merged")) is not bool:
+        raise PermissionError("Dependency merge state is not proven")
+    if raw["merged"] is False:
+        return {"ready": False, "reason": "not_merged"}
+    merger = raw.get("merged_by")
+    merge_sha = raw.get("merge_commit_sha")
+    if not isinstance(merge_sha, str):
+        raise ValueError("Dependency merge commit SHA is missing or malformed")
+    _validate_blob_sha(merge_sha)
+    if (raw.get("state") != "closed" or raw.get("draft") is not False or
+            not isinstance(raw.get("merged_at"), str) or not raw["merged_at"].strip() or
+            not isinstance(merger, dict) or merger.get("type") != "User" or
+            type(merger.get("id")) is not int or merger["id"] <= 0 or
+            not isinstance(merger.get("login"), str) or not merger["login"].strip()):
+        raise PermissionError("Dependency requires a completed GitHub-reported user merge")
+    if (not isinstance(comparison, dict) or comparison.get("status") not in {"identical", "ahead"} or
+            not isinstance(comparison.get("merge_base_commit"), dict) or
+            comparison["merge_base_commit"].get("sha") != merge_sha):
+        raise PermissionError("Dependency merge is not an ancestor of the pinned handoff base")
+    return {"ready": True, "repository": repository, "repository_id": repository_id, "pull_number": pull_number,
+            "head_sha": head_sha, "head_branch": head_branch, "base_branch": base_branch, "base_revision": base_revision,
+            "merge_commit_sha": merge_sha, "merged_at": raw["merged_at"],
+            "merged_by": {"id": merger["id"], "login": merger["login"]}}
 
 
 def _validate_read_path(commit_sha: str, path: str) -> tuple[str, ...]:

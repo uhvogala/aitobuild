@@ -633,6 +633,37 @@ the additive certificate, exact approvals, failures and recovery. This accepts t
 bounded supervised local meeting slice, not full M3/M4/M5, general tool certification,
 automatic blocker detection/repeated meetings or hosted/distributed execution.
 
+Dependency handoff local checkpoint (2026-10-09): an explicit operator binding
+reconciles actual saved prerequisite publications with read-only GitHub-reported
+user merge and ancestry evidence, then stages a separate unapproved dependent at
+a new pinned base. Native mocked PM, authenticated ASGI, durable recovery/lineage
+and real copied-seed direct/detached admission fixtures cover the slice; merge and
+verifier transport are mocked. Original approvals/budgets are preserved, stale
+admission fails closed and no automatic approval/merge/scheduler is introduced.
+This checkpoint was fixture-only; later local live acceptance is recorded below.
+
+Dependency/whole-repository review live checkpoint (2026-10-09): after the operator
+independently merged PR 36, exact GET-only merge/ancestry evidence staged a fresh
+base-pinned dependent task with its own approval/ledger. Historical receipt readers
+do not reopen old budgets. A nested-seed preparation refusal remains terminal and
+aborted; a new task with an external seed completed native DeepSeek README delivery,
+nine exact tool decisions, independent constrained verification/cleanup and draft
+PR 37. The initial README-only review exposed a context restriction. Native
+Architect tools now provide whole-repository pinned discovery/search/source reads
+without widening write permissions or replacing complete changed-file inspection.
+Legacy workspace read tools also default to repository-wide scope with runtime
+exclusions and workspace escape guards; explicit operator restrictions remain.
+A fresh zero-write review read actual implementation, tests, package layout and
+configuration, then consumed exact head-pinned COMMENT approval after restart.
+Its two recovered page-limit errors and supervisor metadata-gate diagnostic remain
+preserved; they did not require task/model/budget replay. Independent audit accepted
+real artifacts/context identities, exact effects, terminal idempotency, old evidence
+and cleanup. PR 37 remains draft/unmerged. Full gates: 1,005 passed, two optional skips,
+Ruff/mypy clean. PLAN records the failures, recovery and evidence limits. This
+accepts bounded supervised local dependency/context review, not full M3/M4/M5,
+zero-error tool usability, automatic scheduling, hosted/distributed certification
+or a measured product-team pilot.
+
 Deliverables:
 - Give the Architect read/review tools and repository analysis, not implementation-write privileges.
 - Route review results into fix requests, human review, or blocker-resolution meetings.
@@ -697,7 +728,7 @@ semantic coverage, hosted/distributed execution and the full three-role pilot re
 1. Preserve the configurable definition/storage regressions and existing M0/M1, exact-span and publication safeguards. Run CI for new slices; never target the service checkout.
 2. Preserve the accepted twelve-case live PM matrix and bounded local meeting-to-reviewed-draft/stop cases, with exact task/creation/resolved-link/continuation approvals. Extend broader planning-quality coverage and separately scoped implementation handoff before claiming the full pilot; Developer previews stay unapproved until that approval. Standing trial authorization does not bypass service gates or reset ledgers. Never replay uncertain writes; use read-only inspection for visibility lag. Keep activation explicit, with no fixed team/contribution loop. Automatic blocker detection/repeated meetings and distributed controls remain separate work.
 3. Preserve passing request-scoped/detached fixture and supervised local live acceptance (signed/authenticated delivery, decisions/restart, native SDK tools and independent verification/draft graph), and run hosted CI when authorized publication of the service changes is available. Default server activation and current hosted/distributed delivery remain unverified. Keep GitHub assignee writes separate and do not infer semantic review from metadata.
-4. Add a bounded, operator-triggered dependent-task readiness/handoff slice: reconcile actual human-merged prerequisites read-only, stage an unapproved dependent task, then require separate implementation approval with a freshly pinned base before execution. Publication or a COMMENT alone cannot satisfy a merge prerequisite; do not auto-approve, merge, reset ledgers or replay terminal tasks. Exercise the handoff in a coherent three-role pilot and measure task success, review quality, recovery, spend and human intervention before expanding automation.
+4. Preserve the accepted operator-triggered dependency handoff and whole-repository Architect context: exact human-merge reconciliation stays read-only, handoffs start unapproved and every implementation needs its own pinned base/approval/ledger. Keep historical receipt readers separate from execution storage and Architect read context separate from Developer write scope. Publication or a COMMENT cannot satisfy a merge prerequisite. Do not auto-approve, merge, reset ledgers or replay terminal tasks. Broaden the coherent three-role pilot and measure success, review quality, recovery, spend and human intervention before expanding automation.
 
 Update this snapshot when a milestone's exit checks have actually run. Record
 the date, commands, observed result, and any unvalidated external dependencies;
