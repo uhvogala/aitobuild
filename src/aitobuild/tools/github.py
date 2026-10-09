@@ -66,6 +66,7 @@ class GitHubIssue:
     labels: tuple[str, ...] = ()
     html_url: str | None = None
     repository: str | None = None
+    issue_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -177,6 +178,10 @@ def pinned_changes_from_snapshot(snapshot: Mapping[str, Any]) -> dict[str, GitHu
 
 
 class GitHubAdapter(Protocol):
+    def inspect_planning_target(self, *, repository: str, repository_id: int, base_revision: str) -> dict[str, Any]: ...
+
+    def find_issue_publication(self, *, repository: str, marker: str, max_pages: int = 10) -> tuple[GitHubIssue, ...]: ...
+
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue: ...
 
     def list_issues(
@@ -198,6 +203,7 @@ class GitHubAdapter(Protocol):
         labels: tuple[str, ...] = (),
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], Any] | None = None,
     ) -> GitHubIssue: ...
 
     def update_issue(
@@ -212,6 +218,7 @@ class GitHubAdapter(Protocol):
         labels: tuple[str, ...] | None = None,
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], Any] | None = None,
     ) -> GitHubIssue: ...
 
     def link_issues(
@@ -331,6 +338,21 @@ class MockGitHubAdapter:
     _next_pr: int = 1
     _branch_heads: dict[str, dict[str, str]] = field(default_factory=dict)
     commit_files: dict[tuple[str, str], dict[str, GitHubBlobChange]] = field(default_factory=dict)
+    repository_ids: dict[str, int] = field(default_factory=dict)
+
+    def inspect_planning_target(self, *, repository: str, repository_id: int, base_revision: str) -> dict[str, Any]:
+        repo = self._resolve_repository(repository)
+        if self.repository_ids.get(repo) != repository_id or (repo, base_revision) not in self.commit_files:
+            raise PermissionError("Planning repository identity or pinned base differs")
+        return {"repository": repo, "repository_id": repository_id, "base_revision": base_revision}
+
+    def find_issue_publication(self, *, repository: str, marker: str, max_pages: int = 10) -> tuple[GitHubIssue, ...]:
+        repo = self._resolve_repository(repository)
+        if type(max_pages) is not int or max_pages <= 0:
+            raise ValueError("Publication lookup needs a positive page bound")
+        if len(self.issues.get(repo, {})) > max_pages * 100:
+            raise PermissionError("Issue lookup exceeds the configured page bound")
+        return tuple(issue for issue in self.issues.get(repo, {}).values() if marker in issue.body)
 
     def _resolve_repository(self, repository: str) -> str:
         return assert_repository_allowed(
@@ -384,6 +406,7 @@ class MockGitHubAdapter:
         labels: tuple[str, ...] = (),
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], Any] | None = None,
     ) -> GitHubIssue:
         assert_role_action_allowed(role, ActionClass.ISSUE_WRITE)
         assert_repo_write_approval(
@@ -391,6 +414,8 @@ class MockGitHubAdapter:
             approved=approved,
         )
         repository = self._resolve_repository(repository)
+        if before_write is not None:
+            before_write()
         number = self._next_issue
         self._next_issue += 1
         issue = GitHubIssue(
@@ -401,6 +426,7 @@ class MockGitHubAdapter:
             labels=tuple(label.strip() for label in labels if label.strip()),
             html_url=f"https://github.com/{repository}/issues/{number}",
             repository=repository,
+            issue_id=number,
         )
         self.issues.setdefault(repository, {})[number] = issue
         return issue
@@ -417,6 +443,7 @@ class MockGitHubAdapter:
         labels: tuple[str, ...] | None = None,
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], Any] | None = None,
     ) -> GitHubIssue:
         assert_role_action_allowed(role, ActionClass.ISSUE_WRITE)
         assert_repo_write_approval(
@@ -425,6 +452,8 @@ class MockGitHubAdapter:
         )
         repository = self._resolve_repository(repository)
         current = self.get_issue(repository=repository, issue_number=issue_number)
+        if before_write is not None:
+            before_write()
         updated = GitHubIssue(
             number=current.number,
             title=title.strip() if title is not None else current.title,
@@ -433,6 +462,7 @@ class MockGitHubAdapter:
             labels=tuple(labels) if labels is not None else current.labels,
             html_url=current.html_url,
             repository=current.repository or repository,
+            issue_id=current.issue_id,
         )
         self.issues[repository][issue_number] = updated
         return updated
@@ -1012,6 +1042,34 @@ class GhCliGitHubAdapter:
         raw = self._api(f"repos/{repo}/issues/{issue_number}")
         return _issue_from_api(raw, repository=repo)
 
+    def inspect_planning_target(self, *, repository: str, repository_id: int, base_revision: str) -> dict[str, Any]:
+        repo = self._resolve_repository(repository)
+        if re.fullmatch(r"[0-9a-f]{40}", base_revision) is None:
+            raise ValueError("Planning base must be a resolved commit SHA")
+        identity = self._api(f"repos/{repo}")
+        commit = self._api(f"repos/{repo}/commits/{base_revision}")
+        if (not isinstance(identity, dict) or type(identity.get("id")) is not int or identity["id"] != repository_id or
+                str(identity.get("full_name", "")).lower() != repo or
+                not isinstance(commit, dict) or commit.get("sha") != base_revision):
+            raise PermissionError("Planning repository identity or pinned base differs")
+        return {"repository": repo, "repository_id": repository_id, "base_revision": base_revision}
+
+    def find_issue_publication(self, *, repository: str, marker: str, max_pages: int = 10) -> tuple[GitHubIssue, ...]:
+        repo = self._resolve_repository(repository)
+        if type(max_pages) is not int or max_pages <= 0 or not marker:
+            raise ValueError("Publication lookup requires a marker and positive page bound")
+        matches: list[GitHubIssue] = []
+        for page in range(1, max_pages + 1):
+            raw = self._api(f"repos/{repo}/issues?state=all&per_page=100&page={page}")
+            if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
+                raise RuntimeError("Unreadable issue publication lookup")
+            for item in raw:
+                if "pull_request" not in item and marker in str(item.get("body") or ""):
+                    matches.append(_issue_from_api(item, repository=repo))
+            if len(raw) < 100:
+                return tuple(matches)
+        raise PermissionError("Issue publication lookup is incomplete at its configured page bound")
+
     def list_issues(
         self,
         *,
@@ -1045,6 +1103,7 @@ class GhCliGitHubAdapter:
         labels: tuple[str, ...] = (),
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], Any] | None = None,
     ) -> GitHubIssue:
         assert_role_action_allowed(role, ActionClass.ISSUE_WRITE)
         assert_repo_write_approval(
@@ -1056,6 +1115,8 @@ class GhCliGitHubAdapter:
         cleaned_labels = [label.strip() for label in labels if label.strip()]
         if cleaned_labels:
             payload["labels"] = cleaned_labels
+        if before_write is not None:
+            before_write()
         raw = self._api(f"repos/{repo}/issues", method="POST", payload=payload)
         return _issue_from_api(raw, repository=repo)
 
@@ -1071,6 +1132,7 @@ class GhCliGitHubAdapter:
         labels: tuple[str, ...] | None = None,
         approved: bool,
         require_human_approval_for_repo_writes: bool,
+        before_write: Callable[[], Any] | None = None,
     ) -> GitHubIssue:
         assert_role_action_allowed(role, ActionClass.ISSUE_WRITE)
         assert_repo_write_approval(
@@ -1089,6 +1151,8 @@ class GhCliGitHubAdapter:
             payload["labels"] = [label.strip() for label in labels if label.strip()]
         if not payload:
             return self.get_issue(repository=repo, issue_number=issue_number)
+        if before_write is not None:
+            before_write()
         raw = self._api(f"repos/{repo}/issues/{issue_number}", method="PATCH", payload=payload)
         return _issue_from_api(raw, repository=repo)
 
@@ -1817,6 +1881,7 @@ def _issue_from_api(raw: Any, *, repository: str) -> GitHubIssue:
         labels=tuple(labels),
         html_url=str(raw["html_url"]) if raw.get("html_url") else None,
         repository=repository,
+        issue_id=raw.get("id") if type(raw.get("id")) is int else None,
     )
 
 

@@ -22,6 +22,7 @@ from aitobuild.organization_runner import (
 )
 from aitobuild.organization_runtime import WorkflowLimits, WorkflowPredicate
 from aitobuild.organization_reviews import PublishedReviewAdmission
+from aitobuild.organization_planning import PlanningAdmission
 from aitobuild.tools.github import GitHubAdapter
 
 
@@ -67,12 +68,18 @@ class ManagedOrganizationService:
         limits: WorkflowLimits = WorkflowLimits(),
         reviews: PublishedReviewAdmission | None = None,
         automatic_review_followups: bool = False,
+        planning: PlanningAdmission | None = None,
     ) -> None:
         self._definitions = definitions
         self._assignments = assignments
         self._runs = runs
         self._previews = previews
         self._worker = worker
+        if planning is not None and (planning.definitions is not definitions or planning.previews is not previews or
+                                     planning.operator_id != operator_id):
+            raise PermissionError("Planning must use service-owned definitions, previews and operator identity")
+        self._planning = planning
+        self._planning_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in planning.routes) if planning else ()
         if reviews is not None:
             reviews.validate_binding(definitions=definitions, previews=previews, worker=worker)
         self._reviews = reviews
@@ -85,7 +92,7 @@ class ManagedOrganizationService:
         targets = [(route.repository, route.repository_id) for route in self._routes]
         if len(targets) != len(set(targets)):
             raise ValueError("Managed repository routes must be unambiguous")
-        for route in (*self._routes, *self._review_routes, *self._correction_routes):
+        for route in (*self._routes, *self._review_routes, *self._correction_routes, *self._planning_routes):
             snapshot = definitions.get(route.organization_id, route.revision)
             if snapshot is None or not any(route.event in item.events for item in snapshot.definition.routes):
                 raise ValueError("Managed activation requires an existing explicit revision/event")
@@ -104,6 +111,11 @@ class ManagedOrganizationService:
         )
 
     def _route(self, preview: DeveloperPreview) -> ManagedRoute | None:
+        if str(preview.bundle_payload.get("task_id", "")).startswith("pm-planning-"):
+            if self._planning is None:
+                raise PermissionError("Planning tasks require their trusted admission binding")
+            planning_route = self._planning.route_for(preview.preview_id)
+            return ManagedRoute.model_validate(planning_route.model_dump()) if planning_route else None
         if self._reviews is None and str(preview.bundle_payload.get("task_id", "")).startswith(("published-review-", "published-correction-")):
             raise PermissionError("Staged review tasks require their trusted admission binding")
         if self._reviews is not None:
@@ -148,6 +160,10 @@ class ManagedOrganizationService:
         return self._runs.get(assignment.assignment_id) if assignment is not None else None
 
     def budget_path(self, preview_id: str) -> Path:
+        if self._planning is not None:
+            path = self._planning.original_budget_path(preview_id)
+            if path is not None:
+                return path
         if self._reviews is not None:
             path = self._reviews.original_budget_path(preview_id)
             if path is not None:
@@ -257,8 +273,9 @@ class ManagedOrganizationService:
         if route is None or not preview.approved:
             return None
         if activation is not None:
-            if self._reviews is not None and (self._reviews.route_for(preview_id) is not None or self._reviews.correction_route_for(preview_id) is not None) and activation != route:
-                raise PermissionError("Saved review activation must retain the exact staged revision/event")
+            if ((self._planning is not None and self._planning.route_for(preview_id) is not None) or
+                    self._reviews is not None and (self._reviews.route_for(preview_id) is not None or self._reviews.correction_route_for(preview_id) is not None)) and activation != route:
+                raise PermissionError("Saved planning/review activation must retain the exact staged revision/event")
             if (activation.repository, activation.repository_id, activation.organization_id) != (
                 route.repository, route.repository_id, route.organization_id,
             ):
@@ -296,7 +313,10 @@ class ManagedOrganizationService:
                     else:
                         coordinator = binding
                 reviews = self._reviews
-                if reviews is not None and reviews.route_for(preview_id) is not None:
+                planning = self._planning
+                if planning is not None and planning.route_for(preview_id) is not None:
+                    await _delivery_call(lambda: planning.prepare(preview_id))
+                elif reviews is not None and reviews.route_for(preview_id) is not None:
                     await _delivery_call(lambda: reviews.prepare(preview_id))
                 else:
                     prepared = await _delivery_call(lambda: self._worker.prepare(preview_id))
@@ -327,6 +347,13 @@ class ManagedOrganizationService:
         if assignment is None:
             raise ValueError("Assignment not found")
         issue = assignment.bundle.issue_context
+        if assignment.task_id.startswith("pm-planning-"):
+            if self._planning is None:
+                raise PermissionError("Planning assignment requires its trusted admission binding")
+            planning_route = self._planning.owned_route(assignment.task_id, assignment.preview_id)
+            if (planning_route.organization_id != assignment.organization_id or self._assignments.for_task(assignment.task_id) != assignment):
+                raise PermissionError("Planning assignment is outside this managed activation")
+            return assignment
         route = next((route for route in (*self._routes, *self._review_routes, *self._correction_routes) if issue is not None and
                       (route.repository, route.repository_id, route.organization_id) ==
                       (issue.repository, issue.repository_id, assignment.organization_id)), None)

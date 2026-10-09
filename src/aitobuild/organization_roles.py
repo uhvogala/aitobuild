@@ -23,6 +23,7 @@ from aitobuild.organization_assignments import AssignmentProposal
 from aitobuild.organization_delivery import _delivery_call
 from aitobuild.organization_runner import ManagedOperation, ManagedTaskContext, WorkflowInput
 from aitobuild.organization_runtime import OrganizationRuntime
+from aitobuild.organization_planning import ManagedPlanning, PlanProposal
 from aitobuild.organization_reviews import PublishedReviewTarget as PublishedReviewTarget
 from aitobuild.organization_reviews import CorrectionProposal
 from aitobuild.organization_service import CoordinatorBinding
@@ -198,6 +199,7 @@ class NativeManagedRoles:
         review_target_for: Callable[[ManagedTaskContext], PublishedReviewTarget] | None = None,
         invoke_timeout_seconds: float = 180,
         allow_correction_proposals: bool = False,
+        planning: ManagedPlanning | None = None,
     ) -> None:
         if not proposal_event.strip() or not math.isfinite(invoke_timeout_seconds) or invoke_timeout_seconds <= 0:
             raise ValueError("Managed roles require an explicit proposal route and positive timeout")
@@ -210,10 +212,14 @@ class NativeManagedRoles:
         self._target_for = review_target_for
         self._timeout = invoke_timeout_seconds
         self._allow_corrections = allow_correction_proposals
+        self._planning = planning
 
     @property
     def operations(self) -> Mapping[str, ManagedOperation]:
         operations = {"pm_propose_assignment": ManagedOperation(self.propose, role=AgentRole.PM)}
+        if self._planning is not None:
+            operations["pm_plan_issues"] = ManagedOperation(
+                self.plan, role=AgentRole.PM, action=ActionClass.ISSUE_WRITE, on_response=self.approve_plan)
         if self._worker is not None and self._github is not None and self._target_for is not None:
             operations["architect_review_published"] = ManagedOperation(
                 self.review, role=AgentRole.ARCHITECT, action=ActionClass.PR_REVIEW, on_response=self.approve_review,
@@ -297,6 +303,66 @@ class NativeManagedRoles:
         session.state["aitobuild_role_proposal"] = proposal.model_dump(mode="json")
         await self._sessions.set(context.run.session_id, session)
         return {"proposal": proposal.model_dump(mode="json"), "event": self._proposal_event, "metadata_only": True}
+
+    async def plan(self, context: ManagedTaskContext, message: Any) -> WorkflowInput:
+        agent = self._agent(context, AgentRole.PM)
+        planning = self._planning
+        if planning is None:
+            raise PermissionError("Managed PM planning is not configured")
+        request = planning.request(context)
+        session = await self._session(context, agent, {"role": "pm_planning", "scope": request.scope.model_dump(mode="json")})
+        if session.state.get("aitobuild_plan_state") is not None:
+            raise PermissionError("Saved planning invocation cannot replay")
+        session.state["aitobuild_plan_state"] = "running"
+        await self._sessions.set(context.run.session_id, session)
+
+        @tool(name="pm_inspect_planning_request", approval_mode="never_require")
+        async def inspect_request() -> dict[str, Any]:
+            evidence = await _delivery_call(lambda: planning.inspect(context))
+            if len(json.dumps(evidence).encode()) > MAX_TOOL_RESULT_BYTES - 256:
+                raise ValueError("Planning inspection must fit inline before recording evidence")
+            session.state["aitobuild_plan_inspections"] = evidence
+            await self._sessions.set(context.run.session_id, session)
+            return evidence
+
+        text = await self._invoke(context, agent, session, (inspect_request,),
+                                  "Inspect the approved planning request and pinned repository/base. Return JSON only: "
+                                  "{issues: [{key, title, objective, acceptance_criteria, dependencies, labels}]}. "
+                                  "Keys are local identifiers; dependencies reference these keys and must be acyclic. "
+                                  "Never provide repository, actor, assignee, approval or commands. This is a proposal only. "
+                                  "Limits: " + request.scope.limits.model_dump_json())
+        proposal = PlanProposal.model_validate_json(text)
+        evidence = session.state.get("aitobuild_plan_inspections")
+        if not isinstance(evidence, dict):
+            raise PermissionError("Planning requires saved complete request and target inspection")
+        data = await _delivery_call(lambda: planning.propose(context, proposal, evidence))
+        session.state["aitobuild_plan_state"] = "proposed"
+        session.state["aitobuild_plan_approval"] = data
+        await self._sessions.set(context.run.session_id, session)
+        return WorkflowInput("Approve exact PM issue content and dependency publication", data, "service_approval")
+
+    async def approve_plan(self, context: ManagedTaskContext, original: Any, approved: Any) -> dict[str, Any] | WorkflowInput:
+        self._agent(context, AgentRole.PM)
+        planning = self._planning
+        session = await self._sessions.get(context.run.session_id)
+        if (planning is None or session is None or session.state.get("aitobuild_plan_state") != "proposed" or
+                session.state.get("aitobuild_plan_approval") != original):
+            raise PermissionError("PM publication must retain its exact saved native proposal")
+        request = planning.request(context)
+        pins = {"assignment_id": context.assignment.assignment_id, "revision": context.assignment.revision,
+            "scope_digest": context.assignment.scope_digest, "budget_path": context.assignment.budget_path,
+            "role": "pm_planning", "scope": request.scope.model_dump(mode="json")}
+        if session.session_id != context.run.session_id or session.state.get("aitobuild_role_pins") != pins:
+            raise PermissionError("PM publication session cannot switch scope, revision or owner")
+        result = await _delivery_call(lambda: planning.publish(context, original, approved))
+        if result["state"] == "awaiting_links":
+            session.state["aitobuild_plan_approval"] = result["approval"]
+            await self._sessions.set(context.run.session_id, session)
+            return WorkflowInput("Approve exact resolved dependency links", result["approval"], "service_approval")
+        session.state["aitobuild_plan_state"] = "published"
+        session.state["aitobuild_plan_publication"] = result
+        await self._sessions.set(context.run.session_id, session)
+        return result
 
     async def _target(self, context: ManagedTaskContext) -> dict[str, Any]:
         assignment = context.revalidate()

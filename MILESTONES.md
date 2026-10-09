@@ -1,11 +1,11 @@
 # Delivery Milestones
 
-Last verified: 2026-10-08. This is the execution roadmap; [PLAN.md](PLAN.md)
+Last verified: 2026-10-09. This is the execution roadmap; [PLAN.md](PLAN.md)
 describes the target architecture and [README.md](README.md) documents setup.
 Statuses below are evidence-based, not completion estimates or promised dates.
 
 Latest refresh: merged PRs #11/#13 pulled to `69aa8d4`, preserving local bounded
-follow-ups, now committed locally as `307b86a`. Current gates: 853 tests pass/two optional Docker skips; Ruff/mypy (48 sources) pass.
+follow-ups, now committed locally as `307b86a`. That baseline passed 853 tests/two optional Docker skips; Ruff/mypy (48 sources) passed.
 Issues #9/#10/#12 are resolved. Exact recovery is read-only; every actual remote
 write remains original-budget guarded. Older consolidation counts and blocker
 descriptions below are historical. Both real Docker probes and fresh Grok scoped
@@ -56,9 +56,40 @@ terminal restart, one-round scope and cleanup. This accepts the supervised
 correction/re-review sequence through explicit operator recovery, not an
 uninterrupted configured-service run or automatic retry endpoint. Reporter and
 audit-schema errors are retained; metadata-only recovery never replayed the model
-or COMMENT. The trial helper's timestamp audit remains a follow-up. Evidence:
+or COMMENT. The trial helper's timestamp audit is now repaired and validated
+offline using actual saved snapshots and ten negative mutations. Evidence:
 `sim/.run-artifacts/example-correction-20261008/final-correction-recovery-report.json`.
 Nineteen native review contract cases passed again; no service push or merge.
+
+Latest bounded slice (2026-10-09): opt-in managed native PM planning and durable
+approval-gated issue publication over `c690958`. Forty-nine local cases cover strict
+bounded plans, native inspection evidence, request/detached/HTTP admission,
+immutable original ledgers, creation and resolved-link approval restarts, one-shot
+decisions, lost state, drift, cancellation, rejection, expiry, uncertain effects,
+bounded GitHub lookup and partial preview staging. Developer handoffs remain
+unapproved/unassigned; no implementation executes. These local tests alone do not
+accept live PM planning/publication, hosted/distributed delivery or meetings.
+At that implementation checkpoint there was no commit, push, merge, dependency
+change, default activation or live write; subsequent live acceptance follows below.
+Final local gates: **902 passed/two optional Docker skips**, Ruff/mypy
+(49 source files), editor diagnostics and ignored-harness lint pass.
+
+Subsequent bounded live PM acceptance (2026-10-09): twelve fresh native Grok/GitHub
+cases passed request/detached success, creation/link rejection, cancellation,
+real original-deadline expiry, landed/absent response loss, partial handoff staging
+and real concurrent issue-body drift. Valid exact service decisions were consumed;
+the expired approval intent was refused before consumption. No gate bypass or
+model authority. Independent audit verified fifteen unique demo
+issues (#12-#26), nine unapproved/unassigned/unprepared Developer previews, original
+ledgers, failed/aborted outcomes, historical evidence, unchanged master/prior draft
+heads and cleanup. Immediate list visibility caused two saved audit refusals;
+direct receipt reads and later metadata-only reconciliation recovered without
+write/model replay or deadline reset. Evidence:
+`sim/.run-artifacts/example-planning-20261009/live-report.json`.
+Post-trial 49 focused contracts, Ruff/mypy and supervisor lint pass. No product
+source edit, commit/push/merge, dependencies or default activation during trials.
+This accepts bounded supervised local ASGI PM planning/publication, not hosted
+execution, distributed recovery, implementation handoff execution or full M5.
 
 ## Direction
 
@@ -101,12 +132,13 @@ execute task code against the aitobuild service checkout.
 | Persistent Docker sessions | Private checkouts/home volumes, restart memory/history and scoped cleanup | Live integration evidence; prototype isolation only |
 | MCP shell/filesystem | Native stdio transport adapter, configurable names | Optional; compatibility validation pending |
 | GitHub output | Allowlisted gh CLI branch/commit/draft publication, immutable snapshots and exact reconciliation; supervised live same-PR correction | Hosted delivery and broader live coverage pending |
-| Architect/PM/meetings | Native PM delegation, saved COMMENT approvals and recovered supervised live correction/re-review | Managed PM planning/writes and meetings pending; no automatic failed-review retry |
+| Architect/PM/meetings | Native PM delegation, bounded supervised live planning/publication and recovered correction/re-review | Broader PM semantics and executed meetings pending; no automatic failed-review retry |
 | Operations | Manual tick API, local durable managed worker and successful hosted CI baseline | M0 accepted; broader durable state/distributed controls and tracing missing |
 
-Current local gates with consolidated PR #11 and supervised correction cycles atop
-`38c721d`: **798 passed, two optional Docker probes skipped**;
-Ruff and mypy (47 source files) and the mock fixture simulation pass. Worker gates
+Current local gates including managed PM planning: **902 passed, two optional
+Docker probes skipped**, Ruff and mypy (49 source files). Earlier consolidated
+PR #11 gates at `38c721d` passed 798 tests, Ruff/mypy (47 sources) and the mock
+fixture simulation. Worker gates
 passed with 587; service gates
 passed with 549; runner gates
 passed with 531; assignment gates passed with 492;
@@ -588,7 +620,18 @@ Exit criteria:
 
 ## M5: Supervised Product-Team Pilot
 
-Status: **future direction**. Depends on M4.
+Status: **bounded PM planning/publication implemented and supervised live accepted;
+full pilot remains future direction**. Depends on M4 for operational acceptance.
+
+The managed slice offers a repository/base/revision-pinned unapproved planning
+task and initializes its original zero-write ledger only after task approval.
+Configured native PM output is metadata, with immutable plan/inspection receipts.
+Separate exact creation and resolved dependency approvals precede GitHub effects;
+write-time scope/content/deadline checks and saved intents prevent blind retry.
+Read-only reconciliation can confirm landed effects or recover local preview staging,
+but incomplete/ambiguous writes require inspection. Planned Developer previews
+remain unapproved; a separate scoped implementation approval is still required.
+This does not complete the three-role live pilot or certify planning quality.
 
 Deliverables:
 - Add PM backlog tools for approved issue creation, decomposition, dependencies, and completion tracking.
@@ -601,15 +644,13 @@ Exit criteria:
 
 ## Immediate Work Queue
 
-Local integration of [PR #11](https://github.com/uhvogala/aitobuild/pull/11)
-(operator-only correction approvals/chain recovery) and the preserved managed
-lifecycle is complete and uncommitted. Next resolve [issue #9](https://github.com/uhvogala/aitobuild/issues/9)
-(uncertain PR-create receipt) and [issue #10](https://github.com/uhvogala/aitobuild/issues/10)
-(atomic-write/symlink/permission hardening) before claiming live delivery acceptance.
-These remain open; no remote PR merge or live trial was performed.
+PR #11 integration, issues #9/#10/#12 and supervised correction/re-review recovery
+are complete at the committed baseline. The bounded PM planning/publication slice
+is uncommitted and now accepted in twelve bounded supervised live cases. Broader
+semantic coverage, hosted/distributed execution and the three-role pilot remain open.
 
 1. Preserve the configurable definition/storage regressions and existing M0/M1, exact-span and publication safeguards. Run CI for new slices; never target the service checkout.
-2. Prioritize uncertain PR-create recovery and shared storage/permission hardening before fresh live delivery acceptance. Opt-in service/worker routing, PM coordination, source/diff inspection and supervised correction cycles are locally implemented. Broader integration remains managed PM planning/issue writes and bounded executed meetings. Preserve immutable receipts, exact separate approvals and original budgets; never replay uncertain effects or widen permissions. Keep activation explicit, with no fixed team/contribution loop. Distributed controls remain separate.
+2. Preserve the accepted twelve-case live PM matrix and exact task/creation/resolved-link approvals. Extend broader planning-quality coverage and separately scoped implementation handoff before claiming the full pilot; Developer previews stay unapproved until that approval. Standing trial authorization does not bypass service gates or reset ledgers. Never replay uncertain writes; use read-only inspection for visibility lag. Keep activation explicit, with no fixed team/contribution loop. Bounded executed meetings and distributed controls remain separate work.
 3. Preserve passing request-scoped/detached fixture acceptance (signed/authenticated delivery, decisions/restart, native SDK/mock-transport tools and independent verification/mock draft graph), and run hosted CI when authorized publication of the service changes is available. Default server activation, live configured-worker delivery and hosted CI remain unverified. Keep GitHub assignee writes separate and do not infer semantic review from metadata.
 4. Stage a freshly approved live draft trial using outcome-based contribution grading. Recheck GitHub hosting/authentication/allowlist; do not replay the previously aborted task. Recovered tool errors are diagnostics, not contribution blockers. Stage head-bound COMMENT review only with actual source/diff inspection before claiming semantic review.
 

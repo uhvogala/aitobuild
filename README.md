@@ -20,21 +20,45 @@ Team structure and lifecycle are not fixed in code.
 - [.devcontainer/certs/README.md](.devcontainer/certs/README.md): host certificate setup.
 - [agents.md](agents.md): repository conventions for contributors and coding agents.
 
-## Current status (2026-10-08)
+## Current status (2026-10-09)
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
 | Organization configuration | Immutable revisions, native graphs, durable assignments/runs, opt-in workers, native PM coordination and bounded correction follow-ups | Broader live configuration coverage and distributed controls |
 | Ingress and routing | Signed webhooks, internal auth, issue extraction, durable scope approval/dedupe and activated task queueing | Hosted GitHub webhook delivery and deployment activation |
 | Developer execution | Preview approval, scoped exact-text edits, independent verification and supervised live same-PR correction delivery | Stronger isolation and broader live coverage |
-| Native model runtime | Configured Developer, read-only PM proposals and scoped Architect operations with persistent approvals | Broader PM planning/writes and live model coverage |
-| GitHub integration | Verified drafts, immutable source/base diff reads, head-pinned COMMENTs and recovered supervised correction/re-review | Hosted delivery and broader live coverage |
+| Native model runtime | Configured Developer, supervised live managed PM planning/publication and scoped Architect operations | Broader PM semantic coverage and hosted model execution |
+| GitHub integration | Verified drafts, immutable reads, head-pinned COMMENTs and durable exact-approved PM issue publication | Hosted delivery and broader live coverage |
 | Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Current local gates for the bounded follow-ups committed as `307b86a` over `69aa8d4`: **853 tests pass**,
-with two optional prepared-target Docker probes skipped; Ruff and mypy (48 source
-files) pass. Local bounded follow-ups are preserved. Issues #9/#10 are resolved:
+Managed PM planning adds 49 local regressions over `c690958`, with no default
+activation, dependency change, commit or remote write. Native SDK mocked transport,
+request/detached admission, authenticated HTTP approval/restart and uncertain-write
+recovery pass. Exact issue creation and resolved dependency links have separate
+approvals; Developer previews remain unapproved and unassigned.
+Final local gates: **902 passed, two optional Docker probes skipped**;
+Ruff, mypy (49 source files), editor diagnostics and ignored harness lint pass.
+Standing user authorization then enabled twelve bounded live PM cases with real
+Grok/GitHub through authenticated local ASGI controls. Request/detached success,
+both approval rejections, cancellation, real deadline expiry, landed/absent
+POST/PATCH response loss, partial staging and a real concurrent body edit passed
+their intended outcomes. Fifteen demo issues (#12-#26) remain open/unassigned;
+nine Developer previews remain unapproved, undispatched and unprepared. No
+implementation, merge or service push occurred. Original budgets, historical
+evidence, remote master and prior draft heads were independently verified unchanged.
+Immediate GitHub issue-list reads temporarily missed fresh markers. The supervisor
+now audits known receipts by direct GET; uncertain landed effects recovered through
+later read-only reconciliation without POST/PATCH/model replay. Both original
+failed audit reports are preserved. This accepts the bounded supervised local
+native PM planning/publication path, not hosted/distributed execution or the full
+three-role pilot. Evidence:
+[sim/.run-artifacts/example-planning-20261009/live-report.json](sim/.run-artifacts/example-planning-20261009/live-report.json).
+Supervisor-only corrections are separately retained in
+[sim/.run-artifacts/example-planning-20261009/live-supervisor-notes.json](sim/.run-artifacts/example-planning-20261009/live-supervisor-notes.json).
+The prior committed baseline passed 853 tests, with two optional prepared-target
+Docker probes skipped; Ruff and mypy (48 source files) passed. Local bounded
+follow-ups are preserved. Issues #9/#10 are resolved:
 uncertain PR creation adopts only the exact draft, state writes share the durable
 writer, and runtime checks survive Python `-O`. Correction reconciliation is
 read-only; only actual writes need the original live budget.
@@ -96,8 +120,10 @@ publication approval, one-round limit and cleanup passed the independent audit.
 This completes the supervised correction/re-review sequence through operator
 recovery, not an uninterrupted configured-service run or a default retry endpoint.
 Reporter serialization and audit-schema errors were recovered without model or
-COMMENT replay; the failed harness audit remains saved and its timestamp check
-still needs repair. Authoritative recovery evidence:
+COMMENT replay; the failed harness audit remains saved. Its versioned-wrapper,
+exact-receipt and bounded timestamp helper is now repaired and validated offline
+against actual saved before/after snapshots and ten negative mutations, without
+replaying a model or COMMENT. Authoritative recovery evidence:
 `sim/.run-artifacts/example-correction-20261008/final-correction-recovery-report.json`.
 The implementation is committed locally; no service push, merge or default
 activation occurred. Nineteen native review contract cases passed again.
@@ -463,11 +489,98 @@ are unavailable. General Architect tools also expose `architect_read_published_s
 and `architect_read_published_diff` under their existing tool-approval policy.
 
 The initial role slice adds 42 regressions, including native SDK mocked transports
-and GET-only CLI adapter stubs. Managed PM issue writes,
-correction/meeting loops and live semantic-review acceptance remain
-pending. Existing operator service/worker factories may register these operations;
+and GET-only CLI adapter stubs. Managed PM publication is described below;
+executed meetings and broader live coverage remain pending.
+Existing operator service/worker factories may register these operations;
 published-review admission below adds opt-in HTTP routing, not default activation
 or an external trial.
+
+### Managed PM Planning and Issue Publication
+
+[src/aitobuild/organization_planning.py](src/aitobuild/organization_planning.py)
+provides opt-in admission, strict planning contracts, immutable file-backed plans
+and `ManagedPlanning`. Extend an existing explicit operator-owned service factory;
+normal startup and the example organization are unchanged. Configure a PM-only
+event route whose native graph uses `pm_plan_issues`. Agent/team IDs, prompts,
+models, delegation, limits and graph ordering are configuration-owned.
+
+```python
+from aitobuild.organization_planning import (
+	ManagedPlanning, PlanningAdmission, PlanningLimits, PlanningRoute, PlanningScope,
+)
+
+admission = PlanningAdmission(
+	definitions=definitions, previews=context.previews,
+	state_dir=context.state_dir / "planning-admission",
+	routes=(PlanningRoute(
+		repository=target_repository, repository_id=target_repository_id,
+		organization_id=snapshot.organization_id, revision=snapshot.revision,
+		event=planning_event,
+	),),
+	operator_id=operator_id,
+)
+planning = ManagedPlanning(
+	admission=admission, github=publication_github,
+	state_dir=context.state_dir / "planning", lookup_max_pages=10,
+)
+preview = admission.offer(
+	request_id=operator_request_id, objective=planning_objective,
+	scope=PlanningScope(
+		repository=target_repository, repository_id=target_repository_id,
+		base_revision=operator_base_sha, base_branch=operator_base_branch,
+		limits=PlanningLimits(max_issues=4, max_plan_bytes=12000),
+	),
+	developer_policy=operator_child_policy,
+)
+```
+
+These names represent trusted factory inputs, not HTTP/model fields. Register
+`NativeManagedRoles(..., planning=planning)` operations and cleanup with the runner,
+and `ManagedOrganizationService(..., planning=admission)` using the same definitions,
+app-owned previews and operator identity. Change the operator binding revision when
+registered behavior changes. No new public write endpoint or activation flag exists.
+
+1. Approve the offered preview through the existing authenticated preview endpoint.
+   It pins repository ID/name, base SHA/branch, immutable definition revision,
+   request, limits and child policy. Planning has no checkout, commands or file
+   writes. Its separate original deadline includes approval waits; lost initialized
+   ledgers, expiry, abort and drift cannot reset it.
+2. The native PM receives only a read-only planning-request/target inspection tool.
+   Strict output contains bounded issue keys, titles, objectives, acceptance criteria,
+   labels and acyclic dependencies. Complete inline inspection and final proposal
+   are saved in an immutable digest-bound plan. Changes need a fresh task/approval;
+   model output cannot choose actors, repositories, approvals or implementation.
+3. Inspect task status and approve the exact saved creation request through
+   `/internal/organization/tasks/approve`. Its nonce binds target pins and exact
+   title/body/labels, including stable markers. The consumed decision and per-issue
+   intent persist before POST. Target identity/base and the original budget are
+   rechecked immediately before each write, not only at proposal time.
+4. Dependencies stop at a second saved approval after creation. It contains actual
+   issue IDs/numbers, original bodies and exact resolved body bytes. Approval replaces
+   only the planned dependency section with Markdown `Depends on #N` references,
+   not GitHub native blocked-by relations. Original live content is rechecked
+   immediately before PATCH. Restart uses saved content without model/creation replay.
+5. Only fully confirmed issue/link receipts stage deterministic Developer previews.
+   They remain unapproved, undispatched and unassigned, with real issue identity,
+   pinned repository/base and child policy. Implementation requires a separate
+   approval and configured Developer route; planning never prepares or executes it.
+
+A batch is not transactional: cancellation, rejection, expiry or drift can leave
+partial approved effects. Preserve them for inspection. `planning.reconcile(assignment_id)`
+uses remote reads and local metadata only. It confirms exact landed effects and
+recovers partial preview staging, even after budget abort/expiry, but cannot create
+missing issues, approve unresolved links, repeat uncertain writes or restart models.
+Missing, ambiguous, drifted or incomplete effects fail closed. Bounded full issue
+list paging refuses truncated lookup. Local locks are not distributed recovery;
+GitHub PATCH has no transactional compare-and-swap against concurrent writers.
+
+The 49 regression cases use native mock transport and mock/stub GitHub adapters;
+the separate twelve-case live matrix above validates bounded supervised PM
+planning/publication, not broad planning quality or hosted delivery. GitHub list
+visibility can lag new writes: a temporary reconciliation refusal is not authority
+to repeat a POST/PATCH. Inspect later via remote reads under the same receipts;
+never reset the original ledger. Legacy `PlanDraftStore` and
+`IssueWriteApprovalStore` remain separate in-memory prototype tools.
 
 ### Native PM Coordinator Binding
 

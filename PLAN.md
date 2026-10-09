@@ -5,7 +5,7 @@ The implementation snapshot in section 7 distinguishes available capabilities
 from remaining work. Operational milestones are tracked in [MILESTONES.md](MILESTONES.md).
 
 Merged baseline (2026-10-08): `69aa8d4` contains PRs #11/#13; the bounded
-follow-ups are now committed locally as `307b86a`. Current gates: 853 tests pass/two optional Docker
+follow-ups are now committed locally as `307b86a`. Committed baseline gates: 853 tests pass/two optional Docker
 skips, Ruff and mypy (48 sources). Issues #9/#10/#12 are resolved upstream.
 Read-only exact reconciliation supersedes older notes about recovery object
 uploads; write-time budget and pre/post-PATCH guards remain enforced. Historical
@@ -74,10 +74,57 @@ The supervised correction/re-review sequence passed through operator recovery;
 the original configured-service review remains failed, not silently retried.
 No production retry endpoint or default activation was added. Reporter datetime
 and audit-wrapper/timestamp errors were recovered metadata-only, with the failed
-harness report retained; its timestamp helper remains a follow-up. Report:
+harness report retained. The timestamp/wrapper audit was subsequently repaired
+and tested offline against saved snapshots and negative mutations. Report:
 `sim/.run-artifacts/example-correction-20261008/final-correction-recovery-report.json`.
 Nineteen native review contract cases passed again. No service push or merge;
-hosted delivery/distributed execution and managed PM planning remain separate.
+hosted delivery/distributed execution and live managed PM acceptance remain separate.
+
+Managed PM planning slice (2026-10-09, uncommitted over `c690958`): explicit
+PM-only revision/event admission offers an unapproved repository/base-pinned task.
+Fresh approval initializes a zero-write original-deadline ledger without checkout
+or commands. A configured native PM uses a read-only request/target inspection
+tool and returns a bounded strict acyclic plan. Immutable plans save original
+scope/revision/operator/binding/approval/budget pins and complete inspection evidence.
+Exact creation approval pins title/body/labels and marker bytes; a separate resolved
+link approval pins actual issue IDs/numbers and final body bytes. Decisions and
+per-effect intents persist before writes. Target, content and original budget are
+checked at write time; restart cannot replay models or reuse consumed approvals.
+
+Durable receipts and bounded marker scans reconcile only exact landed effects.
+Remote read-only reconciliation can finish metadata/preview staging after budget
+abort/expiry, but cannot replay writes or approve unresolved links. Missing,
+ambiguous, drifted and incomplete effects require operator inspection; a batch is
+not atomic. Complete receipts stage separate unapproved Developer previews with
+real issue identity and pinned child policy, never assignment/preparation/execution.
+Normal startup, legacy in-memory PM tools and dependencies are unchanged. Forty-nine
+native mock/request/detached/HTTP/recovery contracts pass; this is local acceptance,
+not live PM semantics, hosted delivery or distributed execution.
+Final local gates: **902 passed/two optional Docker skips**, Ruff and mypy
+(49 source files), editor diagnostics and standalone ignored-harness lint pass.
+
+Bounded live PM acceptance (2026-10-09): standing operator authorization was
+consumed through the unchanged task/creation/resolved-link approvals in twelve
+fresh isolated native Grok/GitHub trials. Request-scoped and detached success,
+rejection at both publication gates, cancellation, real one-minute deadline expiry,
+landed/absent POST/PATCH response loss, partial preview staging and a real synthetic
+concurrent body edit passed. Independent read-only audit confirmed exact plan and
+remote bytes/IDs, consumed decisions, unchanged original deadlines/reservations,
+preserved failed/cancelled/aborted outcomes, no duplicate issues/previews, untouched
+historical evidence/master/prior draft heads and no trial containers. Fifteen
+open unassigned demo issues and nine unapproved/unprepared Developer previews are
+retained; no implementation or merge occurred.
+
+Discovery: immediate GitHub issue-list reads temporarily missed fresh markers,
+causing two supervisor audit refusals. Direct GET verified known receipts and later
+GET-only reconciliation recovered metadata under unchanged original ledgers, without
+model or POST/PATCH replay. Original failed reports and supervisor-validation
+mistakes remain recorded, not normalized into an error-free run. No product source
+change was required; 49 focused regressions/Ruff/mypy and supervisor lint pass again.
+Authoritative evidence: `sim/.run-artifacts/example-planning-20261009/live-report.json`.
+This is bounded supervised local ASGI acceptance with explicitly injected failures,
+not hosted/distributed acceptance or the full live product-team pilot. No service
+commit/push, dependency change or default activation.
 
 ## 1. Executive Summary
 This document outlines a supervised, configurable product-team framework using
@@ -210,7 +257,7 @@ not yet operationally complete:
 * **Phase 5: Review and Coordination.** Configured review/fix/meeting recipes and managed scheduling with durable state and escalation.
 * **Phase 6: Supervised Pilot.** Broaden PM backlog/planning and proactive proposals after delivery/recovery gates pass; evaluate before expanding autonomy.
 
-## 7. Implementation Snapshot (2026-10-07)
+## 7. Implementation Snapshot (2026-10-09)
 
 ### Implemented Building Blocks
 
@@ -478,7 +525,7 @@ and bounded executed meetings remain separate milestones.
 - `developer.async.webhook` returns task metadata by default. Detached consumption exists only for explicitly service/worker-factory-activated approved repository routes, not default startup.
 - Supported repository issue events produce target-specific bundles and require approval-time base SHA pinning. Checkout preparation validates membership in the explicitly configured local seed/base branch, not live GitHub repository identity or remote freshness. No automatic remote lookup/fetch occurs. Legacy fixture payloads without repository context retain prototype routing; unsupported repository webhook events and missing issue criteria are rejected.
 - GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions at `88720aa`. Live acceptance remains pending. The operator installed checksum-verified `gh` 2.102.0 locally for the fresh trial and verified `uhvogala` on github.com; this is not a default image dependency. No live task-result publication has been tested.
-- General PM draft/write-approval stores remain in memory. Explicit native PM coordinator bindings feed saved read-only proposals into trusted service assignments; managed PM planning/issue writes remain pending. Opt-in publication-to-Architect staging and bounded correction/re-review follow-ups retain separate task, exact COMMENT and one-use correction publication approvals. Native correction edits, verification and same-PR updates are locally regression-tested, not live-certified. Meetings and live semantic acceptance remain pending. Reads support regular UTF-8 files up to 1 MiB; binary/link/submodule review needs another approved adapter, not a bypass.
+- General PM draft/write-approval stores remain in memory; the separate opt-in managed path has durable plans, exact creation/resolved-link approvals and per-effect receipts. Twelve supervised local native/GitHub cases accept its bounded live planning/publication path, not broad semantics or hosted delivery. Native PM coordination stays read-only. Planned Developer handoffs remain unapproved. Incomplete/uncertain batches require inspection/read-only reconciliation, not write replay; GitHub list visibility can temporarily lag. Opt-in review/correction follow-ups retain separate task, exact COMMENT and one-use publication approvals. The correction/re-review sequence has live operator-recovery evidence; executed meetings and broader semantic acceptance remain pending. Regular UTF-8 review files are supported up to 1 MiB; binary/link/submodule inputs need another approved adapter, not a bypass.
 - Meetings construct workflows without executing them, and proactive scans interpret supplied metadata rather than inspecting a repository.
 - Scheduler ticks require an external caller; meeting/scheduler state and non-repository trigger dedupe remain in memory. Previews, approvals and repository issue task/delivery identities persist locally. `dispatched` records metadata routing, not worker completion; inspect the saved queue after restart. Distributed coordination and full lifecycle auditing remain pending.
 - Native runs without a bound preview and unbound legacy runs remain prototypes. Approved native tasks persist unique-path reservations and an absolute deadline, fail closed after abort, and use offline read-only repository execution. Browser/arbitrary MCP adapters are excluded; native memory has a separate scoped SDK store. Distributed coordination, durable auditing and scratch/disk quotas remain pending.
