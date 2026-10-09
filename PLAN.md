@@ -4,6 +4,99 @@ This document describes the target architecture, not a fully implemented system.
 The implementation snapshot in section 7 distinguishes available capabilities
 from remaining work. Operational milestones are tracked in [MILESTONES.md](MILESTONES.md).
 
+## Implementation Notes
+
+This section records completed work and acceptance checkpoints, including failures
+and supervised recovery. Earlier counts, pending work and commit status describe
+their checkpoint, not the current system. Current setup and usage belong in
+[README.md](README.md); contributor rules belong in [agents.md](agents.md).
+
+Managed meeting live acceptance (2026-10-09): `DeepSeek-V4.1-Flash` executed a
+fresh supervised PM -> bounded three-role meeting -> Developer -> Architect
+sequence through authenticated local ASGI and detached workers, real GitHub and
+constrained Docker. Exact PM creation/resolved-link gates published issues 34/35;
+only the original implementation child was approved. Three configured discussion
+rounds and a separate resolver produced an unchanged-scope plan. Restart consumed
+its exact digest-pinned approval without discussion replay, followed by seven
+separate native tool approvals, correct two-file artifacts, independent pytest
+exit 0/cleanup and exact verified-snapshot draft publication:
+[PR 36](https://github.com/uhvogala/aitobuild_example/pull/36), head
+`b6a3167a41b41e228265238ae3e71cb8de441b2c`.
+
+The first readiness call timed out; a separately retained tool-free probe passed
+before admission. The first Architect task failed closed on a body exceeding the
+1,972-character publication limit, with cleanup and its original ledger aborted.
+Native review guidance now derives and states that limit; exact-limit/overflow
+regressions pass. A fresh separately approved zero-write review task, new binding
+and original ledger inspected complete immutable source AND base diffs, found no
+defect and reached its own exact COMMENT gate. Restart published
+[the approved COMMENT](https://github.com/uhvogala/aitobuild_example/pull/36#pullrequestreview-5469346772)
+without model replay; no correction was invented.
+
+Two fresh live stop cases also passed: exact continuation rejection and a
+scope-changing resolver proposal. Both retained terminal receipts, original
+aborted deadlines, zero reservations and successful cleanup; admission-time
+private checkouts stayed untouched with no implementation, verification or
+publication. The rejection harness initially assumed approval created no checkout;
+an additive metadata-only audit corrected that expectation without repeating a
+meeting or consumed decision. All original failures remain preserved.
+
+The additive `sim/.run-artifacts/example-e2e-20261009-meetings-deepseek-v1/acceptance-report.json`
+records all three accepted cases and evidence hashes. Accepted native diagnostics
+are empty. Exact draft bytes/modes/head/base, original budgets, idle and terminal
+restart, duplicate-effect prevention, unapproved/unexecuted dependent issue 35,
+unchanged previous draft/master/evidence and absence of trial containers passed.
+Full gates: 940 passed, two optional Docker skips, three existing SDK warnings;
+Ruff, mypy over 50 source files and touched editor diagnostics clean. This is
+recovered supervised local acceptance, not an uninterrupted run, general tool
+certification, automatic blocker detection/repeated meetings or hosted/distributed
+M3/M4/M5 completion. Service changes remain uncommitted; no service push or merge,
+dependency changes, default-model change or default activation.
+
+Managed blocker-resolution slice (2026-10-09): opt-in configured task graphs now
+execute native read-only group chats with bounded rounds, transcript bytes and the
+original task deadline. Durable receipts pin blocker evidence, configured team,
+scope/revision/bindings, transcript and strict continuation/scope-change/escalation
+outcomes. Exact saved service approval consumes an input-data digest before
+continuation; native Developer sessions pin/revalidate approved guidance without
+changing their frozen task. Rejection/escalation/cancellation/timeout/interrupted
+work fail closed without replay or ledger recreation. Mocked native DeepSeek
+transport, direct/service/detached paths and an independently executed fixture
+assertion cover meeting-to-draft continuation and post-approval plan tampering.
+Deployment `DeepSeek-V4.1-Flash` is selectable through existing runtime/model-profile
+configuration; the application default is unchanged. Live provider, complete live
+meeting-to-Architect acceptance, automatic blocker detection/repeated meetings and
+hosted/distributed execution are not certified by these fixture checks.
+Verification: 938 tests passed, two optional Docker skips and three existing SDK
+warnings; Ruff, mypy across 50 source files and editor diagnostics were clean.
+The model-free copied-fixture report at
+`sim/.run-artifacts/managed-meetings-20261009.json` records `succeeded=true`, an
+executed command exit 0 and the expected generated artifact; no container session
+was used. That fixture-only checkpoint was uncommitted and made no remote writes
+or default activation; subsequent live acceptance is recorded above.
+
+Foundation work established signed ingress/internal authentication, routing and
+deduplication, policy checks, model bootstrap, escalation and scheduler/meeting
+construction. Hosted baseline CI passed pytest/Ruff/mypy and a retained mock
+simulation artifact on Python 3.14. Tool development added exact-span editing,
+bounded search/paging, prepared Docker sessions, native approval/memory persistence
+and independent success/failure verification with cleanup. Constrained Grok/Kimi
+approved-task fixtures passed; broad standalone zero-error tool certification is
+still incomplete. Recovered tool errors are diagnostics, not automatic contribution
+failure; a qualified delivery still needs correct artifacts, final tests,
+independent verification, approvals, valid original budgets and cleanup.
+
+Configuration work added strict immutable organization revisions, configurable
+agents/teams/models and native Python workflow graphs, followed by durable
+assignment/run journals, opt-in service activation, detached local workers and
+scoped native PM coordination/Architect review. Review admission, bounded correction
+handoff, exact operator-only same-PR publication and durable follow-up recovery
+completed the supervised local lifecycle. Storage writers enforce atomic/fsynced
+replacement, explicit permissions and symlink refusal; runtime guards survive
+Python optimization. Subsequent PM planning/publication and three-role live
+acceptance are recorded below. No checkpoint certifies hosted/distributed operation
+or automatic dependency scheduling.
+
 Merged baseline (2026-10-08): `69aa8d4` contains PRs #11/#13; the bounded
 follow-ups are now committed locally as `307b86a`. Committed baseline gates: 853 tests pass/two optional Docker
 skips, Ruff and mypy (48 sources). Issues #9/#10/#12 are resolved upstream.
@@ -125,6 +218,36 @@ Authoritative evidence: `sim/.run-artifacts/example-planning-20261009/live-repor
 This is bounded supervised local ASGI acceptance with explicitly injected failures,
 not hosted/distributed acceptance or the full live product-team pilot. No service
 commit/push, dependency change or default activation.
+
+Latest bounded three-role E2E acceptance (2026-10-09): managed PM implementation
+committed locally as `fe5d1a5` after fresh 902 tests/two optional Docker skips,
+Ruff/mypy49. A fresh configured native PM plan created/linked issues #31/#32;
+its original implementation preview, not a replacement webhook/task, drove native
+Developer implementation through ten exact tool approvals and independent two-test
+verification into draft PR #33 at `58ab116d64cc3afd287e3bceaff6f504612b683b`.
+Architect complete source/base-diff inspection found no functional defect and
+submitted one exact final-only head-pinned COMMENT `5468186817`. Independent audit
+confirmed exact plans/IDs/link bodies, original handoff identity, remote parent/tree/
+bytes/modes/base/head, consumed decisions, terminal restart/duplicate admission,
+independent original ledgers/reservations and cleanup. Accepted PM/Developer/
+Architect runs retain zero saved native diagnostics. Prior trial JSON evidence,
+failed/aborted predecessors, master and earlier draft heads remain unchanged.
+
+The initial supervisor stopped before planning approval on an uninitialized-ledger
+lookup. A later publication audit used a nonexistent preview field; its completed
+PM effects recovered metadata-only, with original failure retained. Dataclass/JSON
+timestamps also needed canonical comparison. Two native Developer attempts then
+failed/aborted following discovery policy and narrow supervisor-command refusal;
+these are preserved, never replayed or relabelled successful. `allowed_paths` uses
+literal prefixes, not globs. A fresh correctly configured prefix policy succeeded,
+with exact source/test write restrictions enforced independently. No product source
+change was needed during trials; supervisor lint/diagnostics pass. Evidence:
+`sim/.run-artifacts/example-e2e-20261009-v4/final-report.json`.
+This accepts one bounded supervised local three-role chain, not an uninterrupted
+sequence of all earlier attempts, automatic dependency scheduling, dependent docs
+execution, a new correction cycle, hosted/distributed delivery or full M5. The
+dependent preview remains unapproved/unassigned/unprepared. No service push/merge,
+dependencies or default activation. Do not replay consumed trial controls.
 
 ## 1. Executive Summary
 This document outlines a supervised, configurable product-team framework using
@@ -524,10 +647,10 @@ and bounded executed meetings remain separate milestones.
 - Configured factories/native admission/assignment/runner libraries have opt-in app integration through operator-owned service/worker factories; the default server still uses legacy handles and metadata dispatch. Service-only activation awaits execution in the request; optional workers durably enqueue with lifespan-owned execution and explicit bounded unowned-task startup discovery. Explicit repository/revision/event and actor/binding registries cannot be selected by HTTP callers. Internal shared-token identity is not multi-user authentication. Journal capacity does not govern unmanaged HTTP runs. Managed operation graphs pin active revisions; direct agent nodes remain denied. Scoped Developer delivery, PM proposals and Architect review operations are explicit libraries, not automatically activated orchestration. Trusted read-only coordinator callbacks are original-deadline bounded, not arbitrary-code isolation. Run/assignment/admission completion is metadata, not verification/publication approval; native input is distinct from service approval. Only saved waiting checkpoints resume; interrupted running effects cannot be blindly replayed. Busy controls return 409; mandatory cleanup/thread draining and original budgets remain enforced. Cross-process cancellation is polling-based; failed worker slots require inspection/restart. Local locks/state are not distributed execution or hostile-tenant certification. Live delivery/hosted CI acceptance remains pending.
 - `developer.async.webhook` returns task metadata by default. Detached consumption exists only for explicitly service/worker-factory-activated approved repository routes, not default startup.
 - Supported repository issue events produce target-specific bundles and require approval-time base SHA pinning. Checkout preparation validates membership in the explicitly configured local seed/base branch, not live GitHub repository identity or remote freshness. No automatic remote lookup/fetch occurs. Legacy fixture payloads without repository context retain prototype routing; unsupported repository webhook events and missing issue criteria are rejected.
-- GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions at `88720aa`. Live acceptance remains pending. The operator installed checksum-verified `gh` 2.102.0 locally for the fresh trial and verified `uhvogala` on github.com; this is not a default image dependency. No live task-result publication has been tested.
-- General PM draft/write-approval stores remain in memory; the separate opt-in managed path has durable plans, exact creation/resolved-link approvals and per-effect receipts. Twelve supervised local native/GitHub cases accept its bounded live planning/publication path, not broad semantics or hosted delivery. Native PM coordination stays read-only. Planned Developer handoffs remain unapproved. Incomplete/uncertain batches require inspection/read-only reconciliation, not write replay; GitHub list visibility can temporarily lag. Opt-in review/correction follow-ups retain separate task, exact COMMENT and one-use publication approvals. The correction/re-review sequence has live operator-recovery evidence; executed meetings and broader semantic acceptance remain pending. Regular UTF-8 review files are supported up to 1 MiB; binary/link/submodule inputs need another approved adapter, not a bypass.
-- Meetings construct workflows without executing them, and proactive scans interpret supplied metadata rather than inspecting a repository.
-- Scheduler ticks require an external caller; meeting/scheduler state and non-repository trigger dedupe remain in memory. Previews, approvals and repository issue task/delivery identities persist locally. `dispatched` records metadata routing, not worker completion; inspect the saved queue after restart. Distributed coordination and full lifecycle auditing remain pending.
+- GitHub branch/commit/draft-PR publication is implemented behind the optional allowlisted `gh_cli` adapter; the reproduced snapshot/recovery gaps are fixed locally with regressions at `88720aa`. Supervised local live publication is accepted, not hosted/distributed delivery. The operator installed checksum-verified `gh` 2.102.0 locally and verified `uhvogala` on github.com; this is not a default image dependency.
+- General PM draft/write-approval stores remain in memory; the separate opt-in managed path has durable plans, exact creation/resolved-link approvals and per-effect receipts. Twelve supervised local native/GitHub cases accept its bounded live planning/publication path, not broad semantics or hosted delivery. Native PM coordination stays read-only. Planned Developer handoffs remain unapproved until separate task approval. Incomplete/uncertain batches require inspection/read-only reconciliation, not write replay; GitHub list visibility can temporarily lag. Opt-in review/correction follow-ups retain separate task, exact COMMENT and one-use publication approvals. The correction/re-review sequence has live operator-recovery evidence; bounded executed meetings have supervised local live acceptance, not broader semantic or hosted/distributed certification. Regular UTF-8 review files are supported up to 1 MiB; binary/link/submodule inputs need another approved adapter, not a bypass.
+- Explicit managed blocker meetings execute native bounded discussion with durable evidence and exact-approved unchanged-scope continuation. Supervised local live meeting-to-reviewed-draft execution and rejection/scope-change stops are accepted. Legacy bootstrap only constructs workflows; automatic blocker detection/repeated meetings and hosted/distributed acceptance remain pending. Proactive scans interpret supplied metadata rather than inspecting a repository.
+- Scheduler ticks require an external caller; legacy meeting/scheduler state and non-repository trigger dedupe remain in memory. Managed meeting receipts, previews, approvals and repository issue task/delivery identities persist locally. `dispatched` records metadata routing, not worker completion; inspect the saved queue after restart. Distributed coordination and full lifecycle auditing remain pending.
 - Native runs without a bound preview and unbound legacy runs remain prototypes. Approved native tasks persist unique-path reservations and an absolute deadline, fail closed after abort, and use offline read-only repository execution. Browser/arbitrary MCP adapters are excluded; native memory has a separate scoped SDK store. Distributed coordination, durable auditing and scratch/disk quotas remain pending.
 - The constrained Docker profile has resource/capability/network restrictions and expiry/cleanup checks, but is not a hardened hostile-tenant sandbox. Prefix matching is not shell parsing; dependency installation and build outputs cannot write the repository mount.
 - The capability matrix tests check entries, not duplicate implementations; the successful CI baseline does not prove no-duplicate capability enforcement.

@@ -247,9 +247,13 @@ uv run python -m sim.evaluate_tools --model grok-4.6 \
   --output sim/.run-artifacts/grok-tool-evaluation.json
 uv run python -m sim.evaluate_tools --model Kimi-K2.7-Code \
   --invoke-timeout 360 --output sim/.run-artifacts/kimi-tool-evaluation.json
+uv run python -m sim.evaluate_tools --model DeepSeek-V4.1-Flash \
+  --output sim/.run-artifacts/deepseek-tool-evaluation.json
 ```
 
 The default env file is the live example with the deployed Azure v1 endpoint.
+Deployment names are passed through exactly; the DeepSeek command is opt-in and
+does not imply live tool certification or change the default deployment.
 Use `--env-file` for ignored local overrides. Use `--no-browser` to explicitly
 exclude browser coverage; `--recovery` injects exactly one expected stale-text edit error.
 Normal runs require zero unexpected tool errors, even if a retry later succeeds.

@@ -15,7 +15,7 @@ from filelock import FileLock
 from pydantic import Field, JsonValue, StrictStr, model_validator
 
 from aitobuild.durable_files import atomic_write_text
-from aitobuild.developer_delivery import DeveloperDeliveryWorker
+from aitobuild.developer_delivery import ARCHITECT_REVIEW_BODY_MAX, ARCHITECT_REVIEW_BODY_PREFIX, DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload, is_path_allowed
 from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot
@@ -465,8 +465,10 @@ class NativeManagedRoles:
             await self._sessions.set(context.run.session_id, session)
             return {"correction": proposal, "metadata_only": True}
 
+        max_body = ARCHITECT_REVIEW_BODY_MAX - len(ARCHITECT_REVIEW_BODY_PREFIX)
         guidance = ("Inspect complete source AND diff for each approved changed path at the pinned target below. "
-                    "Return COMMENT review text only; never claim metadata alone proves semantic correctness. "
+                f"Return COMMENT review text only, at most {max_body} characters including whitespace. "
+                "Be concise; never claim metadata alone proves semantic correctness. "
                     "Publication requires a separate operator approval.")
         tools: tuple[Any, ...] = (read_source, read_diff)
         if self._allow_corrections:

@@ -13,6 +13,7 @@ import pytest
 
 from aitobuild.organization import FileDefinitionStore, parse_organization_definition
 from aitobuild.organization_assignments import AssignmentService, FileAssignmentStore
+from aitobuild.developer_delivery import ARCHITECT_REVIEW_BODY_MAX, ARCHITECT_REVIEW_BODY_PREFIX
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.organization_roles import NativeManagedRoles, PublishedReviewTarget
 from aitobuild.organization_runner import FileRunStore, ManagedWorkflowRunner, RuntimeActor
@@ -1252,7 +1253,7 @@ def test_published_review_http_hook_and_metadata_only_retry(tmp_path, published_
 
 @pytest.mark.parametrize("scenario", ["approved", "preamble", "empty_final", "rejected", "metadata_only", "head_drift", "recovered", "publication_race",
                                       "partial_page", "skip_page", "oversized_output", "body_drift", "evidence_drift", "uncertain_submit", "expired_at_write",
-                                      "correction", "correction_outside", "correction_partial", "correction_drift"])
+                                      "correction", "correction_outside", "correction_partial", "correction_drift", "body_at_limit", "body_over_limit"])
 def test_native_architect_review_requires_inspection_and_exact_saved_approval(
     tmp_path, published_delivery, monkeypatch, scenario,
 ):
@@ -1276,9 +1277,12 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
             "content": "x" * 7000, "total_bytes": 7000, "truncated": False, "next_offset": None,
         })
     bodies = []
+    max_body = ARCHITECT_REVIEW_BODY_MAX - len(ARCHITECT_REVIEW_BODY_PREFIX)
+    expected_comment = "x" * max_body if scenario == "body_at_limit" else "Scoped source/diff inspected; retain human merge authority."
 
     def reply(request):
         body = json.loads(request.content)
+        assert f"at most {max_body} characters including whitespace" in json.dumps(body["messages"])
         bodies.append(body)
         step = len(bodies) - (1 if scenario == "recovered" else 0)
         if correction_case and step == 3:
@@ -1288,7 +1292,10 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
             }}]}
             finish = "tool_calls"
         elif scenario == "metadata_only" or step >= 3:
-            message = {"role": "assistant", "content": "   " if scenario == "empty_final" else "  Scoped source/diff inspected; retain human merge authority.  "}
+            content = "   " if scenario == "empty_final" else "  " + expected_comment + "  "
+            if scenario == "body_over_limit":
+                content = "x" * (max_body + 1)
+            message = {"role": "assistant", "content": content}
             finish = "stop"
         else:
             name = "architect_read_published_source" if step <= 1 else "architect_read_published_diff"
@@ -1317,7 +1324,11 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
 
                 before = json.loads(Path(assignment.budget_path).read_text())
                 waiting = await make_runner(adapter()).start(assignment.assignment_id)
-                if scenario == "empty_final":
+                if scenario == "body_over_limit":
+                    assert waiting.state == "failed" and f"exceeds {max_body} characters" in waiting.error
+                    assert not waiting.pending and not github.reviews
+                    assert json.loads(Path(assignment.budget_path).read_text()) == before | {"aborted": True}
+                elif scenario == "empty_final":
                     assert waiting.state == "failed" and "final assistant response" in waiting.error
                     assert not waiting.pending and not github.reviews
                     assert json.loads(Path(assignment.budget_path).read_text()) == before | {"aborted": True}
@@ -1326,7 +1337,7 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                 else:
                     assert waiting.state == "waiting", waiting.error
                     assert waiting.pending[0].kind == "service_approval"
-                    assert waiting.pending[0].data["body"] == "Scoped source/diff inspected; retain human merge authority."
+                    assert waiting.pending[0].data["body"] == expected_comment
                     assert github.reviews == []
                     if scenario == "correction":
                         assert waiting.pending[0].data["correction"] == {"paths": [path], "objective": "Correct the inspected edge case and retain passing tests"}
@@ -1374,9 +1385,9 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                         monkeypatch.setattr(worker, "submit_architect_review", expired)
                     done = await make_runner(adapter()).approve(assignment.assignment_id, request_id=waiting.pending[0].request_id,
                                                                approved=scenario != "rejected")
-                    if scenario in {"approved", "preamble", "recovered", "correction", "correction_outside"}:
+                    if scenario in {"approved", "preamble", "recovered", "correction", "correction_outside", "body_at_limit"}:
                         assert done.state == "completed", done.error
-                        assert github.reviews[0].body == "aitobuild Architect review\n\nScoped source/diff inspected; retain human merge authority."
+                        assert github.reviews[0].body == ARCHITECT_REVIEW_BODY_PREFIX + expected_comment
                         assert len(github.reviews) == 1
                         assert await make_runner(adapter()).start(assignment.assignment_id) == done
                         assert json.loads(Path(assignment.budget_path).read_text()) == before

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
+from hashlib import sha256
 import json
 from pathlib import Path
 from typing import Any, Protocol
@@ -64,6 +65,7 @@ class NativeDeliveryImplementation:
         self, *, worker: DeveloperDeliveryWorker,
         runtime_for: Callable[[DefinitionSnapshot], OrganizationRuntime],
         tools: DeveloperToolContext, state_dir: Path, invoke_timeout_seconds: float = 180,
+        continuation_for: Callable[[ManagedTaskContext], str] | None = None,
     ) -> None:
         if (not isinstance(tools.container_session_adapter, ContainerSessionBashAdapter)
                 or tools.enable_mcp_adapters or tools.mcp_tool_adapter is not None or tools.use_legacy_patch_tool):
@@ -76,6 +78,7 @@ class NativeDeliveryImplementation:
         self._state_dir = state_dir.resolve()
         self._sessions = FileSessionStore(self._state_dir / "sessions")
         self._timeout = invoke_timeout_seconds
+        self._continuation = continuation_for
 
     async def run(self, context: ManagedTaskContext) -> DeliveryInvocation:
         return await self._invoke(context)
@@ -89,6 +92,9 @@ class NativeDeliveryImplementation:
         self, context: ManagedTaskContext, *, request_id: str | None = None, approved: bool | None = None,
     ) -> DeliveryInvocation:
         assignment = context.revalidate()
+        continuation = self._continuation(context) if self._continuation is not None else ""
+        if not isinstance(continuation, str):
+            raise TypeError("Approved continuation guidance must be text")
         if str(self._worker.budget_path(assignment.preview_id)) != assignment.budget_path:
             raise PermissionError("Native delivery must reopen its original ledger")
         runtime = self._runtime(context.snapshot)
@@ -102,6 +108,8 @@ class NativeDeliveryImplementation:
         pins = {"assignment_id": assignment.assignment_id, "revision": assignment.revision,
                 "scope_digest": assignment.scope_digest, "preview_id": assignment.preview_id,
                 "budget_path": assignment.budget_path}
+        if self._continuation is not None:
+            pins["continuation_digest"] = sha256(continuation.encode()).hexdigest()
         session = await self._sessions.get(session_id)
         if session is None:
             if request_id is not None:
@@ -116,6 +124,8 @@ class NativeDeliveryImplementation:
         if request_id is None and pending:
             raise ValueError("Native implementation requires its saved approval continuation")
         message: Any = "Approved task bundle (authoritative scope):\n" + assignment.bundle_content
+        if continuation:
+            message += "\n" + continuation
         if request_id is not None:
             if type(approved) is not bool:
                 raise PermissionError("Native approval requires an explicit Boolean decision")
@@ -155,6 +165,8 @@ class NativeDeliveryImplementation:
                 @function_middleware
                 async def guarded_tool(call: FunctionInvocationContext, call_next: Callable[[], Awaitable[None]]) -> None:
                     context.revalidate()
+                    if self._continuation is not None and self._continuation(context) != continuation:
+                        raise PermissionError("Approved continuation guidance changed during native execution")
                     try:
                         await call_next()
                         contents = call.result
@@ -177,6 +189,8 @@ class NativeDeliveryImplementation:
                         middleware=[guarded_tool, build_output_guard(output_dir)],
                     )
                 context.revalidate()
+                if self._continuation is not None and self._continuation(context) != continuation:
+                    raise PermissionError("Approved continuation guidance changed during native execution")
                 requests = response.user_input_requests
                 if any(request.type != "function_approval_request" for request in requests):
                     raise PermissionError("Unsupported native human input cannot become service approval")

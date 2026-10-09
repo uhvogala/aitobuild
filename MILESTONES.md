@@ -91,6 +91,27 @@ source edit, commit/push/merge, dependencies or default activation during trials
 This accepts bounded supervised local ASGI PM planning/publication, not hosted
 execution, distributed recovery, implementation handoff execution or full M5.
 
+Latest bounded three-role chain (2026-10-09): PM source/tests/docs committed locally
+as `fe5d1a5` after fresh 902 tests/two skips/Ruff/mypy49. Fresh native planning
+created/linked issues #31/#32; the original implementation child entered configured
+Developer delivery without replacement issue admission. Ten scoped tool decisions,
+independent two-test verification and exact approved remote snapshot produced draft
+PR #33 at `58ab116d64cc3afd287e3bceaff6f504612b683b`. Architect inspected complete
+source/base-diffs and submitted exact final-only COMMENT `5468186817`, finding no
+functional defect. Independent audit passed terminal restart/duplicates, original
+separate ledgers/reservations, receipts/decisions, historical and failed predecessor
+evidence, unchanged master/prior drafts and cleanup. Accepted native roles have
+zero saved diagnostics. Earlier supervisor/schema/policy failures and failed/
+aborted native attempts remain preserved; recovery never replayed consumed PM
+approvals/writes or reset budgets. Literal-prefix policy and JSON normalization
+fixed supervisor configuration/reporting, not product source. Dependent docs stay
+unapproved/unassigned/unprepared. Evidence:
+`sim/.run-artifacts/example-e2e-20261009-v4/final-report.json`.
+This accepts the bounded supervised local planning-to-original-preview-to-verified-
+draft-to-exact-review path, not full M5, automatic dependencies, a new correction
+cycle, docs execution or hosted/distributed deployment. No service push/merge,
+dependency change or default activation during trials.
+
 ## Direction
 
 Build a supervised product-team framework with configurable agent instances,
@@ -132,7 +153,7 @@ execute task code against the aitobuild service checkout.
 | Persistent Docker sessions | Private checkouts/home volumes, restart memory/history and scoped cleanup | Live integration evidence; prototype isolation only |
 | MCP shell/filesystem | Native stdio transport adapter, configurable names | Optional; compatibility validation pending |
 | GitHub output | Allowlisted gh CLI branch/commit/draft publication, immutable snapshots and exact reconciliation; supervised live same-PR correction | Hosted delivery and broader live coverage pending |
-| Architect/PM/meetings | Native PM delegation, bounded supervised live planning/publication and recovered correction/re-review | Broader PM semantics and executed meetings pending; no automatic failed-review retry |
+| Architect/PM/meetings | Native PM delegation/planning/publication, recovered correction/re-review and supervised local live bounded meeting-to-reviewed-draft continuation with rejection/scope-change stops | Broader semantics and hosted/distributed acceptance; no automatic failed-task retry |
 | Operations | Manual tick API, local durable managed worker and successful hosted CI baseline | M0 accepted; broader durable state/distributed controls and tracing missing |
 
 Current local gates including managed PM planning: **902 passed, two optional
@@ -589,6 +610,29 @@ This completes local correction-lifecycle implementation, not semantic/live M3
 acceptance or executed meeting coverage.
 
 
+Managed meeting implementation checkpoint (2026-10-09): explicit approved graphs
+execute native configured group chats with durable blocker/transcript/proposal
+receipts and original deadlines. Exact one-shot input-digest approvals permit
+unchanged-scope Developer continuation; scope changes/unresolved outcomes stop for
+human action. Native mocked DeepSeek transport covers direct/service/detached
+meeting-to-verified-draft fixtures and fail-closed recovery/integrity boundaries.
+This is local fixture acceptance, not complete live meeting-to-review, automatic
+blocker detection/repeated meetings or hosted/distributed M3/M4 certification.
+
+Managed meeting live checkpoint (2026-10-09): DeepSeek-native PM planning,
+three-round configured discussion, exact-approved continuation, scoped Developer
+delivery and separate head-pinned Architect COMMENT passed through authenticated
+local ASGI/detached workers, real GitHub and independent constrained Docker
+verification. Rejection and scope-change cases stopped with untouched prepared
+checkouts, original aborted ledgers and cleanup. The oversized first review failed
+closed; after prompt-budget repair a freshly approved task succeeded without
+replaying that failure. Draft PR 36 remains unmerged, dependent issue 35 unapproved,
+prior draft/master/evidence unchanged and no trial containers remain. Full gates:
+940 passed/two optional skips, Ruff/mypy clean. PLAN Implementation Notes records
+the additive certificate, exact approvals, failures and recovery. This accepts the
+bounded supervised local meeting slice, not full M3/M4/M5, general tool certification,
+automatic blocker detection/repeated meetings or hosted/distributed execution.
+
 Deliverables:
 - Give the Architect read/review tools and repository analysis, not implementation-write privileges.
 - Route review results into fix requests, human review, or blocker-resolution meetings.
@@ -646,13 +690,14 @@ Exit criteria:
 
 PR #11 integration, issues #9/#10/#12 and supervised correction/re-review recovery
 are complete at the committed baseline. The bounded PM planning/publication slice
-is uncommitted and now accepted in twelve bounded supervised live cases. Broader
-semantic coverage, hosted/distributed execution and the three-role pilot remain open.
+is committed locally and accepted in twelve bounded supervised live cases. Managed
+meetings have bounded supervised local live acceptance. Broader
+semantic coverage, hosted/distributed execution and the full three-role pilot remain open.
 
 1. Preserve the configurable definition/storage regressions and existing M0/M1, exact-span and publication safeguards. Run CI for new slices; never target the service checkout.
-2. Preserve the accepted twelve-case live PM matrix and exact task/creation/resolved-link approvals. Extend broader planning-quality coverage and separately scoped implementation handoff before claiming the full pilot; Developer previews stay unapproved until that approval. Standing trial authorization does not bypass service gates or reset ledgers. Never replay uncertain writes; use read-only inspection for visibility lag. Keep activation explicit, with no fixed team/contribution loop. Bounded executed meetings and distributed controls remain separate work.
-3. Preserve passing request-scoped/detached fixture acceptance (signed/authenticated delivery, decisions/restart, native SDK/mock-transport tools and independent verification/mock draft graph), and run hosted CI when authorized publication of the service changes is available. Default server activation, live configured-worker delivery and hosted CI remain unverified. Keep GitHub assignee writes separate and do not infer semantic review from metadata.
-4. Stage a freshly approved live draft trial using outcome-based contribution grading. Recheck GitHub hosting/authentication/allowlist; do not replay the previously aborted task. Recovered tool errors are diagnostics, not contribution blockers. Stage head-bound COMMENT review only with actual source/diff inspection before claiming semantic review.
+2. Preserve the accepted twelve-case live PM matrix and bounded local meeting-to-reviewed-draft/stop cases, with exact task/creation/resolved-link/continuation approvals. Extend broader planning-quality coverage and separately scoped implementation handoff before claiming the full pilot; Developer previews stay unapproved until that approval. Standing trial authorization does not bypass service gates or reset ledgers. Never replay uncertain writes; use read-only inspection for visibility lag. Keep activation explicit, with no fixed team/contribution loop. Automatic blocker detection/repeated meetings and distributed controls remain separate work.
+3. Preserve passing request-scoped/detached fixture and supervised local live acceptance (signed/authenticated delivery, decisions/restart, native SDK tools and independent verification/draft graph), and run hosted CI when authorized publication of the service changes is available. Default server activation and current hosted/distributed delivery remain unverified. Keep GitHub assignee writes separate and do not infer semantic review from metadata.
+4. Add a bounded, operator-triggered dependent-task readiness/handoff slice: reconcile actual human-merged prerequisites read-only, stage an unapproved dependent task, then require separate implementation approval with a freshly pinned base before execution. Publication or a COMMENT alone cannot satisfy a merge prerequisite; do not auto-approve, merge, reset ledgers or replay terminal tasks. Exercise the handoff in a coherent three-role pilot and measure task success, review quality, recovery, spend and human intervention before expanding automation.
 
 Update this snapshot when a milestone's exit checks have actually run. Record
 the date, commands, observed result, and any unvalidated external dependencies;

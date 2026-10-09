@@ -61,6 +61,11 @@ class WorkflowDecision(DefinitionModel):
     kind: InputKind
     actor_id: StrictStr
     value: JsonValue
+    data_digest: Digest | None = None
+
+
+def workflow_input_digest(data: Any) -> str:
+    return sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
 class ManagedRun(DefinitionModel):
@@ -501,6 +506,7 @@ class ManagedWorkflowRunner:
                 "decisions": (*run.decisions, *(WorkflowDecision(
                     request_id=request_id, kind=response["kind"], actor_id=self._actor().actor_id,
                     value=response["value"],
+                    data_digest=workflow_input_digest(next(item.data for item in run.pending if item.request_id == request_id)),
                 ) for request_id, response in (responses or {}).items())),
             })
             self._runs.save(running)

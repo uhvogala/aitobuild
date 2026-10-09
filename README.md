@@ -15,145 +15,49 @@ Team structure and lifecycle are not fixed in code.
 ## Start here
 
 - [MILESTONES.md](MILESTONES.md): current progress, ordered milestones, and exit criteria.
-- [PLAN.md](PLAN.md): target architecture and implementation gaps.
+- [PLAN.md](PLAN.md): target architecture, implementation notes and remaining work.
 - [sim/README.md](sim/README.md): local simulation and optional Docker/live-model setup.
 - [.devcontainer/certs/README.md](.devcontainer/certs/README.md): host certificate setup.
 - [agents.md](agents.md): repository conventions for contributors and coding agents.
 
-## Current status (2026-10-09)
+## Current status
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
 | Organization configuration | Immutable revisions, native graphs, durable assignments/runs, opt-in workers, native PM coordination and bounded correction follow-ups | Broader live configuration coverage and distributed controls |
 | Ingress and routing | Signed webhooks, internal auth, issue extraction, durable scope approval/dedupe and activated task queueing | Hosted GitHub webhook delivery and deployment activation |
 | Developer execution | Preview approval, scoped exact-text edits, independent verification and supervised live same-PR correction delivery | Stronger isolation and broader live coverage |
-| Native model runtime | Configured Developer, supervised live managed PM planning/publication and scoped Architect operations | Broader PM semantic coverage and hosted model execution |
+| Native model runtime | Native PM planning, approved Developer delivery and head-pinned Architect review | Broader PM semantics, dependency scheduling and hosted model execution |
 | GitHub integration | Verified drafts, immutable reads, head-pinned COMMENTs and durable exact-approved PM issue publication | Hosted delivery and broader live coverage |
-| Meetings and proactive scans | Lifecycle registry, workflow construction, deterministic scan output | Meeting execution and real repository analysis |
-| Operations | Tick endpoint, policy checks, local durable previews/issue-task state, verified hosted CI baseline | Background tick driver, broader durable state, tracing, stronger isolation |
+| Meetings and proactive scans | Opt-in bounded native blocker meetings, durable transcripts/proposals, exact-approved continuation through supervised local delivery/review and deterministic scans | Automatic blocker detection, repeated meetings, hosted/distributed acceptance and real repository scans |
+| Operations | Tick endpoint, policy checks, local durable previews/issue-task state and CI quality gates | Background tick driver, broader durable state, tracing, stronger isolation |
 
-Managed PM planning adds 49 local regressions over `c690958`, with no default
-activation, dependency change, commit or remote write. Native SDK mocked transport,
-request/detached admission, authenticated HTTP approval/restart and uncertain-write
-recovery pass. Exact issue creation and resolved dependency links have separate
-approvals; Developer previews remain unapproved and unassigned.
-Final local gates: **902 passed, two optional Docker probes skipped**;
-Ruff, mypy (49 source files), editor diagnostics and ignored harness lint pass.
-Standing user authorization then enabled twelve bounded live PM cases with real
-Grok/GitHub through authenticated local ASGI controls. Request/detached success,
-both approval rejections, cancellation, real deadline expiry, landed/absent
-POST/PATCH response loss, partial staging and a real concurrent body edit passed
-their intended outcomes. Fifteen demo issues (#12-#26) remain open/unassigned;
-nine Developer previews remain unapproved, undispatched and unprepared. No
-implementation, merge or service push occurred. Original budgets, historical
-evidence, remote master and prior draft heads were independently verified unchanged.
-Immediate GitHub issue-list reads temporarily missed fresh markers. The supervisor
-now audits known receipts by direct GET; uncertain landed effects recovered through
-later read-only reconciliation without POST/PATCH/model replay. Both original
-failed audit reports are preserved. This accepts the bounded supervised local
-native PM planning/publication path, not hosted/distributed execution or the full
-three-role pilot. Evidence:
-[sim/.run-artifacts/example-planning-20261009/live-report.json](sim/.run-artifacts/example-planning-20261009/live-report.json).
-Supervisor-only corrections are separately retained in
-[sim/.run-artifacts/example-planning-20261009/live-supervisor-notes.json](sim/.run-artifacts/example-planning-20261009/live-supervisor-notes.json).
-The prior committed baseline passed 853 tests, with two optional prepared-target
-Docker probes skipped; Ruff and mypy (48 source files) passed. Local bounded
-follow-ups are preserved. Issues #9/#10 are resolved:
-uncertain PR creation adopts only the exact draft, state writes share the durable
-writer, and runtime checks survive Python `-O`. Correction reconciliation is
-read-only; only actual writes need the original live budget.
-Both real Docker probes passed separately. A fresh Grok trial for example issue
-#3 completed scoped implementation and five-test independent verification with
-cleanup, unchanged deadline and one recovered exact-span error. No task-result
-publication occurred in that first trial. A separately approved fresh issue #4
-trial then passed implementation, independent verification, exact remote snapshot
-checks and restart deduplication, producing [draft PR #5](https://github.com/uhvogala/aitobuild_example/pull/5).
-A native configured Architect inspected complete source/diffs and posted the exact
-operator-approved head-pinned COMMENT. The first review's five-minute budget
-expired and refused submission; a separately approved fresh 30-minute review
-completed with cleanup, without resetting the failed ledger. Its one-off report
-was adapted to retain JSON-safe role evidence rather than native message objects.
-No genuine defect or correction was proposed; live same-PR correction remains
-unrun. This is supervised operator-driven acceptance, not autonomous configured
-service/webhook acceptance. No merge, service commit/push or default activation.
-The subsequent approved service trial for issue #6 published
-[draft PR #7](https://github.com/uhvogala/aitobuild_example/pull/7) through the
-authenticated ASGI app and detached worker, with live Grok/Docker/GitHub adapters.
-Signed webhook injection, idle-approval restart, duplicate delivery, independent
-five-test verification and exact remote snapshot checks passed. One exact-span
-edit error was recovered before verification. Initial Architect inspection hit
-GitHub read errors and a model timeout; its failed run/aborted ledger are retained.
-A separately approved fresh revision/task/session/30-minute ledger completed
-source/diff inspection and the exact final-only COMMENT. Approval-boundary and
-terminal restarts preserved runs/budgets and exactly one remote review; cleanup
-passed. This local TestClient trial does not certify hosted webhook delivery,
-distributed execution or live correction. Evidence is retained under
-`sim/.run-artifacts/example-service-20261008`.
-A separately approved fresh full repeat for issue #8 produced
-[draft PR #9](https://github.com/uhvogala/aitobuild_example/pull/9) and its exact
-final-only COMMENT. Both native roles completed on their first attempt with zero
-saved diagnostics; ten narrowly checked native approvals, five independent tests,
-complete source/diff inspection, idle and terminal restarts, duplicate admission,
-exact remote snapshot and cleanup checks passed. Original ledgers and the prior
-trial remain unchanged. One-off metadata audit mistakes were corrected without
-model replay or COMMENT resubmission. Evidence is retained under
-`sim/.run-artifacts/example-service-20261008-fresh`; the same hosting and
-distributed-execution limits apply.
-The later explicitly labeled synthetic correction fixture for issue #10 produced
-[draft PR #11](https://github.com/uhvogala/aitobuild_example/pull/11). A fresh
-Architect review identified its negative-left sign bug and posted an exact
-final-only COMMENT under standing operator authorization. A linked fresh Developer
-correction passed six independent tests and exact nonce-bound publication approval,
-fast-forwarding that same PR to `9ddc9dcedacb70bb075bf2c3fd91f5444b36a3e8`.
-Restart/duplicate publication, exact remote snapshot, original ledger preservation,
-one-round bound and cleanup passed. Earlier timeout/provider failures and a
-supervisor-rejected harmless `true` command remain recorded. Operator retirement
-now supports abandoned idle approvals and already-aborted original budgets;
-neither is replayed or reset. The first corrected-head review failed closed on provider
-`429 pd_decode_pushback`, so publication passed but the full correction/re-review
-cycle was not accepted at that checkpoint. Evidence: `sim/.run-artifacts/example-correction-20261008/final-correction-report.json`.
-A subsequent fresh operator-bound native review completed four source/diff
-inspections and posted the exact final-only corrected-head COMMENT at review
-`5459666675`, with no remaining functional defect identified. Waiting/terminal
-restart, exact remote reviews and snapshot, original runs/ledgers, consumed
-publication approval, one-round limit and cleanup passed the independent audit.
-This completes the supervised correction/re-review sequence through operator
-recovery, not an uninterrupted configured-service run or a default retry endpoint.
-Reporter serialization and audit-schema errors were recovered without model or
-COMMENT replay; the failed harness audit remains saved. Its versioned-wrapper,
-exact-receipt and bounded timestamp helper is now repaired and validated offline
-against actual saved before/after snapshots and ten negative mutations, without
-replaying a model or COMMENT. Authoritative recovery evidence:
-`sim/.run-artifacts/example-correction-20261008/final-correction-recovery-report.json`.
-The implementation is committed locally; no service push, merge or default
-activation occurred. Nineteen native review contract cases passed again.
-The prior 325-test baseline
-included both real Docker probes for independent pytest success/failure and cleanup.
-The original patch-repair
-failures are fixed without relaxing ambiguous-context rejection. Prepared Docker
-sessions, managed terminals/processes, native memory/restart and browser tools
-have live integration evidence. Real Grok and Kimi evaluations retain strict
-failure reports; neither is yet certified as a zero-error full-suite baseline.
+The managed PM-to-Developer-to-Architect flow is validated for bounded supervised
+local execution. PM issue creation and resolved dependency links need separate
+exact approvals; staged Developer tasks remain unapproved until a human approves
+their implementation. Review and correction follow-ups also need their own task
+and publication approvals. Automatic dependency scheduling, hosted webhook delivery,
+distributed execution and automatic blocker detection remain outside the supported flow.
+Explicit managed graphs can resolve reported blockers through bounded read-only
+meetings before continuing the unchanged approved task.
 
-The [CI workflow](.github/workflows/ci.yml) is configured for pushes, pull requests
-and manual runs on Python 3.14 with locked uv dependencies and ripgrep. It runs
-pytest, Ruff, mypy and the mock fixture simulation, retaining an available
-simulation report for 14 days even on failure. It needs no Azure credentials.
-The [hosted baseline](https://github.com/uhvogala/aitobuild/actions/runs/37308813245)
-passed at `c6edaef`, with 180 tests and the simulation artifact retained. M0 is
-accepted. M1's constrained native profile has passing Grok/Kimi approved-task
-fixture trials; the broad standalone tool suite is not fully certified.
+GitHub defaults to mock mode. Real-repository trials use
+[uhvogala/aitobuild_example](https://github.com/uhvogala/aitobuild_example) with
+approved scope, explicit repository configuration and disposable target checkouts.
+Never execute target tasks against the service checkout. Original deadlines,
+receipts and consumed approvals are preserved; failed or uncertain effects must
+not be blindly replayed.
 
-Supervised real-repository trials use
-[uhvogala/aitobuild_example](https://github.com/uhvogala/aitobuild_example).
-Staged trials may start as soon as a concrete workflow slice is ready to test;
-full M2 delivery is not a prerequisite. Require approved task scope, explicit
-repository configuration, disposable checkouts and the safeguards applicable to
-that slice. The current simulation harness still uses copied fixtures.
-
+Implementation and acceptance history is recorded in [PLAN.md](PLAN.md#implementation-notes).
 See [agent tool evaluation](sim/README.md#agent-tool-evaluation) for model comparison,
-token/cache usage and artifact checks. Large tool outputs are saved to private
-files with bounded previews and paged retrieval; oversized API prompts are rejected.
+token/cache usage and artifact checks. The broad standalone tool suite is not fully
+certified. Large outputs use private files and bounded paging; oversized API prompts
+are rejected.
+
+The [CI workflow](.github/workflows/ci.yml) runs pytest, Ruff, mypy and the mock
+fixture simulation on Python 3.14 with locked uv dependencies and ripgrep. It
+retains available simulation reports for 14 days, including failures, and needs
+no Azure credentials.
 
 ## Quick start
 
@@ -215,6 +119,19 @@ Native agent invocations require native model profiles, not mock handles. Role
 templates precede configured guidance, and Developer memory is isolated by
 organization/revision/agent. Workflow construction is not managed execution,
 delivery acceptance or approval; task scope/budgets/verification remain separate.
+
+To select the `DeepSeek-V4.1-Flash` deployment on an already configured Foundry
+endpoint, set:
+
+```bash
+export AITOBUILD_FOUNDRY_MODEL="DeepSeek-V4.1-Flash"
+```
+
+Alternatively, register a named native model profile created with
+`RuntimeConfig(foundry_model="DeepSeek-V4.1-Flash", ...)` and reference that profile
+from a configured agent's `model_profile`. Deployment names pass through unchanged;
+selecting this model does not change the application default, activate a workflow
+or relax tool/approval policy. Provider availability requires a live check.
 
 Workflow documents use `format: "python_graph"`, a `start` node, `nodes`, `edges`
 and explicit `outputs`. Nodes reference configured agents or registered operations.
@@ -315,15 +232,12 @@ graph-supplied commands or target/publication metadata. Publication requires an
 explicit operator GitHub binding; mock publication is opt-in for fixtures only.
 
 Managed graphs currently admit operation nodes, including that native Developer
-adapter; direct configured `agent` nodes fail closed pending scoped role adapters.
+adapter; direct configured `agent` nodes fail closed.
 `completed` means the selected graph and cleanup finished, not independent
 verification, semantic review or publication approval; implement-only graphs stop
-at `implemented`. Thirty-eight runner regressions cover actual SDK/mock-transport
-approval/rejection/recovered edits, restart, revision/ownership drift, duplicates,
-cancellation and a disposable-target prepare/implement/verify/mock-draft graph.
-No live model/GitHub/Docker trial or hosted CI was repeated for that runner slice.
-Default HTTP workflows remain unchanged; journal capacity does not govern unmanaged
-HTTP runs. Broader managed roles and distributed controls remain pending.
+at `implemented`. Default HTTP workflows remain unmanaged without explicit
+activation; journal capacity does not govern unmanaged HTTP runs. Distributed
+controls remain pending.
 
 ### Opt-in managed service
 
@@ -356,7 +270,7 @@ uses only the approved target/base and original worker ledger. Duplicate dispatc
 metadata, including a durable `dedupe` result, resolves existing ownership and run
 receipts; the dispatch marker cannot suppress recovery after an earlier service
 interruption. New activation revisions apply to unclaimed tasks, not existing runs.
-Unactivated repositories and apps without a factory keep their prior behavior.
+Unactivated repositories and apps without a factory keep metadata-only dispatch.
 
 Optional internal controls (all require `X-Internal-Token`):
 - `GET /internal/organization/tasks/{preview_id}` returns `managed_run` or null.
@@ -377,17 +291,8 @@ selection has no run yet; status does not certify budgets or delivery. Cancellat
 uses frozen assignment ownership even if mutable preview state becomes unreadable.
 Failed/expired/interrupted runs retain terminal evidence and never get fresh budgets.
 
-Service validation on 2026-10-07 adds 18 cases: authentication/strict fields,
-approval/webhook/trigger routing, restart/duplicate delivery, original revision,
-decision kinds/rejection, cancellation/expiry/interruption, activation isolation,
-coordinator identity, admission races/capacity and cleanup after preview corruption.
-Actual native Developer SDK approve/reject/recovered-edit and independent verification/
-mock-draft fixtures also run through the service entrypoint. Full gates: 549 passed,
-two optional Docker skips, Ruff/mypy (43 files), and legacy mock simulation success.
-No live model/GitHub/Docker trial or hosted CI was added. Without a worker factory,
-execution still awaits the graph in the calling request. The optional detached
-worker follows below. Capacity still excludes unmanaged HTTP runs. Live delivery
-acceptance remains pending and requires fresh explicit approval.
+Without a worker factory, execution awaits the graph in the calling request.
+The optional detached worker follows below. Capacity excludes unmanaged HTTP runs.
 
 ### Opt-in detached local worker
 
@@ -447,13 +352,8 @@ reports live worker slots, active previews and retained lifecycle errors. A fail
 receipt write stops that slot; inspect evidence and restart rather than replaying
 effects or resetting budgets.
 
-Worker validation adds 38 cases, including actual native SDK mocked-transport
-approval/rejection/recovered exact-span editing and independent verification/mock
-draft delivery. Full gates: 587 passed/two optional Docker skips, Ruff/mypy (44 files),
-clean editor diagnostics and mock simulation success/artifact/exit 0. This is local
-file-lock coordination, not distributed execution, hostile-tenant certification or
-multi-user authentication. No new live model/GitHub/Docker trial, hosted CI, remote
-write or default activation occurred.
+This is local file-lock coordination, not distributed execution, hostile-tenant
+certification or multi-user authentication.
 
 ### Scoped native PM and Architect operations
 
@@ -488,12 +388,73 @@ APPROVE, REQUEST_CHANGES, merge, implementation writes and arbitrary source targ
 are unavailable. General Architect tools also expose `architect_read_published_source`
 and `architect_read_published_diff` under their existing tool-approval policy.
 
-The initial role slice adds 42 regressions, including native SDK mocked transports
-and GET-only CLI adapter stubs. Managed PM publication is described below;
-executed meetings and broader live coverage remain pending.
-Existing operator service/worker factories may register these operations;
-published-review admission below adds opt-in HTTP routing, not default activation
-or an external trial.
+Existing operator service/worker factories may register these operations.
+Published-review admission below adds opt-in HTTP routing, not default activation.
+Managed PM publication and bounded blocker meetings are described below.
+
+### Managed Blocker Meetings
+
+[src/aitobuild/organization_meetings.py](src/aitobuild/organization_meetings.py)
+provides `NativeManagedMeetings`, strict `BlockerRequest`/`MeetingBinding` contracts
+and atomic/fsynced `FileMeetingStore` receipts. Register it explicitly in an approved
+task graph; the legacy meeting bootstrap still only constructs workflows.
+The graph's preceding trusted operation must supply an agenda and blocker evidence,
+not arbitrary actor, task, model or budget overrides. Automatic mid-implementation
+blocker detection is not supplied.
+
+```python
+from aitobuild.organization_meetings import NativeManagedMeetings, MeetingBinding, MeetingLimits
+
+meetings = NativeManagedMeetings(
+	runtime_for=runtime_for,
+	state_dir=context.state_dir / "meetings",
+	runs=runs,
+	bindings={blocked_workflow_id: MeetingBinding(
+		participants=participant_ids,
+		resolver=resolver_id,
+		limits=MeetingLimits(max_rounds=4, max_transcript_bytes=32000),
+	)},
+	invoke_timeout_seconds=180,
+)
+native = NativeDeliveryImplementation(
+	worker=context.worker, runtime_for=runtime_for, tools=context.tools,
+	state_dir=context.state_dir / "native",
+	continuation_for=meetings.continuation,
+)
+
+async def cleanup(task_context):
+	try:
+		await meetings.cleanup(task_context)
+	finally:
+		await delivery.cleanup(task_context)
+
+operations = {**delivery.operations, **meetings.operations}
+```
+
+Construct `delivery` with that `native` implementation, and register `operations`,
+the combined cleanup and a new operator binding revision in the service/runner.
+Configured `meeting_resolve_blocker` nodes receive strict `BlockerRequest` data.
+Participants/resolver must be named members of the frozen task team, use native
+model profiles and have no persistent tool profiles. Native `GroupChatBuilder`
+uses bounded round-robin discussion; a configured participant then emits the strict
+`continue`, `scope_change` or `escalate` proposal. No meeting participant receives
+filesystem, command, GitHub, implementation or approval tools.
+
+Blocker evidence, task/revision/scope/binding pins, original absolute deadline,
+transcript and proposal are durable. A `continue` proposal waits for its exact
+one-shot service approval through the existing managed task controls. The consumed
+decision pins the saved input digest; Developer sessions also pin the approved
+guidance and revalidate it on tool calls/resumes. Task scope, approvals, verification
+and publication gates remain unchanged. Rejection, scope change, unresolved output,
+timeout, cancellation or interrupted execution stop the graph; scope change needs
+a newly approved task. Saved idle approvals resume without rerunning the discussion.
+Missing/corrupt/drifted receipts cannot authorize continuation or recreate budgets.
+
+One meeting invocation per managed run is supported. Repeated meetings, automatic
+blocker detection, automatic failed-task recovery and hosted/distributed acceptance
+remain separate work. Supervised local meeting-to-reviewed-draft execution and
+rejection/scope-change stops are accepted; this does not certify general tool use
+or enable default activation.
 
 ### Managed PM Planning and Issue Publication
 
@@ -574,11 +535,8 @@ Missing, ambiguous, drifted or incomplete effects fail closed. Bounded full issu
 list paging refuses truncated lookup. Local locks are not distributed recovery;
 GitHub PATCH has no transactional compare-and-swap against concurrent writers.
 
-The 49 regression cases use native mock transport and mock/stub GitHub adapters;
-the separate twelve-case live matrix above validates bounded supervised PM
-planning/publication, not broad planning quality or hosted delivery. GitHub list
-visibility can lag new writes: a temporary reconciliation refusal is not authority
-to repeat a POST/PATCH. Inspect later via remote reads under the same receipts;
+GitHub list visibility can lag new writes: a temporary reconciliation refusal is
+not authority to repeat a POST/PATCH. Inspect later via remote reads under the same receipts;
 never reset the original ledger. Legacy `PlanDraftStore` and
 `IssueWriteApprovalStore` remain separate in-memory prototype tools.
 
@@ -622,10 +580,7 @@ remain evidence, not assignment authority or independent verification.
 The service alone validates eligibility and creates the Developer assignment under
 trusted PM identity; the callback creates no separate PM assignment or issue write.
 Journal capacity applies to the assigned owner, not coordinator calls; detached
-worker bounds still govern execution. This bridge adds 17 native mock-transport
-regressions for service/detached admission, capacity reuse, corruption/pins,
-cancellation, expiry and runtime refusal. Default startup remains unmanaged;
-no live model/GitHub/Docker trial, hosted CI, push or remote write was added.
+worker bounds still govern execution. Default startup remains unmanaged.
 
 ### Published Review Admission
 
@@ -684,15 +639,8 @@ Frozen-owner cancellation can still abort the original review ledger when mutabl
 preview metadata is damaged. The exact saved COMMENT body/target needs another
 one-shot `/internal/organization/tasks/approve` decision; restart does not rerun the model.
 
-Eighteen regressions cover staging/recovery, HTTP authentication and approval,
-immutable revisions/scope/ledgers, and native mocked source/diff inspection followed
-by service/detached COMMENT approval or frozen-owner cancellation. Full local gates
-are 664 passed/two optional Docker skips, Ruff/mypy (46 sources), diagnostics,
-six-call-site service compatibility and successful mock simulation. Access counters
-still do not certify semantic review. No default activation, live trial, remote
-write or dependency change accompanied those checks. The role/coordinator/review
-baseline was subsequently committed as `823ea98` and is on `master`. Scoped
-correction handoff is described below; managed PM writes and bounded meetings remain pending.
+Access counters do not certify semantic review. Scoped correction handoff is
+described below; meetings do not replace a separately approved head-pinned review.
 
 ### Scoped Correction Handoff
 
@@ -732,7 +680,7 @@ published branch; preparation does not fetch, and missing heads fail closed.
 Deleted initialized budgets cannot be recreated by replaying preparation.
 Register the existing delivery operations for implementation and independent
 verification; a completed metadata graph is neither an implemented correction
-nor a verified/publishable artifact. The handoff slice was committed at `7d7ea13`.
+nor a verified/publishable artifact.
 
 Same-PR correction publication (operator-only): each verified `published-correction-*`
 delivery is its own record holding one round and never rewrites the original. Authenticated
@@ -776,11 +724,6 @@ block those checks; files that cannot be parsed at all still fail closed.
 A push that landed before the PR closed or became ready stays `publishing` for operator
 inspection; the service does not reopen the PR or change its state.
 Managed `delivery_publish` and the legacy publish endpoint refuse correction tasks.
-
-Twenty correction regressions cover actual native Architect mocked transports,
-exact approval and refusals, request/detached handoff, authenticated HTTP offers,
-staging recovery, scope/head/revision pins and fresh/missing-seed preparation.
-That baseline proves handoff/preparation, not a live Developer correction or semantic review.
 
 ### Complete Supervised Correction Cycle
 
@@ -828,30 +771,6 @@ metadata when present. Authenticated
 `POST /internal/organization/followups/offer` accepts only `{"preview_id": "..."}` and
 retries staging after interruption/error without replaying models, publication,
 approval or budgets. Staging failures preserve completed delivery and visible errors.
-
-PR consolidation (2026-10-08): [PR #11](https://github.com/uhvogala/aitobuild/pull/11)
-at `8bd1015` is imported locally atop `38c721d`, together with the preserved lifecycle.
-The operator-only one-use publisher replaces the earlier direct managed correction
-publisher. Combined gates: **798 passed/two optional Docker skips**, Ruff/mypy
-(47 sources), clean diagnostics, compatible callers and successful mock simulation.
-Regressions retain native SDK mocked-model exact edits, real disposable-file
-assertions through a recording verifier, request/detached decisions, bounded lineage
-and staging retries, plus exact approvals, chain/failure/retirement checks and
-per-write expiry and pre/post-PATCH race guards. The refresh adds six request/detached
-replacement-attempt cases covering release, retirement, interruption, tampering and immutable
-predecessors. Earlier lifecycle/sync/consolidation gates were 715/733/792 passing tests.
-Both existing hosted baseline checks for upstream `8bd1015` passed. The upstream adapter
-still lacks our budget callbacks and pre/post-PATCH guards; seven isolated upstream probes
-confirm the missing hooks and race gaps, reported in a [PR comment](https://github.com/uhvogala/aitobuild/pull/11#issuecomment-6055261194).
-No live model/Docker/contribution-publication trial, new hosted run, dependency change,
-default activation, commit, push or remote merge accompanies this refresh.
-Local evidence is not semantic/live acceptance.
-
-Next: [issue #9](https://github.com/uhvogala/aitobuild/issues/9)
-(uncertain PR-create response) and [issue #10](https://github.com/uhvogala/aitobuild/issues/10)
-(atomic-write/symlink/permission hardening), then freshly approved hosted/live
-delivery and review acceptance. Managed PM planning/writes and executed meetings
-remain separate work.
 
 ### API setup
 
@@ -1071,7 +990,7 @@ Preview flow:
 
 ### Durable repository issue preparation
 
-The first M2 slice supports GitHub `issues` events with `opened`, `assigned`, or
+Repository issue admission supports GitHub `issues` events with `opened`, `assigned`, or
 `edited` actions. Assignment creates a reviewable preview, not authorization to
 execute; `assigned` must include an assignee login. Other repository webhook
 events, closed issues, and PRs are rejected. Payloads must provide repository
@@ -1082,7 +1001,7 @@ heading with bullet, checkbox, or numbered list items. Missing criteria are
 rejected rather than replaced with a generic objective. Service source files
 are not added as target context. The existing default isolation policy is part
 of the scope shown for human review; arbitrary scope overrides are not supported
-for extracted repository issue previews in this slice.
+for extracted repository issue previews.
 
 Webhooks do not supply a base commit SHA. Approve the preview through
 `POST /internal/developer/preview/approve` with `preview_id` and `base_revision`,
@@ -1104,10 +1023,11 @@ with `pending_only=false` to recover `approved` or `dispatched` records. These
 states describe metadata routing, not worker execution or completion.
 
 Repository issue bundles require the prepared-target native execution path below.
-The legacy run endpoint and harness remain blocked for issue tasks. Delivery
-commits, pushes and PR operations remain absent. No live
-GitHub trial has run for this slice. Other trigger dedupe, meetings and scheduler
-state remain in memory; this is not distributed storage.
+The legacy run endpoint and harness remain blocked for issue tasks. Preparation
+does not commit, push or publish; publication uses the guarded delivery path and
+requires explicit approval. Other trigger dedupe, legacy meetings and scheduler
+state remain in memory; managed meeting receipts are local durable files, not
+distributed storage.
 
 ### Prepare an approved target checkout
 
@@ -1230,8 +1150,8 @@ internal authentication, the immutable human-approved issue and a live allowlist
 `gh_cli` adapter. Configure `AITOBUILD_GITHUB_ADAPTER=gh_cli` and
 `AITOBUILD_GITHUB_ALLOWED_REPOS` with the target repository. Install and
 authenticate `gh` against the intended GitHub host before using it; the CLI is
-not included in the service container. Live trial publication needs separate
-explicit scope approval, not permission inferred from a prior no-publication run.
+not included in the service container. Real publication requires explicit scope
+approval; task completion alone does not authorize it.
 
 Publication captures immutable upload bytes/modes during the checkout digest
 walk and compares the digest to independent verification before remote writes.
@@ -1306,7 +1226,7 @@ MCP adapter mode:
 - Session images must include Node.js/`npx`; the adapters launch shell/filesystem
 	servers through `docker exec ... npx -y`. Server packages, schemas, paths, and
 	tool names still need integration validation; MCP is optional, not required
-	for the verified local baseline.
+	for native delivery, and is unavailable for preview-bound native tasks.
 
 Agent Framework tool wiring:
 
@@ -1314,9 +1234,9 @@ Agent Framework tool wiring:
 - Tool functions are compatible with the `@tool(...)` pattern from the Agent Framework sample `02_add_tools.py` when `agent_framework.tool` is available.
 - Targeted edits use `developer_edit_file(path, old_text, new_text)`. The non-empty old text must match exactly once; insertion repeats a unique existing anchor in the replacement. Stale or ambiguous matches leave the file unchanged. No diff syntax, line-prefix repair or newline normalization is involved.
 - The legacy `developer_apply_patch` parser remains opt-in through `DeveloperToolContext.use_legacy_patch_tool` for compatibility; it is not advertised to models by default. Use `developer_write_file` for new files or an explicitly requested full-file replacement.
-- A focused Grok/Kimi read-edit-test probe passed for both models with zero tool errors and independent pytest verification. This is editing evidence, not full-suite acceptance.
 - `developer_find_files` discovers paths with glob filters; `developer_search_files` searches literal text or Rust regex and returns paths, line numbers and byte columns. Both use ripgrep, respect allowed roots and ignore files, and support bounded pages with `next_offset`. Hidden/ignored files are opt-in; content searches skip files over 1 MiB and return bounded line previews. Read selected files before exact-text edits.
-- Shell `rg` is available in the prepared image and allowed by preview command policy. Restart existing Developer containers to pick up image changes; private checkouts and home data persist. The workspace dev-container package change takes effect on rebuild.
+- `DeveloperIsolationPolicy.allowed_paths` uses literal equality/prefixes, not globs. File-discovery patterns are separate from this policy; keep reads/discovery within scope and restrict writes to authorized paths.
+- Shell `rg` is available in the prepared image and allowed by preview command policy. Rebuild images after toolchain changes; new Developer sessions use the rebuilt image. Do not reset an existing task's ledger to adopt image changes.
 
 Developer Agent runtime flow:
 
@@ -1415,9 +1335,10 @@ remain required before unattended execution.
 
 ## State and recovery
 
-Deduplication, previews, meetings, escalation events, and session mappings are
-in memory. Restarting the server loses that application state, and reload mode
-can invalidate previews. Docker containers may outlive the API process; use
+Non-repository trigger deduplication, legacy meetings, escalation events and active
+session mappings are in memory. Repository previews, managed runs/decisions and
+managed blocker meetings persist in local stores. Restart loses the in-memory
+state. Docker containers may outlive the API process; use
 `/internal/developer/session/stop-all` to clean up containers discovered under
 the configured name prefix. Native AgentSession, history, memory and pending
 approvals persist in the configured local state directory; these are trusted
