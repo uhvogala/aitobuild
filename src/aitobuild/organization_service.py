@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from pydantic import Field, JsonValue, StrictInt, StrictStr
 
 from aitobuild.agent_tools import DeveloperToolContext
+from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
 from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
-from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry
-from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, EventName, Identifier
+from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry, preview_approval_operation
+from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, EventName, Identifier, OrganizationDefinition
 from aitobuild.organization_assignments import AssignmentProposal, AssignmentService, AssignmentStore, TaskAssignment
 from aitobuild.organization_delivery import _delivery_call
 from aitobuild.organization_runner import (
@@ -25,6 +26,7 @@ from aitobuild.organization_reviews import PublishedReviewAdmission
 from aitobuild.organization_planning import PlanningAdmission
 from aitobuild.organization_dependencies import ManagedDependencies
 from aitobuild.tools.github import GitHubAdapter
+from aitobuild.publish_approvals import publish_policy_operation
 
 
 class ManagedRoute(DefinitionModel):
@@ -41,6 +43,9 @@ class ManagedServiceContext:
     worker: DeveloperDeliveryWorker
     tools: DeveloperToolContext
     state_dir: Path
+    approval_policy: ApprovalPolicy = ApprovalPolicy()
+    organization_definition: OrganizationDefinition | None = None
+    task_base_revision_for: Callable[[DeveloperPreview], str | None] | None = None
 
 
 CoordinatorProposal = Callable[[DefinitionSnapshot, DeveloperPreview], Awaitable[AssignmentProposal]]
@@ -71,12 +76,23 @@ class ManagedOrganizationService:
         automatic_review_followups: bool = False,
         planning: PlanningAdmission | None = None,
         dependencies: ManagedDependencies | None = None,
+        approval_policy: ApprovalPolicy = ApprovalPolicy(),
+        task_base_revision_for: Callable[[DeveloperPreview], str | None] | None = None,
+        correction_publication_github: GitHubAdapter | None = None,
+        allow_mock_publication: bool = False,
     ) -> None:
         self._definitions = definitions
         self._assignments = assignments
         self._runs = runs
         self._previews = previews
         self._worker = worker
+        if approval_policy.task_admission == "automatic" and not callable(task_base_revision_for):
+            raise ValueError("Automatic task admission requires a trusted pinned-base binding")
+        self._task_base = task_base_revision_for
+        if approval_policy.correction == "automatic" and (reviews is None or correction_publication_github is None):
+            raise ValueError("Automatic correction requires trusted review and publication bindings")
+        self._correction_github = correction_publication_github
+        self._allow_mock_publication = allow_mock_publication
         if planning is not None and (planning.definitions is not definitions or planning.previews is not previews or
                                      planning.operator_id != operator_id):
             raise PermissionError("Planning must use service-owned definitions, previews and operator identity")
@@ -115,10 +131,18 @@ class ManagedOrganizationService:
                 budget_path_for=self.budget_path,
             ), actor_provider=self._actor.get, operations=operations, cleanup=cleanup,
             binding_revision=binding_revision, predicates=predicates, limits=limits,
+            approval_policy=approval_policy,
+            external_approval_stages=(ApprovalStage.TASK_ADMISSION, ApprovalStage.CORRECTION),
         )
+
+    @property
+    def approval_policy(self) -> ApprovalPolicy:
+        return self._runner.approval_policy
 
     def _route(self, preview: DeveloperPreview) -> ManagedRoute | None:
         task_id = str(preview.bundle_payload.get("task_id", ""))
+        if task_id.startswith("published-correction-") and self.approval_policy.correction == "disabled":
+            raise PermissionError("Correction is disabled")
         if self._dependencies is None and task_id.startswith("dependent-issue-"):
             raise PermissionError("Dependent handoffs require their trusted admission binding")
         if self._dependencies is not None:
@@ -159,12 +183,37 @@ class ManagedOrganizationService:
         if preview is None:
             raise ValueError("Preview not found")
         route = self._route(preview)
-        if route is None or not preview.approved:
+        if route is None:
+            return None
+        preview = self._automatic_task_approval(preview)
+        if not preview.approved:
             return None
         assignment = self._owned(preview, route)
         if assignment is not None:
             route = route.model_copy(update={"revision": assignment.revision, "event": assignment.event})
         return preview, route
+
+    def _automatic_task_approval(self, preview: DeveloperPreview) -> DeveloperPreview:
+        if self.approval_policy.task_admission == "disabled":
+            raise PermissionError("Task admission is disabled")
+        if preview.approved or self.approval_policy.task_admission == "human":
+            return preview
+        if self._task_base is None:
+            raise PermissionError("Automatic task admission has no trusted base binding")
+        base = self._task_base(preview)
+        bundle = developer_task_bundle_from_payload(preview.bundle_payload)
+        if bundle.issue_context is not None:
+            if bundle.issue_context.base_revision is not None and base != bundle.issue_context.base_revision:
+                raise PermissionError("Automatic admission cannot replace an already pinned task base")
+            bundle = replace(bundle, issue_context=replace(bundle.issue_context, base_revision=base))
+        elif base is not None:
+            raise PermissionError("Non-repository admission cannot add a repository base")
+        decision = self.approval_policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id=self.operator_id,
+            operation=preview_approval_operation(preview.preview_id, bundle.to_payload()), automatic_supported=True)
+        approved = self._previews.approve(preview.preview_id, base_revision=base, approval_policy=decision)
+        if approved is None:
+            raise ValueError("Preview disappeared before configured admission")
+        return approved
 
     def recorded_assignment(self, task_id: str) -> TaskAssignment | None:
         assignment = self._assignments.for_task(task_id)
@@ -195,6 +244,8 @@ class ManagedOrganizationService:
         preview = self._previews.get(preview_id)
         if preview is not None:
             await _delivery_call(lambda: self._route(preview))
+            if not preview.approved and self.approval_policy.task_admission == "disabled":
+                raise PermissionError("Task admission is disabled")
 
     async def offer_dependency_handoff(self, *, planning_assignment_id: str, issue_key: str, base_revision: str) -> dict[str, Any]:
         dependencies = self._dependencies
@@ -204,6 +255,8 @@ class ManagedOrganizationService:
             planning_assignment_id=planning_assignment_id, issue_key=issue_key, base_revision=base_revision))
 
     async def offer_correction(self, review_preview_id: str) -> DeveloperPreview | None:
+        if self.approval_policy.correction == "disabled":
+            raise PermissionError("Correction is disabled")
         reviews = self._reviews
         if reviews is None:
             return None
@@ -219,6 +272,8 @@ class ManagedOrganizationService:
 
     async def stage_correction_publication(self, correction_preview_id: str) -> dict[str, Any]:
         """Stage the exact same-PR push (diff, pinned head, PR number) for one-use operator approval."""
+        if self.approval_policy.correction == "disabled":
+            raise PermissionError("Correction is disabled")
         reviews = self._correction_reviews()
         binding = await _delivery_call(lambda: reviews.correction_publication_binding(correction_preview_id))
         return await _delivery_call(lambda: self._worker.stage_correction_publication(
@@ -227,14 +282,31 @@ class ManagedOrganizationService:
     async def publish_correction(
         self, correction_preview_id: str, *, approval_digest: str, github: GitHubAdapter,
         allow_mock_publication: bool = False,
+        _policy_source: Literal["human", "operator_policy"] = "human",
     ) -> tuple[DeliveryPreparation, DeveloperPreview | None]:
         """Consume the operator's exact approval, fast-forward the pinned PR, then stage the next Architect review."""
         reviews = self._correction_reviews()
         binding = await _delivery_call(lambda: reviews.correction_publication_binding(correction_preview_id))
+        saved = await _delivery_call(lambda: self._worker.publication_approval(correction_preview_id))
+        if saved is None or saved.state in {"pending", "invalidated"}:
+            await self.stage_correction_publication(correction_preview_id)
+            saved = await _delivery_call(lambda: self._worker.publication_approval(correction_preview_id))
+        if saved is None:
+            raise PermissionError("Correction requires an exact staged publication approval")
+        run = self.status(correction_preview_id)
+        decision = self.approval_policy.resolve(ApprovalStage.CORRECTION, actor_id=self.operator_id,
+            operation=publish_policy_operation(approval_digest, saved.snapshot),
+            expected_revision=run.approval_policy_revision if run is not None else None,
+            automatic_supported=self._correction_github is not None, source=_policy_source)
+        if saved.approval_policy is not None and saved.state in {"consuming", "consumed"}:
+            if saved.approval_policy.policy_revision != decision.policy_revision:
+                raise PermissionError("Correction publication policy revision changed")
+            decision = saved.approval_policy
         record = await _delivery_call(lambda: self._worker.approve_and_publish_correction(
             correction_preview_id, approval_digest=approval_digest, review_receipt_digest=binding,
             actor_id=self.operator_id, github=github, require_human_approval_for_repo_writes=True,
             allow_mock_publication=allow_mock_publication,
+            approval_policy=decision,
         ))
         run = self.status(correction_preview_id)
         if run is not None and run.state == "completed" and run.cleanup_succeeded is True:
@@ -244,6 +316,19 @@ class ManagedOrganizationService:
         else:
             review = await _delivery_call(lambda: reviews.offer(correction_preview_id))
         return record, review
+
+    async def publish_correction_by_policy(self, correction_preview_id: str) -> tuple[DeliveryPreparation, DeveloperPreview | None]:
+        if self.approval_policy.correction != "automatic" or self._correction_github is None:
+            raise PermissionError("Automatic correction publication is not activated")
+        saved = await _delivery_call(lambda: self._worker.publication_approval(correction_preview_id))
+        if saved is None or saved.state in {"pending", "invalidated"}:
+            staged = await self.stage_correction_publication(correction_preview_id)
+            digest = staged["digest"]
+        else:
+            digest = saved.digest
+        return await self.publish_correction(correction_preview_id, approval_digest=digest,
+            github=self._correction_github, allow_mock_publication=self._allow_mock_publication,
+            _policy_source="operator_policy")
 
     async def retire_correction(
         self, correction_preview_id: str, *, github: GitHubAdapter, allow_mock_publication: bool = False,
@@ -268,6 +353,12 @@ class ManagedOrganizationService:
 
     async def _follow_up(self, preview_id: str, run: ManagedRun) -> ManagedRun:
         reviews = self._reviews
+        if self.approval_policy.correction == "automatic" and run.state == "completed" and run.cleanup_succeeded is True:
+            assignment = self._assignments.get(run.assignment_id)
+            if assignment is not None and assignment.task_id.startswith("published-correction-"):
+                record = await _delivery_call(lambda: self._worker.get(preview_id))
+                if record is not None and record.state in {"verified", "publishing", "published"}:
+                    await self.publish_correction_by_policy(preview_id)
         if self._automatic_followups and reviews is not None and run.state == "completed" and run.cleanup_succeeded is True:
             await _delivery_call(lambda: reviews.follow_up(preview_id, run))
         return run
@@ -297,7 +388,10 @@ class ManagedOrganizationService:
         if preview is None:
             raise ValueError("Preview not found")
         route = self._route(preview)
-        if route is None or not preview.approved:
+        if route is None:
+            return None
+        preview = self._automatic_task_approval(preview)
+        if not preview.approved:
             return None
         if activation is not None:
             if str(preview.bundle_payload.get("task_id", "")).startswith("dependent-issue-") and activation != route:

@@ -114,15 +114,17 @@ dependency change or default activation during trials.
 
 ## Direction
 
-Build a supervised product-team framework with configurable agent instances,
+Build a policy-controlled product-team framework with configurable agent instances,
 teams, workflows and delegation. Role templates define permission ceilings, not
 a fixed organization chart. First establish versioned file-backed definitions,
 then configurable factories and recorded assignments, before implementing a
 managed workflow runner. Its first delivery recipe is an approved GitHub issue
 becoming a tested draft PR in an isolated task checkout. PM-led, rule-based or
 human-selected delegation is configurable; PM assignment does not require the
-later full backlog-planning milestone. Humans approve scope and retain merge
-authority. Add review, bounded meetings and proactive recipes without hardcoding
+later full backlog-planning milestone. Human approval is a configurable stage
+policy with manual defaults, not a universal target restriction. Automatic
+decisions must retain exact immutable evidence and consume existing safety gates;
+merge needs its own trusted operator-controlled binding. Add review, bounded meetings and proactive recipes without hardcoding
 one universal lifecycle. Reuse native Microsoft Agent Framework capabilities
 before adding orchestration logic; validate against the pinned SDK, not an
 assumed API. MCP is an optional integration path, not a prerequisite for the MVP.
@@ -719,6 +721,17 @@ Exit criteria:
 
 ## Immediate Work Queue
 
+Central configuration/approval-policy foundation is implemented: strict versioned
+manifest, environment-backed secrets/overrides, shared human/automatic/disabled
+stages, policy revision pins and exact persisted decisions. Native SDK fixtures
+cover automatic task admission, Developer tools, PM creation/resolved links,
+draft/COMMENT publication, bounded meeting continuation and verified same-PR
+correction through request/detached paths. These checks use mocked transports and
+disposable fixtures. Unsupported bindings fail closed; defaults remain manual.
+Automatic merge, broader live automatic-mode acceptance and the complete unattended
+lifecycle require separate implementation and acceptance. Prior supervised trials
+are not autonomous evidence.
+
 PR #11 integration, issues #9/#10/#12 and supervised correction/re-review recovery
 are complete at the committed baseline. The bounded PM planning/publication slice
 is committed locally and accepted in twelve bounded supervised live cases. Managed
@@ -728,7 +741,7 @@ semantic coverage, hosted/distributed execution and the full three-role pilot re
 1. Preserve the configurable definition/storage regressions and existing M0/M1, exact-span and publication safeguards. Run CI for new slices; never target the service checkout.
 2. Preserve the accepted twelve-case live PM matrix and bounded local meeting-to-reviewed-draft/stop cases, with exact task/creation/resolved-link/continuation approvals. Extend broader planning-quality coverage and separately scoped implementation handoff before claiming the full pilot; Developer previews stay unapproved until that approval. Standing trial authorization does not bypass service gates or reset ledgers. Never replay uncertain writes; use read-only inspection for visibility lag. Keep activation explicit, with no fixed team/contribution loop. Automatic blocker detection/repeated meetings and distributed controls remain separate work.
 3. Preserve passing request-scoped/detached fixture and supervised local live acceptance (signed/authenticated delivery, decisions/restart, native SDK tools and independent verification/draft graph), and run hosted CI when authorized publication of the service changes is available. Default server activation and current hosted/distributed delivery remain unverified. Keep GitHub assignee writes separate and do not infer semantic review from metadata.
-4. Preserve the accepted operator-triggered dependency handoff and whole-repository Architect context: exact human-merge reconciliation stays read-only, handoffs start unapproved and every implementation needs its own pinned base/approval/ledger. Keep historical receipt readers separate from execution storage and Architect read context separate from Developer write scope. Publication or a COMMENT cannot satisfy a merge prerequisite. Do not auto-approve, merge, reset ledgers or replay terminal tasks. Broaden the coherent three-role pilot and measure success, review quality, recovery, spend and human intervention before expanding automation.
+4. Preserve the accepted operator-triggered dependency handoff and whole-repository Architect context: exact merge reconciliation stays read-only, handoffs start unapproved and every implementation needs its own pinned base/decision/ledger. Keep historical receipt readers separate from execution storage and Architect read context separate from Developer write scope. Publication or a COMMENT cannot satisfy a merge prerequisite. Automatic decisions require explicit supported operator policy; never let models self-approve, merge through role tools, reset ledgers or replay terminal tasks. Broaden the coherent three-role pilot and measure success, review quality, recovery, spend and human intervention before expanding automatic scheduling or merge.
 
 Update this snapshot when a milestone's exit checks have actually run. Record
 the date, commands, observed result, and any unvalidated external dependencies;

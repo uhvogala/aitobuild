@@ -17,6 +17,7 @@ from filelock import FileLock
 from pydantic import Field, StrictInt, StrictStr, model_validator
 
 from aitobuild.agents import default_agent_specs
+from aitobuild.approval_policy import ApprovalStage
 from aitobuild.durable_files import atomic_write_text
 from aitobuild.organization import DefinitionModel, Identifier
 from aitobuild.organization_runner import (
@@ -167,7 +168,8 @@ class NativeManagedMeetings:
 
     @property
     def operations(self) -> Mapping[str, ManagedOperation]:
-        return {"meeting_resolve_blocker": ManagedOperation(self.resolve, role=self._role, on_response=self.approve)}
+        return {"meeting_resolve_blocker": ManagedOperation(self.resolve, role=self._role, on_response=self.approve,
+                                    approval_stage=ApprovalStage.MEETING_CONTINUATION)}
 
     def _pins(self, context: ManagedTaskContext, binding: MeetingBinding) -> dict[str, Any]:
         assignment = context.revalidate()

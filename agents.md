@@ -2,10 +2,12 @@
 
 ## Project and Reference Docs
 
-aitobuild is a supervised, opt-in product-team framework with configurable PM,
+aitobuild is a policy-controlled, opt-in product-team framework with configurable PM,
 Architect and Developer roles. Approved tasks can produce verified draft PRs;
-humans retain scope approval and merge authority. It is not an autonomous
-issue-to-PR service.
+the accepted default profile uses human scope approval and merge authority.
+Supported managed stages allow configured human or automatic operator-policy
+decisions, with a separate future trusted merge operation. Current supervised
+capabilities must not be described as a complete autonomous issue-to-PR service.
 
 - [README.md](README.md): current capabilities, setup, configuration and APIs.
 - [PLAN.md](PLAN.md): target architecture, implementation notes and remaining work.
@@ -46,6 +48,17 @@ require `X-Internal-Token` by default.
 
 - Keep agent instances, prompts, model profiles, teams/coordinators, workflows
   and delegation configurable. Do not hardcode a team or universal contribution loop.
+- Central settings and stage policies are trusted operator configuration. Keep
+  manual defaults and distinguish implemented adapters from target automatic
+  capabilities. `disabled` refuses work; it never means skipping a gate. Automatic
+  decisions must retain exact operation evidence, actor and policy revision, role
+  ceilings, verification, original budgets and cleanup. No model self-approval,
+  silent active-run policy drift or uncertain-effect replay.
+- [config/aitobuild.example.json](config/aitobuild.example.json) is selected with
+  `AITOBUILD_CONFIG_FILE`; preserve strict schema validation, environment-backed
+  secrets and environment precedence. Explicit factories must bind the effective
+  policy exactly. Automatic admission needs a trusted exact base; automatic
+  correction needs the trusted review/publication bindings. Merge is unsupported.
 - [src/aitobuild/organization.py](src/aitobuild/organization.py) owns strict JSON
   definitions and immutable revisions. Definitions and run state have separate
   storage contracts. [config/organization.example.json](config/organization.example.json)
@@ -81,7 +94,8 @@ require `X-Internal-Token` by default.
 - Actor identity comes from trusted operator/runtime context, never model output
   or request-supplied identity. Change operator binding revisions when registered
   behavior changes; active runs must refuse drift.
-- Repository issue tasks require explicit human approval, repository identity,
+- Repository issue tasks require an exact human or supported operator-policy
+  approval, repository identity,
   an operator-pinned base SHA and criteria under a Markdown Acceptance Criteria
   heading. Changed scope requires a new approved task.
 - Preserve immutable approvals, revisions, receipts, original absolute deadlines

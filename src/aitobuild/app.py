@@ -240,6 +240,8 @@ def create_app(
     managed_worker_factory: Callable[[ManagedOrganizationService, ManagedServiceContext], ManagedOrganizationWorker] | None = None,
 ) -> FastAPI:
     app_config = config or load_config()
+    if app_config.approvals != type(app_config.approvals)() and managed_service_factory is None:
+        raise ValueError("Configured approval policy requires an explicit managed service factory")
     if managed_worker_factory is not None and managed_service_factory is None:
         raise ValueError("Managed worker requires an explicit managed service factory")
     if managed_service_factory is not None and (
@@ -345,11 +347,30 @@ def create_app(
             delivery_worker=delivery_worker,
         )
     role_tools = build_role_tools(context=developer_tool_context)
+
+    def configured_task_base(preview: Any) -> str | None:
+        issue = developer_task_bundle_from_payload(preview.bundle_payload).issue_context
+        if issue is None:
+            return None
+        if issue.base_revision is not None:
+            return issue.base_revision
+        source = next((source for source in app_config.developer.repository_sources
+                       if (source.repository, source.repository_id) == (issue.repository, issue.repository_id)), None)
+        if source is None or source.base_revision is None:
+            raise PermissionError("Automatic admission requires an operator-pinned repository source base")
+        return source.base_revision
+
     managed_context = ManagedServiceContext(
         previews=dispatcher.developer_preview_registry, worker=delivery_worker,
         tools=developer_tool_context, state_dir=developer_state_dir,
+        approval_policy=app_config.approvals, organization_definition=app_config.organization,
+        task_base_revision_for=configured_task_base,
     )
     managed_service = managed_service_factory(managed_context) if managed_service_factory is not None else None
+    if managed_service_factory is not None and managed_service is None:
+        raise ValueError("Managed factory must return an explicitly bound service")
+    if managed_service is not None and managed_service.approval_policy != app_config.approvals:
+        raise ValueError("Managed factory must bind the configured approval policy exactly")
     managed_worker = managed_worker_factory(managed_service, managed_context) if (
         managed_service is not None and managed_worker_factory is not None
     ) else None

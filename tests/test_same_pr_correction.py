@@ -130,6 +130,42 @@ def test_correction_fast_forwards_the_pinned_pr_once(correction_chain):
         worker.publish(correction, github=github, require_human_approval_for_repo_writes=True, allow_mock_publication=True)
 
 
+@pytest.mark.parametrize("mode", ["human", "automatic", "disabled"])
+def test_correction_policy_is_persisted_before_exact_same_pr_push(correction_chain, monkeypatch, mode):
+    from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
+    from aitobuild.publish_approvals import publish_policy_operation
+
+    worker, published_id, github, head, make = correction_chain
+    correction = make()
+    staged = worker.stage_correction_publication(correction, review_receipt_digest=RECEIPT)
+    policy = ApprovalPolicy(correction=mode)
+    ledger = worker.budget_path(correction).read_bytes()
+    if mode == "disabled":
+        with pytest.raises(PermissionError, match="disabled"):
+            policy.resolve(ApprovalStage.CORRECTION, actor_id="operator", operation=staged, automatic_supported=True)
+        assert worker.get(correction).state == "verified"
+        assert worker.budget_path(correction).read_bytes() == ledger
+        return
+    decision = policy.resolve(ApprovalStage.CORRECTION, actor_id="operator",
+        operation=publish_policy_operation(staged["digest"], staged["snapshot"]), automatic_supported=True)
+    advance = github.advance_draft_pull_request_head
+
+    def checked(**kwargs):
+        saved = worker.publication_approval(correction)
+        assert saved.state == "consuming" and saved.approval_policy == decision
+        return advance(**kwargs)
+
+    monkeypatch.setattr(github, "advance_draft_pull_request_head", checked)
+    result = worker.approve_and_publish_correction(correction, approval_digest=staged["digest"],
+        review_receipt_digest=RECEIPT, actor_id="operator", github=github,
+        require_human_approval_for_repo_writes=True, allow_mock_publication=True, approval_policy=decision)
+    assert result.state == "published", result.error
+    assert result.publication["parent_head_sha"] == head
+    assert result.publication["pull_number"] == worker.get(published_id).publication["pull_number"]
+    assert worker.publication_approval(correction).approval_policy == decision
+    assert worker.budget_path(correction).read_bytes() == ledger
+
+
 def test_digest_drift_invalidates_the_one_use_approval(correction_chain, monkeypatch):
     worker, _, github, _, make = correction_chain
     correction = make()

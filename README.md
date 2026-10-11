@@ -3,9 +3,15 @@
 An agentic product-team framework with Product Manager, Architect, and Developer
 roles, built on Microsoft Agent Framework and FastAPI.
 
-Current stage: supervised, opt-in issue-to-draft execution. This is
-not an autonomous issue-to-PR service. Approved tasks can produce tested draft
-PRs in disposable repositories, with humans retaining merge authority.
+Product direction: policy-controlled automation, with human approvals configurable
+per stage rather than mandatory throughout every deployment. A central operator
+configuration gathers runtime, organization, repository, execution and approval
+settings. Automatic policy decisions must preserve exact records and safety gates.
+
+Current stage: policy-controlled, opt-in issue-to-draft execution with manual
+defaults and supported automatic approval stages. This is not a complete autonomous
+issue-to-PR service. Approved tasks can produce tested draft PRs in disposable
+repositories; merge remains outside the supported managed operations.
 Configurable organization definitions, instance
 factories and native workflow admission are available as library APIs. Persisted
 delegation and revision-pinned managed delivery graphs are also library APIs;
@@ -24,6 +30,7 @@ Team structure and lifecycle are not fixed in code.
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
+| Central settings and approvals | Versioned JSON manifest, environment overrides, exact human/automatic/disabled stage policy and durable decision evidence | Trusted merge operation and broader live automatic-mode acceptance |
 | Organization configuration | Immutable revisions, native graphs, durable assignments/runs, opt-in workers, native PM coordination and bounded correction follow-ups | Broader live configuration coverage and distributed controls |
 | Ingress and routing | Signed webhooks, internal auth, issue extraction, durable scope approval/dedupe and activated task queueing | Hosted GitHub webhook delivery and deployment activation |
 | Developer execution | Preview approval, scoped exact-text edits, independent verification and supervised live same-PR correction delivery | Stronger isolation and broader live coverage |
@@ -32,10 +39,16 @@ Team structure and lifecycle are not fixed in code.
 | Meetings and proactive scans | Opt-in bounded native blocker meetings, durable transcripts/proposals, exact-approved continuation through supervised local delivery/review and deterministic scans | Automatic blocker detection, repeated meetings, hosted/distributed acceptance and real repository scans |
 | Operations | Tick endpoint, policy checks, local durable previews/issue-task state and CI quality gates | Background tick driver, broader durable state, tracing, stronger isolation |
 
+Supported managed gates can consume exact operator-policy decisions automatically
+when explicitly bound and configured. Defaults stay manual; verification, role
+permissions, original budgets and recovery checks are not configurable bypasses.
+Unsupported or unregistered stages fail closed. Automatic merge requires a
+separate trusted operation and is unavailable through draft publication tools.
+
 The managed PM-to-Developer-to-Architect flow is validated for bounded supervised
 local execution. PM issue creation and resolved dependency links need separate
-exact approvals; staged Developer tasks remain unapproved until a human approves
-their implementation. Review and correction follow-ups also need their own task
+exact decisions; staged Developer tasks remain unapproved until an independent
+task-admission decision authorizes implementation. Review and correction follow-ups also need their own task
 and publication approvals. Automatic dependency scheduling, hosted webhook delivery,
 distributed execution and automatic blocker detection remain outside the supported flow.
 Explicit managed graphs can resolve reported blockers through bounded read-only
@@ -63,6 +76,84 @@ retains available simulation reports for 14 days, including failures, and needs
 no Azure credentials.
 
 ## Quick start
+
+### Central operator configuration
+
+[config/aitobuild.example.json](config/aitobuild.example.json) is the schema-version-1
+entry point for application settings, approval policy and an inline `organization`
+or relative `organization_file`. It has mock adapters, manual approvals, no target
+seeds and disabled merge; loading it does not activate an organization or delivery.
+
+```bash
+export AITOBUILD_CONFIG_FILE=config/aitobuild.example.json
+```
+
+`load_config()` validates the manifest, then applies the existing `AITOBUILD_*`
+environment overrides without modifying process environment. Unknown fields,
+duplicate keys, invalid types, literal secrets and non-finite JSON are rejected.
+Secrets use `{"$env": "AITOBUILD_WEBHOOK_SECRET"}`-style references. Normal API
+startup still needs the webhook secret and internal token. Omitting the manifest
+preserves environment-only configuration.
+
+Each approval stage accepts `human`, `automatic` or `disabled`. For example, an
+activated delivery graph can use this approval block:
+
+```json
+{
+	"task_admission": "automatic",
+	"developer_tools": "automatic",
+	"draft_publication": "automatic",
+	"max_automatic_decisions": 32,
+	"merge": "disabled"
+}
+```
+
+Unspecified stages stay human. `AITOBUILD_APPROVAL_DEVELOPER_TOOLS=human`, for
+example, overrides the corresponding file mode. `disabled` refuses the operation;
+it never skips its approval gate.
+
+| Stage | Required trusted binding and exact evidence |
+| --- | --- |
+| `task_admission` | Activated service route and `task_base_revision_for`; immutable task bundle/repository/base |
+| `developer_tools` | Native delivery operation; saved SDK request including tool arguments and session pins |
+| `pm_issue_creation` | Managed PM planning; exact issue titles/bodies and original planning scope |
+| `pm_dependency_links` | Managed PM publication; actual issue IDs/numbers and final link-body bytes |
+| `draft_publication` | Delivery publication operation; independently verified checkout/target/bytes/modes/metadata |
+| `review_publication` | Native Architect operation; complete changed-source/diff evidence and exact head-pinned COMMENT |
+| `meeting_continuation` | Native meeting operation; exact saved proposal/input digests and unchanged scope |
+| `correction` | Review admission and `correction_publication_github`; verified same-PR nonce-bound push snapshot |
+| `merge` | Unsupported; keep disabled. No existing agent or publication tool gains merge authority |
+
+The explicit `managed_service_factory` receives `context.approval_policy`,
+`context.organization_definition` and `context.task_base_revision_for` in addition
+to existing resources. Pass the policy unchanged as `approval_policy` to
+`ManagedOrganizationService`; pass the base callback for automatic admission.
+The app-provided callback requires an exact repository name/ID source mapping
+with a resolved lowercase 40-character `base_revision` in
+`settings.developer.repository_sources`, or preserves an already pinned task base.
+It does not fetch, infer HEAD, alter scope or widen allowed paths. Preparation
+still requires a private trusted seed containing that commit and an operator
+verification command plan.
+
+Automatic corrections additionally require the trusted GitHub adapter as
+`correction_publication_github`. Verified completed correction runs consume their
+saved one-use policy approval and advance the same draft; publication stages the
+next unapproved review. `publish_correction_by_policy(preview_id)` also uses this
+exact adapter without inventing or resetting approvals. Manual correction
+publication retains its existing digest control.
+
+Every nondefault mode needs its registered trusted adapter. Missing factories,
+empty factory results, ignored policies and unregistered stages refuse activation.
+Native workflows pin policy revisions, save decisions before effects and enforce
+`max_automatic_decisions` (1-128, default 32) across human waits and restarts. Active
+policy drift fails closed; terminal recovery is metadata-only. Automatic input
+other than Boolean approval requires an explicit trusted exact response callback.
+
+This changes approval decisions, not activation, graph structure or scheduling.
+Organization definitions and model/tool profile references still resolve through
+operator-owned registries and factories. Follow-up staging is not automatic
+dependency scheduling or a complete unattended lifecycle. Existing supervised live
+acceptance does not establish live automatic-mode or hosted/distributed acceptance.
 
 ### Organization definition foundation
 
@@ -248,8 +339,8 @@ controls remain pending.
 the managed runner to the app through
 `create_app(config, managed_service_factory=operator_factory)`. The normal server
 entrypoint and configuration alone do not activate it. The factory receives
-`ManagedServiceContext` with the app-owned preview registry, delivery worker, tools
-and state directory. Register immutable definitions, assignment/run stores,
+`ManagedServiceContext` with the app-owned preview registry, delivery worker, tools,
+state directory, central policy/definition and trusted task-base callback. Register immutable definitions, assignment/run stores,
 `ManagedDeliveryBindings`/`NativeDeliveryImplementation`, predicates and mandatory
 cleanup in the returned `ManagedOrganizationService`; supply a trusted
 `runtime_for(pinned_snapshot)` and native model profiles for native delivery.
@@ -269,6 +360,7 @@ must preserve role/tool ceilings; arbitrary operator Python is not sandboxed.
 
 For activated repository tasks, authenticated preview approval and signed webhook/
 authenticated trigger delivery invoke the configured graph automatically. Preparation
+can also follow exact configured automatic admission without a human API call. It
 uses only the approved target/base and original worker ledger. Duplicate dispatch
 metadata, including a durable `dedupe` result, resolves existing ownership and run
 receipts; the dispatch marker cannot suppress recovery after an earlier service

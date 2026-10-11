@@ -21,11 +21,12 @@ from filelock import FileLock
 from pydantic import AwareDatetime, Field, JsonValue, StrictStr, ValidationError, model_validator
 
 from aitobuild.durable_files import atomic_write_text, sync_directory
+from aitobuild.approval_policy import ApprovalDecision, ApprovalStage
 from aitobuild.organization import DefinitionModel
 
 _Hex64 = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
 _IDENTITY = ("version", "preview_id", "snapshot", "content_digest", "nonce", "digest", "staged_at", "replaced_digest")
-_APPROVAL = ("approved_by", "approved_at")
+_APPROVAL = ("approved_by", "approved_at", "approval_policy")
 
 
 def snapshot_digest(snapshot: dict[str, Any]) -> str:
@@ -35,6 +36,10 @@ def snapshot_digest(snapshot: dict[str, Any]) -> str:
 
 def approval_digest(content_digest: str, nonce: str) -> str:
     return sha256(f"aitobuild-publish-approval:{content_digest}:{nonce}".encode()).hexdigest()
+
+
+def publish_policy_operation(digest: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {"approval_digest": digest, "snapshot": snapshot}
 
 
 class PublishApproval(DefinitionModel):
@@ -54,6 +59,7 @@ class PublishApproval(DefinitionModel):
     consumed_at: AwareDatetime | None = None
     consumed_head_sha: Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{40}$")] | None = None
     error: Annotated[StrictStr, Field(min_length=1)] | None = None
+    approval_policy: ApprovalDecision | None = None
 
     @model_validator(mode="after")
     def validate_identity_and_state(self) -> Self:
@@ -76,6 +82,12 @@ class PublishApproval(DefinitionModel):
         }[self.state]
         if not valid:
             raise ValueError("Publish approval state fields are inconsistent")
+        if self.approval_policy is not None and (
+            self.state not in {"consuming", "consumed"} or self.approval_policy.actor_id != self.approved_by
+            or self.approval_policy.stage != ApprovalStage.CORRECTION
+            or self.approval_policy.operation_digest != snapshot_digest(publish_policy_operation(self.digest, self.snapshot))
+        ):
+            raise ValueError("Publish policy decision must bind the exact consumed correction snapshot and operator")
         return self
 
 
@@ -165,7 +177,8 @@ class PublishApprovalStore:
             )
             return self._save(path, current, staged)
 
-    def begin_consume(self, preview_id: str, *, digest: str, recomputed_content_digest: str, actor_id: str) -> PublishApproval:
+    def begin_consume(self, preview_id: str, *, digest: str, recomputed_content_digest: str, actor_id: str,
+                      approval_policy: ApprovalDecision | None = None) -> PublishApproval:
         """Approve and consume in one step; only an interrupted identical consume may resume."""
         if not isinstance(actor_id, str) or not actor_id.strip():
             raise PermissionError("Publish approval requires an operator identity")
@@ -188,9 +201,12 @@ class PublishApprovalStore:
             if current.state == "consuming":
                 if current.approved_by != actor_id.strip():
                     raise PermissionError("Interrupted publish approval belongs to another operator")
+                if approval_policy is not None and current.approval_policy != approval_policy:
+                    raise PermissionError("Interrupted publish approval policy is immutable")
                 return current
             return self._save(path, current, _advance(current, {
-                "state": "consuming", "approved_by": actor_id.strip(), "approved_at": _now()}))
+                "state": "consuming", "approved_by": actor_id.strip(), "approved_at": _now(),
+                "approval_policy": approval_policy}))
 
     def finish_consume(self, preview_id: str, *, digest: str, head_sha: str | None, error: str | None = None) -> PublishApproval:
         path = self._path(preview_id)

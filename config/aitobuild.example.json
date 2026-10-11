@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "settings": {
+    "webhook_secret": {"$env": "AITOBUILD_WEBHOOK_SECRET"},
+    "runtime": {
+      "foundry_endpoint": null,
+      "foundry_api_key": {"$env": "AITOBUILD_FOUNDRY_API_KEY"},
+      "foundry_model": "gpt-4.1",
+      "allow_mock_model": true
+    },
+    "scheduler": {
+      "enabled": false,
+      "kill_switch": false,
+      "architect_scan_cron": "0 8 * * *",
+      "meeting_tick_cron": "*/30 * * * *",
+      "max_concurrent_proactive_jobs": 2,
+      "quiet_window_start_hour": null,
+      "quiet_window_end_hour": null
+    },
+    "policy": {"require_human_approval_for_repo_writes": true},
+    "security": {
+      "require_internal_auth": true,
+      "internal_api_token": {"$env": "AITOBUILD_INTERNAL_API_TOKEN"}
+    },
+    "github": {"adapter": "mock", "default_repository": null, "allowed_repositories": []},
+    "web_search": {"adapter": "mock"},
+    "developer": {
+      "require_preview_before_dispatch": true,
+      "execution_mode": "mock",
+      "command_timeout_seconds": 120,
+      "session_container_image": "aitobuild-developer:local",
+      "session_container_workdir": "/workspace",
+      "session_container_name_prefix": "aitobuild-dev",
+      "session_container_bind_path": null,
+      "session_container_run_as_current_user": true,
+      "agent_invoke_timeout_seconds": 180,
+      "enable_mcp_adapters": false,
+      "enable_agent_live_logs": false,
+      "mcp_shell_tool_name": "execute_command",
+      "mcp_filesystem_read_tool_name": "read_file",
+      "mcp_filesystem_write_tool_name": "write_file",
+      "state_dir": ".aitobuild/developer",
+      "session_data_volume": null,
+      "enable_browser": false,
+      "repository_sources": []
+    }
+  },
+  "approvals": {
+    "max_automatic_decisions": 32,
+    "task_admission": "human",
+    "developer_tools": "human",
+    "pm_issue_creation": "human",
+    "pm_dependency_links": "human",
+    "draft_publication": "human",
+    "review_publication": "human",
+    "meeting_continuation": "human",
+    "correction": "human",
+    "merge": "disabled"
+  },
+  "organization_file": "organization.example.json"
+}

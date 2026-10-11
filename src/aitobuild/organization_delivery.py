@@ -16,6 +16,7 @@ from agent_framework import (
 )
 
 from aitobuild.agent_tools import DeveloperToolContext, build_developer_tools
+from aitobuild.approval_policy import ApprovalStage
 from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget
 from aitobuild.organization import DefinitionSnapshot
@@ -31,6 +32,7 @@ from aitobuild.tools.github import GitHubAdapter
 class DeliveryInvocation:
     session_id: str
     pending_request_id: str | None = None
+    approval_request: dict[str, Any] | None = None
 
 
 class ApprovedDeliveryImplementation(Protocol):
@@ -132,6 +134,10 @@ class NativeDeliveryImplementation:
             matches = [item for item in pending if item.get("id") == request_id]
             if len(matches) != 1:
                 raise PermissionError("Native tool request is not pending in this session")
+            expected = next((item.data.get("native_request") for item in context.run.pending
+                             if isinstance(item.data, dict) and item.data.get("request_id") == request_id), None)
+            if expected is not None and matches[0] != expected:
+                raise PermissionError("Native tool request differs from the exact saved approval")
             request = Content.from_dict(matches[0])
             if request.type != "function_approval_request":
                 raise PermissionError("Saved input is not a native tool approval")
@@ -200,7 +206,8 @@ class NativeDeliveryImplementation:
                 if not requests and not await self.cleanup(context):
                     raise RuntimeError("Native implementation cleanup failed")
                 self._worker.finish_implementation(assignment.preview_id, session_id=session_id, pending=bool(requests))
-                return DeliveryInvocation(session_id, requests[0].id if requests else None)
+                return DeliveryInvocation(session_id, requests[0].id if requests else None,
+                                          requests[0].to_dict() if requests else None)
             except BaseException as error:
                 self._worker.finish_implementation(
                     assignment.preview_id, session_id=session_id, error=str(error) or type(error).__name__,
@@ -239,11 +246,15 @@ class ManagedDeliveryBindings:
             "delivery_prepare": ManagedOperation(self.prepare),
             "delivery_implement": ManagedOperation(
                 self.implement, action=ActionClass.REPO_WRITE, on_response=self.continue_implementation,
+                approval_stage=ApprovalStage.DEVELOPER_TOOLS,
             ),
             "delivery_verify": ManagedOperation(self.verify),
         }
         if self._github is not None:
-            operations["delivery_publish"] = ManagedOperation(self.publish, action=ActionClass.REPO_WRITE)
+            operations["delivery_publish"] = ManagedOperation(
+                self.publish, action=ActionClass.REPO_WRITE, on_response=self.continue_publication,
+                approval_stage=ApprovalStage.DRAFT_PUBLICATION,
+            )
         return operations
 
     def _check(self, context: ManagedTaskContext) -> None:
@@ -291,7 +302,8 @@ class ManagedDeliveryBindings:
             if not invocation.pending_request_id.strip():
                 raise ValueError("Saved native tool approval requires a request identity")
             return WorkflowInput(
-                "Native delivery tool approval", {"request_id": invocation.pending_request_id}, "service_approval",
+                "Native delivery tool approval", {"request_id": invocation.pending_request_id,
+                                                "native_request": invocation.approval_request}, "service_approval",
             )
         return self._record(context, record, "implemented")
 
@@ -308,8 +320,19 @@ class ManagedDeliveryBindings:
             raise ValueError("Independent verification lacks successful exit/cleanup evidence")
         return result
 
-    async def publish(self, context: ManagedTaskContext, message: Any) -> dict[str, Any]:
+    async def publish(self, context: ManagedTaskContext, message: Any) -> WorkflowInput:
         self._check(context)
+        record = self._worker.get(context.assignment.preview_id)
+        if record is None:
+            raise PermissionError("Draft publication requires an independently verified delivery")
+        self._record(context, record, "verified")
+        snapshot = await _delivery_call(lambda: self._worker.publication_snapshot(context.assignment.preview_id))
+        return WorkflowInput("Publish exact verified draft", snapshot, "service_approval")
+
+    async def continue_publication(self, context: ManagedTaskContext, original: Any, approved: Any) -> dict[str, Any]:
+        self._check(context)
+        if approved is not True or not isinstance(original, dict):
+            raise PermissionError("Exact draft publication approval was rejected")
         github = self._github
         if github is None:
             raise PermissionError("Publication is not registered by the operator")
@@ -318,6 +341,7 @@ class ManagedDeliveryBindings:
         record = await _delivery_call(lambda: self._worker.publish(
             context.assignment.preview_id, github=github,
             require_human_approval_for_repo_writes=True, allow_mock_publication=self._allow_mock,
+            expected_publication=original, before_write=context.revalidate,
         ))
         return self._record(context, record, "published")
 

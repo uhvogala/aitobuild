@@ -14,6 +14,7 @@ from openai import AsyncOpenAI
 import pytest
 
 from aitobuild.organization_planning import FilePlanStore, PlanProposal, PlanRevision, PlanningLimits
+from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
 from aitobuild.developer_isolation import default_developer_isolation_policy, DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import DeveloperPreviewRegistry
 from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker, LocalRepositorySource
@@ -137,7 +138,8 @@ def test_plan_revision_is_immutable_and_survives_restart(tmp_path):
 
 
 def planning_fixture(tmp_path, profile, worker, *, limits=PlanningLimits(), github=None, previews=None, dependencies_enabled=False,
-                     repository="example/target", repository_id=1, base_revision="a" * 40, handoff_operation=None):
+                     repository="example/target", repository_id=1, base_revision="a" * 40, handoff_operation=None,
+                     approval_policy=ApprovalPolicy()):
     document = json.loads((Path(__file__).resolve().parents[1] / "config/organization.example.json").read_text())
     document["workflows"].append({"id": "planning", "document": {
         "format": "python_graph", "start": "plan", "nodes": [{"id": "plan", "kind": "operation", "operation": "pm_plan_issues"}],
@@ -174,7 +176,8 @@ def planning_fixture(tmp_path, profile, worker, *, limits=PlanningLimits(), gith
         service = ManagedOrganizationService(definitions=definitions, assignments=assignments, runs=runs, previews=previews,
                                               worker=worker, routes=(), operator_id="operator", operations=roles.operations | (
                                                   {"definition_probe": handoff_operation} if handoff_operation else {}),
-                                              cleanup=roles.cleanup, binding_revision="planning-v1", planning=admission, dependencies=dependencies)
+                                              cleanup=roles.cleanup, binding_revision="planning-v1", planning=admission, dependencies=dependencies,
+                                              approval_policy=approval_policy)
         return service, planning, roles
 
     service, planning, roles = make_service()
@@ -282,6 +285,60 @@ def test_native_planning_exact_publication_restart_and_unapproved_handoff(tmp_pa
     asyncio.run(exercise())
     assert len(bodies) == 2
     assert [tool["function"]["name"] for tool in bodies[0]["tools"]] == ["pm_inspect_planning_request"]
+
+
+@pytest.mark.parametrize("detached", [False, True])
+def test_native_pm_automatic_create_and_exact_resolved_links(tmp_path, approved_delivery, monkeypatch, detached):
+    bodies = []
+    policy = ApprovalPolicy(pm_issue_creation="automatic", pm_dependency_links="automatic")
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply(bodies))) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service, planning, _, preview, previews, github, restart, _ = planning_fixture(
+                    tmp_path, profile, approved_delivery[1], approval_policy=policy)
+                previews.approve(preview.preview_id)
+                checked = []
+
+                def effect(method, stage):
+                    original = getattr(github, method)
+
+                    def call(**kwargs):
+                        run = service.recorded_run(preview.bundle_payload["task_id"])
+                        assert run.state == "running" and run.decisions[-1].approval_policy.stage == stage
+                        assert run.decisions[-1].approval_policy.source == "operator_policy"
+                        checked.append(stage)
+                        return original(**kwargs)
+
+                    monkeypatch.setattr(github, method, call)
+
+                effect("create_issue", ApprovalStage.PM_ISSUE_CREATION)
+                effect("update_issue", ApprovalStage.PM_DEPENDENCY_LINKS)
+                if detached:
+                    from aitobuild.organization_worker import FileWorkerStore, ManagedOrganizationWorker
+
+                    background = ManagedOrganizationWorker(service=service, store=FileWorkerStore(tmp_path / "automatic-pm-worker.json"))
+                    background.enqueue(preview.preview_id)
+                    await background.start()
+                    try:
+                        await background.wait_idle(preview.preview_id)
+                    finally:
+                        await background.close()
+                    run = service.status(preview.preview_id)
+                else:
+                    run = await service.consume(preview.preview_id)
+                assert run.state == "completed" and run.cleanup_succeeded is True, run.error
+                assert checked == [ApprovalStage.PM_ISSUE_CREATION, ApprovalStage.PM_ISSUE_CREATION, ApprovalStage.PM_DEPENDENCY_LINKS]
+                assert len(run.decisions) == 2 and len(github.issues["example/target"]) == 2
+                assert "- Depends on #1" in github.issues["example/target"][2].body
+                assert all(not previews.get(child).approved for child in run.outputs[0]["developer_previews"])
+                before = service.budget_path(preview.preview_id).read_bytes()
+                assert await restart()[0].consume(preview.preview_id) == run
+                assert len(checked) == 3 and len(bodies) == 2
+                assert service.budget_path(preview.preview_id).read_bytes() == before
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("case", ["merged", "draft", "issue_drift", "dependent_closed", "parent_unapproved", "verification", "cleanup",

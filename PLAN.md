@@ -11,6 +11,40 @@ and supervised recovery. Earlier counts, pending work and commit status describe
 their checkpoint, not the current system. Current setup and usage belong in
 [README.md](README.md); contributor rules belong in [agents.md](agents.md).
 
+Central configuration and exact operator-policy decisions (2026-10-09): added the
+strict versioned application manifest and safe example, environment-backed secrets,
+environment overrides and optional organization loading without activation. Shared
+stage policy supports human/automatic/disabled modes with manual defaults and
+disabled merge. Explicit factories must bind the effective policy exactly; missing
+or unsupported adapters cannot silently activate legacy behavior.
+
+Managed runs pin the immutable policy revision and persist exact decisions before
+native continuation. Automatic decision ceilings survive human waits and restart;
+disabled stages, drift, unbound free-text input and uncertain effects fail closed.
+Native tool evidence includes the SDK request arguments. Automatic admission saves
+the exact task/repository/operator-pinned base and policy decision atomically,
+without replacing an existing base or resetting a ledger. Draft publication now
+has a separate exact verified-byte/target/metadata approval boundary and rechecks
+both its snapshot and managed context before remote writes. Same-PR correction
+reuses the existing nonce-bound approval store, persists policy before the push,
+and retains lineage/head/budget/reconciliation safeguards.
+
+Native SDK fixtures exercise PM issue creation and actual-ID dependency links,
+Developer tool decisions, Architect COMMENT publication, bounded meetings and
+verified correction publication through request and detached execution. Tests
+also cover altered approval evidence, factory mismatch, disabled operations,
+verified-byte mutation, policy drift and restart without replay. These are local
+mocked-model/GitHub integrations, not new live automatic-mode certification. Merge,
+automatic dependency/blocker scheduling and hosted/distributed unattended lifecycle
+remain separate work. Earlier supervised live receipts and approvals were not replayed.
+
+Final local verification: `uv run pytest` passed 1,094 tests with two optional
+skips; `uv run ruff check .`, `uv run mypy src`, editor diagnostics and whitespace
+checks passed. Mock-only `sim/run_local_simulation.py` reported `succeeded=true`,
+a generated fixture artifact, integer command exit 0 and no active session.
+Documentation links/fences passed. No new live model/GitHub effects, service
+activation, merge, commit or push were performed for this configuration slice.
+
 Whole-repository Architect context and dependency live acceptance (2026-10-09):
 the operator independently merged prerequisite PR 36. Native GET-only waiting and
 exact human-merge/ancestry checks were accepted at new base
@@ -329,10 +363,13 @@ dependent preview remains unapproved/unassigned/unprepared. No service push/merg
 dependencies or default activation. Do not replay consumed trial controls.
 
 ## 1. Executive Summary
-This document outlines a supervised, configurable product-team framework using
+This document outlines a policy-controlled, configurable product-team framework using
 the **Microsoft Agent Framework (Python)**. PM, Architect and Developer are
 initial role templates, not fixed team instances or mandatory workflow stages.
-Humans approve scope and retain merge authority.
+Human involvement is a deployment policy, not a universal lifecycle requirement.
+Manual defaults preserve the accepted supervised profile; explicitly configured
+automatic operation is the target, including merge through a separate trusted
+publication operation rather than agent-held merge authority.
 
 To prevent the chaotic, spaghetti-code outputs typical of naive autonomous coding systems, this framework enforces strict role separation and boundaries using two distinct communication paradigms:
 1.  **Asynchronous (GitHub):** The immutable source of truth and state machine.
@@ -381,6 +418,38 @@ runs pin their approved snapshot. A file-backed definition store comes first;
 a database backend can later implement the same contract. Assignment ownership,
 scope approvals, budget ledgers, side-effect receipts and emergency revocation
 remain enforced independently of workflow configuration.
+
+### 2.4 Central Configuration and Approval Policy
+
+One versioned operator-owned JSON manifest is the configuration entry point.
+It gathers runtime/models, repository sources, execution, scheduling, security,
+organization definitions and per-stage approval policy. Secrets are environment
+references; explicit environment overrides remain available. Unknown fields,
+duplicate keys, invalid types and unsupported modes fail closed. Configuration
+does not execute imports or replace trusted operation registries.
+
+Approval stages cover task admission, Developer tools, PM issue creation and
+dependency links, draft publication, Architect review publication, meeting
+continuation, corrections and merge. Each uses `human`, `automatic` or `disabled`;
+all current gates default to `human`, and merge defaults to `disabled` until a
+supported trusted merge binding exists. Automatic mode is an operator policy
+decision for the exact saved operation, not permission for a model to approve
+itself. Disabled means refusal, not approval bypass.
+
+Policy revisions and the effective stage decision belong in immutable run/effect
+evidence. Changes apply to new work; active runs refuse drift rather than silently
+adopting a more permissive policy. Automatic continuation consumes the same exact
+one-shot checkpoints as human input. Scope/head pins, role permissions, independent
+verification, budgets, expiry, cancellation and cleanup remain mandatory. Failed
+tasks and uncertain effects are never blindly replayed. Configured automatic
+scope changes still create distinct authorized tasks and original ledgers.
+
+Central settings, shared policy resolution, native service/worker continuation,
+task admission and exact draft/correction publication adapters are implemented.
+Merge and the complete unattended lifecycle remain staged work. Exposing a mode
+in the schema is not proof of runtime support or live acceptance; unregistered
+stages fail closed. See the current supported-stage table and factory requirements
+in [README.md](README.md#central-operator-configuration).
 
 ## 3. The Agent Roster (Entities & Scopes)
 

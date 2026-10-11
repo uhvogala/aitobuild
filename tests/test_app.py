@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from dataclasses import replace
 from pathlib import Path
 import asyncio
@@ -45,12 +47,13 @@ def _managed_app(config, tmp_path, calls, operation=None, strategy="rules", vers
         delegation["target_agent"] = delegation["eligible_agents"][0]
     definitions = FileDefinitionStore(tmp_path / "managed-definitions")
     snapshot = definitions.save(parse_organization_definition(json.dumps(document)))
+    services = []
 
     def factory(context):
         async def cleanup(task):
             calls.append("cleanup")
 
-        return ManagedOrganizationService(
+        service = ManagedOrganizationService(
             definitions=definitions, assignments=FileAssignmentStore(context.state_dir / "assignments.json"),
             runs=FileRunStore(context.state_dir / "managed-runs"), previews=context.previews, worker=context.worker,
             routes=(ManagedRoute(repository="fixture/widgets", repository_id=101,
@@ -60,7 +63,10 @@ def _managed_app(config, tmp_path, calls, operation=None, strategy="rules", vers
             operations={"definition_probe": operation or ManagedOperation(
                 lambda task, message: calls.append(task.assignment.assignment_id) or "done",
             )}, cleanup=cleanup,
+            approval_policy=context.approval_policy, task_base_revision_for=context.task_base_revision_for,
         )
+        services.append((service, context))
+        return service
 
     from aitobuild.organization_worker import FileWorkerStore, ManagedOrganizationWorker
 
@@ -73,6 +79,7 @@ def _managed_app(config, tmp_path, calls, operation=None, strategy="rules", vers
 
     app = create_app(config, managed_service_factory=factory, managed_worker_factory=worker_factory if detached else None)
     app.state.test_workers = workers
+    app.state.test_services = services
     return app
 
 
@@ -551,6 +558,161 @@ def test_repository_source_config_loads_explicit_mapping(monkeypatch, tmp_path) 
         {"repository": "Fixture/Widgets", "repository_id": 101, "path": str(tmp_path)},
     ]))
     assert load_config().developer.repository_sources == (RepositorySourceConfig("fixture/widgets", 101, str(tmp_path)),)
+
+
+def _central_config(monkeypatch, tmp_path, payload):
+    for name in tuple(os.environ):
+        if name.startswith("AITOBUILD_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("AITOBUILD_WEBHOOK_SECRET", "test-secret")
+    monkeypatch.setenv("AITOBUILD_INTERNAL_API_TOKEN", "test-token")
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("AITOBUILD_CONFIG_FILE", str(path))
+    return path
+
+
+def test_central_config_file_merges_typed_settings_and_environment(monkeypatch, tmp_path) -> None:
+    _central_config(monkeypatch, tmp_path, {"schema_version": 1, "settings": {
+        "runtime": {"foundry_model": "file-model", "allow_mock_model": False},
+        "scheduler": {"enabled": False, "max_concurrent_proactive_jobs": 3},
+        "developer": {"repository_sources": [{"repository": "fixture/widgets", "repository_id": 101, "path": str(tmp_path)}]},
+    }, "approvals": {"developer_tools": "automatic"}})
+    monkeypatch.setenv("AITOBUILD_FOUNDRY_MODEL", "environment-model")
+    config = load_config()
+    assert config.runtime.foundry_model == "environment-model" and not config.runtime.allow_mock_model
+    assert not config.scheduler.enabled and config.scheduler.max_concurrent_proactive_jobs == 3
+    assert config.approvals.developer_tools == "automatic" and config.approvals.task_admission == "human"
+    assert config.developer.repository_sources == (RepositorySourceConfig("fixture/widgets", 101, str(tmp_path)),)
+    assert "AITOBUILD_MAX_PROACTIVE_JOBS" not in os.environ
+    monkeypatch.setenv("AITOBUILD_APPROVAL_DEVELOPER_TOOLS", "human")
+    assert load_config().approvals.developer_tools == "human"
+
+
+@pytest.mark.parametrize("payload", [
+    {}, {"schema_version": True}, {"schema_version": 2}, {"schema_version": 1, "unknown": {}},
+    {"schema_version": 1, "settings": {"unknown": {}}},
+    {"schema_version": 1, "settings": {"runtime": {"unknown": True}}},
+    {"schema_version": 1, "settings": {"runtime": {"allow_mock_model": "false"}}},
+    {"schema_version": 1, "settings": {"scheduler": {"max_concurrent_proactive_jobs": True}}},
+    {"schema_version": 1, "settings": {"security": {"internal_api_token": "plaintext"}}},
+    {"schema_version": 1, "approvals": {"developer_tools": False}},
+    {"schema_version": 1, "approvals": {"unknown": "automatic"}},
+    {"schema_version": 1, "organization": {}, "organization_file": "definition.json"},
+])
+def test_central_config_rejects_ambiguous_or_malformed_settings(monkeypatch, tmp_path, payload) -> None:
+    _central_config(monkeypatch, tmp_path, payload)
+    with pytest.raises(ValueError):
+        load_config()
+
+
+def test_central_config_example_loads_organization_without_activation(monkeypatch, tmp_path) -> None:
+    _central_config(monkeypatch, tmp_path, {"schema_version": 1})
+    monkeypatch.setenv("AITOBUILD_CONFIG_FILE", "config/aitobuild.example.json")
+    config = load_config()
+    assert config.organization is not None and config.organization.id
+    assert config.github.adapter == "mock" and config.approvals.merge == "disabled"
+    assert config.security.internal_api_token == "test-token"
+
+
+def test_central_config_duplicate_keys_and_invalid_boolean_fail_closed(monkeypatch, tmp_path) -> None:
+    path = _central_config(monkeypatch, tmp_path, {"schema_version": 1})
+    path.write_text('{"schema_version":1,"approvals":{"developer_tools":"human","developer_tools":"automatic"}}')
+    with pytest.raises(ValueError, match="Duplicate"):
+        load_config()
+    monkeypatch.delenv("AITOBUILD_CONFIG_FILE")
+    monkeypatch.setenv("AITOBUILD_REQUIRE_APPROVAL_FOR_REPO_WRITES", "typo")
+    with pytest.raises(ValueError, match="Boolean configuration"):
+        load_config()
+
+
+def test_automatic_settings_cannot_silently_activate_legacy_server(test_config) -> None:
+    from aitobuild.approval_policy import ApprovalPolicy
+
+    config = replace(test_config, approvals=ApprovalPolicy(developer_tools="automatic"))
+    with pytest.raises(ValueError, match="explicit managed service factory"):
+        create_app(config)
+    with pytest.raises(ValueError, match="must return"):
+        create_app(config, managed_service_factory=lambda context: None)
+
+
+def test_managed_factory_cannot_ignore_central_policy(test_config, tmp_path, monkeypatch) -> None:
+    from aitobuild.approval_policy import ApprovalPolicy
+    from aitobuild.organization_service import ManagedOrganizationService
+
+    config = replace(test_config, approvals=ApprovalPolicy(task_admission="automatic"))
+    monkeypatch.setattr(ManagedOrganizationService, "approval_policy", property(lambda service: ApprovalPolicy()))
+    with pytest.raises(ValueError, match="configured approval policy exactly"):
+        _managed_app(config, tmp_path, [])
+
+
+@pytest.mark.parametrize("detached", [False, True])
+def test_configured_automatic_task_admission_records_exact_scope_without_reset(
+    test_config, tmp_path, repository_issue_body, local_issue_repository, detached,
+) -> None:
+    from aitobuild.approval_policy import ApprovalPolicy
+
+    source, base = local_issue_repository
+    policy = ApprovalPolicy(task_admission="automatic")
+    config = replace(test_config, approvals=policy, developer=replace(test_config.developer,
+        require_preview_before_dispatch=True, repository_sources=(RepositorySourceConfig("fixture/widgets", 101, str(source), (), base),)))
+    calls = []
+    app = _managed_app(config, tmp_path, calls, detached=detached)
+    with TestClient(app) as client:
+        headers = _internal_headers(config)
+        preview = client.post("/internal/developer/preview", headers=headers, json={
+            "github_event": "issues", "action": "opened", "body": repository_issue_body,
+        }).json()
+        service, context = app.state.test_services[0]
+        admitted = service.admission(preview["preview_id"])
+        assert admitted is not None and admitted[0].approved
+        approved = admitted[0]
+        assert approved.approval_policy.source == "operator_policy"
+        assert approved.approval_policy.actor_id == "configured-operator"
+        assert approved.approval_policy.policy_revision == policy.revision
+        assert approved.bundle_payload["issue_context"]["base_revision"] == base
+        assert service.admission(preview["preview_id"])[0] == approved
+        assert context.previews.get(preview["preview_id"]) == approved
+        response = client.post("/internal/organization/tasks/run", headers=headers, json={"preview_id": preview["preview_id"]})
+        assert response.status_code == 200, response.json()
+        if detached:
+            client.portal.call(app.state.test_workers[0].wait_idle, preview["preview_id"])
+        run = service.status(preview["preview_id"])
+        assert run.state == "completed", run.error
+        assert calls == [run.assignment_id, "cleanup"]
+        before = context.worker.budget_path(preview["preview_id"]).read_bytes()
+        assert client.post("/internal/organization/tasks/run", headers=headers,
+                           json={"preview_id": preview["preview_id"]}).status_code == 200
+        assert context.worker.budget_path(preview["preview_id"]).read_bytes() == before
+        persisted = Path(config.developer.state_dir) / "previews.json"
+        content = json.loads(persisted.read_text())
+        content["previews"][0]["bundle_payload"]["objective"] = "Changed without an exact operator decision"
+        persisted.write_text(json.dumps(content))
+        with pytest.raises(PermissionError, match="exact approved bundle"):
+            context.previews.get(preview["preview_id"])
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_central_config_rejects_nonfinite_json(monkeypatch, tmp_path, constant) -> None:
+    path = _central_config(monkeypatch, tmp_path, {"schema_version": 1})
+    path.write_text('{"schema_version":1,"organization":' + constant + '}')
+    with pytest.raises(ValueError, match="non-finite"):
+        load_config()
+
+
+def test_configured_automatic_admission_refuses_missing_base(test_config, tmp_path, repository_issue_body) -> None:
+    from aitobuild.approval_policy import ApprovalPolicy
+
+    config = replace(test_config, approvals=ApprovalPolicy(task_admission="automatic"))
+    app = _managed_app(config, tmp_path, [])
+    client = TestClient(app)
+    preview = client.post("/internal/developer/preview", headers=_internal_headers(config), json={
+        "github_event": "issues", "action": "opened", "body": repository_issue_body,
+    }).json()
+    service, context = app.state.test_services[0]
+    with pytest.raises(PermissionError, match="operator-pinned"):
+        service.admission(preview["preview_id"])
+    assert not context.previews.get(preview["preview_id"]).approved
 
 
 _FakeSession = AgentSession

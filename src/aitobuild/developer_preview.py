@@ -16,6 +16,8 @@ from uuid import uuid4
 from filelock import FileLock
 
 from aitobuild.durable_files import atomic_write_text
+from aitobuild.approval_policy import ApprovalDecision, ApprovalStage
+from aitobuild.publish_approvals import snapshot_digest
 from aitobuild.developer_isolation import developer_task_bundle_from_payload
 
 
@@ -29,6 +31,7 @@ class DeveloperPreview:
     created_at: datetime
     approved_at: datetime | None = None
     dispatched_at: datetime | None = None
+    approval_policy: ApprovalDecision | None = None
 
     @property
     def state(self) -> str:
@@ -80,6 +83,11 @@ class DeveloperPreviewRegistry:
                 raise ValueError("Invalid persisted preview lifecycle")
             if item["approved"] and bundle.issue_context is not None and bundle.issue_context.base_revision is None:
                 raise ValueError("Approved issue task is missing its pinned base revision")
+            if item.get("approval_policy") is not None:
+                decision = ApprovalDecision.model_validate(item["approval_policy"])
+                if (not item["approved"] or decision.stage != ApprovalStage.TASK_ADMISSION
+                        or decision.operation_digest != snapshot_digest(preview_approval_operation(item["preview_id"], item["bundle_payload"]))):
+                    raise PermissionError("Saved task policy differs from its exact approved bundle")
         self._by_id = {
             item["preview_id"]: DeveloperPreview(
                 preview_id=item["preview_id"], dedupe_key=item["dedupe_key"],
@@ -87,6 +95,7 @@ class DeveloperPreviewRegistry:
                 approved=item["approved"], created_at=datetime.fromisoformat(item["created_at"]),
                 approved_at=datetime.fromisoformat(item["approved_at"]) if item["approved_at"] else None,
                 dispatched_at=datetime.fromisoformat(item["dispatched_at"]) if item.get("dispatched_at") else None,
+                approval_policy=ApprovalDecision.model_validate(item["approval_policy"]) if item.get("approval_policy") is not None else None,
             )
             for item in data["previews"]
         }
@@ -108,6 +117,7 @@ class DeveloperPreviewRegistry:
                     "approved": preview.approved, "created_at": preview.created_at.isoformat(),
                     "approved_at": preview.approved_at.isoformat() if preview.approved_at else None,
                     "dispatched_at": preview.dispatched_at.isoformat() if preview.dispatched_at else None,
+                    **({"approval_policy": preview.approval_policy.model_dump(mode="json")} if preview.approval_policy is not None else {}),
                 }
                 for preview in self._by_id.values()
             ],
@@ -150,7 +160,8 @@ class DeveloperPreviewRegistry:
                 self._by_task[task_key] = preview.preview_id
             return deepcopy(preview)
 
-    def approve(self, preview_id: str, *, base_revision: str | None = None) -> DeveloperPreview | None:
+    def approve(self, preview_id: str, *, base_revision: str | None = None,
+                approval_policy: ApprovalDecision | None = None) -> DeveloperPreview | None:
         with self._transaction(write=True):
             preview = self._by_id.get(preview_id)
             if preview is None:
@@ -168,9 +179,16 @@ class DeveloperPreviewRegistry:
             elif base_revision is not None:
                 raise ValueError("base_revision requires a repository issue task")
             if preview.approved:
+                if approval_policy is not None and preview.approval_policy != approval_policy:
+                    raise PermissionError("Saved task approval policy is immutable")
                 return deepcopy(preview)
+            if approval_policy is not None:
+                if (approval_policy.stage != ApprovalStage.TASK_ADMISSION
+                        or approval_policy.operation_digest != snapshot_digest(preview_approval_operation(preview_id, bundle))):
+                    raise PermissionError("Task approval policy must bind the exact pinned bundle")
             approved_preview = replace(
                 preview, bundle_payload=bundle, approved=True, approved_at=datetime.now(tz=UTC),
+                approval_policy=approval_policy,
             )
             self._by_id[preview_id] = approved_preview
             return deepcopy(approved_preview)
@@ -215,3 +233,7 @@ def _unresolved_scope(bundle: dict[str, Any]) -> dict[str, Any]:
     if isinstance(context, dict):
         context["base_revision"] = None
     return scope
+
+
+def preview_approval_operation(preview_id: str, bundle: dict[str, Any]) -> dict[str, Any]:
+    return {"preview_id": preview_id, "bundle": bundle}

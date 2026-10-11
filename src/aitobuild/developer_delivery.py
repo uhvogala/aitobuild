@@ -23,11 +23,12 @@ from uuid import uuid4
 from filelock import FileLock
 
 from aitobuild.durable_files import atomic_write_text
+from aitobuild.approval_policy import ApprovalDecision
 from aitobuild.developer_isolation import (
     DeveloperTaskBudget, DeveloperTaskBundle, developer_task_bundle_from_payload, is_command_allowed, is_path_allowed,
 )
 from aitobuild.developer_preview import DeveloperPreviewRegistry
-from aitobuild.publish_approvals import PublishApprovalStore, snapshot_digest
+from aitobuild.publish_approvals import PublishApproval, PublishApprovalStore, snapshot_digest
 from aitobuild.policy import AgentRole
 from aitobuild.tools.github import (
     GitHubAdapter,
@@ -414,6 +415,40 @@ class DeveloperDeliveryWorker:
             return record
 
 
+    def publication_snapshot(self, preview_id: str) -> dict[str, Any]:
+        directory = self._task_dir(preview_id)
+        with self.implementation_lock(preview_id):
+            record = self._load_preview_record(preview_id)
+            if record is None or record.state != "verified":
+                raise PermissionError("Draft publication approval requires an independently verified delivery")
+            _refuse_correction_publication(record)
+            preview = self._previews.get(preview_id)
+            if preview is None or not preview.approved or preview.bundle_payload != record.bundle_payload:
+                raise PermissionError("Draft publication approval requires the immutable approved task")
+            bundle = developer_task_bundle_from_payload(record.bundle_payload)
+            budget = DeveloperTaskBudget(path=self.budget_path(preview_id), bundle=bundle, create=False)
+            files, digest, fingerprint = self._capture_publication(directory, record, bundle, budget)
+            return self._publication_snapshot(record, bundle, files, digest, fingerprint)
+
+    def _publication_snapshot(
+        self, record: DeliveryPreparation, bundle: DeveloperTaskBundle,
+        files: dict[str, GitHubBlobChange | None], digest: str, fingerprint: str,
+    ) -> dict[str, Any]:
+        issue = bundle.issue_context
+        if issue is None:
+            raise PermissionError("Draft publication requires a repository issue")
+        title, body, commit_message = self._publication_metadata(bundle, record)
+        return {
+            "preview_id": record.preview_id, "approved_at": record.approved_at,
+            "title": title, "body": body, "commit_message": commit_message,
+            "checkout_digest": digest, "tree_fingerprint": fingerprint,
+            "changed_paths": sorted(files),
+            "blob_shas": {path: None if change is None else change.blob_sha for path, change in sorted(files.items())},
+            "file_modes": {path: None if change is None else change.mode for path, change in sorted(files.items())},
+            "base_ref": issue.base_branch, "base_sha": record.base_revision, "branch": record.branch,
+            "repository": issue.repository, "repository_id": issue.repository_id, "issue_number": issue.issue_number,
+        }
+
     def publish(
         self,
         preview_id: str,
@@ -421,6 +456,8 @@ class DeveloperDeliveryWorker:
         github: GitHubAdapter,
         require_human_approval_for_repo_writes: bool,
         allow_mock_publication: bool = False,
+        expected_publication: dict[str, Any] | None = None,
+        before_write: Callable[[], Any] | None = None,
     ) -> DeliveryPreparation:
         """Publish a verified delivery as a draft PR bound to the approved scope."""
         if isinstance(github, MockGitHubAdapter) and not allow_mock_publication:
@@ -465,9 +502,17 @@ class DeveloperDeliveryWorker:
                 create=False,
             )
             error: str | None = None
-            try:
+            def publication_check() -> None:
                 budget.remaining_seconds()
+                if before_write is not None:
+                    before_write()
+
+            try:
+                publication_check()
                 files, digest, tree_fingerprint = self._capture_publication(directory, record, bundle, budget)
+                snapshot = self._publication_snapshot(record, bundle, files, digest, tree_fingerprint)
+                if expected_publication is not None and snapshot != expected_publication:
+                    raise PermissionError("Draft publication differs from its exact saved approval snapshot")
                 prior = record.publication if isinstance(record.publication, dict) else {}
                 if prior.get("tree_fingerprint") not in (None, tree_fingerprint):
                     raise ValueError("Publication tree fingerprint changed; renew verification")
@@ -517,7 +562,7 @@ class DeveloperDeliveryWorker:
                         files=files,
                         approved=True,
                         require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
-                        before_write=budget.remaining_seconds,
+                        before_write=publication_check,
                     )
                     if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
                         raise RuntimeError("GitHub adapter returned an invalid head SHA")
@@ -542,7 +587,7 @@ class DeveloperDeliveryWorker:
                     existing_pull_number=existing,
                     approved=True,
                     require_human_approval_for_repo_writes=require_human_approval_for_repo_writes,
-                    before_write=budget.remaining_seconds,
+                    before_write=publication_check,
                 )
                 publication = {
                     **publication,
@@ -893,6 +938,9 @@ class DeveloperDeliveryWorker:
             return {"digest": staged.digest, "content_digest": staged.content_digest, "state": staged.state,
                     "snapshot": staged.snapshot}
 
+    def publication_approval(self, preview_id: str) -> PublishApproval | None:
+        return self._approvals.get(preview_id)
+
     def approve_and_publish_correction(
         self,
         preview_id: str,
@@ -903,6 +951,7 @@ class DeveloperDeliveryWorker:
         github: GitHubAdapter,
         require_human_approval_for_repo_writes: bool,
         allow_mock_publication: bool = False,
+        approval_policy: ApprovalDecision | None = None,
     ) -> DeliveryPreparation:
         """Consume the exact approval and fast-forward the pinned PR head; never creates a PR or changes base."""
         if isinstance(github, MockGitHubAdapter) and not allow_mock_publication:
@@ -914,9 +963,14 @@ class DeveloperDeliveryWorker:
                 approval = self._approvals.get(preview_id)
                 if approval is None or approval.digest != approval_digest or approval.state != "consumed":
                     raise PermissionError("Correction was published under a different approval")
+                if approval_policy is not None and approval.approval_policy != approval_policy:
+                    raise PermissionError("Correction was published under a different approval policy")
                 return current
             resuming = current is not None and current.state == "publishing"
             if resuming:
+                saved_policy = self._approvals.get(preview_id)
+                if approval_policy is not None and (saved_policy is None or saved_policy.approval_policy != approval_policy):
+                    raise PermissionError("Interrupted correction publication policy is immutable")
                 if current is None:
                     raise RuntimeError("Internal invariant violated: current is not None")
                 settled = self._resume_by_live_head(
@@ -930,7 +984,8 @@ class DeveloperDeliveryWorker:
             record, snapshot, files, budget = self._correction_snapshot(
                 preview_id, review_receipt_digest=review_receipt_digest, resuming=resuming)
             self._approvals.begin_consume(preview_id, digest=approval_digest,
-                                          recomputed_content_digest=snapshot_digest(snapshot), actor_id=actor_id)
+                                          recomputed_content_digest=snapshot_digest(snapshot), actor_id=actor_id,
+                                          approval_policy=approval_policy)
             publication = {
                 **{key: snapshot[key] for key in ("title", "body", "commit_message", "checkout_digest",
                                                   "tree_fingerprint", "changed_paths", "blob_shas", "file_modes",

@@ -8,6 +8,7 @@ from hashlib import sha256
 import json
 import math
 from pathlib import Path, PurePosixPath
+from aitobuild.approval_policy import ApprovalStage
 from typing import Annotated, Any, Literal, Self
 
 from agent_framework import Agent, AgentSession, FileSessionStore, FunctionInvocationContext, function_middleware, tool
@@ -219,10 +220,12 @@ class NativeManagedRoles:
         operations = {"pm_propose_assignment": ManagedOperation(self.propose, role=AgentRole.PM)}
         if self._planning is not None:
             operations["pm_plan_issues"] = ManagedOperation(
-                self.plan, role=AgentRole.PM, action=ActionClass.ISSUE_WRITE, on_response=self.approve_plan)
+                self.plan, role=AgentRole.PM, action=ActionClass.ISSUE_WRITE, on_response=self.approve_plan,
+                approval_stage=ApprovalStage.PM_ISSUE_CREATION, approval_stages=(ApprovalStage.PM_DEPENDENCY_LINKS,))
         if self._worker is not None and self._github is not None and self._target_for is not None:
             operations["architect_review_published"] = ManagedOperation(
                 self.review, role=AgentRole.ARCHITECT, action=ActionClass.PR_REVIEW, on_response=self.approve_review,
+                approval_stage=ApprovalStage.REVIEW_PUBLICATION,
             )
         return operations
 
@@ -339,7 +342,8 @@ class NativeManagedRoles:
         session.state["aitobuild_plan_state"] = "proposed"
         session.state["aitobuild_plan_approval"] = data
         await self._sessions.set(context.run.session_id, session)
-        return WorkflowInput("Approve exact PM issue content and dependency publication", data, "service_approval")
+        return WorkflowInput("Approve exact PM issue content and dependency publication", data, "service_approval",
+                     approval_stage=ApprovalStage.PM_ISSUE_CREATION)
 
     async def approve_plan(self, context: ManagedTaskContext, original: Any, approved: Any) -> dict[str, Any] | WorkflowInput:
         self._agent(context, AgentRole.PM)
@@ -358,7 +362,8 @@ class NativeManagedRoles:
         if result["state"] == "awaiting_links":
             session.state["aitobuild_plan_approval"] = result["approval"]
             await self._sessions.set(context.run.session_id, session)
-            return WorkflowInput("Approve exact resolved dependency links", result["approval"], "service_approval")
+            return WorkflowInput("Approve exact resolved dependency links", result["approval"], "service_approval",
+                                 approval_stage=ApprovalStage.PM_DEPENDENCY_LINKS)
         session.state["aitobuild_plan_state"] = "published"
         session.state["aitobuild_plan_publication"] = result
         await self._sessions.set(context.run.session_id, session)

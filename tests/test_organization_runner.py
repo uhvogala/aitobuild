@@ -12,6 +12,7 @@ from openai import AsyncOpenAI
 import pytest
 
 from aitobuild.agent_tools import DeveloperToolContext
+from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
 from aitobuild.developer_delivery import DeveloperDeliveryWorker, LocalRepositorySource
 from aitobuild.developer_isolation import DeveloperTaskBudget
 from aitobuild.organization import FileDefinitionStore, parse_organization_definition
@@ -28,7 +29,7 @@ from test_dispatcher import approved_delivery as approved_delivery, verification
 from test_organization_assignments import approved_task, coordinator_proposal, setup_service, assign
 
 
-def runner_fixture(tmp_path, operations=None, actor=None, cleanup=None):
+def runner_fixture(tmp_path, operations=None, actor=None, cleanup=None, approval_policy=None):
     service, snapshot, previews, assignments = setup_service(tmp_path)
     preview = approved_task(tmp_path, previews)
     assignment = assign(service, snapshot, preview, **coordinator_proposal())
@@ -42,6 +43,7 @@ def runner_fixture(tmp_path, operations=None, actor=None, cleanup=None):
         actor_provider=actor or (lambda: RuntimeActor("operator", "operator")),
         operations=operations or {"definition_probe": ManagedOperation(lambda context, message: message)},
         cleanup=cleanup or clean, binding_revision="test-v1",
+        approval_policy=approval_policy or ApprovalPolicy(),
     )
     return runner, assignment, service, snapshot, previews, assignments
 
@@ -83,9 +85,127 @@ def test_native_human_input_restart_restores_without_replaying_initial_operation
     assert calls == ["initial", "response"]
 
 
+@pytest.mark.parametrize("mode", ["human", "automatic", "disabled"])
+def test_configured_policy_uses_exact_native_checkpoint_decisions(tmp_path, mode):
+    calls = []
+    operation = ManagedOperation(
+        lambda context, message: calls.append("initial") or WorkflowInput("Exact operation", {"scope": message}, "service_approval"),
+        on_response=lambda context, original, response: calls.append(response) or original,
+        approval_stage=ApprovalStage.DEVELOPER_TOOLS,
+    )
+    policy = ApprovalPolicy(developer_tools=mode)
+    runner, assignment, *_ = runner_fixture(tmp_path, {"definition_probe": operation}, approval_policy=policy)
+    before = Path(assignment.budget_path).read_bytes()
+    run = asyncio.run(runner.start(assignment.assignment_id, input="exact-scope"))
+    assert run.approval_policy_revision == policy.revision
+    assert run.state == {"human": "waiting", "automatic": "completed", "disabled": "failed"}[mode], run.error
+    if mode == "disabled":
+        assert not calls and "disabled" in run.error
+        assert run.cleanup_succeeded is True
+        return
+    if mode == "human":
+        assert calls == ["initial"] and not run.decisions
+        run = asyncio.run(runner.approve(assignment.assignment_id, request_id=run.pending[0].request_id, approved=True))
+    assert calls == ["initial", True]
+    assert run.decisions[0].approval_policy.source == ("human" if mode == "human" else "operator_policy")
+    assert run.decisions[0].approval_policy.actor_id == "operator"
+    assert run.decisions[0].approval_policy.policy_revision == policy.revision
+    assert Path(assignment.budget_path).read_bytes() == before
+    assert asyncio.run(runner.start(assignment.assignment_id, input="exact-scope")) == run
+    assert calls == ["initial", True]
+
+
+def test_automatic_policy_refuses_unknown_stage_and_unbound_response(tmp_path):
+    with pytest.raises(ValueError, match="trusted operation binding"):
+        runner_fixture(tmp_path, approval_policy=ApprovalPolicy(merge="automatic"))
+    operation = ManagedOperation(lambda context, message: WorkflowInput("Choose text", {}),
+                                 on_response=lambda context, original, response: response,
+                                 approval_stage=ApprovalStage.DEVELOPER_TOOLS)
+    runner, assignment, *_ = runner_fixture(tmp_path, {"definition_probe": operation},
+                                           approval_policy=ApprovalPolicy(developer_tools="automatic"))
+    run = asyncio.run(runner.start(assignment.assignment_id))
+    assert run.state == "failed" and "exact response binding" in run.error
+    assert not run.decisions
+
+
+def test_active_policy_drift_fails_without_approving_or_replaying(tmp_path):
+    calls = []
+    operation = ManagedOperation(lambda context, message: calls.append("initial") or WorkflowInput("Approve", {}, "service_approval"),
+                                 on_response=lambda context, original, response: calls.append("effect"),
+                                 approval_stage=ApprovalStage.DEVELOPER_TOOLS)
+    runner, assignment, *_ = runner_fixture(tmp_path, {"definition_probe": operation})
+    waiting = asyncio.run(runner.start(assignment.assignment_id))
+    restarted, *_ = runner_fixture(tmp_path, {"definition_probe": operation},
+                                   approval_policy=ApprovalPolicy(developer_tools="automatic"))
+    failed = asyncio.run(restarted.start(assignment.assignment_id))
+    assert failed.state == "failed" and "policy revision changed" in failed.error
+    assert failed.approval_policy_revision == waiting.approval_policy_revision
+    assert calls == ["initial"] and not failed.decisions
+
+
+def test_automatic_policy_bounds_repeated_native_decisions(tmp_path):
+    operation = ManagedOperation(lambda context, message: WorkflowInput("Approve", {}, "service_approval"),
+                                 on_response=lambda context, original, response: WorkflowInput("Again", {}, "service_approval"),
+                                 approval_stage=ApprovalStage.DEVELOPER_TOOLS)
+    runner, assignment, *_ = runner_fixture(tmp_path, {"definition_probe": operation},
+        approval_policy=ApprovalPolicy(developer_tools="automatic", max_automatic_decisions=2))
+    failed = asyncio.run(runner.start(assignment.assignment_id))
+    assert failed.state == "failed" and "limit exceeded" in failed.error
+    assert len(failed.decisions) == 2 and failed.cleanup_succeeded is True
+
+
+def test_automatic_decision_limit_survives_human_wait_and_restart(tmp_path):
+    calls = []
+
+    def continuation(context, original, response):
+        calls.append(original)
+        stage = ApprovalStage.PM_ISSUE_CREATION if original == "automatic" else ApprovalStage.DEVELOPER_TOOLS
+        return WorkflowInput("Exact next operation", "human" if original == "automatic" else "automatic",
+                             "service_approval", stage)
+
+    operation = ManagedOperation(lambda context, message: WorkflowInput("First", "automatic", "service_approval"),
+        on_response=continuation, approval_stage=ApprovalStage.DEVELOPER_TOOLS,
+        approval_stages=(ApprovalStage.PM_ISSUE_CREATION,))
+    policy = ApprovalPolicy(developer_tools="automatic", max_automatic_decisions=1)
+    runner, assignment, *_ = runner_fixture(tmp_path, {"definition_probe": operation}, approval_policy=policy)
+    waiting = asyncio.run(runner.start(assignment.assignment_id))
+    assert waiting.state == "waiting" and len(waiting.decisions) == 1
+    restarted, *_ = runner_fixture(tmp_path, {"definition_probe": operation}, approval_policy=policy)
+    failed = asyncio.run(restarted.approve(assignment.assignment_id, request_id=waiting.pending[0].request_id, approved=True))
+    assert failed.state == "failed" and "limit exceeded" in failed.error
+    assert len(failed.decisions) == 2 and calls == ["automatic", "human"]
+    assert failed.approval_policy_revision == policy.revision and failed.cleanup_succeeded is True
+
+
+def test_one_operation_can_keep_creation_manual_and_links_automatic(tmp_path):
+    calls = []
+
+    def continuation(context, original, response):
+        calls.append(original["stage"])
+        if original["stage"] == "creation":
+            return WorkflowInput("Exact links", {"stage": "links"}, "service_approval", ApprovalStage.PM_DEPENDENCY_LINKS)
+        return {"published": True}
+
+    operation = ManagedOperation(
+        lambda context, message: WorkflowInput("Exact issues", {"stage": "creation"}, "service_approval"),
+        on_response=continuation, approval_stage=ApprovalStage.PM_ISSUE_CREATION,
+        approval_stages=(ApprovalStage.PM_DEPENDENCY_LINKS,),
+    )
+    policy = ApprovalPolicy(pm_dependency_links="automatic")
+    runner, assignment, *_ = runner_fixture(tmp_path, {"definition_probe": operation}, approval_policy=policy)
+    waiting = asyncio.run(runner.start(assignment.assignment_id))
+    assert waiting.state == "waiting" and not calls
+    completed = asyncio.run(runner.approve(assignment.assignment_id, request_id=waiting.pending[0].request_id, approved=True))
+    assert completed.state == "completed", completed.error
+    assert calls == ["creation", "links"]
+    assert [decision.approval_policy.source for decision in completed.decisions] == ["human", "operator_policy"]
+    assert [decision.approval_policy.stage for decision in completed.decisions] == [ApprovalStage.PM_ISSUE_CREATION, ApprovalStage.PM_DEPENDENCY_LINKS]
+
+
 @pytest.mark.parametrize("entrypoint", ["runner", "service", "worker"])
+@pytest.mark.parametrize("publication_mode", ["human", "automatic", "disabled", "changed"])
 def test_configured_delivery_stages_reuse_guarded_services_and_original_budget(
-    tmp_path, approved_delivery, verification_adapter, monkeypatch, entrypoint,
+    tmp_path, approved_delivery, verification_adapter, monkeypatch, entrypoint, publication_mode,
 ):
     previews, _, preview_id, source, _ = approved_delivery
     worker = DeveloperDeliveryWorker(
@@ -139,6 +259,7 @@ def test_configured_delivery_stages_reuse_guarded_services_and_original_budget(
         worker=worker, implementation=Implementation(), verification_adapter=verification_adapter,
         github=github, allow_mock_publication=True,
     )
+    policy = ApprovalPolicy(draft_publication="human" if publication_mode == "changed" else publication_mode)
     monkeypatch.setattr("aitobuild.developer_delivery.shell_request", lambda *args, **kwargs: {
         "ok": True, "status": "exited", "exit_code": 0, "output": "passed", "next_cursor": 6,
     })
@@ -146,6 +267,7 @@ def test_configured_delivery_stages_reuse_guarded_services_and_original_budget(
         definitions=definitions, assignments=assignments, assignment_service=service,
         runs=FileRunStore(tmp_path / "runs"), actor_provider=lambda: RuntimeActor("operator", "operator"),
         operations=bindings.operations, cleanup=bindings.cleanup, binding_revision="delivery-test-v1",
+        approval_policy=policy,
     )
     from aitobuild.organization_service import ManagedOrganizationService, ManagedRoute
 
@@ -159,6 +281,7 @@ def test_configured_delivery_stages_reuse_guarded_services_and_original_budget(
                              organization_id=snapshot.organization_id, revision=snapshot.revision,
                              event="github.issue.ready"),), coordinators={"planner": coordinator},
         operations=bindings.operations, cleanup=bindings.cleanup, binding_revision="delivery-test-v1",
+        approval_policy=policy,
     )
     budget_path = worker.budget_path(preview_id)
     before = json.loads(budget_path.read_text())
@@ -179,7 +302,24 @@ def test_configured_delivery_stages_reuse_guarded_services_and_original_budget(
             await detached.close()
 
     run = asyncio.run(invoke())
+    if publication_mode in {"human", "changed"}:
+        assert run.state == "waiting", run.error
+        assert worker.get(preview_id).state == "verified" and not github.branch_commits
+        assert run.pending[0].approval_stage == ApprovalStage.DRAFT_PUBLICATION
+        if publication_mode == "changed":
+            (Path(worker.get(preview_id).checkout_path) / "src/probe.py").write_text("unverified replacement\n")
+        assigned = assignments.for_task(previews.get(preview_id).bundle_payload["task_id"])
+        run = asyncio.run(managed_service.decide(assigned.assignment_id, request_id=run.pending[0].request_id, approved=True))
+    if publication_mode in {"disabled", "changed"}:
+        assert run.state == "failed" and not github.branch_commits
+        assert json.loads(budget_path.read_text())["aborted"] is True
+        assert run.cleanup_succeeded is True
+        assert bool(verification_adapter.closed) == (publication_mode == "changed")
+        assert calls == (["implement", "cleanup"] if publication_mode == "changed" else ["cleanup"])
+        return
     assert run.state == "completed", run.error
+    assert len(run.decisions) == 1
+    assert run.decisions[0].approval_policy.source == ("operator_policy" if publication_mode == "automatic" else "human")
     assert run.outputs == ({"preview_id": preview_id, "state": "published"},)
     assert worker.get(preview_id).verification["cleanup_succeeded"] is True
     assert len(github.branch_commits) == 1
@@ -779,7 +919,7 @@ def test_recovered_tool_errors_remain_diagnostics_not_contribution_rejection(tmp
     assert completed.outputs[0]["recovered_errors"] == ["Stale exact span"]
 
 
-@pytest.mark.parametrize("scenario", ["approved", "rejected", "recovered"])
+@pytest.mark.parametrize("scenario", ["approved", "rejected", "recovered", "automatic"])
 @pytest.mark.parametrize("entrypoint", ["runner", "service", "worker"])
 def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_tools(
     tmp_path, approved_delivery, verification_adapter, scenario, entrypoint,
@@ -850,12 +990,14 @@ def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_to
                     ),
                 )
                 bindings = ManagedDeliveryBindings(worker=worker, implementation=native, verification_adapter=verification_adapter)
+                policy = ApprovalPolicy(developer_tools="automatic") if scenario == "automatic" else ApprovalPolicy()
 
                 def make_runner():
                     return ManagedWorkflowRunner(
                         definitions=definitions, assignments=assignments, assignment_service=service,
                         runs=FileRunStore(tmp_path / "runs"), actor_provider=lambda: RuntimeActor("operator", "operator"),
                         operations=bindings.operations, cleanup=bindings.cleanup, binding_revision="native-v1",
+                        approval_policy=policy,
                     )
 
                 def make_service():
@@ -871,6 +1013,7 @@ def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_to
                                              organization_id=snapshot.organization_id, revision=snapshot.revision,
                                              event="github.issue.ready"),), coordinators={"planner": coordinator},
                         operations=bindings.operations, cleanup=bindings.cleanup, binding_revision="native-v1",
+                        approval_policy=policy,
                     )
 
                 async def detached_invoke(assignment_id=None, *, request_id=None, approved=None):
@@ -900,14 +1043,25 @@ def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_to
                     assignment = assignments.for_task(previews.get(preview_id).bundle_payload["task_id"])
                     waiting = await make_runner().start(assignment.assignment_id)
                 assignment = assignments.for_task(previews.get(preview_id).bundle_payload["task_id"])
-                assert waiting.state == "waiting", waiting.error
-                assert worker.get(preview_id).state == "awaiting_tool_approval"
-                assert waiting.pending[0].kind == "service_approval"
-                assert not (Path(worker.get(preview_id).checkout_path) / "src/probe.py").exists()
-                approve = (detached_invoke if entrypoint == "worker" else
-                           make_service().decide if entrypoint == "service" else make_runner().approve)
-                completed = await approve(assignment.assignment_id, request_id=waiting.pending[0].request_id,
-                                          approved=scenario != "rejected")
+                if scenario == "automatic":
+                    completed = waiting
+                    assert len(completed.decisions) == 1
+                    evidence = completed.decisions[0].approval_policy
+                    assert evidence.stage == ApprovalStage.DEVELOPER_TOOLS
+                    assert evidence.source == "operator_policy" and evidence.policy_revision == policy.revision
+                    assert completed.decisions[0].actor_id == evidence.actor_id
+                    restart = (await make_runner().start(assignment.assignment_id) if entrypoint == "runner" else
+                               await make_service().consume(preview_id))
+                    assert restart == completed
+                else:
+                    assert waiting.state == "waiting", waiting.error
+                    assert worker.get(preview_id).state == "awaiting_tool_approval"
+                    assert waiting.pending[0].kind == "service_approval"
+                    assert not (Path(worker.get(preview_id).checkout_path) / "src/probe.py").exists()
+                    approve = (detached_invoke if entrypoint == "worker" else
+                               make_service().decide if entrypoint == "service" else make_runner().approve)
+                    completed = await approve(assignment.assignment_id, request_id=waiting.pending[0].request_id,
+                                              approved=scenario != "rejected")
                 if scenario == "rejected":
                     assert completed.state == "failed" and "rejected" in completed.error
                     assert worker.get(preview_id).state == "failed"

@@ -14,6 +14,7 @@ from openai import AsyncOpenAI
 import pytest
 
 from aitobuild.agent_tools import DeveloperToolContext
+from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
 from aitobuild.developer_delivery import DeveloperDeliveryWorker, LocalRepositorySource
 from aitobuild.organization import FileDefinitionStore, parse_organization_definition
 from aitobuild.organization_assignments import AssignmentService, FileAssignmentStore
@@ -184,7 +185,7 @@ def test_native_meeting_exact_approval_restart_does_not_replay(tmp_path, approve
 
 
 @pytest.mark.parametrize("entrypoint", ["runner", "service", "worker"])
-@pytest.mark.parametrize("scenario", ["approved", "rejected", "plan_tamper"])
+@pytest.mark.parametrize("scenario", ["approved", "automatic", "rejected", "plan_tamper"])
 def test_configured_blocker_meeting_to_verified_draft(
     tmp_path, approved_delivery, verification_adapter, monkeypatch, entrypoint, scenario,
 ):
@@ -272,12 +273,15 @@ def test_configured_blocker_meeting_to_verified_draft(
                     return await meetings.resolve(context, BLOCKER)
 
                 operations = {**meetings.operations, **delivery.operations,
-                              "meeting_resolve_blocker": ManagedOperation(blocker, on_response=meetings.approve)}
+                              "meeting_resolve_blocker": ManagedOperation(blocker, on_response=meetings.approve,
+                                  approval_stage=ApprovalStage.MEETING_CONTINUATION)}
+                policy = ApprovalPolicy(meeting_continuation="automatic", developer_tools="automatic",
+                                        draft_publication="automatic") if scenario == "automatic" else ApprovalPolicy()
 
                 def make_runner():
                     return ManagedWorkflowRunner(definitions=definitions, assignments=assignments, assignment_service=assignment_service,
                         runs=runs, actor_provider=lambda: RuntimeActor("operator", "operator"), operations=operations,
-                        cleanup=cleanup, binding_revision="meeting-v1")
+                        cleanup=cleanup, binding_revision="meeting-v1", approval_policy=policy)
 
                 def make_service():
                     async def coordinator(pinned, preview):
@@ -285,7 +289,8 @@ def test_configured_blocker_meeting_to_verified_draft(
                     return ManagedOrganizationService(definitions=definitions, assignments=assignments, runs=runs, previews=previews,
                         worker=worker, operator_id="operator", routes=(ManagedRoute(repository="fixture/widgets", repository_id=101,
                             organization_id=snapshot.organization_id, revision=snapshot.revision, event="github.issue.ready"),),
-                        coordinators={"planner": coordinator}, operations=operations, cleanup=cleanup, binding_revision="meeting-v1")
+                        coordinators={"planner": coordinator}, operations=operations, cleanup=cleanup, binding_revision="meeting-v1",
+                        approval_policy=policy)
 
                 async def invoke(assignment_id=None, *, request_id=None, approved=None):
                     if entrypoint == "worker":
@@ -313,6 +318,18 @@ def test_configured_blocker_meeting_to_verified_draft(
                 before = json.loads(worker.budget_path(preview_id).read_text())
                 waiting = await invoke()
                 assignment = assignments.for_task(previews.get(preview_id).bundle_payload["task_id"])
+                if scenario == "automatic":
+                    assert waiting.state == "completed", waiting.error
+                    assert len(requests) == 6 and len(verified) == 1 and len(github.branch_commits) == 1
+                    assert worker.get(preview_id).state == "published"
+                    assert meetings.store.get(waiting.run_id).state == "resolved"
+                    assert [item.approval_policy.stage for item in waiting.decisions] == [
+                        ApprovalStage.MEETING_CONTINUATION, ApprovalStage.DEVELOPER_TOOLS, ApprovalStage.DRAFT_PUBLICATION]
+                    assert all(item.approval_policy.source == "operator_policy" for item in waiting.decisions)
+                    assert waiting.cleanup_succeeded is True and not (source / "src/probe.py").exists()
+                    assert json.loads(worker.budget_path(preview_id).read_text()) == before | {"reserved_paths": ["src/probe.py"]}
+                    assert await invoke() == waiting and len(requests) == 6
+                    return
                 assert waiting.state == "waiting", waiting.error
                 assert len(requests) == 4 and worker.get(preview_id).state == "prepared"
                 assert not verified and not github.branch_commits
@@ -340,6 +357,9 @@ def test_configured_blocker_meeting_to_verified_draft(
                     assert "operator decision" in completed.error
                     assert len(requests) == 5 and not verified and not github.branch_commits
                     return
+                assert completed.state == "waiting" and completed.pending[0].approval_stage == ApprovalStage.DRAFT_PUBLICATION
+                assert worker.get(preview_id).state == "verified" and not github.branch_commits
+                completed = await invoke(assignment.assignment_id, request_id=completed.pending[0].request_id, approved=True)
                 assert completed.state == "completed", completed.error
                 record = worker.get(preview_id)
                 assert record.state == "published" and record.publication["draft"] is True
@@ -348,7 +368,7 @@ def test_configured_blocker_meeting_to_verified_draft(
                 assert verification_adapter.created[0][1] is True
                 assert len(github.branch_commits) == 1 and not (source / "src/probe.py").exists()
                 assert meetings.store.get(waiting.run_id).state == "resolved"
-                assert len(completed.decisions) == 2 and all(item.data_digest for item in completed.decisions)
+                assert len(completed.decisions) == 3 and all(item.data_digest for item in completed.decisions)
                 assert all(item.actor_id == "operator" for item in completed.decisions)
                 assert json.loads(worker.budget_path(preview_id).read_text()) == before | {"reserved_paths": ["src/probe.py"]}
                 assert await invoke() == completed and len(requests) == 6

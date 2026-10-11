@@ -21,6 +21,7 @@ from filelock import FileLock
 from pydantic import AwareDatetime, JsonValue, StrictBool, StrictStr, TypeAdapter, model_validator
 
 from aitobuild.durable_files import atomic_write_text, sync_directory
+from aitobuild.approval_policy import ApprovalDecision, ApprovalPolicy, ApprovalStage
 from aitobuild.developer_isolation import DeveloperTaskBudget
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, Identifier
 from aitobuild.organization_assignments import (
@@ -54,6 +55,7 @@ class PendingWorkflowInput(DefinitionModel):
     kind: InputKind
     prompt: StrictStr
     data: JsonValue
+    approval_stage: ApprovalStage | None = None
 
 
 class WorkflowDecision(DefinitionModel):
@@ -62,6 +64,7 @@ class WorkflowDecision(DefinitionModel):
     actor_id: StrictStr
     value: JsonValue
     data_digest: Digest | None = None
+    approval_policy: ApprovalDecision | None = None
 
 
 def workflow_input_digest(data: Any) -> str:
@@ -91,6 +94,7 @@ class ManagedRun(DefinitionModel):
     error: StrictStr | None = None
     cleanup_succeeded: StrictBool | None = None
     terminal_state: Literal["completed", "failed", "cancelled"] | None = None
+    approval_policy_revision: Digest | None = None
 
     @model_validator(mode="after")
     def validate_state(self) -> Self:
@@ -211,6 +215,7 @@ class WorkflowInput:
     prompt: str
     data: JsonValue
     kind: InputKind = "human_input"
+    approval_stage: ApprovalStage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,11 +224,22 @@ class ManagedOperation:
     role: AgentRole = AgentRole.DEVELOPER
     action: ActionClass = ActionClass.READ_ONLY
     on_response: Callable[[ManagedTaskContext, Any, Any], Any] | None = None
+    approval_stage: ApprovalStage | None = None
+    automatic_response: Callable[[ManagedTaskContext, PendingWorkflowInput], JsonValue] | None = None
+    approval_stages: tuple[ApprovalStage, ...] = ()
 
     def __post_init__(self) -> None:
         assert_role_action_allowed(self.role, self.action)
         if not callable(self.handler) or (self.on_response is not None and not callable(self.on_response)):
             raise ValueError("Managed operation handlers must be callable")
+        if self.approval_stage is not None and (not isinstance(self.approval_stage, ApprovalStage) or self.on_response is None):
+            raise ValueError("Approval stage requires a registered stage and continuation handler")
+        if self.automatic_response is not None and (self.approval_stage is None or not callable(self.automatic_response)):
+            raise ValueError("Automatic response requires a trusted stage-bound callback")
+        if self.approval_stages and (self.on_response is None or
+                any(not isinstance(stage, ApprovalStage) for stage in self.approval_stages) or
+                len(set(self.approval_stages)) != len(self.approval_stages)):
+            raise ValueError("Additional approval stages require unique registered stages and a continuation")
 
 
 async def _resolve(value: Any) -> Any:
@@ -241,8 +257,13 @@ class _ManagedExecutor(Executor):
         if isinstance(result, WorkflowInput):
             if self._operation.on_response is None or result.kind not in {"human_input", "service_approval"}:
                 raise ValueError("Workflow input requires an explicit continuation handler and kind")
-            await ctx.request_info(request_data={"kind": result.kind, "prompt": result.prompt,
-                                                 "data": result.data}, response_type=dict)
+            data: dict[str, Any] = {"kind": result.kind, "prompt": result.prompt, "data": result.data}
+            stage = result.approval_stage or self._operation.approval_stage
+            if stage is not None:
+                if stage not in (*self._operation.approval_stages, self._operation.approval_stage):
+                    raise PermissionError("Input stage is outside its trusted operation binding")
+                data["approval_stage"] = stage.value
+            await ctx.request_info(request_data=data, response_type=dict)
         else:
             TypeAdapter(JsonValue).validate_python(result)
             await ctx.send_message(result)
@@ -301,6 +322,8 @@ class ManagedWorkflowRunner:
         binding_revision: str,
         predicates: Mapping[str, WorkflowPredicate] | None = None,
         limits: WorkflowLimits = WorkflowLimits(),
+        approval_policy: ApprovalPolicy = ApprovalPolicy(),
+        external_approval_stages: tuple[ApprovalStage, ...] = (),
     ) -> None:
         self._definitions = definitions
         self._assignments = assignments
@@ -308,6 +331,16 @@ class ManagedWorkflowRunner:
         self._runs = runs
         self._actor = actor_provider
         self._operations = dict(operations)
+        self.approval_policy = ApprovalPolicy.model_validate(approval_policy.model_dump())
+        supported = {stage for operation in self._operations.values()
+                 for stage in (*operation.approval_stages, operation.approval_stage) if stage is not None}
+        if any(not isinstance(stage, ApprovalStage) for stage in external_approval_stages):
+            raise ValueError("External approval bindings require registered stages")
+        supported.update(external_approval_stages)
+        defaults = ApprovalPolicy()
+        for stage in ApprovalStage:
+            if self.approval_policy.mode(stage) != defaults.mode(stage) and stage not in supported:
+                raise ValueError(f"Approval stage has no trusted operation binding: {stage.value}")
         self._cleanup = cleanup
         self._predicates = dict(predicates or {})
         self._limits = limits
@@ -359,6 +392,9 @@ class ManagedWorkflowRunner:
             raise ValueError("Pinned organization revision not found")
 
         def revalidate() -> TaskAssignment:
+            expected = run.approval_policy_revision or ApprovalPolicy().revision
+            if expected != self.approval_policy.revision:
+                raise PermissionError("Approval policy revision changed during active work")
             current = self._service.revalidate(assignment.assignment_id)
             if _assignment_digest(current) != run.assignment_digest:
                 raise PermissionError("Managed run assignment pins changed")
@@ -389,11 +425,12 @@ class ManagedWorkflowRunner:
                 organization_id=assignment.organization_id, revision=assignment.revision,
                 workflow_id=assignment.workflow_id, scope_digest=assignment.scope_digest,
                 binding_revision=self._binding_revision,
+                approval_policy_revision=self.approval_policy.revision,
                 workflow_name=f"{assignment.organization_id}.{assignment.revision}.{assignment.workflow_id}.{identity}",
                 input=input, created_at=now, updated_at=now,
             )
             self._runs.save(run)
-            return await self._invoke(run, assignment)
+            return await self._advance_automatic(await self._invoke(run, assignment), assignment)
 
     async def _existing(self, run: ManagedRun, assignment: TaskAssignment) -> ManagedRun:
         if run.state in TERMINAL:
@@ -411,8 +448,90 @@ class ManagedWorkflowRunner:
         if run.state == "running":
             return await self._terminate(run, context, "failed", "Interrupted native invocation; automatic replay is blocked")
         if run.state == "waiting":
-            return run
-        return await self._invoke(run, assignment)
+            return await self._advance_automatic(run, assignment)
+        return await self._advance_automatic(await self._invoke(run, assignment), assignment)
+
+    def _input_operation(self, context: ManagedTaskContext, request: PendingWorkflowInput) -> ManagedOperation:
+        workflow = next(item for item in context.snapshot.definition.workflows if item.id == context.run.workflow_id)
+        admitted = _admit_graph(
+            workflow.document, runtime=OrganizationRuntime(context.snapshot, {}, {}, {}, {}),
+            operations={name: WorkflowOperation(operation.handler) for name, operation in self._operations.items()},
+            predicates=self._predicates, limits=self._limits,
+        )
+        node = next((node for node in admitted.nodes if node.id == request.node_id), None)
+        if node is None or node.kind != "operation" or node.operation not in self._operations:
+            raise PermissionError("Pending input has no trusted operation binding")
+        return self._operations[node.operation]
+
+    def _policy_decision(
+        self, context: ManagedTaskContext, request: PendingWorkflowInput, value: JsonValue,
+        *, source: Literal["human", "operator_policy"],
+    ) -> ApprovalDecision | None:
+        operation = self._input_operation(context, request)
+        stage = self._input_stage(operation, request)
+        if stage is None:
+            if source == "operator_policy":
+                raise PermissionError("Automatic decision requires a stage-bound operation")
+            return None
+        return self.approval_policy.resolve(
+            stage, actor_id=self._actor().actor_id,
+            operation={"request": request.model_dump(mode="json"), "response": value},
+            expected_revision=context.run.approval_policy_revision or ApprovalPolicy().revision,
+            automatic_supported=True, source=source,
+        )
+
+    def _input_stage(self, operation: ManagedOperation, request: PendingWorkflowInput) -> ApprovalStage | None:
+        stage = request.approval_stage or operation.approval_stage
+        if stage is not None and stage not in (*operation.approval_stages, operation.approval_stage):
+            raise PermissionError("Input stage is outside its trusted operation binding")
+        return stage
+
+    async def _advance_automatic(self, run: ManagedRun, assignment: TaskAssignment) -> ManagedRun:
+        count = sum(decision.approval_policy is not None and decision.approval_policy.source == "operator_policy"
+                    for decision in run.decisions)
+        while run.state == "waiting":
+            context = self._context(run, assignment)
+            try:
+                context.revalidate()
+                selected = None
+                for request in run.pending:
+                    operation = self._input_operation(context, request)
+                    stage = self._input_stage(operation, request)
+                    if stage is None:
+                        continue
+                    mode = self.approval_policy.mode(stage)
+                    if mode == "disabled":
+                        raise PermissionError(f"Approval stage is disabled: {stage.value}")
+                    if mode == "automatic":
+                        selected = request, operation
+                        break
+                if selected is None:
+                    return run
+                if self._actor().kind != "operator":
+                    raise PermissionError("Automatic decisions require trusted operator runtime context")
+                if count >= self.approval_policy.max_automatic_decisions:
+                    raise PermissionError("Automatic decision limit exceeded; a new task is required")
+                request, operation = selected
+                if operation.automatic_response is not None:
+                    value = operation.automatic_response(context, request)
+                elif request.kind == "service_approval":
+                    value = True
+                else:
+                    raise PermissionError("Automatic human-input response requires a trusted exact response binding")
+                TypeAdapter(JsonValue).validate_python(value)
+                context.revalidate()
+                decision = self._policy_decision(context, request, value, source="operator_policy")
+                if decision is None:
+                    raise PermissionError("Automatic policy evidence is missing")
+                run = await self._invoke(run, assignment, responses={request.request_id: {"kind": request.kind, "value": value}},
+                                         policy_decisions={request.request_id: decision})
+                count += 1
+            except Exception as error:
+                saved = self._runs.get(assignment.assignment_id)
+                if saved is not None and saved.state in TERMINAL | {"finalizing"}:
+                    raise
+                return await self._terminate(run, context, "failed", str(error))
+        return run
 
     async def resume(self, assignment_id: str, *, request_id: str, response: JsonValue) -> ManagedRun:
         return await self._resume(assignment_id, request_id, response, "human_input")
@@ -439,7 +558,14 @@ class ManagedWorkflowRunner:
             request = next((item for item in run.pending if item.request_id == request_id), None)
             if request is None or request.kind != kind:
                 raise PermissionError("Request identity/kind is not pending; native input is not service approval")
-            return await self._invoke(run, assignment, responses={request_id: {"kind": kind, "value": value}})
+            context = self._context(run, assignment)
+            try:
+                decision = self._policy_decision(context, request, value, source="human")
+            except PermissionError as error:
+                return await self._terminate(run, context, "failed", str(error))
+            run = await self._invoke(run, assignment, responses={request_id: {"kind": kind, "value": value}},
+                                     policy_decisions={request_id: decision} if decision is not None else None)
+            return await self._advance_automatic(run, assignment)
 
     async def cancel(self, assignment_id: str) -> ManagedRun:
         if self._actor().kind != "operator":
@@ -469,6 +595,8 @@ class ManagedWorkflowRunner:
         nodes: dict[str, Executor] = {}
         for node in admitted.nodes:
             operation = self._operations[str(node.operation)]
+            if operation.approval_stage is not None and self.approval_policy.mode(operation.approval_stage) == "disabled":
+                raise PermissionError(f"Approval stage is disabled: {operation.approval_stage.value}")
             if operation.action != ActionClass.READ_ONLY and operation.role != selected.role:
                 raise PermissionError("Managed write/review operation exceeds the assigned role")
             nodes[node.id] = _ManagedExecutor(node.id, operation, context)
@@ -479,6 +607,7 @@ class ManagedWorkflowRunner:
 
     async def _invoke(
         self, run: ManagedRun, assignment: TaskAssignment, *, responses: dict[str, Any] | None = None,
+        policy_decisions: Mapping[str, ApprovalDecision] | None = None,
     ) -> ManagedRun:
         context = self._context(run, assignment)
         current = run
@@ -507,6 +636,7 @@ class ManagedWorkflowRunner:
                     request_id=request_id, kind=response["kind"], actor_id=self._actor().actor_id,
                     value=response["value"],
                     data_digest=workflow_input_digest(next(item.data for item in run.pending if item.request_id == request_id)),
+                    approval_policy=(policy_decisions or {}).get(request_id),
                 ) for request_id, response in (responses or {}).items())),
             })
             self._runs.save(running)
@@ -525,6 +655,7 @@ class ManagedWorkflowRunner:
             pending = tuple(PendingWorkflowInput(
                 request_id=request_id, node_id=event.source_executor_id,
                 kind=event.data["kind"], prompt=event.data["prompt"], data=event.data["data"],
+                approval_stage=event.data.get("approval_stage"),
             ) for request_id, event in checkpoint.pending_request_info_events.items())
             updated = ManagedRun.model_validate(running.model_dump() | {
                 "checkpoint_id": storage.latest, "checkpoint_digest": storage.digest(storage.latest),

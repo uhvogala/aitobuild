@@ -405,11 +405,11 @@ def test_publication_stages_unapproved_head_pinned_review_once(tmp_path, publish
 
 
 @pytest.mark.parametrize("detached", [False, True])
-@pytest.mark.parametrize("outcome", ["approve", "cancel_corrupt_preview", "correction", "correction_missing_seed",
+@pytest.mark.parametrize("outcome", ["approve", "automatic_review", "cancel_corrupt_preview", "correction", "correction_disabled", "correction_missing_seed",
                                      "correction_partial", "correction_scope", "correction_journal_loss", "correction_head_drift",
                                      "correction_revision", "correction_missing_budget", "correction_sibling", "correction_publication", "correction_publication_recovery",
                                      "correction_retry", "correction_retry_retired", "correction_retry_interrupted",
-                                     "correction_native", "correction_native_recovered", "correction_native_rejected",
+                                     "correction_native", "correction_native_automatic", "correction_native_recovered", "correction_native_rejected",
                                      "correction_native_outside", "correction_native_verification_failure", "correction_native_head_drift",
                                      "correction_native_followup_retry", "correction_native_two_rounds", "correction_native_publish_bypass", "correction_limit_zero"])
 def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, published_delivery, detached, outcome, monkeypatch, test_config, verification_adapter):
@@ -421,6 +421,13 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
     definitions, snapshot = review_definition(tmp_path)
     correcting = outcome.startswith("correction")
     native_correcting = outcome.startswith("correction_native")
+    from aitobuild.approval_policy import ApprovalPolicy
+
+    automatic_correction = outcome == "correction_native_automatic"
+    policy = (ApprovalPolicy(correction="automatic") if automatic_correction else
+              ApprovalPolicy(review_publication="automatic") if outcome == "automatic_review" else
+              ApprovalPolicy(correction="disabled") if outcome == "correction_disabled" else ApprovalPolicy())
+    test_config = replace(test_config, approvals=policy)
     if native_correcting:
         document = snapshot.definition.model_dump(mode="json")
         document["workflows"][0]["document"] = {
@@ -549,6 +556,8 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         previews=previews, worker=worker, routes=(), reviews=reviews, operations=operations, cleanup=cleanup,
                         operator_id="trusted-review-operator", binding_revision="reviews-v1",
                         automatic_review_followups=native_correcting,
+                        approval_policy=policy, correction_publication_github=github if automatic_correction else None,
+                        allow_mock_publication=automatic_correction,
                     )
 
                 current = service()
@@ -560,12 +569,23 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                     assert background.enqueue(preview.preview_id).state == "queued"
                     await background.start()
                     try:
-                        assert (await background.wait_idle(preview.preview_id)).state == "waiting"
+                        assert (await background.wait_idle(preview.preview_id)).state == ("completed" if outcome == "automatic_review" else "waiting")
                     finally:
                         await background.close()
                     waiting = current.status(preview.preview_id)
                 else:
                     waiting = await current.consume(preview.preview_id)
+                if outcome == "automatic_review":
+                    assert waiting.state == "completed" and waiting.cleanup_succeeded is True, waiting.error
+                    assert len(github.reviews) == 1 and github.reviews[0].event == "COMMENT"
+                    assert waiting.decisions[0].approval_policy.source == "operator_policy"
+                    assert waiting.decisions[0].approval_policy.policy_revision == policy.revision
+                    before = reviews.budget_path(preview.preview_id).read_bytes()
+                    assert await service().consume(preview.preview_id) == waiting
+                    assert len(github.reviews) == 1 and len(bodies) == 3
+                    assert reviews.budget_path(preview.preview_id).read_bytes() == before
+                    assert developer_budget.read_bytes() == before_developer
+                    return
                 assert waiting.state == "waiting", waiting.error
                 assert waiting.pending[0].kind == "service_approval" and not github.reviews
                 assert worker.get(preview.preview_id) is None
@@ -589,6 +609,17 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                 assert reviews.budget_path(preview.preview_id).read_bytes() == budget_before
                 assert developer_budget.read_bytes() == before_developer
                 if correcting:
+                    if outcome == "correction_disabled":
+                        with pytest.raises(PermissionError, match="disabled"):
+                            await service().offer_correction(preview.preview_id)
+                        correction = reviews.offer_correction(preview.preview_id, done)
+                        previews.approve(correction.preview_id)
+                        with pytest.raises(PermissionError, match="disabled"):
+                            service().admission(correction.preview_id)
+                        assert worker.get(correction.preview_id) is None
+                        assert not worker.budget_path(correction.preview_id).exists()
+                        assert developer_budget.read_bytes() == before_developer
+                        return
                     if outcome == "correction_limit_zero":
                         with pytest.raises(PermissionError, match="round limit"):
                             await service().offer_correction(preview.preview_id)
@@ -780,6 +811,22 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                             assert len(github.branch_commits) == original_commits and final_budget["aborted"]
                             assert service().follow_up_status(completed.run_id) is None
                             assert worker._approvals.get(correction.preview_id) is None
+                            return
+                        if automatic_correction:
+                            assert record.state == "published", record.error
+                            assert record.publication["pull_number"] == original.publication["pull_number"]
+                            assert record.publication["parent_head_sha"] == original.publication["head_sha"]
+                            approval = worker.publication_approval(correction.preview_id)
+                            assert approval.state == "consumed" and approval.approval_policy.source == "operator_policy"
+                            assert approval.approval_policy.actor_id == "trusted-review-operator"
+                            assert approval.approval_policy.policy_revision == completed.approval_policy_revision == policy.revision
+                            assert len(github.pull_requests[repository]) == 1
+                            assert len(github.branch_commits) == original_commits + 1
+                            assert service().follow_up_status(completed.run_id)["state"] == "staged"
+                            count = len(developer_bodies)
+                            assert await invoke_native() == completed
+                            assert len(developer_bodies) == count and len(github.branch_commits) == original_commits + 1
+                            assert worker.budget_path(correction.preview_id).read_text() == json.dumps(final_budget)
                             return
                         assert record.state == "verified" and artifact.read_text() == "def probe():\n    return False\n"
                         assert completed.outputs[-1]["state"] == "verified"

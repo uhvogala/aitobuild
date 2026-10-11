@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
-from os import getenv
+from os import environ
 from pathlib import Path
 import re
+from typing import Any, get_args, get_type_hints
+
+from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
+from aitobuild.organization import OrganizationDefinition
 
 
 @dataclass(slots=True, frozen=True)
@@ -57,6 +61,7 @@ class RepositorySourceConfig:
     repository_id: int
     path: str
     verification_commands: tuple[str, ...] = ()
+    base_revision: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -91,16 +96,155 @@ class AppConfig:
     developer: DeveloperConfig
     github: GitHubConfig
     web_search: WebSearchConfig
+    approvals: ApprovalPolicy = field(default_factory=ApprovalPolicy)
+    organization: OrganizationDefinition | None = None
 
 
 DEFAULT_SCAN_CRON = "0 8 * * *"
 DEFAULT_MEETING_CRON = "*/30 * * * *"
 
+_CONFIG_CLASSES = {"runtime": RuntimeConfig, "scheduler": SchedulerConfig, "policy": PolicyConfig,
+                   "security": SecurityConfig, "developer": DeveloperConfig, "github": GitHubConfig,
+                   "web_search": WebSearchConfig}
+_CONFIG_ENV = {
+    "runtime": {"foundry_endpoint": "FOUNDRY_ENDPOINT", "foundry_api_key": "FOUNDRY_API_KEY",
+                "foundry_model": "FOUNDRY_MODEL", "allow_mock_model": "ALLOW_MOCK_MODEL"},
+    "scheduler": {"enabled": "SCHEDULER_ENABLED", "kill_switch": "SCHEDULER_KILL_SWITCH",
+                  "architect_scan_cron": "ARCHITECT_SCAN_CRON", "meeting_tick_cron": "MEETING_TICK_CRON",
+                  "max_concurrent_proactive_jobs": "MAX_PROACTIVE_JOBS", "quiet_window_start_hour": "SCHEDULER_QUIET_START_HOUR",
+                  "quiet_window_end_hour": "SCHEDULER_QUIET_END_HOUR"},
+    "policy": {"require_human_approval_for_repo_writes": "REQUIRE_APPROVAL_FOR_REPO_WRITES"},
+    "security": {"require_internal_auth": "REQUIRE_INTERNAL_AUTH", "internal_api_token": "INTERNAL_API_TOKEN"},
+    "github": {"adapter": "GITHUB_ADAPTER", "default_repository": "GITHUB_DEFAULT_REPOSITORY",
+               "allowed_repositories": "GITHUB_ALLOWED_REPOS"},
+    "web_search": {"adapter": "WEB_SEARCH_ADAPTER"},
+    "developer": {"require_preview_before_dispatch": "REQUIRE_DEVELOPER_PREVIEW", "execution_mode": "DEVELOPER_EXECUTION_MODE",
+                  "command_timeout_seconds": "DEVELOPER_COMMAND_TIMEOUT_SECONDS", "session_container_image": "DEVELOPER_SESSION_CONTAINER_IMAGE",
+                  "session_container_workdir": "DEVELOPER_SESSION_CONTAINER_WORKDIR", "session_container_name_prefix": "DEVELOPER_SESSION_CONTAINER_PREFIX",
+                  "session_container_bind_path": "DEVELOPER_SESSION_CONTAINER_BIND_PATH", "session_container_run_as_current_user": "DEVELOPER_SESSION_RUN_AS_CURRENT_USER",
+                  "agent_invoke_timeout_seconds": "DEVELOPER_AGENT_INVOKE_TIMEOUT_SECONDS", "enable_mcp_adapters": "DEVELOPER_ENABLE_MCP_ADAPTERS",
+                  "enable_agent_live_logs": "DEVELOPER_ENABLE_AGENT_LIVE_LOGS", "mcp_shell_tool_name": "DEVELOPER_MCP_SHELL_TOOL_NAME",
+                  "mcp_filesystem_read_tool_name": "DEVELOPER_MCP_FILESYSTEM_READ_TOOL_NAME", "mcp_filesystem_write_tool_name": "DEVELOPER_MCP_FILESYSTEM_WRITE_TOOL_NAME",
+                  "state_dir": "DEVELOPER_STATE_DIR", "session_data_volume": "DEVELOPER_SESSION_DATA_VOLUME",
+                  "enable_browser": "DEVELOPER_ENABLE_BROWSER", "repository_sources": "DEVELOPER_REPOSITORY_SOURCES"},
+}
+_SECRET_SETTINGS = {"webhook_secret", "runtime.foundry_api_key", "security.internal_api_token"}
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate configuration key: {key}")
+        result[key] = value
+    return result
+
+
+def _read_config_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise ValueError("Configuration path must be a regular JSON file")
+    with path.open("rb") as stream:
+        content = stream.read(1048577)
+    if len(content) > 1048576:
+        raise ValueError("Configuration exceeds the 1 MiB limit")
+    try:
+        value = json.loads(content.decode("utf-8"), object_pairs_hook=_unique_json_object, parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Configuration must contain valid UTF-8 JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError("Configuration must be a JSON object")
+    return value
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"Configuration cannot contain non-finite JSON constants: {value}")
+
+
+def _file_setting(name: str, value: Any, expected: Any) -> str | None:
+    reference = isinstance(value, dict) and set(value) == {"$env"}
+    if name in _SECRET_SETTINGS and value is not None and not reference:
+        raise ValueError(f"Secret setting requires an environment reference: {name}")
+    if reference:
+        variable = value["$env"]
+        if not isinstance(variable, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", variable):
+            raise ValueError("Secret environment reference must name a variable")
+        value = environ.get(variable)
+    if value is None and type(None) in get_args(expected):
+        return None
+    if name == "github.allowed_repositories":
+        if not isinstance(value, list) or not all(isinstance(item, str) and item and "," not in item for item in value):
+            raise ValueError("github.allowed_repositories must be an array of repository names")
+        return ",".join(value)
+    if name == "developer.repository_sources":
+        if not isinstance(value, list):
+            raise ValueError("developer.repository_sources must be an array")
+        return json.dumps(value, allow_nan=False)
+    valid = (expected is bool and type(value) is bool or expected is int and type(value) is int or
+             expected is str and isinstance(value, str) or expected == str | None and isinstance(value, str) or
+             expected == int | None and type(value) is int)
+    if not valid:
+        raise ValueError(f"Configuration setting has the wrong type: {name}")
+    return json.dumps(value) if type(value) is bool else str(value)
+
+
+def _manifest_values() -> tuple[dict[str, str], ApprovalPolicy, OrganizationDefinition | None]:
+    values: dict[str, str] = {}
+    approvals: dict[str, Any] = {}
+    organization = None
+    selected = environ.get("AITOBUILD_CONFIG_FILE")
+    if selected is not None:
+        if not selected.strip():
+            raise ValueError("AITOBUILD_CONFIG_FILE must name a JSON file")
+        path = Path(selected)
+        manifest = _read_config_json(path)
+        if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1:
+            raise ValueError("Central configuration requires schema_version 1")
+        if set(manifest) - {"schema_version", "settings", "approvals", "organization", "organization_file"}:
+            raise ValueError("Unknown central configuration field")
+        settings = manifest.get("settings", {})
+        if not isinstance(settings, dict) or set(settings) - {*_CONFIG_ENV, "webhook_secret"}:
+            raise ValueError("Unknown application settings section")
+        if "webhook_secret" in settings:
+            secret = _file_setting("webhook_secret", settings["webhook_secret"], str)
+            if secret is not None:
+                values["AITOBUILD_WEBHOOK_SECRET"] = secret
+        for section, names in _CONFIG_ENV.items():
+            group = settings.get(section, {})
+            if not isinstance(group, dict) or set(group) - names.keys():
+                raise ValueError(f"Unknown configuration field in {section}")
+            hints = get_type_hints(_CONFIG_CLASSES[section])
+            for name, value in group.items():
+                encoded = _file_setting(f"{section}.{name}", value, hints[name])
+                if encoded is not None:
+                    values["AITOBUILD_" + names[name]] = encoded
+        approvals = manifest.get("approvals", {})
+        if not isinstance(approvals, dict):
+            raise ValueError("Approval policy must be an object")
+        if "organization" in manifest and "organization_file" in manifest:
+            raise ValueError("Choose inline organization or organization_file, not both")
+        if "organization" in manifest:
+            organization = OrganizationDefinition.model_validate(manifest["organization"])
+        if "organization_file" in manifest:
+            reference = manifest["organization_file"]
+            if not isinstance(reference, str) or not reference.strip():
+                raise ValueError("organization_file must name a JSON definition")
+            organization = OrganizationDefinition.model_validate(_read_config_json(path.parent / reference))
+    for stage in ApprovalStage:
+        override = environ.get("AITOBUILD_APPROVAL_" + stage.value.upper())
+        if override is not None:
+            approvals[stage.value] = override
+    return {**values, **environ}, ApprovalPolicy.model_validate(approvals), organization
+
 
 def _as_bool(value: str | None, *, default: bool) -> bool:
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("Boolean configuration must be true or false")
 
 
 def _require_non_empty(name: str, value: str | None) -> str:
@@ -128,7 +272,7 @@ def _parse_repository_sources(raw: str) -> tuple[RepositorySourceConfig, ...]:
     sources: list[RepositorySourceConfig] = []
     for item in items:
         if (not isinstance(item, dict) or not {"repository", "repository_id", "path"} <= set(item)
-            or set(item) - {"repository", "repository_id", "path", "verification_commands"}):
+            or set(item) - {"repository", "repository_id", "path", "verification_commands", "base_revision"}):
             raise ValueError("Repository sources require repository, repository_id and path")
         repository, repository_id, path = item["repository"], item["repository_id"], item["path"]
         if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", repository):
@@ -144,7 +288,10 @@ def _parse_repository_sources(raw: str) -> tuple[RepositorySourceConfig, ...]:
             or not all(isinstance(command, str) and command.strip() and "\x00" not in command
                    and len(command.encode("utf-8")) <= 8192 for command in commands)):
             raise ValueError("verification_commands must contain at most 16 nonempty command strings of at most 8192 bytes")
-        sources.append(RepositorySourceConfig(repository.lower(), repository_id, path, tuple(commands)))
+        base = item.get("base_revision")
+        if base is not None and (not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base)):
+            raise ValueError("Repository source base_revision must be a resolved lowercase commit SHA")
+        sources.append(RepositorySourceConfig(repository.lower(), repository_id, path, tuple(commands), base))
     return tuple(sources)
 
 
@@ -176,6 +323,8 @@ def _normalize_repository_name(repository: str) -> str:
 
 
 def load_config() -> AppConfig:
+    values, approvals, organization = _manifest_values()
+    getenv = values.get
     webhook_secret = _require_non_empty("AITOBUILD_WEBHOOK_SECRET", getenv("AITOBUILD_WEBHOOK_SECRET"))
 
     runtime = RuntimeConfig(
@@ -336,4 +485,6 @@ def load_config() -> AppConfig:
         developer=developer,
         github=github,
         web_search=web_search,
+        approvals=approvals,
+        organization=organization,
     )
