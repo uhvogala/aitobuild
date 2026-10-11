@@ -139,7 +139,7 @@ def test_plan_revision_is_immutable_and_survives_restart(tmp_path):
 
 def planning_fixture(tmp_path, profile, worker, *, limits=PlanningLimits(), github=None, previews=None, dependencies_enabled=False,
                      repository="example/target", repository_id=1, base_revision="a" * 40, handoff_operation=None,
-                     approval_policy=ApprovalPolicy()):
+                     approval_policy=ApprovalPolicy(), implementation_followups=False):
     document = json.loads((Path(__file__).resolve().parents[1] / "config/organization.example.json").read_text())
     document["workflows"].append({"id": "planning", "document": {
         "format": "python_graph", "start": "plan", "nodes": [{"id": "plan", "kind": "operation", "operation": "pm_plan_issues"}],
@@ -149,6 +149,8 @@ def planning_fixture(tmp_path, profile, worker, *, limits=PlanningLimits(), gith
                                "delegation": {"strategy": "rules", "eligible_agents": ["planner"], "target_agent": "planner"}})
     if dependencies_enabled:
         document["routes"][0]["delegation"]["strategy"] = "human"
+    if implementation_followups:
+        document["routes"][0]["delegation"] = {"strategy": "rules", "eligible_agents": ["developer_one"], "target_agent": "developer_one"}
     definitions = FileDefinitionStore(tmp_path / "planning-definitions")
     snapshot = definitions.save(parse_organization_definition(json.dumps(document)))
     previews = previews or DeveloperPreviewRegistry(tmp_path / "planning-previews.json")
@@ -173,11 +175,17 @@ def planning_fixture(tmp_path, profile, worker, *, limits=PlanningLimits(), gith
         dependencies = ManagedDependencies(planning=planning, worker=worker, state_dir=tmp_path / "dependency-handoffs", routes=(
             PlanningRoute(repository=repository, repository_id=repository_id, organization_id=snapshot.organization_id,
                           revision=snapshot.revision, event="github.issue.ready"),)) if dependencies_enabled else None
+        from aitobuild.organization_service import ManagedRoute
+
+        delivery_routes = (ManagedRoute(repository=repository, repository_id=repository_id, organization_id=snapshot.organization_id,
+                                       revision=snapshot.revision, event="github.issue.ready"),) if implementation_followups else ()
         service = ManagedOrganizationService(definitions=definitions, assignments=assignments, runs=runs, previews=previews,
-                                              worker=worker, routes=(), operator_id="operator", operations=roles.operations | (
+                                              worker=worker, routes=delivery_routes, operator_id="operator", operations=roles.operations | (
                                                   {"definition_probe": handoff_operation} if handoff_operation else {}),
                                               cleanup=roles.cleanup, binding_revision="planning-v1", planning=admission, dependencies=dependencies,
-                                              approval_policy=approval_policy)
+                                              approval_policy=approval_policy, planning_publication=planning if implementation_followups else None,
+                                              task_base_revision_for=(lambda preview: preview.bundle_payload.get("issue_context", {}).get("base_revision"))
+                                              if approval_policy.task_admission == "automatic" else None)
         return service, planning, roles
 
     service, planning, roles = make_service()
@@ -333,10 +341,156 @@ def test_native_pm_automatic_create_and_exact_resolved_links(tmp_path, approved_
                 assert len(run.decisions) == 2 and len(github.issues["example/target"]) == 2
                 assert "- Depends on #1" in github.issues["example/target"][2].body
                 assert all(not previews.get(child).approved for child in run.outputs[0]["developer_previews"])
+                assert planning.independent_preview_ids(run) == (run.outputs[0]["developer_previews"][0],)
                 before = service.budget_path(preview.preview_id).read_bytes()
                 assert await restart()[0].consume(preview.preview_id) == run
+                assert restart()[1].independent_preview_ids(run) == planning.independent_preview_ids(run)
                 assert len(checked) == 3 and len(bodies) == 2
                 assert service.budget_path(preview.preview_id).read_bytes() == before
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("restart_before_children", [False, True])
+def test_pm_independent_followup_queueing_retains_separate_task_admission(tmp_path, approved_delivery, automatic, restart_before_children):
+    from aitobuild.organization_runner import ManagedOperation
+    from aitobuild.organization_worker import FileWorkerStore, ManagedOrganizationWorker
+
+    calls, bodies = [], []
+    policy = ApprovalPolicy(task_admission="automatic" if automatic else "human",
+                            pm_issue_creation="automatic", pm_dependency_links="automatic")
+    document = proposal()
+    document["issues"].append({"key": "third", "title": "Third issue", "objective": "Implement third behavior",
+                               "acceptance_criteria": ["Third behavior passes"]})
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply(bodies, document))) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service, planning, _, preview, previews, github, restart, _ = planning_fixture(
+                    tmp_path, profile, approved_delivery[1], previews=approved_delivery[0], repository="fixture/widgets", repository_id=101,
+                    base_revision=approved_delivery[4], approval_policy=policy, implementation_followups=True,
+                    handoff_operation=ManagedOperation(lambda context, message: calls.append(context.assignment.preview_id) or "done"))
+                previews.approve(preview.preview_id)
+                background = ManagedOrganizationWorker(service=service, store=FileWorkerStore(tmp_path / "pm-followups.json"),
+                                                       queue_follow_ups=True, poll_seconds=0.01)
+                scanned = asyncio.Event()
+                discover = service.planning_follow_up_preview_ids
+
+                def lookup(source):
+                    children = discover(source)
+                    scanned.set()
+                    return () if restart_before_children else children
+
+                service.planning_follow_up_preview_ids = lookup
+                background.enqueue(preview.preview_id)
+                await background.start()
+                try:
+                    async with asyncio.timeout(5):
+                        parent_job = await background.wait_idle(preview.preview_id)
+                        assert parent_job.state == "completed", parent_job.error
+                        run = service.recorded_run(parent_job.task_id)
+                        first_id, dependent_id, third_id = run.outputs[0]["developer_previews"]
+                        before = service.budget_path(preview.preview_id).read_bytes()
+                        if restart_before_children:
+                            await background.close()
+                            assert background.store.get(first_id) is None and background.store.get(third_id) is None
+                            service = restart()[0]
+                            discover = service.planning_follow_up_preview_ids
+                            scanned.clear()
+
+                            def recovered_lookup(source):
+                                children = discover(source)
+                                scanned.set()
+                                return children
+
+                            service.planning_follow_up_preview_ids = recovered_lookup
+                            background = ManagedOrganizationWorker(service=service, store=FileWorkerStore(tmp_path / "pm-followups.json"),
+                                                                   queue_follow_ups=True, poll_seconds=0.01)
+                            await background.start()
+                        await scanned.wait()
+                        for child_id in (first_id, third_id):
+                            if automatic:
+                                child_job = await background.wait_idle(child_id)
+                                assert child_job.state == "completed", child_job.error
+                                assert previews.get(child_id).approval_policy.source == "operator_policy"
+                            else:
+                                assert background.store.get(child_id) is None and not previews.get(child_id).approved
+                        assert background.store.get(dependent_id) is None and not previews.get(dependent_id).approved
+                finally:
+                    await background.close()
+                assert calls == ([first_id, third_id] if automatic else [])
+                assert restart()[0].planning_follow_up_preview_ids(preview.preview_id) == (first_id, third_id)
+                assert service.budget_path(preview.preview_id).read_bytes() == before
+                assert len(github.issues["fixture/widgets"]) == 3 and len(bodies) == 2
+                assert not background.diagnostics()["errors"]
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("case", ["missing_publication", "incomplete", "unapproved_links", "foreign_child", "missing_preview",
+                                  "child_scope", "source_scope", "source_run", "binding", "cleanup", "output", "issue_drift",
+                                  "closed", "dependent", "unbound", "disabled"])
+def test_pm_independent_followup_refuses_changed_or_incomplete_evidence(tmp_path, approved_delivery, monkeypatch, case):
+    from aitobuild.organization_runner import ManagedOperation
+
+    bodies, calls = [], []
+    policy = ApprovalPolicy(task_admission="automatic", pm_issue_creation="automatic", pm_dependency_links="automatic")
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply(bodies))) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service, planning, _, preview, previews, github, _, _ = planning_fixture(
+                    tmp_path, profile, approved_delivery[1], previews=approved_delivery[0], repository="fixture/widgets", repository_id=101,
+                    base_revision=approved_delivery[4], approval_policy=policy, implementation_followups=True,
+                    handoff_operation=ManagedOperation(lambda context, message: calls.append("implementation")))
+                run = await service.consume(preview.preview_id)
+                assert run.state == "completed" and run.cleanup_succeeded is True, run.error
+                first_id, dependent_id = run.outputs[0]["developer_previews"]
+                assert service.planning_follow_up_preview_ids(preview.preview_id) == (first_id,)
+                parent_budget = service.budget_path(preview.preview_id).read_bytes()
+                path = planning.publications.path(run.assignment_id)
+                if case == "missing_publication":
+                    path.unlink()
+                elif case in {"incomplete", "unapproved_links", "foreign_child"}:
+                    saved = json.loads(path.read_text())
+                    if case == "incomplete":
+                        saved["state"] = "publishing"
+                    elif case == "unapproved_links":
+                        saved["link_approved_at"] = None
+                    else:
+                        saved["developer_previews"][0] = approved_delivery[2]
+                    path.write_text(json.dumps(saved))
+                elif case in {"child_scope", "source_scope", "missing_preview"}:
+                    identity = preview.preview_id if case == "source_scope" else first_id
+                    get = previews.get
+                    original = get(identity)
+                    changed = replace(original, bundle_payload=original.bundle_payload | {"objective": "Changed scope"})
+                    monkeypatch.setattr(previews, "get", lambda key: (None if case == "missing_preview" else changed) if key == identity else get(key))
+                elif case in {"source_run", "binding", "cleanup", "output"}:
+                    field, value = {"source_run": ("scope_digest", "f" * 64), "binding": ("binding_revision", "changed"),
+                                    "cleanup": ("cleanup_succeeded", False), "output": ("outputs", ())}[case]
+                    changed = run.model_copy(update={field: value})
+                    with pytest.raises(PermissionError):
+                        planning.independent_preview_ids(changed)
+                    assert not calls and len(bodies) == 2
+                    return
+                elif case in {"issue_drift", "closed"}:
+                    issue = github.issues["fixture/widgets"][1]
+                    github.issues["fixture/widgets"][1] = replace(issue, **({"body": "Changed issue scope"} if case == "issue_drift" else {"state": "closed"}))
+                elif case == "unbound":
+                    service._planning_publication = None
+                elif case == "disabled":
+                    service._runner.approval_policy = policy.model_copy(update={"task_admission": "disabled"})
+                with pytest.raises((ValueError, PermissionError, FileNotFoundError)):
+                    service.admission(dependent_id if case == "dependent" else first_id)
+                assert not calls and len(bodies) == 2 and len(github.issues["fixture/widgets"]) == 2
+                assert service.budget_path(preview.preview_id).read_bytes() == parent_budget
+                assert not approved_delivery[1].budget_path(first_id).exists()
+                if case not in {"child_scope", "missing_preview"}:
+                    assert not previews.get(first_id).approved
 
     asyncio.run(exercise())
 

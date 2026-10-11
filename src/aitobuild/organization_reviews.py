@@ -475,6 +475,24 @@ class PublishedReviewAdmission:
             receipt = self._load().followups.get(run_id)
         return receipt.model_dump(mode="json") if receipt else None
 
+    def follow_up_preview_id(self, preview_id: str, run: ManagedRun) -> str | None:
+        with FileLock(str(self._path) + ".lock", timeout=10):
+            journal = self._load()
+        receipt = journal.followups.get(run.run_id)
+        if receipt is None or receipt.state != "staged":
+            return None
+        if (receipt.source_preview_id, receipt.run_content) != (preview_id, run.model_dump_json()):
+            raise PermissionError("Follow-up source run changed")
+        child_id = receipt.next_preview_id
+        children = [item for item in journal.receipts.values()
+                    if item.review_preview_id == child_id and item.target.preview_id == preview_id]
+        corrections = [item for item in journal.corrections.values()
+                       if item.correction_preview_id == child_id and item.review_preview_id == preview_id
+                       and item.run_content == receipt.run_content]
+        if child_id == preview_id or len(children) + len(corrections) != 1:
+            raise PermissionError("Follow-up requires its exact staged review or correction child")
+        return child_id
+
     def correction_target_for(self, preview_id: str) -> dict[str, Any]:
         self.correction_route_for(preview_id)
         with FileLock(str(self._path) + ".lock", timeout=10):

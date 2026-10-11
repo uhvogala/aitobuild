@@ -20,7 +20,7 @@ from aitobuild.developer_isolation import (
 from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry
 from aitobuild.durable_files import atomic_write_text
 from aitobuild.organization import DefinitionModel, DefinitionStore, EventName, Identifier
-from aitobuild.organization_runner import ManagedTaskContext
+from aitobuild.organization_runner import ManagedRun, ManagedTaskContext
 from aitobuild.policy import AgentRole
 from aitobuild.tools.github import GitHubAdapter, GitHubIssue, normalize_repository_name
 
@@ -602,6 +602,81 @@ class ManagedPlanning:
                 raise PermissionError("Incomplete approved publication requires operator inspection; no writes replayed")
             return self._stage(plan, saved)
 
+    def independent_preview_ids(self, run: ManagedRun) -> tuple[str, ...]:
+        if run.state != "completed" or run.cleanup_succeeded is not True:
+            raise PermissionError("Planning handoff requires a completed cleaned-up run")
+        plan = self.plans.get(run.assignment_id)
+        request = self.admission.request_for(str(plan.pins["preview_id"]))
+        source = self.admission.previews.get(str(plan.pins["preview_id"]))
+        if (request is None or request.route.organization_id != run.organization_id or
+                request.route.revision != run.revision or request.operator_id != self.admission.operator_id or
+            source is None or not source.approved or source.approved_at is None or
+            source.approved_at.isoformat() != plan.pins["approved_at"] or
+            sha256(canonical(source.bundle_payload).encode()).hexdigest() != run.scope_digest or
+            canonical(source.bundle_payload) != request.bundle_content or
+                plan.pins["scope_digest"] != run.scope_digest or plan.pins["revision"] != run.revision or
+                plan.pins["binding_revision"] != run.binding_revision):
+            raise PermissionError("Planning handoff differs from the saved source run")
+        path = self.publications.path(run.assignment_id)
+        with FileLock(str(path) + ".lock", timeout=0):
+            saved = self._load_publication(run.assignment_id, plan)
+        if (saved.state != "published" or len(saved.effects) != len(plan.proposal.issues) or
+                any(effect.state != "linked" for effect in saved.effects) or
+                len(saved.developer_previews) != len(saved.effects) or
+                len(set(saved.developer_previews)) != len(saved.developer_previews) or
+                any(issue.dependencies for issue in plan.proposal.issues) and saved.link_approved_at is None):
+            raise PermissionError("Planning handoff requires complete exact publication receipts")
+        result = {"plan_digest": plan.digest, "state": saved.state, "issues": [effect.receipt for effect in saved.effects],
+                  "developer_previews": list(saved.developer_previews), "implementation_approved": False}
+        if not any(canonical(output) == canonical(result) for output in run.outputs):
+            raise PermissionError("Planning handoff differs from the completed publication output")
+        children = []
+        for effect, preview_id in zip(saved.effects, saved.developer_previews, strict=True):
+            preview = self.admission.previews.get(preview_id)
+            if (preview is None or canonical(preview.bundle_payload) != canonical(self._developer_payload(plan, saved, effect)) or
+                    preview.source_payload != {"plan_digest": plan.digest, "planning_assignment": run.assignment_id}):
+                raise PermissionError("Planned child differs from its exact publication receipt")
+            draft = next(issue for issue in plan.proposal.issues if issue.key == effect.key)
+            if not draft.dependencies:
+                children.append(preview_id)
+        return tuple(children)
+
+    def check_independent_preview(self, preview: DeveloperPreview, run: ManagedRun) -> None:
+        if preview.preview_id not in self.independent_preview_ids(run):
+            raise PermissionError("Planned implementation requires its exact independent child receipt")
+        plan = self.plans.get(run.assignment_id)
+        path = self.publications.path(run.assignment_id)
+        with FileLock(str(path) + ".lock", timeout=0):
+            saved = self._load_publication(run.assignment_id, plan)
+        effect = saved.effects[saved.developer_previews.index(preview.preview_id)]
+        if canonical(preview.bundle_payload) != canonical(self._developer_payload(plan, saved, effect)):
+            raise PermissionError("Planned implementation scope changed before admission")
+        if effect.receipt is None:
+            raise PermissionError("Planned implementation has no exact issue receipt")
+        scope = self._target(plan)
+        current = self.github.get_issue(repository=scope.repository, issue_number=effect.receipt["number"])
+        if self._receipt(current, effect.content, scope) != effect.receipt:
+            raise PermissionError("Published issue drift prevents independent implementation")
+
+    def _developer_payload(self, plan: PlanRevision, saved: _PlanPublication, effect: _IssueEffect) -> dict[str, Any]:
+        if effect.receipt is None:
+            raise PermissionError("Issue has no exact publication receipt")
+        scope = self._target(plan)
+        receipt = effect.receipt
+        draft = next(issue for issue in plan.proposal.issues if issue.key == effect.key)
+        task_id = "planned-issue-" + sha256((saved.assignment_id + ":" + effect.key).encode()).hexdigest()
+        payload = build_developer_task_bundle(task_id=task_id, objective=draft.objective,
+                                              acceptance_criteria=list(draft.acceptance_criteria), constraints=[], context_files=[],
+                                              issue_context=DeveloperIssueContext(
+                                                  repository=scope.repository, repository_id=scope.repository_id,
+                                                  issue_number=receipt["number"], issue_id=receipt["issue_id"],
+                                                  title=receipt["title"], body=receipt["body"],
+                                                  base_branch=scope.base_branch, base_revision=scope.base_revision,
+                                              )).to_payload()
+        payload["policy"] = plan.pins["developer_policy"]
+        developer_task_bundle_from_payload(payload)
+        return payload
+
     def _stage(self, plan: PlanRevision, saved: _PlanPublication) -> dict[str, Any]:
         scope = self._target(plan)
         if len(saved.effects) != len(plan.issues) or any(effect.state != "linked" for effect in saved.effects):
@@ -614,21 +689,8 @@ class ManagedPlanning:
                 raise PermissionError("Published issue drift prevents Developer handoff")
         previews: list[str] = []
         for effect in saved.effects:
-            if effect.receipt is None:
-                raise PermissionError("Issue has no exact publication receipt")
-            receipt = effect.receipt
-            draft = next(issue for issue in plan.proposal.issues if issue.key == effect.key)
-            task_id = "planned-issue-" + sha256((saved.assignment_id + ":" + effect.key).encode()).hexdigest()
-            payload = build_developer_task_bundle(task_id=task_id, objective=draft.objective,
-                                                  acceptance_criteria=list(draft.acceptance_criteria), constraints=[], context_files=[],
-                                                  issue_context=DeveloperIssueContext(
-                                                      repository=scope.repository, repository_id=scope.repository_id,
-                                                      issue_number=receipt["number"], issue_id=receipt["issue_id"],
-                                                      title=receipt["title"], body=receipt["body"],
-                                                      base_branch=scope.base_branch, base_revision=scope.base_revision,
-                                                  )).to_payload()
-            payload["policy"] = plan.pins["developer_policy"]
-            developer_task_bundle_from_payload(payload)
+            payload = self._developer_payload(plan, saved, effect)
+            task_id = str(payload["task_id"])
             preview = self.admission.previews.create_or_get(dedupe_key=task_id, task_key=task_id, bundle_payload=payload,
                                                            source_payload={"plan_digest": plan.digest, "planning_assignment": saved.assignment_id})
             previews.append(preview.preview_id)

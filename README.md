@@ -151,8 +151,9 @@ other than Boolean approval requires an explicit trusted exact response callback
 
 This changes approval decisions, not activation, graph structure or scheduling.
 Organization definitions and model/tool profile references still resolve through
-operator-owned registries and factories. Follow-up staging is not automatic
-dependency scheduling or a complete unattended lifecycle. Existing supervised live
+operator-owned registries and factories. Opt-in detached workers can queue exact
+receipt-backed independent PM children and review/correction follow-ups; this is
+not automatic dependency scheduling or a complete unattended lifecycle. Existing supervised live
 acceptance does not establish live automatic-mode or hosted/distributed acceptance.
 
 ### Organization definition foundation
@@ -405,6 +406,7 @@ def worker_factory(service, context):
 		store=FileWorkerStore(context.state_dir / "organization-worker.json"),
 		max_workers=2,
 		recover_approved=False,
+		queue_follow_ups=context.queue_follow_ups,
 	)
 
 app = create_app(
@@ -436,6 +438,39 @@ or replay uncertain effects. Corrupt state fails closed. Saved idle native waits
 require their exact decision; interrupted unclaimed admission or native running work
 fails with cleanup/abort, never automatic replay. Ready runs may safely start, and
 saved finalizing/terminal results recover metadata only.
+
+Set `settings.managed_worker.queue_follow_ups` to `true` in the central manifest,
+or override it with `AITOBUILD_MANAGED_WORKER_QUEUE_FOLLOW_UPS=true`, to enable
+receipt-backed child admission. The default is `false`. The app requires an
+explicit worker factory and verifies that it binds `context.queue_follow_ups`
+exactly. Standalone operator-created workers accept `queue_follow_ups=True`.
+
+Only completed, successfully cleaned-up parents with an unchanged approved scope
+and an exact saved child receipt qualify. Enable
+`automatic_review_followups=True` on the service to stage these receipts, or stage
+them explicitly. Child admission still uses the configured task policy: pending
+human approval leaves it unqueued, automatic admission saves its own exact decision,
+and disabled admission refuses work. Each child retains its separate scope,
+head/base, ledger, verification and publication gates; correction round ceilings
+remain unchanged. Completed parent receipts are inspected again after restart to
+recover missing child admission, without replaying parent effects. Existing child
+worker receipts, including failed/cancelled terminal jobs, are never replaced.
+Invalid receipts or admission failures stop the worker slot for inspection while
+preserving the completed parent; known receipt-lock contention defers lookup without
+resetting budgets. This does not discover PM dependencies, schedule
+blockers, fetch correction seeds, merge, or coordinate distributed workers.
+
+For independent PM children, explicitly pass `planning_publication=planning` to
+the service alongside its exact `planning=admission` binding, and activate the
+desired Developer repository route. Only a completed graph exposing the exact
+published planning result as an output qualifies. The lookup joins its immutable
+plan, consumed creation/link approvals, all issue receipts, staged child payloads
+and original approved source. It is read-only and cannot recreate missing previews,
+issues, receipts or ledgers. Multiple independent children may be queued within the
+original plan's issue ceiling. The issue identity/body is rechecked before first
+admission. Planned issues with prerequisites are excluded even if manually approved;
+they require the separate merged-prerequisite handoff below. If dependency admission
+is also configured, it must share this exact `ManagedPlanning` instance.
 
 Detached `cancel` accepts exactly one of `preview_id` or `assignment_id`, including
 pre-assignment tasks. Durable cancellation intent survives restart. Active local
@@ -617,6 +652,12 @@ These names represent trusted factory inputs, not HTTP/model fields. Register
 and `ManagedOrganizationService(..., planning=admission)` using the same definitions,
 app-owned previews and operator identity. Change the operator binding revision when
 registered behavior changes. No new public write endpoint or activation flag exists.
+To allow independent children through a configured Developer route, also pass
+`planning_publication=planning`. This exact receipt binding is required unless
+the existing dependency adapter already owns their admission. Opt-in worker
+`queue_follow_ups` uses it for independently ready children; each child still needs
+its own human or configured task-admission decision. Publication alone grants no
+implementation authority.
 
 1. Approve the offered preview through the existing authenticated preview endpoint.
    It pins repository ID/name, base SHA/branch, immutable definition revision,
@@ -950,8 +991,11 @@ under its saved consuming approval and original operator/budget.
 Set `automatic_review_followups=True` on the explicit managed service binding to stage
 a correction after a completed approved COMMENT, or a fresh head-pinned review after
 published delivery. A verified-only correction does not stage its next review until
-the operator publishes it. Follow-ups are separate **unapproved** tasks, not model assignment,
-approval or execution authority. Each task and COMMENT still needs fresh approval.
+an exact human or configured operator-policy approval permits publication.
+Follow-ups are separate **unapproved** tasks, not model assignment, approval or
+execution authority. Each task and COMMENT still needs fresh approval. Explicit
+`queue_follow_ups` workers can admit these saved children under the configured task
+policy; staging alone does not enqueue them.
 Before each correction's preparation, the operator must provision its reviewed head
 and published branch in the local seed; the service does not fetch them.
 

@@ -409,7 +409,7 @@ def test_publication_stages_unapproved_head_pinned_review_once(tmp_path, publish
                                      "correction_partial", "correction_scope", "correction_journal_loss", "correction_head_drift",
                                      "correction_revision", "correction_missing_budget", "correction_sibling", "correction_publication", "correction_publication_recovery",
                                      "correction_retry", "correction_retry_retired", "correction_retry_interrupted",
-                                     "correction_native", "correction_native_automatic", "correction_native_recovered", "correction_native_rejected",
+                                     "correction_native", "correction_native_automatic", "correction_native_queued", "correction_native_recovered", "correction_native_rejected",
                                      "correction_native_outside", "correction_native_verification_failure", "correction_native_head_drift",
                                      "correction_native_followup_retry", "correction_native_two_rounds", "correction_native_publish_bypass", "correction_limit_zero"])
 def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, published_delivery, detached, outcome, monkeypatch, test_config, verification_adapter):
@@ -423,8 +423,11 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
     native_correcting = outcome.startswith("correction_native")
     from aitobuild.approval_policy import ApprovalPolicy
 
-    automatic_correction = outcome == "correction_native_automatic"
-    policy = (ApprovalPolicy(correction="automatic") if automatic_correction else
+    queued_followups = outcome == "correction_native_queued"
+    automatic_correction = outcome in {"correction_native_automatic", "correction_native_queued"}
+    policy = (ApprovalPolicy(task_admission="automatic", developer_tools="automatic", review_publication="automatic",
+                             correction="automatic") if queued_followups else
+              ApprovalPolicy(correction="automatic") if automatic_correction else
               ApprovalPolicy(review_publication="automatic") if outcome == "automatic_review" else
               ApprovalPolicy(correction="disabled") if outcome == "correction_disabled" else ApprovalPolicy())
     test_config = replace(test_config, approvals=policy)
@@ -496,7 +499,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                                             "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
         bodies.append(body)
         step = (len(bodies) - 1) % 4 + 1 if native_correcting else len(bodies)
-        if step == 3 and correcting:
+        if step == 3 and correcting and (not queued_followups or len(bodies) <= 4):
             message = {"role": "assistant", "content": None, "tool_calls": [{"id": "correction", "type": "function", "function": {
                 "name": "architect_propose_correction", "arguments": json.dumps({"paths": worker.get(published_id).publication["changed_paths"],
                                                                                 "objective": "Fix the inspected edge case"}),
@@ -558,10 +561,114 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         automatic_review_followups=native_correcting,
                         approval_policy=policy, correction_publication_github=github if automatic_correction else None,
                         allow_mock_publication=automatic_correction,
+                        task_base_revision_for=(lambda preview: preview.bundle_payload["issue_context"]["base_revision"])
+                        if queued_followups else None,
                     )
 
                 current = service()
                 staged = await current.offer_published_review(published_id)
+                if queued_followups:
+                    enqueued = {}
+
+                    def background_for(current):
+                        background = ManagedOrganizationWorker(service=current,
+                            store=FileWorkerStore(tmp_path / "queued-followups.json"), queue_follow_ups=True, poll_seconds=0.01)
+                        enqueue = background.enqueue
+
+                        def track(preview_id):
+                            job = enqueue(preview_id)
+                            if job is not None:
+                                enqueued.setdefault(preview_id, asyncio.Event()).set()
+                            return job
+
+                        background.enqueue = track
+                        return background
+
+                    background = background_for(current)
+                    if detached:
+                        monkeypatch.setattr(current, "follow_up_preview_id", lambda source: None)
+                    assert not staged.approved
+                    background.enqueue(staged.preview_id)
+                    await background.start()
+                    try:
+                        async with asyncio.timeout(5):
+                            first_job = await background.wait_idle(staged.preview_id)
+                            assert first_job.state == "completed", first_job.error
+                            first = current.recorded_run(first_job.task_id)
+                            assert first.state == "completed" and first.cleanup_succeeded is True, first.error
+                            correction_id = current.follow_up_status(first.run_id)["next_preview_id"]
+                            if detached:
+                                await background.close()
+                                assert background.store.get(correction_id) is None and not previews.get(correction_id).approved
+                                current = service()
+                                background = background_for(current)
+                                await background.start()
+                            await enqueued.setdefault(correction_id, asyncio.Event()).wait()
+                            correction_job = await background.wait_idle(correction_id)
+                            assert correction_job.state == "completed", correction_job.error
+                            correction_run = current.recorded_run(correction_job.task_id)
+                            assert correction_run.state == "completed" and correction_run.cleanup_succeeded is True, correction_run.error
+                            correction = worker.get(correction_id)
+                            assert correction.state == "published"
+                            rereview_id = current.follow_up_status(correction_run.run_id)["next_preview_id"]
+                            await enqueued.setdefault(rereview_id, asyncio.Event()).wait()
+                            rereview_job = await background.wait_idle(rereview_id)
+                            assert rereview_job.state == "completed", rereview_job.error
+                            rereview = current.recorded_run(rereview_job.task_id)
+                            assert rereview.state == "completed" and rereview.cleanup_succeeded is True, rereview.error
+                            assert current.follow_up_status(rereview.run_id)["state"] == "no_correction"
+                    finally:
+                        await background.close()
+                    jobs = background.store.list()
+                    assert len(jobs) == 3 and all(job.state == "completed" for job in jobs)
+                    assert len(github.reviews) == 2 and len(github.pull_requests["fixture/widgets"]) == 1
+                    assert correction.publication["pull_number"] == worker.get(published_id).publication["pull_number"]
+                    assert reviews.target_for(rereview_id).head_sha == correction.publication["head_sha"]
+                    assert len(bodies) == 7 and len(developer_bodies) == 2
+                    for job in jobs:
+                        assert previews.get(job.preview_id).approval_policy.source == "operator_policy"
+                    budgets = {job.preview_id: current.budget_path(job.preview_id).read_bytes() for job in jobs}
+                    counts = (len(bodies), len(developer_bodies), len(github.branch_commits))
+                    with pytest.raises(PermissionError, match="source run changed"):
+                        reviews.follow_up_preview_id("unrelated-source", first)
+                    with pytest.raises(PermissionError, match="source run changed"):
+                        reviews.follow_up_preview_id(staged.preview_id, first.model_copy(update={"error": "Changed receipt"}))
+                    journal = reviews._load()
+                    wrong_child = journal.followups[first.run_id].model_copy(update={"next_preview_id": staged.preview_id})
+                    with monkeypatch.context() as patched:
+                        altered = journal.model_copy(update={"followups": journal.followups | {first.run_id: wrong_child}})
+                        patched.setattr(reviews, "_load", lambda: altered)
+                        with pytest.raises(PermissionError, match="exact staged review or correction child"):
+                            current.follow_up_preview_id(staged.preview_id)
+                    original_get = previews.get
+                    source = original_get(staged.preview_id)
+                    changed_source = replace(source, bundle_payload=source.bundle_payload | {"objective": "Changed scope"})
+                    with monkeypatch.context() as patched:
+                        patched.setattr(previews, "get", lambda identity: changed_source if identity == staged.preview_id else original_get(identity))
+                        with pytest.raises(PermissionError, match="approval/scope changed"):
+                            current.follow_up_preview_id(staged.preview_id)
+                    restored = service()
+                    restarted = background_for(restored)
+                    scanned = asyncio.Event()
+                    discover = restored.follow_up_preview_id
+
+                    def observe(source):
+                        result = discover(source)
+                        scanned.set()
+                        return result
+
+                    monkeypatch.setattr(restored, "follow_up_preview_id", observe)
+                    await restarted.start()
+                    try:
+                        await asyncio.wait_for(scanned.wait(), timeout=5)
+                    finally:
+                        await restarted.close()
+                    assert not restarted.diagnostics()["errors"]
+                    assert restarted.store.list() == jobs
+                    assert counts == (len(bodies), len(developer_bodies), len(github.branch_commits))
+                    assert budgets == {job.preview_id: restored.budget_path(job.preview_id).read_bytes() for job in jobs}
+                    assert developer_budget.read_bytes() == before_developer
+                    return
                 assert await current.consume(staged.preview_id) is None and not bodies
                 preview = previews.approve(staged.preview_id)
                 if detached:

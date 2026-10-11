@@ -728,6 +728,24 @@ cover automatic task admission, Developer tools, PM creation/resolved links,
 draft/COMMENT publication, bounded meeting continuation and verified same-PR
 correction through request/detached paths. These checks use mocked transports and
 disposable fixtures. Unsupported bindings fail closed; defaults remain manual.
+Opt-in detached queueing admits exact saved independent PM and review/correction
+children through explicit operator bindings. Native SDK fixtures cover automatic COMMENT, verified
+same-PR correction and re-review, missing-child admission recovery and terminal
+restart without effect replay. Human task admission still waits for approval;
+source/child receipt drift and invalid admission fail closed. Independent PM handoff
+checks join complete issue/link receipts, exact staged scopes and the completed
+publication output; bounded fan-out and missing-child restart are covered with
+human/automatic task modes. Dependent originals remain blocked behind their
+separate merged-prerequisite handoff. Known receipt-lock contention defers without
+replay or budget reset. The PM child tests use a scoped metadata probe, not a
+qualified delivery or full pilot. This is local
+receipt-backed follow-up queueing, not PM dependency scheduling or a complete
+unattended lifecycle.
+Local checks on 2026-10-11: `uv run pytest --tb=short` (1,125 passed, two optional
+skips), `uv run ruff check .`, `uv run mypy src` and mock-only
+`sim/run_local_simulation.py` passed; the simulation generated its artifact with
+integer command exit 0 and no active session. Native/GitHub transports remain
+mocked for the automatic chain; broader live/hosted acceptance is still unverified.
 Automatic merge, broader live automatic-mode acceptance and the complete unattended
 lifecycle require separate implementation and acceptance. Prior supervised trials
 are not autonomous evidence.

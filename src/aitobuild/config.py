@@ -50,6 +50,11 @@ class WebSearchConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class ManagedWorkerConfig:
+    queue_follow_ups: bool = False
+
+
+@dataclass(slots=True, frozen=True)
 class SecurityConfig:
     require_internal_auth: bool
     internal_api_token: str | None
@@ -98,6 +103,7 @@ class AppConfig:
     web_search: WebSearchConfig
     approvals: ApprovalPolicy = field(default_factory=ApprovalPolicy)
     organization: OrganizationDefinition | None = None
+    managed_worker: ManagedWorkerConfig = field(default_factory=ManagedWorkerConfig)
 
 
 DEFAULT_SCAN_CRON = "0 8 * * *"
@@ -105,7 +111,7 @@ DEFAULT_MEETING_CRON = "*/30 * * * *"
 
 _CONFIG_CLASSES = {"runtime": RuntimeConfig, "scheduler": SchedulerConfig, "policy": PolicyConfig,
                    "security": SecurityConfig, "developer": DeveloperConfig, "github": GitHubConfig,
-                   "web_search": WebSearchConfig}
+                   "web_search": WebSearchConfig, "managed_worker": ManagedWorkerConfig}
 _CONFIG_ENV = {
     "runtime": {"foundry_endpoint": "FOUNDRY_ENDPOINT", "foundry_api_key": "FOUNDRY_API_KEY",
                 "foundry_model": "FOUNDRY_MODEL", "allow_mock_model": "ALLOW_MOCK_MODEL"},
@@ -118,6 +124,7 @@ _CONFIG_ENV = {
     "github": {"adapter": "GITHUB_ADAPTER", "default_repository": "GITHUB_DEFAULT_REPOSITORY",
                "allowed_repositories": "GITHUB_ALLOWED_REPOS"},
     "web_search": {"adapter": "WEB_SEARCH_ADAPTER"},
+    "managed_worker": {"queue_follow_ups": "MANAGED_WORKER_QUEUE_FOLLOW_UPS"},
     "developer": {"require_preview_before_dispatch": "REQUIRE_DEVELOPER_PREVIEW", "execution_mode": "DEVELOPER_EXECUTION_MODE",
                   "command_timeout_seconds": "DEVELOPER_COMMAND_TIMEOUT_SECONDS", "session_container_image": "DEVELOPER_SESSION_CONTAINER_IMAGE",
                   "session_container_workdir": "DEVELOPER_SESSION_CONTAINER_WORKDIR", "session_container_name_prefix": "DEVELOPER_SESSION_CONTAINER_PREFIX",
@@ -487,4 +494,6 @@ def load_config() -> AppConfig:
         web_search=web_search,
         approvals=approvals,
         organization=organization,
+        managed_worker=ManagedWorkerConfig(queue_follow_ups=_as_bool(
+            getenv("AITOBUILD_MANAGED_WORKER_QUEUE_FOLLOW_UPS"), default=False)),
     )

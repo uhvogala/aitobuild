@@ -24,6 +24,7 @@
     },
     "github": {"adapter": "mock", "default_repository": null, "allowed_repositories": []},
     "web_search": {"adapter": "mock"},
+    "managed_worker": {"queue_follow_ups": false},
     "developer": {
       "require_preview_before_dispatch": true,
       "execution_mode": "mock",

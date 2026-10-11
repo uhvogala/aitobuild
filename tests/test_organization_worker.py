@@ -28,12 +28,12 @@ async def finish(worker, preview_id):
         return await worker.wait_idle(preview_id)
 
 
-def other_preview(approved_delivery):
+def other_preview(approved_delivery, *, approve=True):
     previews, _, preview_id, _, revision = approved_delivery
     payload = json.loads(json.dumps(previews.get(preview_id).bundle_payload))
     payload["task_id"] = "other-worker-task"
     preview = previews.create_or_get(dedupe_key="other-worker-task", bundle_payload=payload, source_payload={})
-    return previews.approve(preview.preview_id, base_revision=revision)
+    return previews.approve(preview.preview_id, base_revision=revision) if approve else preview
 
 
 @pytest.mark.parametrize("kind,value", [("service_approval", True), ("human_input", "answer")])
@@ -251,6 +251,98 @@ def test_startup_discovery_is_explicit_and_never_replays_terminal_receipts(tmp_p
 
     asyncio.run(exercise())
     assert calls == (["proposal", "run", "cleanup"] if recover else [])
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("locked", [False, True])
+def test_receipt_backed_followup_queueing_is_opt_in_and_idempotent(tmp_path, approved_delivery, monkeypatch, enabled, locked):
+    _, _, preview_id, _, _ = approved_delivery
+    child = other_preview(approved_delivery)
+    worker, service, _, calls = make_worker(tmp_path, approved_delivery, queue_follow_ups=enabled)
+    worker.enqueue(preview_id)
+    contended = []
+
+    def discover(source):
+        if locked and not contended:
+            from filelock import Timeout
+
+            contended.append(source)
+            raise Timeout("saved-followup.lock")
+        return child.preview_id if source == preview_id else None
+
+    monkeypatch.setattr(service, "follow_up_preview_id", discover)
+    child_queued = asyncio.Event()
+    enqueue = worker.enqueue
+
+    def admit(preview_id):
+        job = enqueue(preview_id)
+        if preview_id == child.preview_id:
+            child_queued.set()
+        return job
+
+    monkeypatch.setattr(worker, "enqueue", admit)
+
+    async def exercise():
+        await worker.start()
+        try:
+            assert (await finish(worker, preview_id)).state == "completed"
+            if enabled:
+                await asyncio.wait_for(child_queued.wait(), timeout=5)
+                assert (await finish(worker, child.preview_id)).state == "completed"
+            else:
+                assert worker.store.get(child.preview_id) is None
+        finally:
+            await worker.close()
+        restarted, restored, _, _ = make_worker(tmp_path, approved_delivery, queue_follow_ups=enabled)
+        monkeypatch.setattr(restored, "follow_up_preview_id", lambda source: child.preview_id if source == preview_id else None)
+        await restarted.start()
+        await restarted.close()
+        assert len(restarted.store.list()) == (2 if enabled else 1)
+
+    asyncio.run(exercise())
+    assert calls == ["proposal", "run", "cleanup"] * (2 if enabled else 1)
+    assert bool(contended) is (enabled and locked)
+
+
+@pytest.mark.parametrize("case", ["human", "invalid_child", "already_failed"])
+def test_followup_queueing_preserves_approval_and_terminal_parent(tmp_path, approved_delivery, monkeypatch, case):
+    _, delivery, preview_id, _, _ = approved_delivery
+    child = other_preview(approved_delivery, approve=False)
+    worker, service, _, calls = make_worker(tmp_path, approved_delivery, queue_follow_ups=True)
+    worker.enqueue(preview_id)
+    discovered = asyncio.Event()
+
+    def discover(source):
+        discovered.set()
+        return child.preview_id if case != "invalid_child" else "unknown-child"
+
+    monkeypatch.setattr(service, "follow_up_preview_id", discover)
+
+    async def exercise():
+        await worker.start()
+        try:
+            assert (await finish(worker, preview_id)).state == "completed"
+            before = delivery.budget_path(preview_id).read_bytes()
+            if case == "already_failed":
+                approved_delivery[0].approve(child.preview_id, base_revision=approved_delivery[4])
+                child_job = worker.enqueue(child.preview_id)
+                worker.store.save(child_job.model_copy(update={"state": "failed", "error": "Saved terminal failure"}))
+            await asyncio.wait_for(discovered.wait(), timeout=5)
+            if case == "invalid_child":
+                failures = await asyncio.wait_for(asyncio.gather(*worker._tasks, return_exceptions=True), timeout=5)
+                assert isinstance(failures[0], ValueError) and worker.diagnostics()["workers"] == 0
+            elif case == "human":
+                assert worker.store.get(child.preview_id) is None and not child.approved
+            else:
+                assert worker.store.get(child.preview_id).state == "failed"
+            assert worker.store.get(preview_id).state == "completed"
+            assert delivery.budget_path(preview_id).read_bytes() == before
+            assert not delivery.budget_path(child.preview_id).exists()
+        finally:
+            await worker.close()
+
+    asyncio.run(exercise())
+    assert calls == ["proposal", "run", "cleanup"]
 
 
 def test_worker_journal_refuses_corruption_and_symlinks(tmp_path, approved_delivery):

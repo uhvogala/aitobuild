@@ -11,6 +11,72 @@ and supervised recovery. Earlier counts, pending work and commit status describe
 their checkpoint, not the current system. Current setup and usage belong in
 [README.md](README.md); contributor rules belong in [agents.md](agents.md).
 
+Independent PM implementation handoff (2026-10-11): extended the opt-in detached
+follow-up queue with an explicit service-owned `planning_publication` binding.
+Read-only lookup joins the exact completed planning output to the immutable plan,
+approved source payload/time, consumed issue/link decisions, complete publication
+receipts and exact staged child payloads. Only independently ready planned issues
+qualify; dependent originals cannot bypass the merged-prerequisite adapter, even
+if approved. New implementation admission rechecks the current issue identity/body
+and retains its separate task decision, pinned base, original child policy and
+ledger. Missing or inconsistent receipts stop instead of being recreated. The
+existing plan issue ceiling bounds fan-out; teams, delegation, routes and graph
+operations remain operator-configured. Dependency/publication bindings cannot
+silently use different planning owners.
+
+Focused fixtures cover human waiting and automatic independent-child admission,
+multiple independent children, restart before child admission, and safe deferral
+on receipt-lock contention. Refusals cover missing/incomplete publications, missing
+link approval or previews, changed source/child scope, changed run/output/binding,
+issue drift/closure, unbound admission, disabled tasks and dependent originals.
+The native PM transport is mocked and Developer queueing uses a scoped metadata
+probe; this is not a full live three-role pilot or qualified delivery certificate.
+Existing native delivery/review/correction fixtures remain separate coverage.
+No dependency readiness scheduling, merge, seed fetching or default activation
+was added; broader live/hosted acceptance remains open.
+
+Final local validation: `uv run pytest --tb=short` passed 1,125 tests with two
+optional skips and three existing SDK warnings. `uv run ruff check .`,
+`uv run mypy src` (52 source files), editor diagnostics and `git diff --check`
+passed. Mock-only `sim/run_local_simulation.py` reported `succeeded=true`, a
+generated artifact, integer command exit 0 and no active session; its report is
+outside Git and its sandbox is ignored. Documentation links/fences passed. The
+user authorized committing/pushing the combined follow-up queue and independent
+PM handoff after these checks; no target repository/model trials, merge or service
+activation were performed.
+
+Receipt-backed detached follow-up queueing (2026-10-11): the central configuration slice was
+committed and pushed as `04489aa`. The next bounded slice adds an opt-in
+`settings.managed_worker.queue_follow_ups` setting and exact factory binding.
+Completed, cleaned-up worker parents can admit only their saved review/correction
+children, with the full source run, approved scope and receipt relationship
+validated. Children still require separate configured task admission and original
+head/base, role, budget, verification and publication gates. Pending human approval
+leaves them unqueued; disabled or invalid admission stops the slot without
+rewriting the completed parent. Restart can recover missing child admission from
+the durable parent/child receipts, but never replaces terminal children or replays
+parent effects. Existing correction round ceilings bound the chain.
+
+The native SDK fixture now exercises automatic head-pinned COMMENT, same-PR
+verified correction and re-review, including restart before child admission and
+metadata-only restart after all three tasks. The chain exposed an admission digest
+bug: reconstructing a task bundle dropped staged payload fields. Admission now
+binds the exact staged payload fields with only the operator-approved base pin,
+matching the registry's immutable approval payload. Tests refuse changed source
+runs/scopes and substituted children. These are mocked-model/GitHub disposable
+fixture checks, not live automatic-mode acceptance. PM dependency scheduling,
+blocker detection, seed fetching, merge and hosted/distributed execution remain
+separate work.
+
+Final local gates: `uv run pytest --tb=short` passed 1,103 tests with two optional
+skips and three existing SDK warnings; `uv run ruff check .`, `uv run mypy src`
+(52 source files), editor diagnostics and `git diff --check` passed. Mock-only
+`sim/run_local_simulation.py` reported `succeeded=true`, a generated artifact,
+integer command exit 0 and no active session. Its report remains outside Git and
+the copied sandbox is ignored. Documentation links/fences passed. At that checkpoint,
+this follow-up slice remained uncommitted; no live repository effects, service activation or merge
+were performed.
+
 Central configuration and exact operator-policy decisions (2026-10-09): added the
 strict versioned application manifest and safe example, environment-backed secrets,
 environment overrides and optional organization loading without activation. Shared

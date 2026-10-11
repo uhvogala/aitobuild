@@ -244,6 +244,8 @@ def create_app(
         raise ValueError("Configured approval policy requires an explicit managed service factory")
     if managed_worker_factory is not None and managed_service_factory is None:
         raise ValueError("Managed worker requires an explicit managed service factory")
+    if app_config.managed_worker.queue_follow_ups and managed_worker_factory is None:
+        raise ValueError("Follow-up queueing requires an explicit managed worker factory")
     if managed_service_factory is not None and (
         not app_config.security.require_internal_auth or not app_config.security.internal_api_token
     ):
@@ -365,6 +367,7 @@ def create_app(
         tools=developer_tool_context, state_dir=developer_state_dir,
         approval_policy=app_config.approvals, organization_definition=app_config.organization,
         task_base_revision_for=configured_task_base,
+        queue_follow_ups=app_config.managed_worker.queue_follow_ups,
     )
     managed_service = managed_service_factory(managed_context) if managed_service_factory is not None else None
     if managed_service_factory is not None and managed_service is None:
@@ -374,9 +377,13 @@ def create_app(
     managed_worker = managed_worker_factory(managed_service, managed_context) if (
         managed_service is not None and managed_worker_factory is not None
     ) else None
+    if managed_worker_factory is not None and managed_worker is None:
+        raise ValueError("Managed worker factory must return an explicitly bound worker")
     if managed_worker is not None:
         if managed_worker.service is not managed_service:
             raise ValueError("Managed worker must use the app's managed service")
+        if managed_worker.queue_follow_ups != app_config.managed_worker.queue_follow_ups:
+            raise ValueError("Managed worker factory must bind configured follow-up queueing exactly")
 
         @asynccontextmanager
         async def managed_lifespan(application: FastAPI):

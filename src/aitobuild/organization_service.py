@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
@@ -23,7 +24,7 @@ from aitobuild.organization_runner import (
 )
 from aitobuild.organization_runtime import WorkflowLimits, WorkflowPredicate
 from aitobuild.organization_reviews import PublishedReviewAdmission
-from aitobuild.organization_planning import PlanningAdmission
+from aitobuild.organization_planning import ManagedPlanning, PlanningAdmission
 from aitobuild.organization_dependencies import ManagedDependencies
 from aitobuild.tools.github import GitHubAdapter
 from aitobuild.publish_approvals import publish_policy_operation
@@ -46,6 +47,7 @@ class ManagedServiceContext:
     approval_policy: ApprovalPolicy = ApprovalPolicy()
     organization_definition: OrganizationDefinition | None = None
     task_base_revision_for: Callable[[DeveloperPreview], str | None] | None = None
+    queue_follow_ups: bool = False
 
 
 CoordinatorProposal = Callable[[DefinitionSnapshot, DeveloperPreview], Awaitable[AssignmentProposal]]
@@ -80,6 +82,7 @@ class ManagedOrganizationService:
         task_base_revision_for: Callable[[DeveloperPreview], str | None] | None = None,
         correction_publication_github: GitHubAdapter | None = None,
         allow_mock_publication: bool = False,
+        planning_publication: ManagedPlanning | None = None,
     ) -> None:
         self._definitions = definitions
         self._assignments = assignments
@@ -97,9 +100,13 @@ class ManagedOrganizationService:
                                      planning.operator_id != operator_id):
             raise PermissionError("Planning must use service-owned definitions, previews and operator identity")
         self._planning = planning
+        if planning_publication is not None and planning_publication.admission is not planning:
+            raise PermissionError("Planning publication must use the exact service-owned admission binding")
+        self._planning_publication = planning_publication
         self._planning_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in planning.routes) if planning else ()
         if dependencies is not None and (
-                dependencies.planning.admission is not planning or dependencies.worker is not worker):
+            dependencies.planning.admission is not planning or dependencies.worker is not worker or
+            planning_publication is not None and dependencies.planning is not planning_publication):
             raise PermissionError("Dependencies must use the exact service-owned planning and worker bindings")
         self._dependencies = dependencies
         self._dependency_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in dependencies.routes) if dependencies else ()
@@ -150,6 +157,17 @@ class ManagedOrganizationService:
             handoff_route = self._dependencies.route_for(preview, recheck=owned is None)
             if handoff_route is not None:
                 return ManagedRoute.model_validate(handoff_route.model_dump())
+        if task_id.startswith("planned-issue-"):
+            if self._planning_publication is None:
+                if self._dependencies is None:
+                    raise PermissionError("Planned implementations require their trusted publication binding")
+            else:
+                parent_id = preview.source_payload.get("planning_assignment")
+                parent = self._runs.get(parent_id) if isinstance(parent_id, str) else None
+                if parent is None or preview.preview_id not in self._planning_publication.independent_preview_ids(parent):
+                    raise PermissionError("Planned implementation requires its completed exact planning source")
+                if self._assignments.for_task(task_id) is None:
+                    self._planning_publication.check_independent_preview(preview, parent)
         if str(preview.bundle_payload.get("task_id", "")).startswith("pm-planning-"):
             if self._planning is None:
                 raise PermissionError("Planning tasks require their trusted admission binding")
@@ -202,14 +220,18 @@ class ManagedOrganizationService:
             raise PermissionError("Automatic task admission has no trusted base binding")
         base = self._task_base(preview)
         bundle = developer_task_bundle_from_payload(preview.bundle_payload)
+        payload = deepcopy(preview.bundle_payload)
         if bundle.issue_context is not None:
+            issue_payload = payload.get("issue_context")
+            if not isinstance(issue_payload, dict):
+                raise ValueError("Repository task requires its exact issue payload")
             if bundle.issue_context.base_revision is not None and base != bundle.issue_context.base_revision:
                 raise PermissionError("Automatic admission cannot replace an already pinned task base")
-            bundle = replace(bundle, issue_context=replace(bundle.issue_context, base_revision=base))
+            issue_payload["base_revision"] = base.lower() if isinstance(base, str) else base
         elif base is not None:
             raise PermissionError("Non-repository admission cannot add a repository base")
         decision = self.approval_policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id=self.operator_id,
-            operation=preview_approval_operation(preview.preview_id, bundle.to_payload()), automatic_supported=True)
+            operation=preview_approval_operation(preview.preview_id, payload), automatic_supported=True)
         approved = self._previews.approve(preview.preview_id, base_revision=base, approval_policy=decision)
         if approved is None:
             raise ValueError("Preview disappeared before configured admission")
@@ -341,6 +363,41 @@ class ManagedOrganizationService:
             allow_mock_publication=allow_mock_publication))
     def follow_up_status(self, run_id: str) -> dict[str, JsonValue] | None:
         return self._reviews.follow_up_status(run_id) if self._reviews is not None else None
+
+    def follow_up_preview_id(self, preview_id: str) -> str | None:
+        preview = self._previews.get(preview_id)
+        if preview is None:
+            raise ValueError("Follow-up source preview not found")
+        run = self.recorded_run(str(preview.bundle_payload["task_id"]))
+        if run is None or run.state != "completed" or run.cleanup_succeeded is not True:
+            return None
+        if self._reviews is None:
+            return None
+        from hashlib import sha256
+        import json
+
+        content = json.dumps(preview.bundle_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if not preview.approved or sha256(content.encode()).hexdigest() != run.scope_digest:
+            raise PermissionError("Follow-up source approval/scope changed")
+        return self._reviews.follow_up_preview_id(preview_id, run)
+
+    def planning_follow_up_preview_ids(self, preview_id: str) -> tuple[str, ...]:
+        publication = self._planning_publication
+        if publication is None or publication.admission.request_for(preview_id) is None:
+            return ()
+        preview = self._previews.get(preview_id)
+        if preview is None:
+            raise ValueError("Planning follow-up source preview not found")
+        run = self.recorded_run(str(preview.bundle_payload["task_id"]))
+        if run is None or run.state != "completed" or run.cleanup_succeeded is not True:
+            return ()
+        from hashlib import sha256
+        import json
+
+        content = json.dumps(preview.bundle_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if not preview.approved or sha256(content.encode()).hexdigest() != run.scope_digest:
+            raise PermissionError("Planning follow-up source approval/scope changed")
+        return publication.independent_preview_ids(run)
 
     async def offer_follow_up(self, preview_id: str) -> dict[str, JsonValue] | None:
         reviews = self._reviews

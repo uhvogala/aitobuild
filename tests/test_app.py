@@ -73,7 +73,8 @@ def _managed_app(config, tmp_path, calls, operation=None, strategy="rules", vers
     workers = []
 
     def worker_factory(service, context):
-        worker = ManagedOrganizationWorker(service=service, store=FileWorkerStore(context.state_dir / "worker.json"))
+        worker = ManagedOrganizationWorker(service=service, store=FileWorkerStore(context.state_dir / "worker.json"),
+                                           queue_follow_ups=context.queue_follow_ups)
         workers.append(worker)
         return worker
 
@@ -576,12 +577,16 @@ def test_central_config_file_merges_typed_settings_and_environment(monkeypatch, 
     _central_config(monkeypatch, tmp_path, {"schema_version": 1, "settings": {
         "runtime": {"foundry_model": "file-model", "allow_mock_model": False},
         "scheduler": {"enabled": False, "max_concurrent_proactive_jobs": 3},
+        "managed_worker": {"queue_follow_ups": True},
         "developer": {"repository_sources": [{"repository": "fixture/widgets", "repository_id": 101, "path": str(tmp_path)}]},
     }, "approvals": {"developer_tools": "automatic"}})
     monkeypatch.setenv("AITOBUILD_FOUNDRY_MODEL", "environment-model")
     config = load_config()
     assert config.runtime.foundry_model == "environment-model" and not config.runtime.allow_mock_model
     assert not config.scheduler.enabled and config.scheduler.max_concurrent_proactive_jobs == 3
+    assert config.managed_worker.queue_follow_ups
+    monkeypatch.setenv("AITOBUILD_MANAGED_WORKER_QUEUE_FOLLOW_UPS", "false")
+    assert not load_config().managed_worker.queue_follow_ups
     assert config.approvals.developer_tools == "automatic" and config.approvals.task_admission == "human"
     assert config.developer.repository_sources == (RepositorySourceConfig("fixture/widgets", 101, str(tmp_path)),)
     assert "AITOBUILD_MAX_PROACTIVE_JOBS" not in os.environ
@@ -594,6 +599,7 @@ def test_central_config_file_merges_typed_settings_and_environment(monkeypatch, 
     {"schema_version": 1, "settings": {"unknown": {}}},
     {"schema_version": 1, "settings": {"runtime": {"unknown": True}}},
     {"schema_version": 1, "settings": {"runtime": {"allow_mock_model": "false"}}},
+    {"schema_version": 1, "settings": {"managed_worker": {"queue_follow_ups": "true"}}},
     {"schema_version": 1, "settings": {"scheduler": {"max_concurrent_proactive_jobs": True}}},
     {"schema_version": 1, "settings": {"security": {"internal_api_token": "plaintext"}}},
     {"schema_version": 1, "approvals": {"developer_tools": False}},
@@ -634,6 +640,20 @@ def test_automatic_settings_cannot_silently_activate_legacy_server(test_config) 
         create_app(config)
     with pytest.raises(ValueError, match="must return"):
         create_app(config, managed_service_factory=lambda context: None)
+
+
+def test_managed_followup_queueing_requires_exact_explicit_factory(test_config, tmp_path, monkeypatch) -> None:
+    from aitobuild.config import ManagedWorkerConfig
+    from aitobuild.organization_worker import ManagedOrganizationWorker
+
+    config = replace(test_config, managed_worker=ManagedWorkerConfig(queue_follow_ups=True))
+    with pytest.raises(ValueError, match="explicit managed worker factory"):
+        create_app(config)
+    app = _managed_app(config, tmp_path, [], detached=True)
+    assert app.state.test_workers[0].queue_follow_ups
+    monkeypatch.setattr(ManagedOrganizationWorker, "queue_follow_ups", property(lambda worker: False))
+    with pytest.raises(ValueError, match="configured follow-up queueing exactly"):
+        _managed_app(config, tmp_path, [], detached=True)
 
 
 def test_managed_factory_cannot_ignore_central_policy(test_config, tmp_path, monkeypatch) -> None:

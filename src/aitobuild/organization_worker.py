@@ -198,7 +198,7 @@ class ManagedOrganizationWorker:
     def __init__(
         self, *, service: ManagedOrganizationService, store: WorkerStore,
         max_workers: int = 1, poll_seconds: float = 1, recover_approved: bool = False,
-        startup_limit: int = 500,
+        startup_limit: int = 500, queue_follow_ups: bool = False,
     ) -> None:
         if (type(max_workers) is not int or not 1 <= max_workers <= 64 or type(poll_seconds) not in {float, int} or
             not math.isfinite(poll_seconds) or poll_seconds <= 0):
@@ -209,13 +209,20 @@ class ManagedOrganizationWorker:
         self._poll = poll_seconds
         if type(recover_approved) is not bool or type(startup_limit) is not int or not 1 <= startup_limit <= 500:
             raise ValueError("Startup recovery must be explicit and bounded")
+        if type(queue_follow_ups) is not bool:
+            raise ValueError("Follow-up queueing must be explicit")
         self._recover = recover_approved
         self._startup_limit = startup_limit
+        self._queue_follow_ups = queue_follow_ups
         self._wake = asyncio.Event()
         self._changed = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
         self._active: dict[str, asyncio.Task[None]] = {}
         self._errors: list[str] = []
+
+    @property
+    def queue_follow_ups(self) -> bool:
+        return self._queue_follow_ups
 
     def diagnostics(self) -> dict[str, object]:
         return {"workers": sum(not task.done() for task in self._tasks),
@@ -365,6 +372,17 @@ class ManagedOrganizationWorker:
         while True:
             self._wake.clear()
             for job in self.store.list():
+                if self._queue_follow_ups and job.state == "completed":
+                    try:
+                        child_id = self.service.follow_up_preview_id(job.preview_id)
+                        children = self.service.planning_follow_up_preview_ids(job.preview_id)
+                        if child_id is not None:
+                            children = (*children, child_id)
+                        for next_id in children:
+                            if self.store.get(next_id) is None:
+                                self.enqueue(next_id)
+                    except LockTimeout:
+                        continue
                 if job.state not in {"queued", "running"} and not (job.state == "waiting" and job.cancel_requested):
                     continue
                 try:
