@@ -7,6 +7,7 @@ from pathlib import Path
 import asyncio
 import hmac
 import json
+import re
 from hashlib import sha256
 from typing import Any
 from uuid import uuid4
@@ -2171,3 +2172,21 @@ def test_escalations_endpoint_returns_deadline_escalations(test_config) -> None:
     body = escalations_response.json()
     assert body["count"] >= 1
     assert any(event["category"] == "deadline_exceeded" for event in body["events"])
+
+
+def test_every_internal_route_refuses_missing_or_wrong_token(test_config, tmp_path):
+    from fastapi.routing import APIRoute
+
+    app = _managed_app(test_config, tmp_path, [], detached=True)
+    routes = [(method, route.path) for route in app.routes if isinstance(route, APIRoute)
+              and route.path.startswith("/internal") for method in sorted(route.methods)]
+    assert len(routes) >= 31
+    failures = []
+    with TestClient(app) as client:
+        for method, path in routes:
+            url = re.sub(r"\{[^}]+\}", "unknown", path)
+            for headers in ({}, {"X-Internal-Token": "wrong-token"}):
+                response = client.request(method, url, headers=headers, json={})
+                if response.status_code != 401:
+                    failures.append((method, path, bool(headers), response.status_code))
+    assert failures == []

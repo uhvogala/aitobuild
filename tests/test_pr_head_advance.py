@@ -646,7 +646,12 @@ def _created_pull(**overrides: Any) -> dict[str, Any]:
     ([_created_pull(), _created_pull(number=3)], False),
     ([_created_pull(title="Someone else's PR")], False),
     ([_created_pull(draft=False)], False),
-], ids=["accepted", "not_created", "ambiguous", "other_title", "not_draft"])
+    ([_created_pull(head={"ref": "aitobuild/other-task", "sha": "c" * 40, "repo": {"full_name": REPO}})], False),
+    ([_created_pull(head={"ref": "aitobuild/issue-8-task", "sha": "c" * 40, "repo": {"full_name": "fork/elsewhere"}})], False),
+    ([_created_pull(base={"ref": "release"})], False),
+    ([_created_pull(state="closed")], False),
+], ids=["accepted", "not_created", "ambiguous", "other_title", "not_draft", "other_head", "other_repo", "other_base",
+        "closed"])
 def test_gh_pr_create_timeout_adopts_only_the_exact_created_draft(created, adopted, monkeypatch) -> None:
     fake = TimedOutCreateGitHub(created=created)
     arguments = dict(role=AgentRole.DEVELOPER, repository=REPO, title="T", body="Closes #8",

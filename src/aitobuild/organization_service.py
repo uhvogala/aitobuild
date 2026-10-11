@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
@@ -28,6 +30,12 @@ from aitobuild.organization_planning import ManagedPlanning, PlanningAdmission
 from aitobuild.organization_dependencies import ManagedDependencies
 from aitobuild.tools.github import GitHubAdapter
 from aitobuild.publish_approvals import publish_policy_operation
+
+
+def _approved_scope_matches(preview: DeveloperPreview, run: ManagedRun) -> bool:
+    """True only when the preview is still approved and its exact bundle matches the run's pinned scope digest."""
+    content = json.dumps(preview.bundle_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return preview.approved and sha256(content.encode()).hexdigest() == run.scope_digest
 
 
 class ManagedRoute(DefinitionModel):
@@ -373,11 +381,7 @@ class ManagedOrganizationService:
             return None
         if self._reviews is None:
             return None
-        from hashlib import sha256
-        import json
-
-        content = json.dumps(preview.bundle_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        if not preview.approved or sha256(content.encode()).hexdigest() != run.scope_digest:
+        if not _approved_scope_matches(preview, run):
             raise PermissionError("Follow-up source approval/scope changed")
         return self._reviews.follow_up_preview_id(preview_id, run)
 
@@ -391,11 +395,7 @@ class ManagedOrganizationService:
         run = self.recorded_run(str(preview.bundle_payload["task_id"]))
         if run is None or run.state != "completed" or run.cleanup_succeeded is not True:
             return ()
-        from hashlib import sha256
-        import json
-
-        content = json.dumps(preview.bundle_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        if not preview.approved or sha256(content.encode()).hexdigest() != run.scope_digest:
+        if not _approved_scope_matches(preview, run):
             raise PermissionError("Planning follow-up source approval/scope changed")
         return publication.independent_preview_ids(run)
 

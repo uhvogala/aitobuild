@@ -354,12 +354,17 @@ class MockGitHubAdapter:
 
     def inspect_dependency_merge(self, *, repository: str, repository_id: int, pull_number: int,
                                  head_sha: str, head_branch: str, base_branch: str, base_revision: str) -> dict[str, Any]:
+        _validate_blob_sha(head_sha)
+        _validate_ref_name(head_branch, field_name="head_branch")
+        _validate_ref_name(base_branch, field_name="base_branch")
         self.inspect_planning_target(repository=repository, repository_id=repository_id, base_revision=base_revision)
         evidence = self.dependency_merges.get((repository, pull_number, base_revision))
-        if evidence is None:
+        # Check the live pull's head/branch/base whenever one exists, even when merge evidence is seeded.
+        if evidence is None or pull_number in self.pull_requests.get(self._resolve_repository(repository), {}):
             pull = self.get_pull_request(repository=repository, pull_number=pull_number)
             if (pull.repository, pull.head_sha, pull.head_ref, pull.base_ref) != (repository, head_sha, head_branch, base_branch):
                 raise PermissionError("Dependency pull request target changed")
+        if evidence is None:
             return {"ready": False, "reason": "merge_unproven"}
         return _dependency_merge_evidence(evidence["pull"], evidence["branch_sha"], evidence.get("comparison"),
             repository=repository, repository_id=repository_id, pull_number=pull_number, head_sha=head_sha,
@@ -373,8 +378,8 @@ class MockGitHubAdapter:
 
     def find_issue_publication(self, *, repository: str, marker: str, max_pages: int = 10) -> tuple[GitHubIssue, ...]:
         repo = self._resolve_repository(repository)
-        if type(max_pages) is not int or max_pages <= 0:
-            raise ValueError("Publication lookup needs a positive page bound")
+        if type(max_pages) is not int or max_pages <= 0 or not marker:
+            raise ValueError("Publication lookup requires a marker and positive page bound")
         if len(self.issues.get(repo, {})) > max_pages * 100:
             raise PermissionError("Issue lookup exceeds the configured page bound")
         return tuple(issue for issue in self.issues.get(repo, {}).values() if marker in issue.body)
@@ -1249,9 +1254,11 @@ class GhCliGitHubAdapter:
                                  head_sha: str, head_branch: str, base_branch: str, base_revision: str) -> dict[str, Any]:
         repo = self._resolve_repository(repository)
         _validate_blob_sha(head_sha)
+        _validate_ref_name(head_branch, field_name="head_branch")
+        cleaned_base = _validate_ref_name(base_branch, field_name="base_branch")
         self.inspect_planning_target(repository=repo, repository_id=repository_id, base_revision=base_revision)
         raw = self._api(f"repos/{repo}/pulls/{pull_number}")
-        branch_sha = self._read_branch_head(repository=repo, branch=base_branch)
+        branch_sha = self._read_branch_head(repository=repo, branch=cleaned_base)
         comparison = None
         if isinstance(raw, dict) and raw.get("merged") is True:
             merge_sha = raw.get("merge_commit_sha")

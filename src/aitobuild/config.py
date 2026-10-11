@@ -112,6 +112,8 @@ DEFAULT_MEETING_CRON = "*/30 * * * *"
 _CONFIG_CLASSES = {"runtime": RuntimeConfig, "scheduler": SchedulerConfig, "policy": PolicyConfig,
                    "security": SecurityConfig, "developer": DeveloperConfig, "github": GitHubConfig,
                    "web_search": WebSearchConfig, "managed_worker": ManagedWorkerConfig}
+# Environment names without their prefix: file settings and overrides both use "AITOBUILD_" + name
+# (for example AITOBUILD_MANAGED_WORKER_QUEUE_FOLLOW_UPS).
 _CONFIG_ENV = {
     "runtime": {"foundry_endpoint": "FOUNDRY_ENDPOINT", "foundry_api_key": "FOUNDRY_API_KEY",
                 "foundry_model": "FOUNDRY_MODEL", "allow_mock_model": "ALLOW_MOCK_MODEL"},

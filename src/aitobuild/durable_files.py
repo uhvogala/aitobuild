@@ -34,8 +34,13 @@ def atomic_write_text(path: Path, content: str, *, mode: int = 0o600) -> None:
     refuse_symlinks(path)
     descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        os.fchmod(descriptor, mode)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        try:
+            os.fchmod(descriptor, mode)
+            handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        except BaseException:
+            os.close(descriptor)  # fdopen never took ownership, so close it here
+            raise
+        with handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())

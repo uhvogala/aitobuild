@@ -73,9 +73,9 @@ skips and three existing SDK warnings; `uv run ruff check .`, `uv run mypy src`
 (52 source files), editor diagnostics and `git diff --check` passed. Mock-only
 `sim/run_local_simulation.py` reported `succeeded=true`, a generated artifact,
 integer command exit 0 and no active session. Its report remains outside Git and
-the copied sandbox is ignored. Documentation links/fences passed. At that checkpoint,
-this follow-up slice remained uncommitted; no live repository effects, service activation or merge
-were performed.
+the copied sandbox is ignored. Documentation links/fences passed. This follow-up
+slice was later committed (`8929623`); no live repository effects, service activation or
+merge were performed at that checkpoint.
 
 Central configuration and exact operator-policy decisions (2026-10-09): added the
 strict versioned application manifest and safe example, environment-backed secrets,

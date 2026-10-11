@@ -1260,3 +1260,65 @@ def test_resolved_dependency_approval_cannot_be_bypassed(tmp_path, approved_deli
 
     asyncio.run(exercise())
     assert len(bodies) == 2
+
+@pytest.mark.parametrize("field,value", [("base_branch", "../main"), ("base_branch", "refs/heads/main"),
+                                         ("base_branch", "main.lock"), ("head_branch", "a..b")])
+def test_dependency_merge_inspection_checks_ref_names_before_any_request(monkeypatch, field, value):
+    adapter = GhCliGitHubAdapter(allowed_repositories=frozenset({"example/target"}))
+    calls = []
+    monkeypatch.setattr(adapter, "_api", lambda endpoint, **kwargs: calls.append(endpoint))
+    arguments = dict(repository="example/target", repository_id=1, pull_number=7, head_sha="a" * 40,
+                     head_branch="aitobuild/issue-1", base_branch="main", base_revision="b" * 40)
+    arguments[field] = value
+    with pytest.raises(ValueError, match=f"{field} must be a plain branch name"):
+        adapter.inspect_dependency_merge(**arguments)
+    assert calls == []
+
+
+def _seeded_mock_dependency():
+    from aitobuild.tools.github import GitHubPullRequest
+
+    github = MockGitHubAdapter()
+    github.repository_ids["example/target"] = 1
+    github.commit_files[("example/target", "b" * 40)] = {}
+    raw = {"number": 7, "state": "closed", "draft": False, "merged": True,
+           "head": {"sha": "a" * 40, "ref": "aitobuild/issue-1", "repo": {"id": 1, "full_name": "example/target"}},
+           "base": {"ref": "main", "repo": {"id": 1, "full_name": "example/target"}}, "merge_commit_sha": "c" * 40,
+           "merged_at": "2026-10-09T12:00:00Z", "merged_by": {"id": 10, "login": "human", "type": "User"}}
+    github.dependency_merges[("example/target", 7, "b" * 40)] = {
+        "pull": raw, "branch_sha": "b" * 40, "comparison": {"status": "ahead", "merge_base_commit": {"sha": "c" * 40}}}
+    live = GitHubPullRequest(number=7, title="t", body="b", state="closed", head_ref="aitobuild/issue-1", base_ref="main",
+                             repository="example/target", head_sha="a" * 40)
+    github.seed_pull_request(repository="example/target", pull_request=live)
+    arguments = dict(repository="example/target", repository_id=1, pull_number=7, head_sha="a" * 40,
+                     head_branch="aitobuild/issue-1", base_branch="main", base_revision="b" * 40)
+    return github, live, arguments
+
+
+@pytest.mark.parametrize("drift", [None, "head_sha", "head_ref", "base_ref", "bad_base_name"])
+def test_mock_dependency_merge_checks_live_target_even_with_seeded_evidence(drift):
+    github, live, arguments = _seeded_mock_dependency()
+    if drift is None:
+        assert github.inspect_dependency_merge(**arguments)["ready"] is True
+        return
+    if drift == "bad_base_name":
+        arguments["base_branch"] = "../main"
+        with pytest.raises(ValueError, match="base_branch must be a plain branch name"):
+            github.inspect_dependency_merge(**arguments)
+        return
+    github.pull_requests["example/target"][7] = replace(live, **{drift: {"head_sha": "d" * 40, "head_ref": "aitobuild/other",
+                                                                         "base_ref": "other"}[drift]})
+    with pytest.raises(PermissionError, match="target changed"):
+        github.inspect_dependency_merge(**arguments)
+
+
+def test_mock_issue_publication_refuses_empty_marker_like_real_adapter(monkeypatch):
+    from aitobuild.tools.github import GitHubIssue
+
+    mock = MockGitHubAdapter()
+    mock.seed_issue(repository="example/target", issue=GitHubIssue(number=1, title="t", body="anything", state="open"))
+    real = GhCliGitHubAdapter(allowed_repositories=frozenset({"example/target"}))
+    monkeypatch.setattr(real, "_api", lambda endpoint, **kwargs: pytest.fail("no request expected"))
+    for adapter in (mock, real):
+        with pytest.raises(ValueError, match="requires a marker"):
+            adapter.find_issue_publication(repository="example/target", marker="")
