@@ -623,8 +623,23 @@ class NativeManagedRoles:
         # Deliberately not build_submit_tool: a correction is optional (zero or one per review) and is
         # metadata attached to the body approval, not the run's required result. It keeps its own write-once check,
         # and errors here must not use up the review body's submit attempts or trigger a reminder turn.
+        correction_attempts = self._submit_attempts(context)
+
         @tool(name="architect_propose_correction", approval_mode="never_require")
         async def propose_correction(paths: list[str], objective: str) -> dict[str, Any]:
+            # Bounded like the submit tools (max_submit_attempts): once the failed attempts are used up, further
+            # calls are refused as a plain result, so neither the framework error nor iteration limit is the bound.
+            used = session.state.get("aitobuild_correction_attempts", 0)
+            if type(used) is not int or used >= correction_attempts:
+                return {"correction": None, "refused": f"architect_propose_correction used all {correction_attempts} attempts"}
+            try:
+                return await check_correction(paths, objective)
+            except Exception:
+                session.state["aitobuild_correction_attempts"] = used + 1
+                await self._sessions.set(context.run.session_id, session)
+                raise
+
+        async def check_correction(paths: list[str], objective: str) -> dict[str, Any]:
             context.revalidate()
             if await self._target(context) != target:
                 raise PermissionError("Correction proposal target changed")
