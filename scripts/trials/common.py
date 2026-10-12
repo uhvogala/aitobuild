@@ -62,10 +62,11 @@ class Recorder:
         print(f"[{line['at']}] {kind} " + json.dumps(fields, default=str)[:400], flush=True)
 
     def save(self) -> None:
-        target = self.directory / "report.json"
-        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(self.report, indent=2, default=str))
-        os.replace(temporary, target)
+        from aitobuild.durable_files import atomic_write_text
+
+        atomic_write_text(
+            self.directory / "report.json", json.dumps(self.report, indent=2, default=str)
+        )
 
 
 def git(directory: Path, *arguments: str) -> str:

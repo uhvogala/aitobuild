@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import argparse
 from hashlib import sha256
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime
 import json
 import os
@@ -194,10 +194,49 @@ def classify_planned_child(task_id: str, status_code: int, plan: dict[str, Any])
     raise RuntimeError(f"Planned child {issue['key']} answered {status_code}")
 
 
+def require_merge_commit_on_base(seed: Path, merge_commit: str, branch: str) -> None:
+    """The merge commit GitHub reports must be reachable from the fetched base branch."""
+    ancestry = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(seed),
+            "merge-base",
+            "--is-ancestor",
+            merge_commit,
+            f"refs/heads/{branch}",
+        ],
+        capture_output=True,
+    )
+    if ancestry.returncode != 0:
+        raise MergePointError(f"Merge commit {merge_commit} is not on {branch}")
+
+
 def require_merge_points(report: dict[str, Any]) -> None:
     """``start`` must end at a merge point; a plan whose children were all blocked or skipped is a failure."""
     if not report.get("merge_points"):
         raise RuntimeError("start reached no merge point")
+
+
+def deliver_planned_children(
+    listing: Iterable[dict[str, Any]],
+    report: dict[str, Any],
+    *,
+    status_of: Callable[[str], int],
+    deliver: Callable[[str], Any],
+) -> None:
+    """Deliver every admissible planned child to its merge point, skip planned dependents (409 until a dependency
+    handoff exists) and fail unless ``start`` ends at a merge point."""
+    for item in listing:
+        task_id = str(item["bundle"].get("task_id", ""))
+        if not task_id.startswith("planned-issue-"):
+            continue
+        preview_id = item["preview_id"]
+        if classify_planned_child(task_id, status_of(preview_id), report["plan"]) == "blocked":
+            report.setdefault("blocked_dependents", []).append(preview_id)
+            continue
+        deliver(preview_id)
+    require_merge_points(report)
 
 
 def brief_edit_action(issue_key: str, what: str, why: str) -> dict[str, Any]:
@@ -448,21 +487,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             point["state"] = check_merge_point(point, pull)
             if point["state"] == "MERGED":
                 point["merge_commit"] = pull["mergeCommit"]["oid"]
-                ancestry = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(seed),
-                        "merge-base",
-                        "--is-ancestor",
-                        point["merge_commit"],
-                        branch,
-                    ]
-                )
-                if ancestry.returncode != 0:
-                    raise MergePointError(
-                        f"Merge commit {point['merge_commit']} is not on {branch}"
-                    )
+                require_merge_commit_on_base(seed, point["merge_commit"], branch)
         report["operator_actions"].append(
             {
                 "at": now(),
@@ -576,22 +601,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     params={"pending_only": "false", "limit": 500},
                     headers=operator.headers,
                 ).json()["items"]
-                for item in listing:
-                    task_id = str(item["bundle"].get("task_id", ""))
-                    if not task_id.startswith("planned-issue-"):
-                        continue
-                    preview_id = item["preview_id"]
-                    code = client.get(
-                        f"/internal/organization/tasks/{preview_id}", headers=operator.headers
-                    ).status_code
-                    # Dependents are staged too but answer 409 until a fresh dependency handoff is approved.
-                    if classify_planned_child(task_id, code, report["plan"]) == "blocked":
-                        report.setdefault("blocked_dependents", []).append(preview_id)
-                        continue
-                    deliver_to_merge_point(
+                deliver_planned_children(
+                    listing,
+                    report,
+                    status_of=lambda preview_id: (
+                        client.get(
+                            f"/internal/organization/tasks/{preview_id}", headers=operator.headers
+                        ).status_code
+                    ),
+                    deliver=lambda preview_id: deliver_to_merge_point(
                         operator, hands, report, client, seed, preview_id, preview_id[:11], None
-                    )
-                require_merge_points(report)
+                    ),
+                )
             else:
                 handoff_key = next_handoff(report["plan"], report.get("merge_points", []))
                 if handoff_key is None:

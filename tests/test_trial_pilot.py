@@ -6,6 +6,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import sys
+import subprocess
 from types import SimpleNamespace
 from typing import Any
 
@@ -201,3 +202,126 @@ def test_start_without_merge_point_fails() -> None:
     with pytest.raises(RuntimeError, match="no merge point"):
         pilot.require_merge_points({"blocked_dependents": ["dp-1"]})
     pilot.require_merge_points({"merge_points": [{"pull_number": 1}]})
+
+
+SIBLINGS = {
+    "planning_assignment_id": "a",
+    "issues": [
+        {"key": "base", "dependencies": []},
+        {"key": "left", "dependencies": ["base"]},
+        {"key": "right", "dependencies": ["base"]},
+    ],
+}
+
+
+def test_open_merge_point_is_the_only_blocker() -> None:
+    # Without the open-merge-point guard "right" would be handed off while "left" is still unmerged.
+    points: list[dict[str, Any]] = [
+        {"issue_key": None, "state": "MERGED"},
+        {"issue_key": "left", "state": "OPEN"},
+    ]
+    assert pilot.next_handoff(SIBLINGS, points) is None
+    points[1]["state"] = "MERGED"
+    assert pilot.next_handoff(SIBLINGS, points) == "right"
+
+
+def git_repo(path: Path) -> tuple[str, str]:
+    def run(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    run("init", "-q", "-b", "master")
+    run("commit", "-q", "--allow-empty", "-m", "base")
+    on_base = run("rev-parse", "HEAD")
+    run("checkout", "-q", "-b", "side")
+    run("commit", "-q", "--allow-empty", "-m", "side")
+    off_base = run("rev-parse", "HEAD")
+    return on_base, off_base
+
+
+def test_merge_commit_must_be_on_base(tmp_path: Path) -> None:
+    on_base, off_base = git_repo(tmp_path)
+    pilot.require_merge_commit_on_base(tmp_path, on_base, "master")
+    with pytest.raises(pilot.MergePointError, match="not on master"):
+        pilot.require_merge_commit_on_base(tmp_path, off_base, "master")
+
+
+def test_start_with_only_blocked_children_fails() -> None:
+    listing = [{"preview_id": "dp-range", "bundle": {"task_id": task_id("stats-range")}}]
+    report: dict[str, Any] = {"plan": PLAN}
+    delivered: list[str] = []
+    with pytest.raises(RuntimeError, match="no merge point"):
+        pilot.deliver_planned_children(
+            listing, report, status_of=lambda _: 409, deliver=delivered.append
+        )
+    assert report["blocked_dependents"] == ["dp-range"] and delivered == []
+
+
+def test_start_delivers_admissible_child() -> None:
+    listing = [
+        {"preview_id": "dp-min", "bundle": {"task_id": task_id("stats-min-max")}},
+        {"preview_id": "dp-range", "bundle": {"task_id": task_id("stats-range")}},
+        {"preview_id": "dp-plan", "bundle": {"task_id": "pm-planning-x"}},
+    ]
+    report: dict[str, Any] = {"plan": PLAN}
+
+    def deliver(preview_id: str) -> None:
+        report.setdefault("merge_points", []).append({"preview_id": preview_id})
+
+    pilot.deliver_planned_children(
+        listing, report, status_of=lambda p: 409 if p == "dp-range" else 200, deliver=deliver
+    )
+    assert [p["preview_id"] for p in report["merge_points"]] == ["dp-min"]
+
+
+def test_policy_rejects_unknown_key() -> None:
+    with pytest.raises(SystemExit):
+        check_policy(policy(max_unknown_thing=1), ("task_admission", "developer_tools"))
+
+
+def test_policy_accepts_max_automatic_admissions() -> None:
+    result = check_policy(
+        policy(max_automatic_admissions=500), ("task_admission", "developer_tools")
+    )
+    assert result["modes"]["max_automatic_admissions"] == 500
+
+
+def test_planned_issue_hash_matches_service() -> None:
+    from aitobuild.developer_isolation import default_developer_isolation_policy
+    from aitobuild.developer_isolation import build_developer_task_bundle
+    from aitobuild.organization_planning import ManagedPlanning
+
+    developer_policy = build_developer_task_bundle(
+        task_id="p",
+        objective="o",
+        acceptance_criteria=["c"],
+        constraints=[],
+        context_files=[],
+        policy=default_developer_isolation_policy(),
+    ).to_payload()["policy"]
+    scope = SimpleNamespace(
+        repository="o/r", repository_id=1, base_branch="master", base_revision="a" * 40
+    )
+    draft = SimpleNamespace(
+        key="stats-range", objective="Add value_range", acceptance_criteria=["works"]
+    )
+    plan = SimpleNamespace(
+        proposal=SimpleNamespace(issues=[draft]), pins={"developer_policy": developer_policy}
+    )
+    effect = SimpleNamespace(
+        key="stats-range", receipt={"number": 51, "issue_id": 9, "title": "t", "body": "b"}
+    )
+    service = SimpleNamespace(_target=lambda _plan: scope)
+    developer_payload: Any = ManagedPlanning._developer_payload
+    payload = developer_payload(
+        service,
+        plan,
+        SimpleNamespace(assignment_id="a"),
+        effect,  # type: ignore[arg-type]
+    )
+    issue = pilot.planned_issue_for(payload["task_id"], PLAN)
+    assert issue is not None and issue["key"] == "stats-range"
