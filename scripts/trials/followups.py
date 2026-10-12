@@ -347,7 +347,19 @@ class HandsOff:
         self.operator.recorder.event("operator_action", action=kind, what=what, **fields)
         self.operator.recorder.save()
 
-    def child(self, preview_id: str, what: str) -> None:
+    def child(self, preview_id: str, what: str, *, human_admission: bool = False) -> None:
+        """Wait for worker pickup, then admit. human_admission skips the wait: since #31 planning tasks
+        never auto-admit, so the operator always approves them through the gated approval endpoint."""
+        if human_admission:
+            result = self.operator.approve_preview(preview_id, what)
+            self.action(
+                "human_task_approval_enqueued",
+                what,
+                preview_id=preview_id,
+                admission=(result.get("managed_admission") or {}).get("state"),
+                endpoint="POST /internal/developer/preview/approve (human planning admission, #31)",
+            )
+            return
         deadline = time.monotonic() + self.pickup
         while time.monotonic() < deadline:
             if self.operator.task(preview_id).get("managed_admission"):
@@ -586,7 +598,7 @@ def main() -> int:
             report["phases"].append(
                 {"phase": "planning", "started_at": now(), "preview_id": planning.preview_id}
             )
-            hands.child(planning.preview_id, "PM planning task")
+            hands.child(planning.preview_id, "PM planning task", human_admission=True)
             status = operator.drive(planning.preview_id, "planning")
             report["phases"][-1].update(
                 ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
