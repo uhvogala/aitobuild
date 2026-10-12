@@ -14,7 +14,7 @@ import pytest
 from aitobuild.organization import FileDefinitionStore, parse_organization_definition
 from aitobuild.organization_assignments import AssignmentService, FileAssignmentStore
 from aitobuild.developer_delivery import ARCHITECT_REVIEW_BODY_MAX, ARCHITECT_REVIEW_BODY_PREFIX
-from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
+from aitobuild.developer_isolation import BudgetDeadlineExpired, DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.organization_roles import NativeManagedRoles, PublishedReviewTarget
 from aitobuild.organization_runner import FileRunStore, ManagedWorkflowRunner, RuntimeActor
 from aitobuild.organization_runtime import ModelProfile, bootstrap_organization
@@ -1503,7 +1503,8 @@ def test_published_review_http_hook_and_metadata_only_retry(tmp_path, published_
                                       "partial_page", "skip_page", "oversized_output", "body_drift", "evidence_drift", "uncertain_submit", "expired_at_write",
                                       "correction", "correction_outside", "correction_partial", "correction_drift", "body_at_limit", "body_over_limit",
                                       "repository_context", "context_only", "context_head_drift", "context_corrupt",
-                                      "event_argument", "resubmit_different", "json_text_only", "deadline_before_reminder"])
+                                      "event_argument", "resubmit_different", "json_text_only", "deadline_before_reminder",
+                                      "deadline_after_turn", "deadline_at_reminder", "correction_exhausted"])
 def test_native_architect_review_requires_inspection_and_exact_saved_approval(
     tmp_path, published_delivery, monkeypatch, scenario,
 ):
@@ -1543,6 +1544,12 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
     DeveloperTaskBudget(path=budget_path_for(preview.preview_id), bundle=developer_task_bundle_from_payload(preview.bundle_payload))
     path = publication.publication["changed_paths"][0]
     correction_case = scenario.startswith("correction")
+    deadline_case = scenario in {"deadline_before_reminder", "deadline_after_turn", "deadline_at_reminder"}
+    reminder_errors = _reminder_deadline_spy(monkeypatch, {"deadline_after_turn": "after_turn",
+                                                           "deadline_at_reminder": "at_reminder"}.get(scenario))
+    # correction_exhausted: five invalid corrections under a raised framework error limit; the tool's own
+    # max_submit_attempts bound (default 3) must be what stops them.
+    correction_steps = range(3, 8) if scenario == "correction_exhausted" else range(3, 4)
     if scenario == "oversized_output":
         source_reader = worker.get_published_source
         monkeypatch.setattr(worker, "get_published_source", lambda *args, **kwargs: source_reader(*args, **kwargs) | {
@@ -1575,13 +1582,13 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
         elif context_case:
             message = {"role": "assistant", "content": expected_comment}
             finish = "stop"
-        elif correction_case and step == 3:
+        elif correction_case and step in correction_steps:
             message = {"role": "assistant", "content": None, "tool_calls": [{"id": "correction", "type": "function", "function": {
-                "name": "architect_propose_correction", "arguments": json.dumps({"paths": ["outside.py" if scenario == "correction_outside" else path],
+                "name": "architect_propose_correction", "arguments": json.dumps({"paths": ["outside.py" if scenario in {"correction_outside", "correction_exhausted"} else path],
                                                                                 "objective": "Correct the inspected edge case and retain passing tests"}),
             }}]}
             finish = "tool_calls"
-        elif scenario == "metadata_only" or step >= 3:
+        elif scenario == "metadata_only" or step >= correction_steps.stop or not correction_case and step >= 3:
             content = "   " if scenario == "empty_final" else "  " + expected_comment + "  "
             if scenario == "body_over_limit":
                 content = "x" * (max_body + 1)
@@ -1597,7 +1604,7 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
             }}]}
             finish = "tool_calls"
         if finish == "stop":
-            if scenario in {"json_text_only", "deadline_before_reminder"}:
+            if scenario == "json_text_only" or deadline_case:
                 # Valid-looking final text with no tool call is never parsed or stored.
                 if scenario == "deadline_before_reminder":
                     monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: FAR_FUTURE)
@@ -1623,6 +1630,8 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
         async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
             async with AsyncOpenAI(api_key="test-key", http_client=transport) as client:
                 profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                if scenario == "correction_exhausted":
+                    profile.client.function_invocation_configuration["max_consecutive_errors_per_request"] = 10
                 assignment, runtime_for, make_runner, _ = role_fixture(
                     tmp_path, profile, role="architect", preview=preview, previews=previews, budget_path_for=budget_path_for,
                 )
@@ -1638,9 +1647,12 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                     assert waiting.state == "failed" and f"exceeds {max_body} characters" in waiting.error
                     assert not waiting.pending and not github.reviews
                     assert json.loads(Path(assignment.budget_path).read_text()) == before | {"aborted": True}
-                elif scenario in {"json_text_only", "deadline_before_reminder"}:
+                elif scenario == "json_text_only" or deadline_case:
                     assert waiting.state == "failed" and not waiting.pending and not github.reviews
                     assert ("did not submit" if scenario == "json_text_only" else "TimeoutError") in waiting.error, waiting.error
+                    if deadline_case:
+                        # The runner labels several timeouts "TimeoutError"; the role site must raise the budget expiry itself.
+                        assert len(reminder_errors) == 1 and type(reminder_errors[0]) is BudgetDeadlineExpired, reminder_errors
                     finals = [item for item in bodies if item["messages"][-1]["role"] != "tool" or
                               "architect_submit_review" in item["messages"][-1].get("content", "")]
                     users = [entry for entry in bodies[-1]["messages"] if entry["role"] == "user"]
@@ -1722,7 +1734,16 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                         assert session.state["aitobuild_comment_body_submit_attempts"] == 1
                         tool_results = [entry["content"] for entry in bodies[-1]["messages"] if entry["role"] == "tool"]
                         assert any(item.startswith("Error") for item in tool_results)
-                    if scenario in {"approved", "preamble", "recovered", "correction", "correction_outside", "body_at_limit", "repository_context",
+                    if scenario == "correction_exhausted":
+                        session = await adapter()._sessions.get(waiting.session_id)
+                        assert session.state["aitobuild_correction_attempts"] == 3
+                        assert "aitobuild_correction_proposal" not in session.state
+                        results = [entry["content"] for entry in bodies[-1]["messages"] if entry["role"] == "tool"
+                                   and entry.get("tool_call_id") == "correction"]
+                        assert [item.startswith("Error") for item in results] == [True, True, True, False, False], results
+                        assert all("used all 3 attempts" in item for item in results[3:]), results
+                    if scenario in {"approved", "preamble", "recovered", "correction", "correction_outside", "correction_exhausted",
+                                    "body_at_limit", "repository_context",
                                     "context_corrupt", "event_argument", "resubmit_different"}:
                         assert done.state == "completed", done.error
                         assert github.reviews[0].body == ARCHITECT_REVIEW_BODY_PREFIX + expected_comment
@@ -1731,13 +1752,13 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                         assert json.loads(Path(assignment.budget_path).read_text()) == before
                         if scenario == "correction":
                             assert done.outputs[0]["correction"] == waiting.pending[0].data["correction"]
-                        if scenario == "correction_outside":
+                        if scenario in {"correction_outside", "correction_exhausted"}:
                             assert "correction" not in done.outputs[0]
                     else:
                         assert done.state == "failed" and not github.reviews
                         assert json.loads(Path(assignment.budget_path).read_text()) == before | {"aborted": True}
                 assert developer_budget.read_bytes() == before_developer
-                if scenario in {"recovered", "correction_outside", "context_corrupt"}:
+                if scenario in {"recovered", "correction_outside", "correction_exhausted", "context_corrupt"}:
                     session = await adapter()._sessions.get(waiting.session_id)
                     assert session.state["aitobuild_role_diagnostics"]
 
@@ -1899,8 +1920,49 @@ def test_published_source_and_diff_use_immutable_pins(published_delivery, monkey
 FAR_FUTURE = 10.0 ** 12
 
 
-@pytest.mark.parametrize("scenario", ["json_text_only", "oversized_text"])
-def test_native_coordinator_never_parses_final_text_and_bounds_responses(tmp_path, approved_delivery, scenario):
+def _reminder_deadline_spy(monkeypatch, when=None):
+    """Spy on run_with_reminder (all role sites call it) and optionally expire the budget clock at a set point.
+
+    ``after_turn``: right after turn 1 returns, i.e. after its post-turn revalidation, so only the
+    pre-reminder checks (revalidate + remaining_seconds) can stop the reminder.
+    ``at_reminder``: right after the pre-reminder revalidate returns, so only the reminder's own
+    remaining_seconds deadline check can stop it. Returns the list of errors run_with_reminder raised.
+    """
+    from aitobuild import organization_roles
+
+    seen: list[BaseException] = []
+    original = organization_roles.run_with_reminder
+
+    def expire():
+        monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: FAR_FUTURE)
+
+    async def spy(submit, message, run, revalidate, remaining_seconds):
+        turns = []
+
+        async def wrapped_run(text):
+            await run(text)
+            turns.append(text)
+            if when == "after_turn" and len(turns) == 1:
+                expire()
+
+        def wrapped_revalidate():
+            result = revalidate()
+            if when == "at_reminder":
+                expire()
+            return result
+
+        try:
+            return await original(submit, message, wrapped_run, wrapped_revalidate, remaining_seconds)
+        except BaseException as error:
+            seen.append(error)
+            raise
+
+    monkeypatch.setattr(organization_roles, "run_with_reminder", spy)
+    return seen
+
+
+@pytest.mark.parametrize("scenario", ["json_text_only", "oversized_text", "deadline_after_turn", "deadline_at_reminder"])
+def test_native_coordinator_never_parses_final_text_and_bounds_responses(tmp_path, approved_delivery, monkeypatch, scenario):
     from aitobuild.organization_roles import NativeCoordinatorProposal
     from aitobuild.tool_outputs import MAX_PROMPT_BYTES
     from test_organization_runner import _service_fixture
@@ -1929,19 +1991,27 @@ def test_native_coordinator_never_parses_final_text_and_bounds_responses(tmp_pat
                                                         event="github.issue.ready", coordinator_id="planner", binding_revision="pm-v1")
                 service, assignments, _ = _service_fixture(tmp_path, approved_delivery, coordinator=coordinator.service_binding)
                 worker.prepare(preview_id)
-                match = "oversized" if scenario == "oversized_text" else "did not submit"
-                with pytest.raises((ValueError, PermissionError), match=match):
-                    await service.consume(preview_id)
+                if scenario.startswith("deadline"):
+                    reminder_errors = _reminder_deadline_spy(monkeypatch, scenario.removeprefix("deadline_"))
+                    with pytest.raises(BudgetDeadlineExpired):
+                        await service.consume(preview_id)
+                    assert len(reminder_errors) == 1 and type(reminder_errors[0]) is BudgetDeadlineExpired
+                else:
+                    match = "oversized" if scenario == "oversized_text" else "did not submit"
+                    with pytest.raises((ValueError, PermissionError), match=match):
+                        await service.consume(preview_id)
                 assert assignments.for_task(previews.get(preview_id).bundle_payload["task_id"]) is None
                 receipt = json.loads(next((tmp_path / "coordinator" / "receipts").glob("*.json")).read_text())
                 assert receipt["state"] == "failed" and receipt.get("proposal") is None
 
     asyncio.run(exercise())
-    # JSON-looking text is never parsed: one reminder turn, then failure. Oversized text fails on the first turn.
-    assert len(bodies) == (1 if scenario == "oversized_text" else 2)
+    # JSON-looking text is never parsed: one reminder turn, then failure. Oversized text fails on the first turn,
+    # and a deadline that expires before the reminder stops it before the model is called again.
+    assert len(bodies) == (2 if scenario == "json_text_only" else 1)
 
 
-@pytest.mark.parametrize("scenario", ["json_text_only", "deadline_before_reminder", "oversized_text"])
+@pytest.mark.parametrize("scenario", ["json_text_only", "deadline_before_reminder", "oversized_text",
+                                      "deadline_after_turn", "deadline_at_reminder"])
 def test_native_pm_proposal_text_reminder_deadline_and_size(tmp_path, monkeypatch, scenario):
     from aitobuild.tool_outputs import MAX_PROMPT_BYTES
 
@@ -1963,34 +2033,18 @@ def test_native_pm_proposal_text_reminder_deadline_and_size(tmp_path, monkeypatc
                 profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
                 assignment, runtime_for, make_runner, _ = role_fixture(tmp_path, profile)
                 adapter = NativeManagedRoles(runtime_for=runtime_for, state_dir=tmp_path / "roles", proposal_event="github.issue.ready")
+                reminder_errors = _reminder_deadline_spy(monkeypatch, {"deadline_after_turn": "after_turn",
+                                                                       "deadline_at_reminder": "at_reminder"}.get(scenario))
                 run = await make_runner(adapter).start(assignment.assignment_id)
                 assert run.state == "failed"
-                expected = {"json_text_only": "did not submit", "oversized_text": "exceeds the byte limit",
-                            "deadline_before_reminder": "TimeoutError"}[scenario]
+                expected = {"json_text_only": "did not submit", "oversized_text": "exceeds the byte limit"}.get(scenario, "TimeoutError")
                 assert expected in run.error, run.error
+                if scenario.startswith("deadline"):
+                    # The runner labels several timeouts "TimeoutError"; the role site must raise the budget expiry itself.
+                    assert len(reminder_errors) == 1 and type(reminder_errors[0]) is BudgetDeadlineExpired, reminder_errors
                 session = await adapter._sessions.get(run.session_id)
                 assert session is None or "aitobuild_role_proposal" not in session.state and \
                     session.state.get("aitobuild_pm_proposal") is None
 
     asyncio.run(exercise())
     assert len(bodies) == (2 if scenario == "json_text_only" else 1)
-
-
-def test_pm_reminder_deadline_check_raises_budget_deadline_expired(tmp_path, monkeypatch):
-    """Directly at the role site: the reminder's deadline check raises BudgetDeadlineExpired."""
-    from aitobuild.developer_isolation import BudgetDeadlineExpired
-    from aitobuild import organization_roles
-
-    seen = []
-    original = organization_roles.run_with_reminder
-
-    async def spy(*args, **kwargs):
-        try:
-            return await original(*args, **kwargs)
-        except BaseException as error:
-            seen.append(error)
-            raise
-
-    monkeypatch.setattr(organization_roles, "run_with_reminder", spy)
-    test_native_pm_proposal_text_reminder_deadline_and_size(tmp_path, monkeypatch, "deadline_before_reminder")
-    assert len(seen) == 1 and isinstance(seen[0], BudgetDeadlineExpired)
