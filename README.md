@@ -148,9 +148,31 @@ decision. Replays and redeliveries reuse it. Automatic admission has two extra g
   `max_automatic_decisions`, which refuses rather than silently waiting. The preview
   stays unapproved, so a human approval can still admit it.
   `max_automatic_decisions` still counts only in-run decisions.
-- At most one automatic admission per repository ID and issue ID. An `edited` event,
+- At most one automatic admission per repository ID and issue ID (webhook, planned and
+  dependent-handoff tasks share the key). An `edited` event,
   or any later trigger whose task differs, never auto-admits: its preview waits for a
   human approval.
+- PM planning tasks (`pm-planning-*`) and any task without a repository issue never
+  auto-admit: automatic mode refuses them with 409 and they need a human admission.
+- A PM-planned child (`planned-issue-*` or `dependent-issue-*`) has no issue author of
+  its own, so it qualifies through its approved plan instead of the author/label
+  allowlist. Using only stored data (never the request), the service requires: the
+  completed planning run named by the child's `planning_assignment`; the stored plan and
+  published publication whose digest equals the child's `plan_digest`; a planning task
+  preview that was admitted by a human (not `operator_policy`); and exactly one recorded
+  `pm_issue_creation` decision for that exact plan's approval data, approved, with
+  `approval_policy.source == "human"`. A planning preview approved through the human
+  approve endpoint has no saved policy record; that is treated as human explicitly,
+  because automatic admission always saves an `operator_policy` record.
+  `planned-issue-*` children must carry `plan_digest`; `dependent-issue-*` handoffs take
+  it from their stored handoff record. The child's repository must be a configured
+  `developer.repository_sources` entry and it keeps its plan-pinned base (refused if
+  missing). Anything missing or mismatched is refused with a specific 409 and the child
+  stays unapproved for a human. `max_automatic_admissions` still counts it in the same
+  write, and the one-automatic-admission-per-issue dedupe keys `ISSUE-*`,
+  `planned-issue-*` and `dependent-issue-*` tasks on the same repository/issue IDs, so a
+  dependent handoff on a new base after a failed delivery waits for a human.
+  So with `pm_issue_creation: automatic`, planned children always wait for a human.
 
 The token-gated `/internal/triggers` endpoint uses the same path, so it also
 auto-admits. When admission is `disabled`, the limit is reached, or a concurrent

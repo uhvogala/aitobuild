@@ -251,6 +251,34 @@ def _issue_allowlisted(source_payload: Any, source: RepositorySourceConfig) -> b
     return bool(names & {name.casefold() for name in source.required_issue_labels})
 
 
+def _is_planned_child(preview: Any) -> bool:
+    task_id = str(preview.bundle_payload.get("task_id", ""))
+    return "planning_assignment" in preview.source_payload or task_id.startswith(("planned-issue-", "dependent-issue-"))
+
+
+def _configured_task_base(preview: Any, sources: Any) -> str | None:
+    """Trusted automatic-admission binding: a configured repository source, the issue author/label allowlist
+    (planned children qualify through their plan, checked by the managed service first), then the pinned base."""
+    issue = developer_task_bundle_from_payload(preview.bundle_payload).issue_context
+    if issue is None:
+        return None
+    source = next((source for source in sources
+                   if (source.repository, source.repository_id) == (issue.repository, issue.repository_id)), None)
+    if source is None:
+        raise PermissionError("Automatic admission requires a configured repository source")
+    if _is_planned_child(preview):
+        if issue.base_revision is None:
+            raise PermissionError("Planned child admission requires its plan-pinned base revision")
+        return issue.base_revision
+    if not _issue_allowlisted(preview.source_payload, source):
+        raise PermissionError("Automatic admission requires an allowlisted issue author or label")
+    if issue.base_revision is not None:
+        return issue.base_revision
+    if source.base_revision is None:
+        raise PermissionError("Automatic admission requires an operator-pinned repository source base")
+    return source.base_revision
+
+
 def create_app(
     config: AppConfig | None = None, *,
     managed_service_factory: Callable[[ManagedServiceContext], ManagedOrganizationService] | None = None,
@@ -370,19 +398,7 @@ def create_app(
     role_tools = build_role_tools(context=developer_tool_context)
 
     def configured_task_base(preview: Any) -> str | None:
-        """Trusted automatic-admission binding: issue author/label allowlist, then the operator-pinned base."""
-        issue = developer_task_bundle_from_payload(preview.bundle_payload).issue_context
-        if issue is None:
-            return None
-        source = next((source for source in app_config.developer.repository_sources
-                       if (source.repository, source.repository_id) == (issue.repository, issue.repository_id)), None)
-        if source is None or not _issue_allowlisted(preview.source_payload, source):
-            raise PermissionError("Automatic admission requires an allowlisted issue author or label")
-        if issue.base_revision is not None:
-            return issue.base_revision
-        if source.base_revision is None:
-            raise PermissionError("Automatic admission requires an operator-pinned repository source base")
-        return source.base_revision
+        return _configured_task_base(preview, app_config.developer.repository_sources)
 
     managed_context = ManagedServiceContext(
         previews=dispatcher.developer_preview_registry, worker=delivery_worker,

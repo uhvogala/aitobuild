@@ -365,7 +365,7 @@ def test_pm_independent_followup_queueing_retains_separate_task_admission(tmp_pa
 
     calls, bodies = [], []
     policy = ApprovalPolicy(task_admission="automatic" if automatic else "human",
-                            pm_issue_creation="automatic", pm_dependency_links="automatic")
+                            pm_issue_creation="human", pm_dependency_links="automatic")
     document = proposal()
     document["issues"].append({"key": "third", "title": "Third issue", "objective": "Implement third behavior",
                                "acceptance_criteria": ["Third behavior passes"]})
@@ -394,6 +394,15 @@ def test_pm_independent_followup_queueing_retains_separate_task_admission(tmp_pa
                 await background.start()
                 try:
                     async with asyncio.timeout(5):
+                        parent_job = await background.wait_idle(preview.preview_id)
+                        assert parent_job.state == "waiting", parent_job.error  # human PM issue-creation approval
+                        waiting = service.recorded_run(parent_job.task_id)
+                        await background.close()
+                        background = ManagedOrganizationWorker(service=service, store=FileWorkerStore(tmp_path / "pm-followups.json"),
+                                                               queue_follow_ups=True, poll_seconds=0.01)
+                        background.enqueue_decision(waiting.assignment_id, request_id=waiting.pending[0].request_id,
+                                                    kind="approve", value=True)
+                        await background.start()
                         parent_job = await background.wait_idle(preview.preview_id)
                         assert parent_job.state == "completed", parent_job.error
                         run = service.recorded_run(parent_job.task_id)
@@ -452,6 +461,7 @@ def test_pm_independent_followup_refuses_changed_or_incomplete_evidence(tmp_path
                     tmp_path, profile, approved_delivery[1], previews=approved_delivery[0], repository="fixture/widgets", repository_id=101,
                     base_revision=approved_delivery[4], approval_policy=policy, implementation_followups=True,
                     handoff_operation=ManagedOperation(lambda context, message: calls.append("implementation")))
+                previews.approve(preview.preview_id)  # planning always needs a human admission
                 run = await service.consume(preview.preview_id)
                 assert run.state == "completed" and run.cleanup_succeeded is True, run.error
                 first_id, dependent_id = run.outputs[0]["developer_previews"]
@@ -1406,3 +1416,220 @@ def test_native_plan_text_is_never_parsed_and_reminder_respects_deadline(tmp_pat
     # Inspect, free text, then (json_text_only) one reminder turn; an expired deadline stops before the reminder.
     assert len(bodies) == (3 if scenario == "json_text_only" else 2)
     assert len(users) == (2 if scenario == "json_text_only" else 1)
+
+
+@pytest.mark.parametrize("case", ["admitted", "limit", "planning_automatic", "planning_operator_policy", "issue_creation_automatic",
+                                  "digest_mismatch", "missing_decision", "decision_not_human", "decision_rejected",
+                                  "decision_wrong_stage", "duplicate_decision", "missing_plan", "missing_assignment",
+                                  "run_incomplete", "unbound"])
+def test_planned_child_qualifies_only_through_human_planning_and_issue_creation(tmp_path, approved_delivery, monkeypatch, case):
+    """Automatic admission of a PM-planned child: the planning task must be human-admitted and the issue creation of
+    that exact plan digest human-approved. Planning previews themselves never auto-admit."""
+    from aitobuild.developer_preview import preview_approval_operation
+
+    bodies, calls = [], []
+    document = proposal()
+    document["issues"].append({"key": "third", "title": "Third issue", "objective": "Implement third behavior",
+                               "acceptance_criteria": ["Third behavior passes"]})
+    policy = ApprovalPolicy(task_admission="automatic", pm_dependency_links="automatic",
+                            pm_issue_creation="automatic" if case == "issue_creation_automatic" else "human",
+                            max_automatic_admissions=1 if case == "limit" else 32)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply(bodies, document))) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service, planning, _, preview, previews, github, _, _ = planning_fixture(
+                    tmp_path, profile, approved_delivery[1], previews=approved_delivery[0], repository="fixture/widgets", repository_id=101,
+                    base_revision=approved_delivery[4], approval_policy=policy, implementation_followups=True,
+                    handoff_operation=ManagedOperation(lambda context, message: calls.append("implementation")))
+                if case == "planning_automatic":
+                    with pytest.raises(PermissionError, match="always require a human admission"):
+                        await service.consume(preview.preview_id)
+                    assert not previews.get(preview.preview_id).approved and not bodies
+                    return
+                if case == "planning_operator_policy":
+                    decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="operator", automatic_supported=True,
+                                              operation=preview_approval_operation(preview.preview_id, preview.bundle_payload))
+                    previews.approve(preview.preview_id, approval_policy=decision)
+                else:
+                    previews.approve(preview.preview_id)  # the human planning admission
+                run = await service.consume(preview.preview_id)
+                if run.state == "waiting":
+                    run = await service.decide(run.assignment_id, request_id=run.pending[0].request_id, approved=True)
+                assert run.state == "completed" and run.cleanup_succeeded is True, run.error
+                first_id, _, third_id = run.outputs[0]["developer_previews"]
+                expected = {
+                    "planning_operator_policy": "human-admitted planning task",
+                    "issue_creation_automatic": "human issue-creation approval",
+                }
+                if case in expected:
+                    with pytest.raises(PermissionError, match=expected[case]):
+                        service.admission(first_id)
+                    assert not previews.get(first_id).approved and not calls
+                    return
+                if case in {"admitted", "limit"}:
+                    admitted, _ = service.admission(first_id)
+                    assert admitted.approved and admitted.approval_policy.source == "operator_policy"
+                    assert admitted.bundle_payload["issue_context"]["base_revision"] == approved_delivery[4]
+                    assert service.admission(first_id)[0].approved_at == admitted.approved_at  # replay never re-counts
+                    if case == "limit":
+                        with pytest.raises(PermissionError, match="admission limit reached"):
+                            service.admission(third_id)
+                        assert not previews.get(third_id).approved
+                    else:
+                        assert service.admission(third_id)[0].approval_policy.source == "operator_policy"
+                    return
+                child = previews.get(first_id)
+                saved = service._runs.get(run.assignment_id)
+                messages = {"digest_mismatch": "plan digest differs", "missing_decision": "exactly one recorded",
+                            "duplicate_decision": "exactly one recorded", "decision_not_human": "human issue-creation approval",
+                            "decision_rejected": "approved issue-creation decision", "decision_wrong_stage": "approved issue-creation decision",
+                            "missing_plan": "stored plan and publication", "missing_assignment": "stored planning assignment",
+                            "run_incomplete": "completed planning run", "unbound": "planning publication binding"}
+                creation = next(item for item in saved.decisions if item.approval_policy is not None
+                                and item.approval_policy.stage == ApprovalStage.PM_ISSUE_CREATION)
+                decisions = list(saved.decisions)
+                index = decisions.index(creation)
+                if case == "digest_mismatch":
+                    child = replace(child, source_payload=child.source_payload | {"plan_digest": "f" * 64})
+                elif case == "missing_assignment":
+                    child = replace(child, source_payload={"plan_digest": child.source_payload["plan_digest"]})
+                elif case == "missing_plan":
+                    planning.plans.path(run.assignment_id).unlink()
+                elif case == "unbound":
+                    service._planning_publication = None
+                elif case == "run_incomplete":
+                    monkeypatch.setattr(service._runs, "get", lambda key: saved.model_copy(update={"state": "waiting"}))
+                else:
+                    if case == "missing_decision":
+                        decisions.pop(index)
+                    elif case == "duplicate_decision":
+                        decisions.append(creation.model_copy(update={"request_id": "again"}))
+                    elif case == "decision_rejected":
+                        decisions[index] = creation.model_copy(update={"value": False})
+                    else:
+                        update = {"source": "operator_policy", "mode": "automatic"} if case == "decision_not_human" else {
+                            "stage": ApprovalStage.PM_DEPENDENCY_LINKS}
+                        decisions[index] = creation.model_copy(update={"approval_policy": creation.approval_policy.model_copy(update=update)})
+                    changed = saved.model_copy(update={"decisions": tuple(decisions)})
+                    monkeypatch.setattr(service._runs, "get", lambda key: changed)
+                with pytest.raises(PermissionError, match=messages[case]):
+                    service._check_planned_child(child)
+                if case in {"missing_decision", "decision_not_human", "missing_plan"}:
+                    with pytest.raises((PermissionError, FileNotFoundError, ValueError)):
+                        service.admission(first_id)
+                    assert not previews.get(first_id).approved
+                assert not calls
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("prefixes", [("dependent-issue-", "dependent-issue-"), ("planned-issue-", "dependent-issue-"),
+                                      ("ISSUE-", "planned-issue-")])
+def test_per_issue_dedupe_covers_planned_and_dependent_handoffs(tmp_path, prefixes):
+    """Handoff A on base 1 is admitted automatically and its delivery fails; handoff B on base 2 for the same
+    repository/issue ID must not be admitted automatically again: it waits for a human."""
+    from aitobuild.developer_isolation import build_developer_task_bundle, DeveloperIssueContext
+    from aitobuild.developer_preview import AutomaticAdmissionDeferred, preview_approval_operation
+
+    previews = DeveloperPreviewRegistry(tmp_path / "previews.json")
+    policy = ApprovalPolicy(task_admission="automatic")
+    staged = []
+    for index, (prefix, base) in enumerate(zip(prefixes, ("1" * 40, "2" * 40))):
+        task_id = prefix + str(index) * 64
+        payload = build_developer_task_bundle(task_id=task_id, objective="Implement", acceptance_criteria=["Passes"],
+            constraints=[], context_files=[], issue_context=DeveloperIssueContext(
+                repository="fixture/widgets", repository_id=101, issue_number=7, issue_id=7007, title="Issue", body="Body",
+                base_branch="main", base_revision=base)).to_payload()
+        staged.append(previews.create_or_get(dedupe_key=task_id, task_key=task_id, bundle_payload=payload,
+                                             source_payload={"planning_assignment": "assignment-x"}))
+    first, second = staged
+    def decide(preview):
+        return policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="operator", automatic_supported=True,
+                              operation=preview_approval_operation(preview.preview_id, preview.bundle_payload))
+    assert previews.approve(first.preview_id, approval_policy=decide(first), max_automatic_admissions=32).approved
+    with pytest.raises(AutomaticAdmissionDeferred):
+        previews.approve(second.preview_id, approval_policy=decide(second), max_automatic_admissions=32)
+    assert not previews.get(second.preview_id).approved
+    assert previews.approve(second.preview_id).approved  # a human can still admit it
+
+
+@pytest.mark.parametrize("case", ["approved_at", "unpublished", "missing_digest", "legacy_human", "no_source", "no_pinned_base",
+                                  "dependent_unbound", "dependent_digest"])
+def test_planned_child_pins_and_sources_fail_closed(tmp_path, approved_delivery, monkeypatch, case):
+    from aitobuild.app import _configured_task_base
+
+    bodies = []
+    policy = ApprovalPolicy(task_admission="automatic", pm_dependency_links="automatic")
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply(bodies))) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service, planning, _, preview, previews, _, _, _ = planning_fixture(
+                    tmp_path, profile, approved_delivery[1], previews=approved_delivery[0], repository="fixture/widgets", repository_id=101,
+                    base_revision=approved_delivery[4], approval_policy=policy, implementation_followups=True,
+                    handoff_operation=ManagedOperation(lambda context, message: None))
+                previews.approve(preview.preview_id)
+                run = await service.consume(preview.preview_id)
+                run = await service.decide(run.assignment_id, request_id=run.pending[0].request_id, approved=True)
+                assert run.state == "completed", run.error
+                first_id, dependent_id = run.outputs[0]["developer_previews"]
+                child = previews.get(first_id)
+                if case == "legacy_human":
+                    # The human approve endpoint saves no policy record: that branch is explicitly human.
+                    assert previews.get(preview.preview_id).approval_policy is None
+                    service._check_planned_child(child)
+                    return
+                if case in {"no_source", "no_pinned_base"}:
+                    source = type("Source", (), {"repository": "fixture/widgets", "repository_id": 101})()
+                    if case == "no_pinned_base":
+                        payload = json.loads(json.dumps(child.bundle_payload))
+                        payload["issue_context"]["base_revision"] = None
+                        child = replace(child, bundle_payload=payload)
+                        with pytest.raises(PermissionError, match="plan-pinned base revision"):
+                            _configured_task_base(child, (source,))
+                        monkeypatch.setattr(previews, "get", lambda key, get=previews.get: child if key == first_id else get(key))
+                        monkeypatch.setattr(service, "_check_planned_child", lambda preview: None)
+                        with pytest.raises(PermissionError, match="plan-pinned base revision"):
+                            service._automatic_task_approval(child)
+                    else:
+                        assert _configured_task_base(child, (source,)) == approved_delivery[4]
+                        with pytest.raises(PermissionError, match="configured repository source"):
+                            _configured_task_base(child, ())
+                    return
+                if case == "dependent_digest":
+                    handoff = previews.get(dependent_id)
+                    handoff = replace(handoff, bundle_payload=handoff.bundle_payload | {"task_id": "dependent-issue-" + "0" * 64},
+                                      source_payload={"planning_assignment": run.assignment_id})
+                    record = type("Handoff", (), {"plan_digest": planning.plans.get(run.assignment_id).digest})()
+                    service._dependencies = type("Dependencies", (), {"_load": lambda self, task_id: record})()
+                    service._check_planned_child(handoff)  # digest read from the stored handoff record
+                    record.plan_digest = "f" * 64
+                    with pytest.raises(PermissionError, match="stored published plan"):
+                        service._check_planned_child(handoff)
+                    return
+                if case == "dependent_unbound":
+                    with pytest.raises(PermissionError, match="trusted handoff binding"):
+                        handoff = previews.get(dependent_id)
+                        service._check_planned_child(replace(handoff, bundle_payload=handoff.bundle_payload | {
+                            "task_id": "dependent-issue-" + "0" * 64}))
+                    return
+                if case == "approved_at":
+                    original = previews.get(preview.preview_id)
+                    from datetime import timedelta
+                    moved = replace(original, approved_at=original.approved_at + timedelta(seconds=1))
+                    monkeypatch.setattr(service._previews, "get", lambda key, get=previews.get: moved if key == preview.preview_id else get(key))
+                    message = "exact approved planning task"
+                elif case == "unpublished":
+                    saved = planning._load_publication(run.assignment_id, planning.plans.get(run.assignment_id))
+                    monkeypatch.setattr(planning, "_load_publication", lambda *args: saved.model_copy(update={"state": "awaiting_links"}))
+                    message = "stored published plan"
+                else:
+                    child = replace(child, source_payload={"planning_assignment": run.assignment_id})
+                    message = "stored plan digest"
+                with pytest.raises(PermissionError, match=message):
+                    service._check_planned_child(child)
+
+    asyncio.run(exercise())
