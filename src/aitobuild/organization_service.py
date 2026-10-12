@@ -17,7 +17,7 @@ from aitobuild.agent_tools import DeveloperToolContext
 from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
 from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
-from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry, preview_approval_operation
+from aitobuild.developer_preview import AutomaticAdmissionDeferred, DeveloperPreview, DeveloperPreviewRegistry, preview_approval_operation
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, EventName, Identifier, OrganizationDefinition
 from aitobuild.organization_assignments import AssignmentProposal, AssignmentService, AssignmentStore, TaskAssignment
 from aitobuild.organization_delivery import _delivery_call
@@ -224,6 +224,8 @@ class ManagedOrganizationService:
             raise PermissionError("Task admission is disabled")
         if preview.approved or self.approval_policy.task_admission == "human":
             return preview
+        if preview.source_payload.get("action") == "edited":
+            return preview  # an edit never auto-admits; it waits for a human approval
         if self._task_base is None:
             raise PermissionError("Automatic task admission has no trusted base binding")
         base = self._task_base(preview)
@@ -240,7 +242,11 @@ class ManagedOrganizationService:
             raise PermissionError("Non-repository admission cannot add a repository base")
         decision = self.approval_policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id=self.operator_id,
             operation=preview_approval_operation(preview.preview_id, payload), automatic_supported=True)
-        approved = self._previews.approve(preview.preview_id, base_revision=base, approval_policy=decision)
+        try:
+            approved = self._previews.approve(preview.preview_id, base_revision=base, approval_policy=decision,
+                                              max_automatic_admissions=self.approval_policy.max_automatic_admissions)
+        except AutomaticAdmissionDeferred:
+            return preview  # one automatic admission per repository/issue ID; later tasks wait for a human
         if approved is None:
             raise ValueError("Preview disappeared before configured admission")
         return approved

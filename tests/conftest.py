@@ -23,6 +23,7 @@ def repository_issue_body() -> dict[str, Any]:
         "repository": {"id": 101, "full_name": "fixture/widgets", "default_branch": "main"},
         "issue": {
             "id": 202, "number": 7, "state": "open", "title": "Handle empty widget names",
+            "user": {"login": "fixture-author"}, "labels": [],
             "body": "Reject empty names.\n\n## Acceptance Criteria\n- [ ] Empty names are rejected.\n- Existing names still work.\n\n## Notes\n- Keep the API stable.",
         },
         "assignee": {"login": "fixture-developer"},

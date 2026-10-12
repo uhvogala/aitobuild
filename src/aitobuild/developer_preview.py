@@ -40,6 +40,18 @@ class DeveloperPreview:
         return "approved" if self.approved else "awaiting_approval"
 
 
+
+def _webhook_issue_identity(bundle: dict[str, Any]) -> tuple[object, object] | None:
+    """Repository/issue IDs of a webhook issue task (staged review/correction tasks are not counted here)."""
+    context = bundle.get("issue_context")
+    if not str(bundle.get("task_id", "")).startswith("ISSUE-") or not isinstance(context, dict):
+        return None
+    return context.get("repository_id"), context.get("issue_id")
+
+
+class AutomaticAdmissionDeferred(PermissionError):
+    """Automatic admission does not apply; the preview stays unapproved and waits for a human approval."""
+
 class DeveloperPreviewRegistry:
     def __init__(self, path: Path | None = None) -> None:
         self._path = path
@@ -161,7 +173,8 @@ class DeveloperPreviewRegistry:
             return deepcopy(preview)
 
     def approve(self, preview_id: str, *, base_revision: str | None = None,
-                approval_policy: ApprovalDecision | None = None) -> DeveloperPreview | None:
+                approval_policy: ApprovalDecision | None = None,
+                max_automatic_admissions: int | None = None) -> DeveloperPreview | None:
         with self._transaction(write=True):
             preview = self._by_id.get(preview_id)
             if preview is None:
@@ -186,6 +199,20 @@ class DeveloperPreviewRegistry:
                 if (approval_policy.stage != ApprovalStage.TASK_ADMISSION
                         or approval_policy.operation_digest != snapshot_digest(preview_approval_operation(preview_id, bundle))):
                     raise PermissionError("Task approval policy must bind the exact pinned bundle")
+                if approval_policy.source == "operator_policy" and max_automatic_admissions is not None:
+                    # Counted inside the same write transaction, from saved approvals only: replays of an
+                    # already-approved preview returned above and never count twice.
+                    admitted = sum(1 for saved in self._by_id.values() if saved.approved and saved.approval_policy is not None
+                                   and saved.approval_policy.stage == ApprovalStage.TASK_ADMISSION
+                                   and saved.approval_policy.source == "operator_policy")
+                    issue = _webhook_issue_identity(bundle)
+                    if issue is not None and any(
+                            saved.approved and saved.approval_policy is not None and saved.approval_policy.source == "operator_policy"
+                            and _webhook_issue_identity(saved.bundle_payload) == issue for saved in self._by_id.values()):
+                        raise AutomaticAdmissionDeferred("This issue was already admitted automatically; "
+                                                         "a later task for it needs a human approval")
+                    if admitted >= max_automatic_admissions:
+                        raise PermissionError("Automatic task admission limit reached; a human approval is required")
             approved_preview = replace(
                 preview, bundle_payload=bundle, approved=True, approved_at=datetime.now(tz=UTC),
                 approval_policy=approval_policy,

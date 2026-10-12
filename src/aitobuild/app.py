@@ -22,7 +22,7 @@ from agent_framework import AgentSession, Content, FileSessionStore, FunctionInv
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 
 from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
-from aitobuild.config import AppConfig, load_config
+from aitobuild.config import AppConfig, RepositorySourceConfig, load_config, validate_automatic_admission_sources
 from aitobuild.developer_delivery import DeveloperDeliveryWorker, LocalRepositorySource
 from aitobuild.developer_execution import DeveloperExecutionEngine, PlannedFileWrite
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
@@ -234,6 +234,23 @@ async def _invoke_agent_run(
     return outcome
 
 
+def _issue_allowlisted(source_payload: Any, source: RepositorySourceConfig) -> bool:
+    """True when the saved issue's author is allowlisted or it carries a required label (case-insensitive)."""
+    body = source_payload.get("body") if isinstance(source_payload, dict) else None
+    issue = body.get("issue") if isinstance(body, dict) else None
+    if not isinstance(issue, dict):
+        return False
+    user = issue.get("user")
+    login = user.get("login") if isinstance(user, dict) else None
+    authors = {name.casefold() for name in source.allowed_issue_authors}
+    if isinstance(login, str) and login.casefold() in authors:
+        return True
+    labels = issue.get("labels")
+    names = {str(label["name"]).casefold() for label in labels if isinstance(label, dict) and isinstance(label.get("name"), str)} \
+        if isinstance(labels, list) else set()
+    return bool(names & {name.casefold() for name in source.required_issue_labels})
+
+
 def create_app(
     config: AppConfig | None = None, *,
     managed_service_factory: Callable[[ManagedServiceContext], ManagedOrganizationService] | None = None,
@@ -252,6 +269,8 @@ def create_app(
         raise ValueError("Managed organization service requires authenticated internal controls")
     if app_config.developer.enable_browser and app_config.developer.execution_mode != "container_session":
         raise ValueError("Developer browser requires container_session mode")
+
+    validate_automatic_admission_sources(app_config)
 
     app = FastAPI(title="aitobuild")
     workspace_root = Path.cwd()
@@ -351,14 +370,17 @@ def create_app(
     role_tools = build_role_tools(context=developer_tool_context)
 
     def configured_task_base(preview: Any) -> str | None:
+        """Trusted automatic-admission binding: issue author/label allowlist, then the operator-pinned base."""
         issue = developer_task_bundle_from_payload(preview.bundle_payload).issue_context
         if issue is None:
             return None
-        if issue.base_revision is not None:
-            return issue.base_revision
         source = next((source for source in app_config.developer.repository_sources
                        if (source.repository, source.repository_id) == (issue.repository, issue.repository_id)), None)
-        if source is None or source.base_revision is None:
+        if source is None or not _issue_allowlisted(preview.source_payload, source):
+            raise PermissionError("Automatic admission requires an allowlisted issue author or label")
+        if issue.base_revision is not None:
+            return issue.base_revision
+        if source.base_revision is None:
             raise PermissionError("Automatic admission requires an operator-pinned repository source base")
         return source.base_revision
 

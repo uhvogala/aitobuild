@@ -676,7 +676,7 @@ def test_configured_automatic_task_admission_records_exact_scope_without_reset(
     source, base = local_issue_repository
     policy = ApprovalPolicy(task_admission="automatic")
     config = replace(test_config, approvals=policy, developer=replace(test_config.developer,
-        require_preview_before_dispatch=True, repository_sources=(RepositorySourceConfig("fixture/widgets", 101, str(source), (), base),)))
+        require_preview_before_dispatch=True, repository_sources=(RepositorySourceConfig("fixture/widgets", 101, str(source), (), base, ("fixture-author",)),)))
     calls = []
     app = _managed_app(config, tmp_path, calls, detached=detached)
     with TestClient(app) as client:
@@ -724,7 +724,9 @@ def test_central_config_rejects_nonfinite_json(monkeypatch, tmp_path, constant) 
 def test_configured_automatic_admission_refuses_missing_base(test_config, tmp_path, repository_issue_body) -> None:
     from aitobuild.approval_policy import ApprovalPolicy
 
-    config = replace(test_config, approvals=ApprovalPolicy(task_admission="automatic"))
+    config = replace(test_config, approvals=ApprovalPolicy(task_admission="automatic"), developer=replace(
+        test_config.developer, repository_sources=(
+            RepositorySourceConfig("fixture/widgets", 101, str(tmp_path), (), None, ("fixture-author",)),)))
     app = _managed_app(config, tmp_path, [])
     client = TestClient(app)
     preview = client.post("/internal/developer/preview", headers=_internal_headers(config), json={
@@ -2200,13 +2202,14 @@ def _issue_webhook(client, config, body, delivery):
     })
 
 
-def _webhook_admission_app(test_config, tmp_path, local_issue_repository, mode, detached=False):
+def _webhook_admission_app(test_config, tmp_path, local_issue_repository, mode, detached=False,
+                           authors=("fixture-author",), labels=(), **policy):
     from aitobuild.approval_policy import ApprovalPolicy
 
     source, base = local_issue_repository
-    config = replace(test_config, approvals=ApprovalPolicy(task_admission=mode), developer=replace(
+    config = replace(test_config, approvals=ApprovalPolicy(task_admission=mode, **policy), developer=replace(
         test_config.developer, require_preview_before_dispatch=True,
-        repository_sources=(RepositorySourceConfig("fixture/widgets", 101, str(source), (), base),)))
+        repository_sources=(RepositorySourceConfig("fixture/widgets", 101, str(source), (), base, authors, labels),)))
     calls = []
     return config, _managed_app(config, tmp_path, calls, detached=detached), calls
 
@@ -2302,5 +2305,137 @@ def test_webhook_automatic_admission_requires_signature_then_activated_repositor
         repository_issue_body["repository"] = {"id": 999, "full_name": "fixture/other", "default_branch": "main"}
         response = _issue_webhook(client, config, repository_issue_body, "other-repo")
         assert response.status_code == 200 and response.json()["route"] == "developer.preview_required"
+    assert all(not preview.approved for preview in context.previews.list_previews(pending_only=False, limit=10))
+    assert calls == []
+
+
+def test_automatic_admission_refuses_startup_without_issue_allowlist(
+    test_config, tmp_path, local_issue_repository, monkeypatch,
+) -> None:
+    with pytest.raises(ValueError, match="allowed_issue_authors or required_issue_labels"):
+        _webhook_admission_app(test_config, tmp_path, local_issue_repository, "automatic", authors=(), labels=())
+    _webhook_admission_app(test_config, tmp_path / "human", local_issue_repository, "human", authors=(), labels=())
+    source, base = local_issue_repository
+    _central_config(monkeypatch, tmp_path, {"schema_version": 1, "approvals": {"task_admission": "automatic"}, "settings": {
+        "developer": {"repository_sources": [{"repository": "fixture/widgets", "repository_id": 101, "path": str(source),
+                                               "base_revision": base}]}}})
+    with pytest.raises(ValueError, match="allowed_issue_authors or required_issue_labels"):
+        load_config()
+
+
+@pytest.mark.parametrize("case", ["unlisted_author", "matching_label", "matching_author", "human_unlisted"])
+def test_automatic_admission_issue_allowlist(
+    test_config, tmp_path, repository_issue_body, local_issue_repository, case,
+) -> None:
+    mode = "human" if case == "human_unlisted" else "automatic"
+    labels = ("aitobuild:auto",) if case == "matching_label" else ()
+    authors = ("fixture-author",) if case == "matching_author" else ("someone-else",)
+    if case == "matching_label":
+        repository_issue_body["issue"]["labels"] = [{"name": "AITOBUILD:auto"}]
+    config, app, calls = _webhook_admission_app(test_config, tmp_path, local_issue_repository, mode,
+                                                authors=authors, labels=labels)
+    client = TestClient(app)
+    response = _issue_webhook(client, config, repository_issue_body, "allowlist-" + case)
+    service, context = app.state.test_services[0]
+    if case == "unlisted_author":
+        assert response.status_code == 409 and "allowlisted issue author or label" in response.json()["detail"]
+        assert all(not preview.approved for preview in context.previews.list_previews(pending_only=False, limit=10))
+        assert calls == []
+        return
+    assert response.status_code == 200, response.text
+    preview_id = response.json()["metadata"]["preview_id"]
+    if case == "human_unlisted":
+        assert not context.previews.get(preview_id).approved and calls == []
+        approved = client.post("/internal/developer/preview/approve", headers=_internal_headers(config), json={
+            "preview_id": preview_id, "base_revision": local_issue_repository[1]})
+        assert approved.status_code == 200 and approved.json()["managed_run"]["state"] == "completed"
+        return
+    assert context.previews.get(preview_id).approval_policy.source == "operator_policy"
+    assert service.status(preview_id).state == "completed"
+
+
+def test_automatic_admission_limit_refuses_and_never_double_counts(
+    test_config, tmp_path, repository_issue_body, local_issue_repository,
+) -> None:
+    config, app, calls = _webhook_admission_app(test_config, tmp_path, local_issue_repository, "automatic",
+                                                max_automatic_admissions=1)
+    client = TestClient(app)
+    first = _issue_webhook(client, config, repository_issue_body, "limit-first")
+    assert first.status_code == 200, first.text
+    for delivery in ("limit-first", "limit-redelivered"):  # replay and redelivery of the admitted issue
+        assert _issue_webhook(client, config, repository_issue_body, delivery).status_code == 200
+    _, context = app.state.test_services[0]
+    admitted = [p for p in context.previews.list_previews(pending_only=False, limit=10) if p.approved]
+    assert len(admitted) == 1
+    other = json.loads(json.dumps(repository_issue_body))
+    other["issue"].update(id=303, number=8, title="Handle long widget names")
+    second = _issue_webhook(client, config, other, "limit-second")
+    assert second.status_code == 409 and "admission limit reached" in second.json()["detail"]
+    pending = [p for p in context.previews.list_previews(pending_only=True, limit=10)]
+    assert len(pending) == 1 and len(calls) == 2  # first task only: [assignment, cleanup]
+    approved = client.post("/internal/developer/preview/approve", headers=_internal_headers(config), json={
+        "preview_id": pending[0].preview_id, "base_revision": local_issue_repository[1]})
+    assert approved.status_code == 200, approved.text  # over the limit, a human approval still admits
+
+
+def test_automatic_admission_refuses_random_outsider(
+    test_config, tmp_path, repository_issue_body, local_issue_repository,
+) -> None:
+    config, app, calls = _webhook_admission_app(test_config, tmp_path, local_issue_repository, "automatic",
+                                                labels=("aitobuild:auto",))
+    repository_issue_body["issue"]["user"] = {"login": "random-outsider"}
+    repository_issue_body["sender"] = {"login": "random-outsider"}
+    response = _issue_webhook(TestClient(app), config, repository_issue_body, "outsider")
+    assert response.status_code == 409 and "allowlisted issue author or label" in response.json()["detail"]
+    _, context = app.state.test_services[0]
+    assert all(not preview.approved for preview in context.previews.list_previews(pending_only=False, limit=10))
+    assert calls == []
+
+
+@pytest.mark.parametrize("edit", ["edited", "reopened_as_new_task"])
+def test_one_automatic_admission_per_issue_and_edits_wait_for_a_human(
+    test_config, tmp_path, repository_issue_body, local_issue_repository, edit,
+) -> None:
+    config, app, calls = _webhook_admission_app(test_config, tmp_path, local_issue_repository, "automatic")
+    client = TestClient(app)
+    first = _issue_webhook(client, config, repository_issue_body, "issue-opened")
+    assert first.status_code == 200, first.text
+    changed = json.loads(json.dumps(repository_issue_body))
+    changed["issue"]["body"] = changed["issue"]["body"].replace("Reject empty names.", "Reject blank names.")
+    content = json.dumps({**changed, "action": "edited" if edit == "edited" else "opened"}).encode()
+    second = client.post("/webhook", content=content, headers={
+        "X-GitHub-Event": "issues", "X-GitHub-Delivery": "issue-" + edit,
+        "X-Hub-Signature-256": _signature(config.webhook_secret, content)})
+    assert second.status_code == 200, second.text
+    assert second.json()["route"] == "developer.preview_required"
+    _, context = app.state.test_services[0]
+    previews = context.previews.list_previews(pending_only=False, limit=10)
+    assert len(previews) == 2 and sum(preview.approved for preview in previews) == 1
+    assert len(calls) == 2  # one run: [assignment, cleanup]
+
+
+def test_automatic_admission_route_matches_repository_id_not_just_name(
+    test_config, tmp_path, repository_issue_body, local_issue_repository,
+) -> None:
+    config, app, calls = _webhook_admission_app(test_config, tmp_path, local_issue_repository, "automatic")
+    _, context = app.state.test_services[0]
+    repository_issue_body["repository"] = {**repository_issue_body["repository"], "id": 999}  # same name, other repo
+    response = _issue_webhook(TestClient(app), config, repository_issue_body, "renamed-repo")
+    # Unmatched route: no admission attempt at all (a name-only match would reach the base binding and 409).
+    assert response.status_code == 200 and response.json()["route"] == "developer.preview_required"
+    assert all(not preview.approved for preview in context.previews.list_previews(pending_only=False, limit=10))
+    assert calls == []
+
+
+def test_edited_event_alone_never_auto_admits(
+    test_config, tmp_path, repository_issue_body, local_issue_repository,
+) -> None:
+    config, app, calls = _webhook_admission_app(test_config, tmp_path, local_issue_repository, "automatic")
+    content = json.dumps({**repository_issue_body, "action": "edited"}).encode()
+    response = TestClient(app).post("/webhook", content=content, headers={
+        "X-GitHub-Event": "issues", "X-GitHub-Delivery": "edited-only",
+        "X-Hub-Signature-256": _signature(config.webhook_secret, content)})
+    assert response.status_code == 200 and response.json()["route"] == "developer.preview_required"
+    _, context = app.state.test_services[0]
     assert all(not preview.approved for preview in context.previews.list_previews(pending_only=False, limit=10))
     assert calls == []
