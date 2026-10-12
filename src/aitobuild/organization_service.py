@@ -9,12 +9,12 @@ from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal, Mapping
+from typing import Annotated, Any, Awaitable, Callable, Literal, Mapping, assert_never
 
 from pydantic import Field, JsonValue, StrictInt, StrictStr
 
 from aitobuild.agent_tools import DeveloperToolContext
-from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
+from aitobuild.approval_policy import ApprovalDecision, ApprovalPolicy, ApprovalStage
 from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import (AutomaticAdmissionDeferred, DeveloperPreview, DeveloperPreviewRegistry, is_planned_child,
@@ -37,6 +37,53 @@ def _approved_scope_matches(preview: DeveloperPreview, run: ManagedRun) -> bool:
     """True only when the preview is still approved and its exact bundle matches the run's pinned scope digest."""
     content = json.dumps(preview.bundle_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return preview.approved and sha256(content.encode()).hexdigest() == run.scope_digest
+
+
+
+class Human(DefinitionModel):
+    """A person approved the exact task (the HTTP approve endpoint)."""
+    kind: Literal["human"] = "human"
+    base_revision: StrictStr | None = None
+
+
+class OperatorPolicy(DefinitionModel):
+    """Configured automatic admission through the issue author/label allowlist."""
+    kind: Literal["operator_policy"] = "operator_policy"
+
+
+class PlannedChild(DefinitionModel):
+    """A PM-planned child (or dependent handoff) qualifying through its human-approved plan (#31)."""
+    kind: Literal["planned_child"] = "planned_child"
+
+
+class InheritedReview(DefinitionModel):
+    """A staged Architect review inheriting eligibility from its admitted parent (#37)."""
+    kind: Literal["inherited_review"] = "inherited_review"
+
+
+AdmissionEvidence = Annotated[Human | OperatorPolicy | PlannedChild | InheritedReview, Field(discriminator="kind")]
+
+
+def admit_task(previews: DeveloperPreviewRegistry, preview_id: str, evidence: AdmissionEvidence, *,
+               base_revision: str | None = None, decision: ApprovalDecision | None = None,
+               max_automatic_admissions: int | None = None,
+               expected: DeveloperPreview | None = None) -> DeveloperPreview | None:
+    """The only caller of DeveloperPreviewRegistry._approve_admission (PLAN 2.4); `expected` is the exact preview
+    the configured checks evaluated and must equal the stored one, since the decision digest omits source_payload. Configured evidence is checked by
+    OrganizationService.admit_task first; the limit and dedupe follow the resolved decision source."""
+    match evidence:
+        case Human():
+            if decision is not None or base_revision is not None:
+                raise ValueError("Human admission carries its own base revision and no policy decision")
+            base_revision = evidence.base_revision
+        case OperatorPolicy() | PlannedChild() | InheritedReview():
+            if decision is None or expected is None:
+                raise PermissionError("Configured admission requires a resolved decision and its evaluated preview")
+        case _:
+            assert_never(evidence)
+    limit = max_automatic_admissions if decision is not None and decision.source == "operator_policy" else None
+    return previews._approve_admission(preview_id, base_revision=base_revision, approval_policy=decision, expected=expected,
+                            max_automatic_admissions=limit)
 
 
 class ManagedRoute(DefinitionModel):
@@ -220,19 +267,45 @@ class ManagedOrganizationService:
             route = route.model_copy(update={"revision": assignment.revision, "event": assignment.event})
         return preview, route
 
-    def _automatic_task_approval(self, preview: DeveloperPreview) -> DeveloperPreview:
+    def _admission_gate(self, preview: DeveloperPreview) -> bool:
+        """True when a configured (non-human) admission may be evaluated at all; False leaves the task waiting."""
         if self.approval_policy.task_admission == "disabled":
             raise PermissionError("Task admission is disabled")
         if preview.approved or self.approval_policy.task_admission == "human":
-            return preview
+            return False
         if preview.source_payload.get("action") == "edited":
-            return preview  # an edit never auto-admits; it waits for a human approval
+            return False  # an edit never auto-admits; it waits for a human approval
         bundle = developer_task_bundle_from_payload(preview.bundle_payload)
         if bundle.task_id.startswith("pm-planning-") or bundle.issue_context is None:
             raise PermissionError("Planning and non-repository tasks always require a human admission")
-        # A staged Architect review is eligible only as the admitted parent task whose exact published head it
-        # reviews; the parent then goes through the same planned-child check and trusted base callback.
-        eligibility = self._admitted_review_parent(preview) if published_review_target(preview) is not None else preview
+        return True
+
+    @staticmethod
+    def _evidence_for(preview: DeveloperPreview) -> OperatorPolicy | PlannedChild | InheritedReview:
+        if published_review_target(preview) is not None:
+            return InheritedReview()
+        return PlannedChild() if is_planned_child(preview) else OperatorPolicy()
+
+    def _automatic_task_approval(self, preview: DeveloperPreview) -> DeveloperPreview:
+        if not self._admission_gate(preview):
+            return preview
+        return self._admit(preview, self._evidence_for(preview))
+
+    def _admit(self, preview: DeveloperPreview, evidence: OperatorPolicy | PlannedChild | InheritedReview) -> DeveloperPreview:
+        """Configured-evidence checks; the approval itself goes through the module-level admit_task (PLAN 2.4)."""
+        if self._evidence_for(preview) != evidence:
+            raise PermissionError("Admission evidence does not match its task")
+        bundle = developer_task_bundle_from_payload(preview.bundle_payload)
+        eligibility: DeveloperPreview
+        match evidence:
+            case InheritedReview():
+                # A staged Architect review is eligible only as the admitted parent task whose exact published head
+                # it reviews; the parent then goes through the same planned-child check and trusted base callback.
+                eligibility = self._admitted_review_parent(preview)
+            case PlannedChild() | OperatorPolicy():
+                eligibility = preview
+            case _:
+                assert_never(evidence)
         if is_planned_child(eligibility):
             self._check_planned_child(eligibility)
             parent_issue = developer_task_bundle_from_payload(eligibility.bundle_payload).issue_context
@@ -254,8 +327,8 @@ class ManagedOrganizationService:
         decision = self.approval_policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id=self.operator_id,
             operation=preview_approval_operation(preview.preview_id, payload), automatic_supported=True)
         try:
-            approved = self._previews.approve(preview.preview_id, base_revision=base, approval_policy=decision,
-                                              max_automatic_admissions=self.approval_policy.max_automatic_admissions)
+            approved = admit_task(self._previews, preview.preview_id, evidence, base_revision=base, decision=decision, expected=preview,
+                                  max_automatic_admissions=self.approval_policy.max_automatic_admissions)
         except AutomaticAdmissionDeferred:
             return preview  # one automatic admission per repository/issue ID; later tasks wait for a human
         if approved is None:

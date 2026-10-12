@@ -168,7 +168,10 @@ class DispatcherAgent(Dispatcher):
     def approve_developer_preview(
         self, preview_id: str, *, base_revision: str | None = None,
     ) -> DeveloperPreview | None:
-        return self.developer_preview_registry.approve(preview_id, base_revision=base_revision)
+        # Deferred import: organization_service imports aitobuild.dispatcher (transitively), so a top-level import would cycle.
+        from aitobuild.organization_service import Human, admit_task  # the one admission route (PLAN 2.4)
+
+        return admit_task(self.developer_preview_registry, preview_id, Human(base_revision=base_revision))
 
     def uses_durable_dedupe(self, event: InternalEvent) -> bool:
         body = event.payload.get("body")
