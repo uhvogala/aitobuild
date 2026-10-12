@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import asyncio
+import time
 from concurrent.futures import ThreadPoolExecutor
 import json
 from threading import Event
@@ -219,7 +220,7 @@ def test_operator_cancellation_keeps_worker_available_for_other_tasks(tmp_path, 
         worker.enqueue(preview_id)
         await worker.start()
         try:
-            await started.wait()
+            await asyncio.wait_for(started.wait(), timeout=30)
             assert (await worker.cancel(preview_id)).state == "cancelled"
             worker.enqueue(second.preview_id)
             assert (await finish(worker, second.preview_id)).state == "completed"
@@ -680,3 +681,77 @@ def test_followup_queueing_skips_a_child_that_already_has_a_receipt(tmp_path, ap
 
     asyncio.run(exercise())
     assert child.preview_id not in enqueued
+
+
+
+class _ContendedLock:
+    """Invocation lock that reports contention until a deadline, like a dispatcher that has not woken yet."""
+
+    def __init__(self, lock, until):
+        self._lock = lock
+        self._until = until
+
+    def acquire(self, *args, **kwargs):
+        from filelock import Timeout
+
+        if time.monotonic() < self._until:
+            raise Timeout(self._lock.lock_file)
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self, *args, **kwargs):
+        return self._lock.release(*args, **kwargs)
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+def _cancel_under_contention(tmp_path, approved_delivery, monkeypatch, *, held_seconds):
+    _, _, preview_id, _, _ = approved_delivery
+
+    async def exercise():
+        started = asyncio.Event()
+
+        async def operation(context, message):
+            started.set()
+            await asyncio.Event().wait()
+
+        worker, _, _, _ = make_worker(tmp_path, approved_delivery, ManagedOperation(operation))
+        worker.enqueue(preview_id)
+        await worker.start()
+        try:
+            await asyncio.wait_for(started.wait(), timeout=30)
+            real = worker.store.invocation_lock
+            until = time.monotonic() + held_seconds
+            monkeypatch.setattr(worker.store, "invocation_lock",
+                                lambda pid: _ContendedLock(real(pid), until) if pid == preview_id else real(pid))
+            began = time.monotonic()
+            try:
+                return await asyncio.wait_for(worker.cancel(preview_id), timeout=30), time.monotonic() - began
+            finally:
+                monkeypatch.setattr(worker.store, "invocation_lock", real)
+        finally:
+            await worker.close()
+
+    return asyncio.run(exercise())
+
+
+def test_cancel_waits_for_local_dispatcher_to_release_lock(tmp_path, approved_delivery, monkeypatch):
+    # Deterministic form of #33: the dispatcher still holds the lock briefly after the cancelled task ends.
+    job, _ = _cancel_under_contention(tmp_path, approved_delivery, monkeypatch, held_seconds=0.2)
+    assert job.state == "cancelled"
+
+
+def test_local_cancel_lock_wait_is_bounded_and_explicit(tmp_path, approved_delivery, monkeypatch):
+    from filelock import Timeout
+
+    import aitobuild.organization_worker as module
+
+    monkeypatch.setattr(module, "_LOCAL_CANCEL_LOCK_SECONDS", 0.2)
+    began = time.monotonic()
+    with pytest.raises(Timeout):
+        _cancel_under_contention(tmp_path, approved_delivery, monkeypatch, held_seconds=60)
+    assert time.monotonic() - began < 10

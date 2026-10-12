@@ -194,6 +194,10 @@ class FileWorkerStore:
         return FileLock(self._checked(path), timeout=0)
 
 
+_LOCAL_CANCEL_LOCK_SECONDS = 5.0
+_LOCAL_CANCEL_LOCK_RETRY_SECONDS = 0.01
+
+
 class ManagedOrganizationWorker:
     def __init__(
         self, *, service: ManagedOrganizationService, store: WorkerStore,
@@ -341,17 +345,39 @@ class ManagedOrganizationWorker:
             except asyncio.CancelledError:
                 if not active.done():
                     raise
-        with self.store.invocation_lock(preview_id):
+        # Without a local task another worker may own the lock, so keep the immediate refusal there.
+        lock = await self._acquire_after_local_cancel(preview_id) if active is not None else None
+        if lock is None:
+            lock = self.store.invocation_lock(preview_id)
+            lock.acquire()
+        try:
             current = self.store.get(preview_id)
             if current is None:
                 raise ValueError("Worker admission disappeared")
             if current.state not in {"completed", "failed", "cancelled"}:
                 await self._abort(current)
                 self._update(current, state="cancelled", error="Operator cancelled worker admission")
+        finally:
+            lock.release()
         result = self.store.get(preview_id)
         if result is None:
             raise RuntimeError("Internal invariant violated: result is not None")
         return result
+
+    async def _acquire_after_local_cancel(self, preview_id: str) -> FileLock:
+        # The dispatcher loop that owned the cancelled task releases the invocation lock only after its
+        # own wait wakes up, which can race with this coroutine. Yield to the loop and retry for a bounded
+        # time; if the lock is still held after that, fail explicitly with the lock timeout.
+        deadline = asyncio.get_running_loop().time() + _LOCAL_CANCEL_LOCK_SECONDS
+        while True:
+            lock = self.store.invocation_lock(preview_id)
+            try:
+                lock.acquire()
+                return lock
+            except LockTimeout:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise
+            await asyncio.sleep(_LOCAL_CANCEL_LOCK_RETRY_SECONDS)
 
     async def wait_idle(self, preview_id: str) -> WorkerJob:
         while True:
