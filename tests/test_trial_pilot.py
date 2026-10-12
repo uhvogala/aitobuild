@@ -28,7 +28,9 @@ PLAN = {
 
 
 def args(*extra: str, tmp: Path):
-    return pilot.parse_arguments([*extra, "--work-root", str(tmp)])
+    return pilot.parse_arguments(
+        [*extra, "--work-root", str(tmp), "--allowed-issue-author", "uhvogala"]
+    )
 
 
 def test_start_defaults_lock_repository_and_stages(tmp_path: Path) -> None:
@@ -78,7 +80,15 @@ def test_override_and_resume_accepted(tmp_path: Path) -> None:
 
 def test_work_root_inside_service_refused() -> None:
     with pytest.raises(SystemExit):
-        pilot.parse_arguments(["start", "--work-root", str(pilot.SERVICE_ROOT / "runs")])
+        pilot.parse_arguments(
+            [
+                "start",
+                "--allowed-issue-author",
+                "uhvogala",
+                "--work-root",
+                str(pilot.SERVICE_ROOT / "runs"),
+            ]
+        )
 
 
 def test_resolve_automatic_stages() -> None:
@@ -390,5 +400,54 @@ def test_refresh_seed_base_refuses_diverged_seed(tmp_path: Path) -> None:
         ],
         check=True,
     )
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(pilot.SeedError, match="(?s)diverged.*(fatal|forward)"):
         pilot.refresh_seed_base(seed, "master")
+
+
+def test_refresh_seed_base_refuses_dirty_seed(tmp_path: Path) -> None:
+    _, seed = seed_clone(tmp_path)
+    (seed / "stray.txt").write_text("x")
+    with pytest.raises(pilot.SeedError, match="uncommitted"):
+        pilot.refresh_seed_base(seed, "master")
+
+
+def test_refresh_seed_base_refuses_other_checkout(tmp_path: Path) -> None:
+    upstream, seed = seed_clone(tmp_path)
+    subprocess.run(["git", "-C", str(seed), "checkout", "-q", "-b", "other"], check=True)
+    with pytest.raises(pilot.SeedError, match="must have master checked out"):
+        pilot.refresh_seed_base(seed, "master")
+    # the seed's own branch "other" must not have been fast-forwarded either
+    assert pilot.git(seed, "rev-parse", "HEAD") != pilot.git(upstream, "rev-parse", "HEAD")
+
+
+def test_pilot_requires_issue_author(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        pilot.parse_arguments(["start", "--work-root", str(tmp_path)])
+
+
+@pytest.mark.parametrize("value", ["", "  ", "*", "uh*", "a,b", "uhvogala bot", "-x", "a" * 40])
+def test_pilot_rejects_bad_issue_author(value: str, tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        pilot.parse_arguments(
+            ["start", "--work-root", str(tmp_path), "--allowed-issue-author", value]
+        )
+
+
+def test_early_failure_is_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_network(*_: str) -> None:
+        raise RuntimeError("gh unavailable")
+
+    monkeypatch.setattr(pilot, "gh_json", no_network)
+    monkeypatch.setattr(
+        pilot, "datetime", type("Frozen", (), {"now": staticmethod(lambda tz: _Stamp())})
+    )
+    with pytest.raises(RuntimeError, match="gh unavailable"):
+        pilot.main(["start", "--allowed-issue-author", "uhvogala", "--work-root", str(tmp_path)])
+    report = json.loads((tmp_path / "artifacts" / "trial4-frozen" / "report.json").read_text())
+    assert report["result"] == "failed" and "gh unavailable" in report["failure"]
+    assert report["ended_at"] and report["sessions"][-1]["ended_at"]
+
+
+class _Stamp:
+    def strftime(self, _: str) -> str:
+        return "frozen"

@@ -35,6 +35,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import followups  # noqa: E402 - script-local shared module
 from common import (  # noqa: E402
+    record_early_failure,
+    add_issue_author_argument,
+    repository_source,
+    require_issue_author,
+    trial_environment_values,
     ALL_STAGES,
     ALLOWED_AUTOMATIC_STAGES,
     DEFAULT_ENDPOINT,
@@ -82,6 +87,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--work-root", type=Path, default=Path("/workspace/trials"))
     parser.add_argument("--model", default="grok-4.6")
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
+    add_issue_author_argument(parser)
     parser.add_argument("--sudo-docker", action="store_true")
     parser.add_argument("--automatic-stage", action="append", choices=ALL_STAGES)
     parser.add_argument("--poll-seconds", type=positive, default=3.0)
@@ -110,6 +116,10 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     try:
         arguments.automatic_stages = resolve_automatic_stages(arguments.automatic_stage)
     except ValueError as error:
+        parser.error(str(error))
+    try:
+        require_issue_author(arguments.automatic_stages, arguments.allowed_issue_author)
+    except SystemExit as error:
         parser.error(str(error))
     work_root = arguments.work_root.resolve()
     if work_root == SERVICE_ROOT or SERVICE_ROOT in work_root.parents:
@@ -194,11 +204,25 @@ def classify_planned_child(task_id: str, status_code: int, plan: dict[str, Any])
     raise RuntimeError(f"Planned child {issue['key']} answered {status_code}")
 
 
+class SeedError(RuntimeError):
+    """The local seed cannot be fast-forwarded safely to the merged base."""
+
+
 def refresh_seed_base(seed: Path, branch: str) -> str:
     """Bring the seed's checked-out base branch up to the merged remote base.
 
     Git refuses to fetch into the checked-out branch, so fetch into the remote-tracking ref and fast-forward the
-    clean seed checkout to it; a diverged seed fails instead of being reset."""
+    clean seed checkout to it. A dirty, detached or diverged seed fails instead of being reset."""
+    status = git(seed, "status", "--porcelain")
+    if status:
+        raise SeedError(f"Seed has uncommitted changes:\n{status}")
+    head = subprocess.run(
+        ["git", "-C", str(seed), "symbolic-ref", "--quiet", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if head != branch:
+        raise SeedError(f"Seed must have {branch} checked out, not {head or 'a detached HEAD'}")
     git(
         seed,
         "fetch",
@@ -207,9 +231,15 @@ def refresh_seed_base(seed: Path, branch: str) -> str:
         "origin",
         f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
     )
-    if git(seed, "symbolic-ref", "--quiet", "--short", "HEAD") != branch:
-        raise RuntimeError(f"Seed must have {branch} checked out")
-    git(seed, "merge", "--ff-only", "--quiet", f"refs/remotes/origin/{branch}")
+    merged = subprocess.run(
+        ["git", "-C", str(seed), "merge", "--ff-only", "--quiet", f"refs/remotes/origin/{branch}"],
+        capture_output=True,
+        text=True,
+    )
+    if merged.returncode != 0:
+        raise SeedError(
+            f"Seed {branch} has diverged from origin/{branch}; refusing to reset it: {merged.stderr.strip()}"
+        )
     return git(seed, "rev-parse", f"refs/heads/{branch}")
 
 
@@ -453,118 +483,111 @@ def main(argv: Sequence[str] | None = None) -> int:
         "merge_gate": MERGE_GATE,
         "service_merge_stage": "disabled",
     }
-    repo = gh_json("api", f"repos/{arguments.repository}")
-    report.update(
-        trial="4: small M5 pilot",
-        trial_id=trial_id,
-        repository=repo["full_name"],
-        model=arguments.model,
-        run_dir=str(run_dir),
-        result="running",
-    )
-    seed, service_cwd = run_dir / "seed", run_dir / "service"
-    branch = repo["default_branch"]
-    if arguments.command == "start":
-        run_dir.mkdir(parents=True)
-        subprocess.run(
-            [
-                "git",
-                "clone",
-                "--quiet",
-                "--branch",
-                branch,
-                f"https://github.com/{repo['full_name']}.git",
-                str(seed),
-            ],
-            check=True,
+    try:
+        repo = gh_json("api", f"repos/{arguments.repository}")
+        report.update(
+            trial="4: small M5 pilot",
+            trial_id=trial_id,
+            repository=repo["full_name"],
+            model=arguments.model,
+            run_dir=str(run_dir),
+            result="running",
         )
-        report["service_commit"] = git(SERVICE_ROOT, "rev-parse", "HEAD")
-        subprocess.run(
-            ["git", "clone", "--quiet", "--no-local", str(SERVICE_ROOT), str(service_cwd)],
-            check=True,
-        )
-        git(service_cwd, "checkout", "--quiet", "--detach", report["service_commit"])
-    else:
-        refresh_seed_base(seed, branch)
-        for point in report.get("merge_points", []):
-            pull = gh_json(
-                "pr",
-                "view",
-                str(point["pull_number"]),
-                "-R",
-                repo["full_name"],
-                "--json",
-                "state,headRefOid,mergeCommit",
-            )
-            point["state"] = check_merge_point(point, pull)
-            if point["state"] == "MERGED":
-                point["merge_commit"] = pull["mergeCommit"]["oid"]
-                require_merge_commit_on_base(seed, point["merge_commit"], branch)
-        report["operator_actions"].append(
-            {
-                "at": now(),
-                "kind": "seed_provisioning",
-                "what": "merged base branch into seed before dependency handoff",
-                "head_sha": git(seed, "rev-parse", f"refs/heads/{branch}"),
-            }
-        )
-    base = git(seed, "rev-parse", f"refs/heads/{branch}")
-    report.setdefault("bases", []).append(base)
-    recorder.save()
-    if arguments.sudo_docker:
-        prepare_docker_wrapper(run_dir / "bin")
-    token = secrets.token_hex(24)  # per process, never written to the report
-    configure_trial_environment(
-        automatic_stages=stages,
-        values={
-            "AITOBUILD_WEBHOOK_SECRET": secrets.token_hex(24),
-            "AITOBUILD_INTERNAL_API_TOKEN": token,
-            "AITOBUILD_REQUIRE_INTERNAL_AUTH": "true",
-            "AITOBUILD_REQUIRE_APPROVAL_FOR_REPO_WRITES": "true",
-            "AITOBUILD_REQUIRE_DEVELOPER_PREVIEW": "true",
-            "AITOBUILD_ALLOW_MOCK_MODEL": "false",
-            "AITOBUILD_FOUNDRY_ENDPOINT": arguments.endpoint,
-            "AITOBUILD_FOUNDRY_MODEL": arguments.model,
-            "AITOBUILD_DEVELOPER_EXECUTION_MODE": "container_session",
-            "AITOBUILD_DEVELOPER_SESSION_CONTAINER_IMAGE": "aitobuild-developer:local",
-            "AITOBUILD_DEVELOPER_STATE_DIR": str(run_dir / "state" / "developer"),
-            "AITOBUILD_DEVELOPER_AGENT_INVOKE_TIMEOUT_SECONDS": str(int(arguments.invoke_timeout)),
-            "AITOBUILD_DEVELOPER_REPOSITORY_SOURCES": json.dumps(
+        seed, service_cwd = run_dir / "seed", run_dir / "service"
+        branch = repo["default_branch"]
+        if arguments.command == "start":
+            run_dir.mkdir(parents=True)
+            subprocess.run(
                 [
-                    {
-                        "repository": repo["full_name"],
-                        "repository_id": repo["id"],
-                        "path": str(seed),
-                        "verification_commands": [followups.VERIFY_COMMAND],
-                        "base_revision": base,
-                    }
-                ]
+                    "git",
+                    "clone",
+                    "--quiet",
+                    "--branch",
+                    branch,
+                    f"https://github.com/{repo['full_name']}.git",
+                    str(seed),
+                ],
+                check=True,
+            )
+            report["service_commit"] = git(SERVICE_ROOT, "rev-parse", "HEAD")
+            subprocess.run(
+                ["git", "clone", "--quiet", "--no-local", str(SERVICE_ROOT), str(service_cwd)],
+                check=True,
+            )
+            git(service_cwd, "checkout", "--quiet", "--detach", report["service_commit"])
+        else:
+            refresh_seed_base(seed, branch)
+            for point in report.get("merge_points", []):
+                pull = gh_json(
+                    "pr",
+                    "view",
+                    str(point["pull_number"]),
+                    "-R",
+                    repo["full_name"],
+                    "--json",
+                    "state,headRefOid,mergeCommit",
+                )
+                point["state"] = check_merge_point(point, pull)
+                if point["state"] == "MERGED":
+                    point["merge_commit"] = pull["mergeCommit"]["oid"]
+                    require_merge_commit_on_base(seed, point["merge_commit"], branch)
+            report["operator_actions"].append(
+                {
+                    "at": now(),
+                    "kind": "seed_provisioning",
+                    "what": "merged base branch into seed before dependency handoff",
+                    "head_sha": git(seed, "rev-parse", f"refs/heads/{branch}"),
+                }
+            )
+        base = git(seed, "rev-parse", f"refs/heads/{branch}")
+        report.setdefault("bases", []).append(base)
+        recorder.save()
+        if arguments.sudo_docker:
+            prepare_docker_wrapper(run_dir / "bin")
+        token = secrets.token_hex(24)  # per process, never written to the report
+        configure_trial_environment(
+            automatic_stages=stages,
+            values=trial_environment_values(
+                source=repository_source(
+                    repository=repo["full_name"],
+                    repository_id=repo["id"],
+                    path=seed,
+                    verification_command=followups.VERIFY_COMMAND,
+                    base_revision=base,
+                    issue_author=arguments.allowed_issue_author,
+                ),
+                run_dir=run_dir,
+                endpoint=arguments.endpoint,
+                model=arguments.model,
+                invoke_timeout=arguments.invoke_timeout,
+                secret=secrets.token_hex(24),
+                token=token,
             ),
-            "AITOBUILD_GITHUB_ADAPTER": "gh_cli",
-            "AITOBUILD_GITHUB_DEFAULT_REPOSITORY": repo["full_name"],
-            "AITOBUILD_GITHUB_ALLOWED_REPOS": repo["full_name"],
-            "AITOBUILD_WEB_SEARCH_ADAPTER": "mock",
-            "AITOBUILD_SCHEDULER_ENABLED": "false",
-            "AITOBUILD_MANAGED_WORKER_QUEUE_FOLLOW_UPS": "true",
-        },
-    )
-    os.chdir(service_cwd)
+        )
+        os.chdir(service_cwd)
 
-    from fastapi.testclient import TestClient
+        from fastapi.testclient import TestClient
 
-    from aitobuild.app import create_app
-    from aitobuild.config import load_config
-    from aitobuild.developer_isolation import default_developer_isolation_policy
-    from aitobuild.organization_planning import PlanningLimits, PlanningScope
+        from aitobuild.app import create_app
+        from aitobuild.config import load_config
+        from aitobuild.developer_isolation import default_developer_isolation_policy
+        from aitobuild.organization_planning import PlanningLimits, PlanningScope
 
-    config = load_config()
-    report["approval_policy"] = check_policy(config.approvals, stages)
-    service_factory, worker_factory, holder = build(
-        repo["full_name"], repo["id"], run_dir / "state" / "organization", arguments.invoke_timeout
-    )
-    app = create_app(
-        config, managed_service_factory=service_factory, managed_worker_factory=worker_factory
-    )
+        config = load_config()
+        report["approval_policy"] = check_policy(config.approvals, stages)
+        service_factory, worker_factory, holder = build(
+            repo["full_name"],
+            repo["id"],
+            run_dir / "state" / "organization",
+            arguments.invoke_timeout,
+        )
+        app = create_app(
+            config, managed_service_factory=service_factory, managed_worker_factory=worker_factory
+        )
+    except BaseException as error:  # noqa: BLE001 - failures before the service starts are recorded too
+        record_early_failure(recorder, error)
+        raise
+
     try:
         with TestClient(app) as client:
             operator = Operator(
