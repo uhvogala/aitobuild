@@ -27,6 +27,7 @@ from aitobuild.tools.filesystem import MockFilesystemAdapter
 from aitobuild.tools.github import MockGitHubAdapter
 from test_dispatcher import approved_delivery as approved_delivery, verification_adapter as verification_adapter
 from test_organization_assignments import approved_task, coordinator_proposal, setup_service, assign
+from conftest import approve_preview
 
 
 def runner_fixture(tmp_path, operations=None, actor=None, cleanup=None, approval_policy=None):
@@ -415,7 +416,7 @@ def test_service_capacity_rejection_keeps_prepared_budget_for_later_admission(tm
     payload = json.loads(json.dumps(previews.get(preview_id).bundle_payload))
     payload["task_id"] = "other-approved-task"
     other = previews.create_or_get(dedupe_key="other-approved-task", bundle_payload=payload, source_payload={})
-    other = previews._approve_admission(other.preview_id, base_revision=revision)
+    other = approve_preview(previews, other.preview_id, base_revision=revision)
     with pytest.raises(ValueError, match="capacity"):
         asyncio.run(service.consume(other.preview_id))
     assert assignments.for_task("other-approved-task") is None

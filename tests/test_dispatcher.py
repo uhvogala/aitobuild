@@ -21,6 +21,7 @@ from aitobuild.developer_preview import DeveloperPreviewRegistry
 from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import EventOrigin, EventType, make_internal_event
 from aitobuild.triggers import InMemoryDedupeStore, TriggerEngine
+from conftest import approve_preview
 
 
 def test_dispatcher_routes_webhook_events() -> None:
@@ -266,7 +267,7 @@ def test_preview_scope_cannot_be_mutated_by_callers(tmp_path, repository_issue_b
     preview.bundle_payload["policy"]["allowed_paths"].append("secrets/")
     repository_issue_body["issue"]["title"] = "Mutated"
     assert registry.get(preview.preview_id).bundle_payload == expected
-    approved = registry._approve_admission(preview.preview_id, base_revision="a" * 40)
+    approved = approve_preview(registry, preview.preview_id, base_revision="a" * 40)
     approved.bundle_payload["objective"] = "Mutated"
     assert registry.get(preview.preview_id).bundle_payload["objective"] == expected["objective"]
 
@@ -387,7 +388,7 @@ def test_delivery_prepares_only_the_approved_base_in_a_private_checkout(tmp_path
     )
     with pytest.raises(ValueError, match="approval"):
         worker.prepare(preview.preview_id)
-    approved = registry._approve_admission(preview.preview_id, base_revision=revision)
+    approved = approve_preview(registry, preview.preview_id, base_revision=revision)
     for sources in ((), (LocalRepositorySource(repository, 102, source),)):
         unconfigured = DeveloperDeliveryWorker(
             preview_registry=registry, state_dir=tmp_path / "state", service_root=Path.cwd(),
@@ -420,7 +421,7 @@ def approved_delivery(tmp_path, repository_issue_body, local_issue_repository):
     preview = DispatcherAgent(developer_preview_registry=registry).create_developer_preview(
         dedupe_key="github:worker", github_event="issues", action="opened", body=repository_issue_body,
     )
-    registry._approve_admission(preview.preview_id, base_revision=revision)
+    approve_preview(registry, preview.preview_id, base_revision=revision)
     worker = DeveloperDeliveryWorker(
         preview_registry=registry, state_dir=tmp_path / "state", service_root=Path.cwd(),
         repository_sources=(LocalRepositorySource("fixture/widgets", 101, source),),
@@ -916,7 +917,7 @@ def test_preparation_rejects_commit_outside_the_base_branch(tmp_path, repository
     preview = DispatcherAgent(developer_preview_registry=registry).create_developer_preview(
         dedupe_key="github:unrelated", github_event="issues", action="opened", body=repository_issue_body,
     )
-    registry._approve_admission(preview.preview_id, base_revision=unrelated)
+    approve_preview(registry, preview.preview_id, base_revision=unrelated)
     worker = DeveloperDeliveryWorker(
         preview_registry=registry, state_dir=tmp_path / "state", service_root=Path.cwd(),
         repository_sources=(LocalRepositorySource("fixture/widgets", 101, source),),

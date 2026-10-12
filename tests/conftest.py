@@ -89,3 +89,9 @@ def test_config(tmp_path: Path) -> AppConfig:
         github=GitHubConfig(adapter="mock", default_repository="uhvogala/aitobuild_example"),
         web_search=WebSearchConfig(adapter="mock"),
     )
+
+
+def approve_preview(registry: Any, preview_id: str, **kwargs: Any) -> Any:
+    """Test-only stand-in for a human or recorded admission: the one place tests reach the private
+    DeveloperPreviewRegistry._approve_admission directly (src code must go through admission's admit_task)."""
+    return registry._approve_admission(preview_id, **kwargs)

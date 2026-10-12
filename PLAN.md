@@ -504,8 +504,11 @@ itself. Disabled means refusal, not approval bypass.
 
 Task admission has exactly one route: the module-level `admit_task` in
 `organization_service.py`, the only code that may reach the private
-`DeveloperPreviewRegistry._approve_admission` (a test scans `src` for any other
-reference, alias or `getattr` string). Human approvals (the HTTP approve
+`DeveloperPreviewRegistry._approve_admission`. A static test scans `src` for any
+other reference: source text, attribute access and aliases, every string constant
+(including implicit concatenation), and names assembled from literals with `+`,
+f-strings, `str.join` or `%`. A name built fully at runtime cannot be caught
+statically and is left to review. Human approvals (the HTTP approve
 endpoint) and configured admissions both enter it with typed evidence, a closed
 tagged union: `Human`, `OperatorPolicy`, `PlannedChild` (#31) and
 `InheritedReview` (#37). The configured checks run in `ManagedOrganizationService._admit`,
