@@ -168,6 +168,7 @@ class DispatcherAgent(Dispatcher):
     def approve_developer_preview(
         self, preview_id: str, *, base_revision: str | None = None,
     ) -> DeveloperPreview | None:
+        # Deferred import: organization_service imports aitobuild.dispatcher (transitively), so a top-level import would cycle.
         from aitobuild.organization_service import Human, admit_task  # the one admission route (PLAN 2.4)
 
         return admit_task(self.developer_preview_registry, preview_id, Human(base_revision=base_revision))

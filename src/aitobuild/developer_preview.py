@@ -212,13 +212,17 @@ class DeveloperPreviewRegistry:
                 self._by_task[task_key] = preview.preview_id
             return deepcopy(preview)
 
-    def approve(self, preview_id: str, *, base_revision: str | None = None,
+    def _approve_admission(self, preview_id: str, *, base_revision: str | None = None,
                 approval_policy: ApprovalDecision | None = None,
-                max_automatic_admissions: int | None = None) -> DeveloperPreview | None:
+                max_automatic_admissions: int | None = None,
+                expected: DeveloperPreview | None = None) -> DeveloperPreview | None:
+        """Private: call only through organization_service.admit_task (PLAN 2.4; enforced by tests)."""
         with self._transaction(write=True):
             preview = self._by_id.get(preview_id)
             if preview is None:
                 return None
+            if expected is not None and preview != expected:
+                raise PermissionError("Admitted preview differs from its stored record")
             bundle = deepcopy(preview.bundle_payload)
             context = bundle.get("issue_context")
             if isinstance(context, dict):

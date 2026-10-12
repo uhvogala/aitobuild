@@ -59,7 +59,7 @@ def correction_chain(implemented_delivery, verification_adapter, monkeypatch):
             "correction_from_review": review_id,
             "published_review": {"preview_id": target_id, "head_sha": target.publication["head_sha"]},
         })
-        worker._previews.approve(preview.preview_id)
+        worker._previews._approve_admission(preview.preview_id)
         record = worker.prepare(preview.preview_id)
         assert record.state == "prepared", record.error
         parsed = developer_task_bundle_from_payload(record.bundle_payload)

@@ -66,8 +66,10 @@ AdmissionEvidence = Annotated[Human | OperatorPolicy | PlannedChild | InheritedR
 
 def admit_task(previews: DeveloperPreviewRegistry, preview_id: str, evidence: AdmissionEvidence, *,
                base_revision: str | None = None, decision: ApprovalDecision | None = None,
-               max_automatic_admissions: int | None = None) -> DeveloperPreview | None:
-    """The only caller of DeveloperPreviewRegistry.approve. Configured evidence is checked by
+               max_automatic_admissions: int | None = None,
+               expected: DeveloperPreview | None = None) -> DeveloperPreview | None:
+    """The only caller of DeveloperPreviewRegistry._approve_admission (PLAN 2.4); `expected` is the exact preview
+    the configured checks evaluated and must equal the stored one, since the decision digest omits source_payload. Configured evidence is checked by
     OrganizationService.admit_task first; the limit and dedupe follow the resolved decision source."""
     match evidence:
         case Human():
@@ -75,12 +77,12 @@ def admit_task(previews: DeveloperPreviewRegistry, preview_id: str, evidence: Ad
                 raise ValueError("Human admission carries its own base revision and no policy decision")
             base_revision = evidence.base_revision
         case OperatorPolicy() | PlannedChild() | InheritedReview():
-            if decision is None:
-                raise PermissionError("Configured admission requires a resolved approval decision")
+            if decision is None or expected is None:
+                raise PermissionError("Configured admission requires a resolved decision and its evaluated preview")
         case _:
             assert_never(evidence)
     limit = max_automatic_admissions if decision is not None and decision.source == "operator_policy" else None
-    return previews.approve(preview_id, base_revision=base_revision, approval_policy=decision,
+    return previews._approve_admission(preview_id, base_revision=base_revision, approval_policy=decision, expected=expected,
                             max_automatic_admissions=limit)
 
 
@@ -289,22 +291,8 @@ class ManagedOrganizationService:
             return preview
         return self._admit(preview, self._evidence_for(preview))
 
-    def admit_task(self, preview_id: str, evidence: AdmissionEvidence) -> DeveloperPreview:
-        """The one task-admission route (see PLAN 2.4). New admission sources add an evidence variant here."""
-        if isinstance(evidence, Human):
-            approved = admit_task(self._previews, preview_id, evidence)
-            if approved is None:
-                raise ValueError("Preview not found")
-            return approved
-        preview = self._previews.get(preview_id)
-        if preview is None:
-            raise ValueError("Preview disappeared before configured admission")
-        if not self._admission_gate(preview):
-            return preview
-        return self._admit(preview, evidence)
-
     def _admit(self, preview: DeveloperPreview, evidence: OperatorPolicy | PlannedChild | InheritedReview) -> DeveloperPreview:
-        """Body of admit_task for configured evidence, on the exact preview the caller evaluated."""
+        """Configured-evidence checks; the approval itself goes through the module-level admit_task (PLAN 2.4)."""
         if self._evidence_for(preview) != evidence:
             raise PermissionError("Admission evidence does not match its task")
         bundle = developer_task_bundle_from_payload(preview.bundle_payload)
@@ -339,7 +327,7 @@ class ManagedOrganizationService:
         decision = self.approval_policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id=self.operator_id,
             operation=preview_approval_operation(preview.preview_id, payload), automatic_supported=True)
         try:
-            approved = admit_task(self._previews, preview.preview_id, evidence, base_revision=base, decision=decision,
+            approved = admit_task(self._previews, preview.preview_id, evidence, base_revision=base, decision=decision, expected=preview,
                                   max_automatic_admissions=self.approval_policy.max_automatic_admissions)
         except AutomaticAdmissionDeferred:
             return preview  # one automatic admission per repository/issue ID; later tasks wait for a human

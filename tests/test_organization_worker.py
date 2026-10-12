@@ -35,7 +35,7 @@ def other_preview(approved_delivery, *, approve=True):
     payload = json.loads(json.dumps(previews.get(preview_id).bundle_payload))
     payload["task_id"] = "other-worker-task"
     preview = previews.create_or_get(dedupe_key="other-worker-task", bundle_payload=payload, source_payload={})
-    return previews.approve(preview.preview_id, base_revision=revision) if approve else preview
+    return previews._approve_admission(preview.preview_id, base_revision=revision) if approve else preview
 
 
 @pytest.mark.parametrize("kind,value", [("service_approval", True), ("human_input", "answer")])
@@ -326,7 +326,7 @@ def test_followup_queueing_preserves_approval_and_terminal_parent(tmp_path, appr
             assert (await finish(worker, preview_id)).state == "completed"
             before = delivery.budget_path(preview_id).read_bytes()
             if case == "already_failed":
-                approved_delivery[0].approve(child.preview_id, base_revision=approved_delivery[4])
+                approved_delivery[0]._approve_admission(child.preview_id, base_revision=approved_delivery[4])
                 child_job = worker.enqueue(child.preview_id)
                 worker.store.save(child_job.model_copy(update={"state": "failed", "error": "Saved terminal failure"}))
             await asyncio.wait_for(discovered.wait(), timeout=5)

@@ -415,7 +415,7 @@ def test_service_capacity_rejection_keeps_prepared_budget_for_later_admission(tm
     payload = json.loads(json.dumps(previews.get(preview_id).bundle_payload))
     payload["task_id"] = "other-approved-task"
     other = previews.create_or_get(dedupe_key="other-approved-task", bundle_payload=payload, source_payload={})
-    other = previews.approve(other.preview_id, base_revision=revision)
+    other = previews._approve_admission(other.preview_id, base_revision=revision)
     with pytest.raises(ValueError, match="capacity"):
         asyncio.run(service.consume(other.preview_id))
     assert assignments.for_task("other-approved-task") is None
