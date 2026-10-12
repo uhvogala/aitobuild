@@ -354,9 +354,12 @@ def phase(
     preview_id: str,
     label: str,
     what: str,
+    *,
+    human_admission: bool = False,
 ) -> dict[str, Any]:
     report["phases"].append({"phase": label, "started_at": now(), "preview_id": preview_id})
-    hands.child(preview_id, what)
+    # Since #31 planning tasks never auto-admit, so the planning phase admits as a human (as in followups, #35).
+    hands.child(preview_id, what, human_admission=human_admission)
     status = operator.drive(preview_id, label)
     report["phases"][-1].update(
         ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
@@ -636,7 +639,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     endpoint="none (PlanningAdmission.offer)",
                 )
                 status = phase(
-                    operator, hands, report, planning.preview_id, "planning", "PM planning task"
+                    operator, hands, report, planning.preview_id, "planning", "PM planning task",
+                    human_admission=True,
                 )
                 run = status.get("managed_run") or {}
                 if run.get("state") != "completed":

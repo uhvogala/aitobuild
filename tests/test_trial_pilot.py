@@ -451,3 +451,35 @@ def test_early_failure_is_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 class _Stamp:
     def strftime(self, _: str) -> str:
         return "frozen"
+
+
+class _RecordingHands:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, bool]] = []
+
+    def child(self, preview_id: str, what: str, *, human_admission: bool = False) -> None:
+        self.calls.append((preview_id, what, human_admission))
+
+
+class _DrivenOperator:
+    def drive(self, preview_id: str, label: str) -> dict:
+        return {"managed_run": {"state": "completed"}}
+
+
+def test_phase_forwards_human_admission() -> None:
+    hands, report = _RecordingHands(), {"phases": []}
+    pilot.phase(_DrivenOperator(), hands, report, "plan-1", "planning", "PM planning task", human_admission=True)  # type: ignore[arg-type]
+    pilot.phase(_DrivenOperator(), hands, report, "child-1", "delivery:x", "Developer x")  # type: ignore[arg-type]
+    assert hands.calls == [("plan-1", "PM planning task", True), ("child-1", "Developer x", False)]
+
+
+def test_pilot_planning_phase_admits_planning_task_as_human() -> None:
+    import ast
+
+    tree = ast.parse(Path(pilot.__file__).read_text())
+    planning_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                      and getattr(node.func, "id", None) == "phase"
+                      and any(isinstance(arg, ast.Constant) and arg.value == "planning" for arg in node.args)]
+    assert len(planning_calls) == 1
+    flags = {kw.arg: kw.value for kw in planning_calls[0].keywords}
+    assert isinstance(flags.get("human_admission"), ast.Constant) and flags["human_admission"].value is True
