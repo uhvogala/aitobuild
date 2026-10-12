@@ -61,8 +61,16 @@ revision pin and the count against `max_automatic_decisions`.
 
 ```bash
 .venv/bin/python scripts/trials/correction_cycle.py --sudo-docker \
-	[--approval-mode human|automatic] [--model grok-4.6] [--work-root /workspace/trials]
+	[--approval-mode human|automatic] [--allowed-issue-author <login>] [--model grok-4.6] \
+	[--work-root /workspace/trials]
+.venv/bin/python scripts/trials/followups.py --sudo-docker --allowed-issue-author <login>
 ```
+
+`--allowed-issue-author` has no default and is required whenever a stage is automatic (the default
+`--approval-mode automatic` of `followups.py` and `pilot.py` included): it becomes the repository source's only
+`allowed_issue_authors` entry, which automatic task admission requires since #23. It must be exactly one GitHub
+login; blanks, wildcards and lists are refused, and the harness refuses to start without it. Use the login that
+authors the trial issues (check with `gh issue view <n> --json author`).
 
 The target is locked to `uhvogala/aitobuild_example`. Any other `--repository` needs
 `--allow-other-repository`. `--poll-seconds`, `--stage-timeout` and `--invoke-timeout` must be positive.
@@ -95,9 +103,9 @@ human stages are given by the script and recorded).
 
 ```bash
 # 1. plan, then deliver + review every independent issue; stops with result=paused_at_merge_point
-uv run python scripts/trials/pilot.py start --sudo-docker
+uv run python scripts/trials/pilot.py start --sudo-docker --allowed-issue-author <login>
 # 2. after the PR in report.merge_points is merged by a person
-uv run python scripts/trials/pilot.py resume --sudo-docker --run-dir /workspace/trials/runs/trial4-<stamp> \
+uv run python scripts/trials/pilot.py resume --sudo-docker --allowed-issue-author <login> --run-dir /workspace/trials/runs/trial4-<stamp> \
     [--brief-edit-what "..." --brief-edit-why "..."]
 ```
 
@@ -109,3 +117,7 @@ planning but answer 409 until that handoff exists; `start` skips them. If a pers
 resuming, pass `--brief-edit-what/--brief-edit-why`; it lands in `report.operator_actions` as `brief_edit`.
 Repeat `resume` until the plan is done. Runs and artifacts live under `--work-root` (outside the checkout,
 git-ignored); delete `runs/trial4-*` once the pilot is finished.
+
+`resume` refuses a seed with uncommitted changes, a seed without the base branch checked out and a seed whose base
+branch diverged from origin (git's error is included). Any failure, including one before the service starts, is
+recorded in `report.json` as `result: failed` with the error and an end time.

@@ -30,7 +30,11 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import (  # noqa: E402 - script-local shared module
+from common import (  # noqa: E402
+    add_issue_author_argument,
+    repository_source,
+    require_issue_author,
+    trial_environment_values,
     ALL_STAGES,
     ALLOWED_AUTOMATIC_STAGES,
     DEFAULT_ENDPOINT,
@@ -401,6 +405,7 @@ def main() -> int:
     parser.add_argument("--work-root", type=Path, default=Path("/workspace/trials"))
     parser.add_argument("--model", default="grok-4.6")
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
+    add_issue_author_argument(parser)
     parser.add_argument("--sudo-docker", action="store_true")
     parser.add_argument("--approval-mode", choices=("human", "automatic"), default="automatic")
     parser.add_argument(
@@ -434,6 +439,7 @@ def main() -> int:
     refused = set(automatic_stages) - set(ALLOWED_AUTOMATIC_STAGES)
     if refused:
         raise SystemExit(f"Refusing automatic approval for {sorted(refused)}")
+    require_issue_author(automatic_stages, arguments.allowed_issue_author)
     work_root = arguments.work_root.resolve()
     if work_root == SERVICE_ROOT or SERVICE_ROOT in work_root.parents:
         raise SystemExit("--work-root must live outside the service checkout")
@@ -481,37 +487,22 @@ def main() -> int:
     secret, token = secrets.token_hex(24), secrets.token_hex(24)
     configure_trial_environment(
         automatic_stages=automatic_stages,
-        values={
-            "AITOBUILD_WEBHOOK_SECRET": secret,
-            "AITOBUILD_INTERNAL_API_TOKEN": token,
-            "AITOBUILD_REQUIRE_INTERNAL_AUTH": "true",
-            "AITOBUILD_REQUIRE_APPROVAL_FOR_REPO_WRITES": "true",
-            "AITOBUILD_REQUIRE_DEVELOPER_PREVIEW": "true",
-            "AITOBUILD_ALLOW_MOCK_MODEL": "false",
-            "AITOBUILD_FOUNDRY_ENDPOINT": arguments.endpoint,
-            "AITOBUILD_FOUNDRY_MODEL": arguments.model,
-            "AITOBUILD_DEVELOPER_EXECUTION_MODE": "container_session",
-            "AITOBUILD_DEVELOPER_SESSION_CONTAINER_IMAGE": "aitobuild-developer:local",
-            "AITOBUILD_DEVELOPER_STATE_DIR": str(run_dir / "state" / "developer"),
-            "AITOBUILD_DEVELOPER_AGENT_INVOKE_TIMEOUT_SECONDS": str(int(arguments.invoke_timeout)),
-            "AITOBUILD_DEVELOPER_REPOSITORY_SOURCES": json.dumps(
-                [
-                    {
-                        "repository": repo["full_name"],
-                        "repository_id": repo["id"],
-                        "path": str(seed),
-                        "verification_commands": [VERIFY_COMMAND],
-                        "base_revision": base,
-                    }
-                ]
+        values=trial_environment_values(
+            source=repository_source(
+                repository=repo["full_name"],
+                repository_id=repo["id"],
+                path=seed,
+                verification_command=VERIFY_COMMAND,
+                base_revision=base,
+                issue_author=arguments.allowed_issue_author,
             ),
-            "AITOBUILD_GITHUB_ADAPTER": "gh_cli",
-            "AITOBUILD_GITHUB_DEFAULT_REPOSITORY": repo["full_name"],
-            "AITOBUILD_GITHUB_ALLOWED_REPOS": repo["full_name"],
-            "AITOBUILD_WEB_SEARCH_ADAPTER": "mock",
-            "AITOBUILD_SCHEDULER_ENABLED": "false",
-            "AITOBUILD_MANAGED_WORKER_QUEUE_FOLLOW_UPS": "true",
-        },
+            run_dir=run_dir,
+            endpoint=arguments.endpoint,
+            model=arguments.model,
+            invoke_timeout=arguments.invoke_timeout,
+            secret=secret,
+            token=token,
+        ),
     )
     service_cwd = run_dir / "service"
     subprocess.run(

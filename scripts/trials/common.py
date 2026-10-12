@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import time
@@ -377,6 +378,100 @@ def positive(value: str) -> float:
     if not number > 0 or number == float("inf"):
         raise ValueError("must be a positive number")
     return number
+
+
+GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+
+
+def issue_author(value: str) -> str:
+    """argparse type for one exact GitHub login: no blanks, wildcards, lists or other patterns."""
+    if not GITHUB_LOGIN.fullmatch(value):
+        raise ValueError("must be exactly one GitHub login (no wildcards, blanks or lists)")
+    return value
+
+
+def add_issue_author_argument(parser: Any) -> None:
+    parser.add_argument(
+        "--allowed-issue-author",
+        type=issue_author,
+        default=None,
+        help="The one GitHub login whose issues automatic task admission may accept; required for automatic runs.",
+    )
+
+
+def require_issue_author(automatic_stages: tuple[str, ...], author: str | None) -> None:
+    """Automatic runs refuse to start unless the operator named the issue author explicitly."""
+    if automatic_stages and author is None:
+        raise SystemExit("--allowed-issue-author is required for automatic runs")
+
+
+def repository_source(
+    *,
+    repository: str,
+    repository_id: int,
+    path: Path,
+    verification_command: str,
+    base_revision: str | None,
+    issue_author: str | None,
+) -> dict[str, Any]:
+    """The single repository source every trial binds; automatic admission only accepts the named author."""
+    source: dict[str, Any] = {
+        "repository": repository,
+        "repository_id": repository_id,
+        "path": str(path),
+        "verification_commands": [verification_command],
+    }
+    if base_revision is not None:
+        source["base_revision"] = base_revision
+    if issue_author is not None:
+        source["allowed_issue_authors"] = [issue_author]
+    return source
+
+
+def trial_environment_values(
+    *,
+    source: dict[str, Any],
+    run_dir: Path,
+    endpoint: str,
+    model: str,
+    invoke_timeout: float,
+    secret: str,
+    token: str,
+) -> dict[str, str]:
+    """Process environment shared by every trial script (secrets stay in this process only)."""
+    repository = source["repository"]
+    return {
+        "AITOBUILD_WEBHOOK_SECRET": secret,
+        "AITOBUILD_INTERNAL_API_TOKEN": token,
+        "AITOBUILD_REQUIRE_INTERNAL_AUTH": "true",
+        "AITOBUILD_REQUIRE_APPROVAL_FOR_REPO_WRITES": "true",
+        "AITOBUILD_REQUIRE_DEVELOPER_PREVIEW": "true",
+        "AITOBUILD_ALLOW_MOCK_MODEL": "false",
+        "AITOBUILD_FOUNDRY_ENDPOINT": endpoint,
+        "AITOBUILD_FOUNDRY_MODEL": model,
+        "AITOBUILD_DEVELOPER_EXECUTION_MODE": "container_session",
+        "AITOBUILD_DEVELOPER_SESSION_CONTAINER_IMAGE": "aitobuild-developer:local",
+        "AITOBUILD_DEVELOPER_STATE_DIR": str(run_dir / "state" / "developer"),
+        "AITOBUILD_DEVELOPER_AGENT_INVOKE_TIMEOUT_SECONDS": str(int(invoke_timeout)),
+        "AITOBUILD_DEVELOPER_REPOSITORY_SOURCES": json.dumps([source]),
+        "AITOBUILD_GITHUB_ADAPTER": "gh_cli",
+        "AITOBUILD_GITHUB_DEFAULT_REPOSITORY": repository,
+        "AITOBUILD_GITHUB_ALLOWED_REPOS": repository,
+        "AITOBUILD_WEB_SEARCH_ADAPTER": "mock",
+        "AITOBUILD_SCHEDULER_ENABLED": "false",
+        "AITOBUILD_MANAGED_WORKER_QUEUE_FOLLOW_UPS": "true",
+    }
+
+
+def record_early_failure(recorder: Recorder, error: BaseException) -> None:
+    """A failure before the service starts still lands in report.json with an end time and the error."""
+    recorder.report["result"] = "failed"
+    recorder.report["failure"] = f"{type(error).__name__}: {error}"
+    recorder.report["ended_at"] = now()
+    sessions = recorder.report.get("sessions") or []
+    if sessions and "ended_at" not in sessions[-1]:
+        sessions[-1]["ended_at"] = recorder.report["ended_at"]
+    recorder.save()
 
 
 def configure_trial_environment(
