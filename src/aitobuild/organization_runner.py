@@ -17,12 +17,12 @@ from agent_framework import (
     Executor, FileCheckpointStorage, WorkflowCheckpoint, WorkflowContext,
     WorkflowRunState, handler, response_handler,
 )
-from filelock import FileLock, Timeout as _LockTimeout
+from filelock import FileLock
 from pydantic import AwareDatetime, JsonValue, StrictBool, StrictStr, TypeAdapter, model_validator
 
 from aitobuild.durable_files import atomic_write_text, sync_directory
 from aitobuild.approval_policy import ApprovalDecision, ApprovalPolicy, ApprovalStage
-from aitobuild.developer_isolation import DeveloperTaskBudget
+from aitobuild.developer_isolation import BudgetDeadlineExpired, DeveloperTaskBudget
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, Identifier
 from aitobuild.organization_assignments import (
     AssignmentProposal, AssignmentService, AssignmentStore, Digest, TaskAssignment,
@@ -197,8 +197,12 @@ def _assignment_digest(assignment: TaskAssignment) -> str:
 
 
 def _failure_label(error: BaseException) -> str:
-    """One label for budget deadline expiry, whichever check (admission, revalidation or invocation) saw it first."""
-    if isinstance(error, TimeoutError) and not isinstance(error, _LockTimeout):
+    """One label for budget deadline expiry, whichever check (admission, revalidation or invocation) saw it first.
+
+    Only an actual deadline expiry is relabelled; aborted ledgers, lock timeouts and every other error keep
+    their own message. The native invocation's asyncio timeout carries no message, so it is "TimeoutError" too.
+    """
+    if type(error) is BudgetDeadlineExpired:
         return "TimeoutError"
     return str(error) or type(error).__name__
 
