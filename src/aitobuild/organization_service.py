@@ -22,7 +22,7 @@ from aitobuild.organization import DefinitionModel, DefinitionSnapshot, Definiti
 from aitobuild.organization_assignments import AssignmentProposal, AssignmentService, AssignmentStore, TaskAssignment
 from aitobuild.organization_delivery import _delivery_call
 from aitobuild.organization_runner import (
-    ManagedOperation, ManagedRun, ManagedTaskContext, ManagedWorkflowRunner, RunStore, RuntimeActor,
+    ManagedOperation, ManagedRun, ManagedTaskContext, ManagedWorkflowRunner, RunStore, RuntimeActor, workflow_input_digest,
 )
 from aitobuild.organization_runtime import WorkflowLimits, WorkflowPredicate
 from aitobuild.organization_reviews import PublishedReviewAdmission
@@ -226,10 +226,18 @@ class ManagedOrganizationService:
             return preview
         if preview.source_payload.get("action") == "edited":
             return preview  # an edit never auto-admits; it waits for a human approval
-        if self._task_base is None:
-            raise PermissionError("Automatic task admission has no trusted base binding")
-        base = self._task_base(preview)
         bundle = developer_task_bundle_from_payload(preview.bundle_payload)
+        if bundle.task_id.startswith("pm-planning-") or bundle.issue_context is None:
+            raise PermissionError("Planning and non-repository tasks always require a human admission")
+        if "planning_assignment" in preview.source_payload or bundle.task_id.startswith(("planned-issue-", "dependent-issue-")):
+            self._check_planned_child(preview)
+            base = bundle.issue_context.base_revision
+            if base is None:
+                raise PermissionError("Planned child admission requires its plan-pinned base revision")
+        else:
+            if self._task_base is None:
+                raise PermissionError("Automatic task admission has no trusted base binding")
+            base = self._task_base(preview)
         payload = deepcopy(preview.bundle_payload)
         if bundle.issue_context is not None:
             issue_payload = payload.get("issue_context")
@@ -250,6 +258,42 @@ class ManagedOrganizationService:
         if approved is None:
             raise ValueError("Preview disappeared before configured admission")
         return approved
+
+    def _check_planned_child(self, preview: DeveloperPreview) -> None:
+        """A PM-planned child qualifies only through a human-admitted planning task and a human issue-creation
+        approval of its exact plan digest; anything missing or mismatched fails closed."""
+        publication = self._planning_publication
+        if publication is None:
+            raise PermissionError("Planned child admission requires the trusted planning publication binding")
+        assignment_id = preview.source_payload.get("planning_assignment")
+        if not isinstance(assignment_id, str) or not assignment_id:
+            raise PermissionError("Planned child admission requires its stored planning assignment")
+        run = self._runs.get(assignment_id)
+        if run is None or run.state != "completed":
+            raise PermissionError("Planned child admission requires its completed planning run")
+        try:
+            plan = publication.plans.get(assignment_id)
+            saved = publication._load_publication(assignment_id, plan)
+        except (OSError, ValueError) as error:
+            raise PermissionError("Planned child admission requires its stored plan and publication") from error
+        digest = preview.source_payload.get("plan_digest", plan.digest)
+        if digest != plan.digest or saved.plan_digest != plan.digest or saved.state != "published" or saved.approved_at is None:
+            raise PermissionError("Planned child plan digest differs from its stored published plan")
+        planning = self._previews.get(str(plan.pins.get("preview_id", "")))
+        if (planning is None or not planning.approved or planning.approved_at is None or
+                planning.approved_at.isoformat() != plan.pins.get("approved_at") or
+                planning.approval_policy is not None and planning.approval_policy.source != "human"):
+            raise PermissionError("Planned child admission requires a human-admitted planning task")
+        expected = workflow_input_digest(publication.approval_data(plan, saved))
+        matches = [item for item in run.decisions if item.data_digest == expected]
+        if len(matches) != 1:
+            raise PermissionError("Planned child admission requires exactly one recorded issue-creation decision for its plan")
+        decision = matches[0]
+        if (decision.kind != "service_approval" or decision.value is not True or decision.approval_policy is None or
+                decision.approval_policy.stage != ApprovalStage.PM_ISSUE_CREATION):
+            raise PermissionError("Planned child admission requires an approved issue-creation decision for its plan")
+        if decision.approval_policy.source != "human":
+            raise PermissionError("Planned child admission requires a human issue-creation approval")
 
     def recorded_assignment(self, task_id: str) -> TaskAssignment | None:
         assignment = self._assignments.for_task(task_id)

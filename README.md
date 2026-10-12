@@ -151,6 +151,19 @@ decision. Replays and redeliveries reuse it. Automatic admission has two extra g
 - At most one automatic admission per repository ID and issue ID. An `edited` event,
   or any later trigger whose task differs, never auto-admits: its preview waits for a
   human approval.
+- PM planning tasks (`pm-planning-*`) and any task without a repository issue never
+  auto-admit: automatic mode refuses them with 409 and they need a human admission.
+- A PM-planned child (`planned-issue-*` or `dependent-issue-*`) has no issue author of
+  its own, so it qualifies through its approved plan instead of the author/label
+  allowlist. Using only stored data (never the request), the service requires: the
+  completed planning run named by the child's `planning_assignment`; the stored plan and
+  published publication whose digest equals the child's `plan_digest`; a planning task
+  preview that was admitted by a human (not `operator_policy`); and exactly one recorded
+  `pm_issue_creation` decision for that exact plan's approval data, approved, with
+  `approval_policy.source == "human"`. Anything missing or mismatched is refused with a
+  specific 409 and the child stays unapproved for a human. The child keeps its
+  plan-pinned base, and `max_automatic_admissions` still counts it in the same write.
+  So with `pm_issue_creation: automatic`, planned children always wait for a human.
 
 The token-gated `/internal/triggers` endpoint uses the same path, so it also
 auto-admits. When admission is `disabled`, the limit is reached, or a concurrent

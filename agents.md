@@ -118,6 +118,10 @@ require `X-Internal-Token` by default.
   `required_issue_labels` allowlist, refused at startup if both are empty. It is
   capped by `max_automatic_admissions`, counted durably once per admitted preview;
   over the cap it refuses and the task waits for human approval.
+- Planning tasks and tasks without a repository issue never auto-admit. A PM-planned
+  child auto-admits only through its plan: a human-admitted planning task plus a human
+  `pm_issue_creation` decision bound to the child's exact stored plan digest, checked
+  from stored data. Anything missing or mismatched fails closed with 409.
 - PM task approval, exact issue creation and resolved dependency publication are
   separate gates. Actual issue IDs/numbers and final link-body bytes need their
   own saved approval. Complete receipts stage only unapproved Developer previews;
