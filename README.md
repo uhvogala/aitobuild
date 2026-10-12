@@ -115,6 +115,7 @@ it never skips its approval gate.
 | Stage | Required trusted binding and exact evidence |
 | --- | --- |
 | `task_admission` | Activated service route and `task_base_revision_for`; immutable task bundle/repository/base |
+| | **Warning:** `automatic` lets signed issue webhooks (and token-gated `/internal/triggers`) start tasks without a person; it requires a per-source issue author/label allowlist and is capped by `max_automatic_admissions` |
 | `developer_tools` | Native delivery operation; saved SDK request including tool arguments and session pins |
 | `pm_issue_creation` | Managed PM planning; exact issue titles/bodies and original planning scope |
 | `pm_dependency_links` | Managed PM publication; actual issue IDs/numbers and final link-body bytes |
@@ -129,6 +130,33 @@ Stages that can be set to `automatic` (each only with its trusted binding above)
 `draft_publication`, `review_publication`, `meeting_continuation` and `correction`.
 Draft, review and correction publication can therefore be automatic. `merge`
 cannot be automatic; it stays `disabled` and has no merge operation.
+
+Signed issue webhooks go through the same task admission as
+`POST /internal/organization/tasks/run`. Under `human` the preview waits for a human
+approval, `disabled` refuses with 409, and `automatic` records one `operator_policy`
+decision. Replays and redeliveries reuse it. Automatic admission has two extra guards:
+
+- Each `developer.repository_sources` entry needs `allowed_issue_authors` and/or
+  `required_issue_labels` (case-insensitive). Configuration refuses to load, and the
+  app refuses to start, under automatic admission if both are empty for any source.
+  Only issues from a listed author, or carrying a listed label, are admitted
+  automatically. Human approval is unaffected.
+- `max_automatic_admissions` (1-10000, default 32) caps the saved `operator_policy`
+  task admissions in this service's preview registry. It is counted in the same write
+  transaction as the approval, so replays never count twice. Over the limit, automatic
+  admission is refused with `PermissionError` (409 on the webhook). This matches
+  `max_automatic_decisions`, which refuses rather than silently waiting. The preview
+  stays unapproved, so a human approval can still admit it.
+  `max_automatic_decisions` still counts only in-run decisions.
+- At most one automatic admission per repository ID and issue ID. An `edited` event,
+  or any later trigger whose task differs, never auto-admits: its preview waits for a
+  human approval.
+
+The token-gated `/internal/triggers` endpoint uses the same path, so it also
+auto-admits. When admission is `disabled`, the limit is reached, or a concurrent
+duplicate holds the invocation lock, the webhook returns 409 after the preview has been
+created. GitHub records this as a failed delivery. The saved preview stays
+unapproved.
 
 The explicit `managed_service_factory` receives `context.approval_policy`,
 `context.organization_definition` and `context.task_base_revision_for` in addition

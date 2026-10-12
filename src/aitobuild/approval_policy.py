@@ -44,6 +44,7 @@ class ApprovalDecision(DefinitionModel):
 
 class ApprovalPolicy(DefinitionModel):
     max_automatic_decisions: StrictInt = Field(default=32, ge=1, le=128)
+    max_automatic_admissions: StrictInt = Field(default=32, ge=1, le=10000)
     task_admission: ApprovalMode = "human"
     developer_tools: ApprovalMode = "human"
     pm_issue_creation: ApprovalMode = "human"

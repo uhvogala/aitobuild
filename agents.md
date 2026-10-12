@@ -113,6 +113,11 @@ require `X-Internal-Token` by default.
   `review_publication`, `meeting_continuation` and `correction`. Draft, review and
   correction publication can be automatic; `merge` stays `disabled` (no merge
   operation exists). Defaults stay `human`.
+- Webhook ingress uses the same task admission as `/tasks/run`; there is no separate
+  path. Automatic admission requires a per-source `allowed_issue_authors` or
+  `required_issue_labels` allowlist, refused at startup if both are empty. It is
+  capped by `max_automatic_admissions`, counted durably once per admitted preview;
+  over the cap it refuses and the task waits for human approval.
 - PM task approval, exact issue creation and resolved dependency publication are
   separate gates. Actual issue IDs/numbers and final link-body bytes need their
   own saved approval. Complete receipts stage only unapproved Developer previews;

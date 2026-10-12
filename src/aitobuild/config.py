@@ -67,6 +67,9 @@ class RepositorySourceConfig:
     path: str
     verification_commands: tuple[str, ...] = ()
     base_revision: str | None = None
+    # Automatic task admission gate: the issue author must be listed, or the issue must carry a listed label.
+    allowed_issue_authors: tuple[str, ...] = ()
+    required_issue_labels: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -281,7 +284,8 @@ def _parse_repository_sources(raw: str) -> tuple[RepositorySourceConfig, ...]:
     sources: list[RepositorySourceConfig] = []
     for item in items:
         if (not isinstance(item, dict) or not {"repository", "repository_id", "path"} <= set(item)
-            or set(item) - {"repository", "repository_id", "path", "verification_commands", "base_revision"}):
+            or set(item) - {"repository", "repository_id", "path", "verification_commands", "base_revision",
+                            "allowed_issue_authors", "required_issue_labels"}):
             raise ValueError("Repository sources require repository, repository_id and path")
         repository, repository_id, path = item["repository"], item["repository_id"], item["path"]
         if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", repository):
@@ -300,7 +304,14 @@ def _parse_repository_sources(raw: str) -> tuple[RepositorySourceConfig, ...]:
         base = item.get("base_revision")
         if base is not None and (not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base)):
             raise ValueError("Repository source base_revision must be a resolved lowercase commit SHA")
-        sources.append(RepositorySourceConfig(repository.lower(), repository_id, path, tuple(commands), base))
+        gates = []
+        for key in ("allowed_issue_authors", "required_issue_labels"):
+            names = item.get(key, [])
+            if (not isinstance(names, list) or len(names) > 64 or
+                    not all(isinstance(name, str) and name.strip() and len(name) <= 100 for name in names)):
+                raise ValueError(f"Repository source {key} must be at most 64 nonempty names")
+            gates.append(tuple(name.strip() for name in names))
+        sources.append(RepositorySourceConfig(repository.lower(), repository_id, path, tuple(commands), base, *gates))
     return tuple(sources)
 
 
@@ -485,7 +496,7 @@ def load_config() -> AppConfig:
     if web_search.adapter not in {"mock", "duckduckgo", "ddg", "live"}:
         raise ValueError("AITOBUILD_WEB_SEARCH_ADAPTER must be mock or duckduckgo")
 
-    return AppConfig(
+    config = AppConfig(
         webhook_secret=webhook_secret,
         runtime=runtime,
         scheduler=scheduler,
@@ -499,3 +510,15 @@ def load_config() -> AppConfig:
         managed_worker=ManagedWorkerConfig(queue_follow_ups=_as_bool(
             getenv("AITOBUILD_MANAGED_WORKER_QUEUE_FOLLOW_UPS"), default=False)),
     )
+    validate_automatic_admission_sources(config)
+    return config
+
+
+def validate_automatic_admission_sources(config: AppConfig) -> None:
+    """Fail closed: automatic task admission needs an author or label allowlist on every repository source."""
+    if config.approvals.task_admission != "automatic":
+        return
+    for source in config.developer.repository_sources:
+        if not source.allowed_issue_authors and not source.required_issue_labels:
+            raise ValueError(f"Automatic task admission requires allowed_issue_authors or required_issue_labels "
+                             f"for repository source {source.repository}")
