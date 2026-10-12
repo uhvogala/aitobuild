@@ -55,6 +55,37 @@ def _webhook_issue_identity(bundle: dict[str, Any]) -> tuple[object, object] | N
     return context.get("repository_id"), context.get("issue_id")
 
 
+REVIEW_TASK_PREFIX = "published-review-"
+
+
+def is_planned_child(preview: Any) -> bool:
+    """The one rule for a PM-planned child or its dependent handoff (shared by app and managed service)."""
+    task_id = str(preview.bundle_payload.get("task_id", ""))
+    return "planning_assignment" in preview.source_payload or task_id.startswith(("planned-issue-", "dependent-issue-"))
+
+
+def published_review_target(preview: Any) -> tuple[str, str] | None:
+    """(reviewed delivery preview id, exact published head) of a staged Architect review task, else None.
+
+    Corrections also carry a published_review target but are not reviews; they never qualify here."""
+    if not str(preview.bundle_payload.get("task_id", "")).startswith(REVIEW_TASK_PREFIX):
+        return None
+    if "correction_from_review" in preview.source_payload:
+        raise PermissionError("A review task cannot carry a correction source")
+    target = preview.source_payload.get("published_review")
+    if (not isinstance(target, dict) or not isinstance(target.get("preview_id"), str) or not target["preview_id"]
+            or not isinstance(target.get("head_sha"), str) or not target["head_sha"]):
+        raise PermissionError("Review admission requires its exact published review target")
+    return target["preview_id"], target["head_sha"]
+
+
+def _review_identity(bundle: dict[str, Any], source: dict[str, Any]) -> tuple[object, object] | None:
+    if not str(bundle.get("task_id", "")).startswith(REVIEW_TASK_PREFIX):
+        return None
+    target = source.get("published_review")
+    return (target.get("preview_id"), target.get("head_sha")) if isinstance(target, dict) else ("", "")
+
+
 class AutomaticAdmissionDeferred(PermissionError):
     """Automatic admission does not apply; the preview stays unapproved and waits for a human approval."""
 
@@ -217,6 +248,12 @@ class DeveloperPreviewRegistry:
                             and _webhook_issue_identity(saved.bundle_payload) == issue for saved in self._by_id.values()):
                         raise AutomaticAdmissionDeferred("This issue was already admitted automatically; "
                                                          "a later task for it needs a human approval")
+                    review = _review_identity(bundle, preview.source_payload)
+                    if review is not None and any(
+                            saved.approved and saved.approval_policy is not None and saved.approval_policy.source == "operator_policy"
+                            and _review_identity(saved.bundle_payload, saved.source_payload) == review for saved in self._by_id.values()):
+                        raise AutomaticAdmissionDeferred("This published head already had an automatic review; "
+                                                         "another review of it needs a human approval")
                     if admitted >= max_automatic_admissions:
                         raise PermissionError("Automatic task admission limit reached; a human approval is required")
             approved_preview = replace(

@@ -26,7 +26,7 @@ from aitobuild.config import AppConfig, RepositorySourceConfig, load_config, val
 from aitobuild.developer_delivery import DeveloperDeliveryWorker, LocalRepositorySource
 from aitobuild.developer_execution import DeveloperExecutionEngine, PlannedFileWrite
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
-from aitobuild.developer_preview import DeveloperPreviewRegistry
+from aitobuild.developer_preview import DeveloperPreviewRegistry, is_planned_child, published_review_target
 from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import make_internal_event, normalize_github_webhook, parse_trigger_request
 from aitobuild.organization_assignments import AssignmentProposal
@@ -251,14 +251,13 @@ def _issue_allowlisted(source_payload: Any, source: RepositorySourceConfig) -> b
     return bool(names & {name.casefold() for name in source.required_issue_labels})
 
 
-def _is_planned_child(preview: Any) -> bool:
-    task_id = str(preview.bundle_payload.get("task_id", ""))
-    return "planning_assignment" in preview.source_payload or task_id.startswith(("planned-issue-", "dependent-issue-"))
-
-
 def _configured_task_base(preview: Any, sources: Any) -> str | None:
     """Trusted automatic-admission binding: a configured repository source, the issue author/label allowlist
-    (planned children qualify through their plan, checked by the managed service first), then the pinned base."""
+    (planned children qualify through their plan, checked by the managed service first), then the pinned base.
+    Staged Architect reviews never reach this directly: the managed service passes the admitted parent task
+    whose exact published head they review, so a review qualifies only as its parent does."""
+    if published_review_target(preview) is not None:
+        raise PermissionError("Review admission is evaluated only through its admitted parent task")
     issue = developer_task_bundle_from_payload(preview.bundle_payload).issue_context
     if issue is None:
         return None
@@ -266,7 +265,7 @@ def _configured_task_base(preview: Any, sources: Any) -> str | None:
                    if (source.repository, source.repository_id) == (issue.repository, issue.repository_id)), None)
     if source is None:
         raise PermissionError("Automatic admission requires a configured repository source")
-    if _is_planned_child(preview):
+    if is_planned_child(preview):
         if issue.base_revision is None:
             raise PermissionError("Planned child admission requires its plan-pinned base revision")
         return issue.base_revision

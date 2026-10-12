@@ -2048,3 +2048,138 @@ def test_native_pm_proposal_text_reminder_deadline_and_size(tmp_path, monkeypatc
 
     asyncio.run(exercise())
     assert len(bodies) == (2 if scenario == "json_text_only" else 1)
+
+
+@pytest.mark.parametrize("case", ["allowlisted", "not_allowlisted", "direct_callback", "parent_unapproved", "parent_is_review",
+                                  "missing_record", "unpublished_record", "head_mismatch", "record_bundle_differs", "issue_differs",
+                                  "staged_target_mismatch", "planned_parent", "limit", "no_review_binding", "correction_stays_human"])
+def test_review_inherits_automatic_admission_only_from_its_admitted_parent(tmp_path, published_delivery, case, monkeypatch):
+    """A staged Architect review is admitted automatically only as the admitted task whose exact published head it
+    reviews, through the same trusted base callback (allowlist / planned child); every mismatch fails closed."""
+    from aitobuild.app import _configured_task_base
+    from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
+    from aitobuild.config import RepositorySourceConfig
+    from aitobuild.developer_preview import AutomaticAdmissionDeferred, preview_approval_operation
+    from aitobuild.organization_reviews import PublishedReviewAdmission, PublishedReviewRoute
+    from aitobuild.organization_service import ManagedOrganizationService
+
+    worker, published_id, _, github, _ = published_delivery
+    definitions, snapshot = review_definition(tmp_path)
+    previews = worker._previews
+    reviews = PublishedReviewAdmission(
+        definitions=definitions, previews=previews, worker=worker, github=github, state_dir=tmp_path / "review-admission",
+        routes=(PublishedReviewRoute(repository="fixture/widgets", repository_id=101, organization_id=snapshot.organization_id,
+                                     revision=snapshot.revision, event="published.review"),))
+    authors = () if case == "not_allowlisted" else ("fixture-author",)
+    sources = (RepositorySourceConfig("fixture/widgets", 101, "unused", (), None, authors),)
+    policy = ApprovalPolicy(task_admission="automatic", max_automatic_admissions=1 if case == "limit" else 5)
+
+    async def cleanup(task):
+        return None
+
+    service = ManagedOrganizationService(
+        definitions=definitions, assignments=FileAssignmentStore(tmp_path / "assignments.json"), runs=FileRunStore(tmp_path / "runs"),
+        previews=previews, worker=worker, routes=(), reviews=None if case == "no_review_binding" else reviews, operations={},
+        cleanup=cleanup, operator_id="configured-operator", binding_revision="reviews-v1", approval_policy=policy,
+        task_base_revision_for=lambda preview: _configured_task_base(preview, sources))
+    staged = reviews.offer(published_id)
+    assert staged is not None and not staged.approved
+    parent = previews.get(published_id)
+    record = worker.get(published_id)
+
+    def patch_get(owner, attribute, target_id, value):
+        original = getattr(owner, attribute)
+        monkeypatch.setattr(owner, attribute, lambda preview_id, **kw: value if preview_id == target_id else original(preview_id, **kw))
+
+    if case == "allowlisted":
+        admitted = service._automatic_task_approval(staged)
+        assert admitted.approved and admitted.approval_policy.source == "operator_policy"
+        assert admitted.bundle_payload["issue_context"] == parent.bundle_payload["issue_context"]
+        assert service._automatic_task_approval(previews.get(staged.preview_id)) == admitted  # replay, no second count
+        # At most one automatic review per published head: a second review task of the same head defers to a human.
+        twin = previews.create_or_get(dedupe_key="twin", bundle_payload=staged.bundle_payload | {"task_id": "published-review-twin"},
+                                      source_payload=staged.source_payload)
+        decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
+                                  operation=preview_approval_operation(twin.preview_id, twin.bundle_payload), automatic_supported=True)
+        with pytest.raises(AutomaticAdmissionDeferred, match="already had an automatic review"):
+            previews.approve(twin.preview_id, approval_policy=decision, max_automatic_admissions=5)
+        other_head = previews.create_or_get(dedupe_key="other-head", source_payload={"published_review": {
+            "preview_id": published_id, "head_sha": "f" * 40}}, bundle_payload=staged.bundle_payload | {"task_id": "published-review-other"})
+        decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
+                                  operation=preview_approval_operation(other_head.preview_id, other_head.bundle_payload), automatic_supported=True)
+        assert previews.approve(other_head.preview_id, approval_policy=decision, max_automatic_admissions=5).approved
+        return
+    if case == "direct_callback":
+        with pytest.raises(PermissionError, match="only through its admitted parent"):
+            _configured_task_base(staged, sources)
+        return
+    if case == "correction_stays_human":
+        correction = replace(parent, bundle_payload=parent.bundle_payload | {"task_id": "published-correction-x"},
+                             source_payload={"correction_from_review": staged.preview_id, "published_review": staged.source_payload["published_review"]})
+        with pytest.raises(PermissionError, match="allowlisted issue author"):
+            _configured_task_base(correction, sources)
+        with pytest.raises(PermissionError, match="cannot carry a correction source"):
+            service._automatic_task_approval(replace(staged, source_payload=correction.source_payload))
+        return
+    expected = {
+        "not_allowlisted": "allowlisted issue author",
+        "parent_unapproved": "admitted parent task",
+        "parent_is_review": "Only an admitted delivery task",
+        "missing_record": "published delivery record",
+        "unpublished_record": "published delivery record",
+        "head_mismatch": "exact published head",
+        "record_bundle_differs": "differs from its admitted task",
+        "issue_differs": "differ from its admitted parent",
+        "staged_target_mismatch": "differs from its staging receipt",
+        "planned_parent": "planned check reached",
+        "limit": "admission limit reached",
+        "no_review_binding": "trusted review staging binding",
+    }[case]
+    candidate = staged
+    if case == "parent_unapproved":
+        patch_get(service._previews, "get", published_id, replace(parent, approved=False))
+    elif case == "parent_is_review":
+        patch_get(service._previews, "get", published_id, replace(parent, bundle_payload=parent.bundle_payload | {"task_id": "published-review-y"}))
+    elif case == "missing_record":
+        monkeypatch.setattr(service, "_worker", SimpleWorker(worker, {published_id: None}))
+    elif case == "unpublished_record":
+        monkeypatch.setattr(service, "_worker", SimpleWorker(worker, {published_id: replace(record, state="verified")}))
+    elif case == "head_mismatch":
+        monkeypatch.setattr(service, "_worker", SimpleWorker(worker, {published_id: replace(
+            record, publication=record.publication | {"head_sha": "e" * 40})}))
+    elif case == "record_bundle_differs":
+        monkeypatch.setattr(service, "_worker", SimpleWorker(worker, {published_id: replace(
+            record, bundle_payload=record.bundle_payload | {"objective": "something else"})}))
+    elif case == "issue_differs":
+        issue = staged.bundle_payload["issue_context"] | {"base_revision": "d" * 40}
+        candidate = replace(staged, bundle_payload=staged.bundle_payload | {"issue_context": issue})
+    elif case == "staged_target_mismatch":
+        candidate = replace(staged, source_payload={"published_review": {"preview_id": published_id, "head_sha": "a" * 40}})
+    elif case == "limit":  # reviews count toward max_automatic_admissions like any automatic admission
+        used = previews.create_or_get(dedupe_key="used", source_payload={"published_review": {"preview_id": published_id, "head_sha": "f" * 40}},
+                                      bundle_payload=staged.bundle_payload | {"task_id": "published-review-used"})
+        decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
+                                  operation=preview_approval_operation(used.preview_id, used.bundle_payload), automatic_supported=True)
+        assert previews.approve(used.preview_id, approval_policy=decision, max_automatic_admissions=1).approved
+    elif case == "planned_parent":
+        patch_get(service._previews, "get", published_id, replace(parent, source_payload=parent.source_payload | {"planning_assignment": "p"}))
+
+        def planned(preview):
+            assert preview.preview_id == published_id
+            raise PermissionError("planned check reached")
+
+        monkeypatch.setattr(service, "_check_planned_child", planned)
+    with pytest.raises(PermissionError, match=expected):
+        service._automatic_task_approval(candidate)
+    assert not previews.get(staged.preview_id).approved
+
+
+class SimpleWorker:
+    def __init__(self, worker, overrides):
+        self._inner, self._overrides = worker, overrides
+
+    def get(self, preview_id):
+        return self._overrides[preview_id] if preview_id in self._overrides else self._inner.get(preview_id)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
