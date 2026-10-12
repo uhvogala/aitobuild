@@ -1336,7 +1336,7 @@ Validation: 81 consent checks passed, including restart/dispatch, journal-before
 approval ordering, shared-store contention, scope/target/base/budget/policy refusals,
 publication-only refusal, post-save drift, corruption, expiry and lost-response
 metadata recovery. Ruff and mypy passed. On the rebased `f7918b7` baseline, which includes the merged
-#36 cancellation fix,  consent tests and the full suite (1,477 passes, two
+#36 cancellation fix, 97 consent tests and the full suite (1,477 passes, two
 skips) passed in two consecutive runs. The mock copied-fixture
 report at `/tmp/aitobuild-consent-admission-simulation-report.json` records accepted
 execution, a generated artifact, integer command exit 0 and `succeeded=true`;
