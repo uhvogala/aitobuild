@@ -522,15 +522,19 @@ evidence variant. A new admission source (for example Discussions consent from
 `_approve_admission` itself or add a parallel path. Changing the route itself
 requires an explicit update to this section first.
 
+Rule: consent admission requires `task_admission` to be `automatic`. Under
+`human` mode a consent is refused, and only the HTTP approve endpoint
+(`Human` evidence) admits a task.
+
 Deliberate exception for `Consent` evidence (#42): a consent decision is
 human-sourced (`source="human"`), so it never counts toward
 `max_automatic_admissions`, like any human approval. It is still reached through
 automated reading of a discussion comment rather than a person acting in the
-service, so a consent admission keeps the per-issue `(repository_id, issue_id)`
-dedupe: it is refused when the same issue was already admitted by consent or
-automatically, and a later task for that issue needs a direct human approval.
-Consent requires the automatic task-admission policy; under `human` mode only the
-HTTP approve endpoint admits.
+service, so it shares the per-issue `(repository_id, issue_id)` dedupe with
+automatic admissions, in both directions: a consent admission is refused when the
+issue was already admitted by consent or automatically, and an automatic
+admission defers when the issue was already admitted by consent. A later task
+for that issue needs a direct human approval.
 
 Policy revisions and the effective stage decision belong in immutable run/effect
 evidence. Changes apply to new work; active runs refuse drift rather than silently

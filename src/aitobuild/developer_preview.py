@@ -269,9 +269,11 @@ class DeveloperPreviewRegistry:
                                    and saved.approval_policy.source == "operator_policy")
                     issue = _webhook_issue_identity(bundle)
                     if issue is not None and any(
-                            saved.approved and saved.approval_policy is not None and saved.approval_policy.source == "operator_policy"
-                            and _webhook_issue_identity(saved.bundle_payload) == issue for saved in self._by_id.values()):
-                        raise AutomaticAdmissionDeferred("This issue was already admitted automatically; "
+                            saved.approved and _webhook_issue_identity(saved.bundle_payload) == issue and (
+                                saved.consent_approval is not None  # two-way with the consent dedupe (PLAN 2.4)
+                                or saved.approval_policy is not None and saved.approval_policy.source == "operator_policy")
+                            for saved in self._by_id.values()):
+                        raise AutomaticAdmissionDeferred("This issue was already admitted automatically or by consent; "
                                                          "a later task for it needs a human approval")
                     review = _review_identity(bundle, preview.source_payload)
                     if review is not None and any(

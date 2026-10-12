@@ -734,26 +734,43 @@ def test_consent_decision_must_match_the_live_policy(task_admission_fixture):
     assert not registry.get(projection.preview_id).approved
 
 
-def test_consent_skips_the_automatic_limit(task_admission_fixture):
+def _automatic(registry, policy, preview):
+    bundle = deepcopy(preview.bundle_payload)
+    bundle["issue_context"]["base_revision"] = "c" * 40
+    return policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
+                          operation=preview_approval_operation(preview.preview_id, bundle), automatic_supported=True)
+
+
+def test_consent_does_not_count_toward_the_automatic_limit(task_admission_fixture):
     store, registry, bridge, projection, inputs = task_admission_fixture
     policy = inputs["profile"].policy
     preview = registry.get(projection.preview_id)
-    other = _sibling(registry, preview, key="other-issue", task_suffix="-other", issue_id=999)
-    bundle = deepcopy(other.bundle_payload)
-    bundle["issue_context"]["base_revision"] = "c" * 40
-    automatic = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
-                               operation=preview_approval_operation(other.preview_id, bundle), automatic_supported=True)
-    assert approve_preview(registry, other.preview_id, base_revision="c" * 40, approval_policy=automatic,
-                           max_automatic_admissions=1).approved  # the automatic limit (1) is now used up
-    assert bridge.approve(projection).approved  # human consent does not count toward it
-    later = _sibling(registry, preview, key="later-issue", task_suffix="-later", issue_id=1000)
-    bundle = deepcopy(later.bundle_payload)
-    bundle["issue_context"]["base_revision"] = "c" * 40
-    decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
-                              operation=preview_approval_operation(later.preview_id, bundle), automatic_supported=True)
-    with pytest.raises(PermissionError, match="limit reached"):  # and the consent did not add to the automatic count
-        approve_preview(registry, later.preview_id, base_revision="c" * 40, approval_policy=decision,
-                        max_automatic_admissions=2 - 1)
+    limit = 2
+    first = _sibling(registry, preview, key="first-issue", task_suffix="-first", issue_id=901)
+    assert approve_preview(registry, first.preview_id, base_revision="c" * 40, approval_policy=_automatic(registry, policy, first),
+                           max_automatic_admissions=limit).approved  # limit - 1 automatic admissions used
+    assert bridge.approve(projection).approved  # human consent in between
+    last = _sibling(registry, preview, key="last-issue", task_suffix="-last", issue_id=902)
+    # Still room for exactly one more automatic admission: the consent did not take a slot.
+    assert approve_preview(registry, last.preview_id, base_revision="c" * 40, approval_policy=_automatic(registry, policy, last),
+                           max_automatic_admissions=limit).approved
+    extra = _sibling(registry, preview, key="extra-issue", task_suffix="-extra", issue_id=903)
+    with pytest.raises(PermissionError, match="limit reached"):
+        approve_preview(registry, extra.preview_id, base_revision="c" * 40, approval_policy=_automatic(registry, policy, extra),
+                        max_automatic_admissions=limit)
+
+
+def test_automatic_admission_defers_after_a_consent_admission_of_the_same_issue(task_admission_fixture):
+    from aitobuild.developer_preview import AutomaticAdmissionDeferred
+
+    store, registry, bridge, projection, inputs = task_admission_fixture
+    preview = registry.get(projection.preview_id)
+    assert bridge.approve(projection).approved
+    twin = _sibling(registry, preview, key="same-issue-later", task_suffix="-later")  # same (repository_id, issue_id)
+    with pytest.raises(AutomaticAdmissionDeferred, match="automatically or by consent"):
+        approve_preview(registry, twin.preview_id, base_revision="c" * 40,
+                        approval_policy=_automatic(registry, inputs["profile"].policy, twin), max_automatic_admissions=32)
+    assert not registry.get(twin.preview_id).approved
 
 
 @pytest.mark.parametrize("earlier", ["automatic", "consent"])
