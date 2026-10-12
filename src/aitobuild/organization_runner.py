@@ -22,7 +22,7 @@ from pydantic import AwareDatetime, JsonValue, StrictBool, StrictStr, TypeAdapte
 
 from aitobuild.durable_files import atomic_write_text, sync_directory
 from aitobuild.approval_policy import ApprovalDecision, ApprovalPolicy, ApprovalStage
-from aitobuild.developer_isolation import DeveloperTaskBudget
+from aitobuild.developer_isolation import BudgetDeadlineExpired, DeveloperTaskBudget
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, Identifier
 from aitobuild.organization_assignments import (
     AssignmentProposal, AssignmentService, AssignmentStore, Digest, TaskAssignment,
@@ -194,6 +194,17 @@ class FileRunStore:
 
 def _assignment_digest(assignment: TaskAssignment) -> str:
     return sha256(assignment.model_dump_json(exclude={"state", "closed_at", "outcome"}).encode()).hexdigest()
+
+
+def _failure_label(error: BaseException) -> str:
+    """One label for budget deadline expiry, whichever check (admission, revalidation or invocation) saw it first.
+
+    Only an actual deadline expiry is relabelled; aborted ledgers, lock timeouts and every other error keep
+    their own message. The native invocation's asyncio timeout carries no message, so it is "TimeoutError" too.
+    """
+    if type(error) is BudgetDeadlineExpired:
+        return "TimeoutError"
+    return str(error) or type(error).__name__
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +427,9 @@ class ManagedWorkflowRunner:
                 if run.input != input:
                     raise ValueError("Duplicate invocation cannot replace managed input")
                 return await self._existing(run, assignment)
+            # Deadline first: an expired budget refuses as TimeoutError before the approval/admission lookup,
+            # leaving the ledger (reservations included) untouched.
+            DeveloperTaskBudget(path=Path(assignment.budget_path), bundle=assignment.bundle, create=False).remaining_seconds()
             assignment = self._service.revalidate(assignment_id)
             now = datetime.now(tz=UTC)
             identity = sha256(assignment_id.encode()).hexdigest()
@@ -444,7 +458,7 @@ class ManagedWorkflowRunner:
                 raise PermissionError("Managed operator binding revision has changed")
             context.revalidate()
         except Exception as error:
-            return await self._terminate(run, context, "failed", str(error))
+            return await self._terminate(run, context, "failed", _failure_label(error))
         if run.state == "running":
             return await self._terminate(run, context, "failed", "Interrupted native invocation; automatic replay is blocked")
         if run.state == "waiting":
@@ -530,7 +544,7 @@ class ManagedWorkflowRunner:
                 saved = self._runs.get(assignment.assignment_id)
                 if saved is not None and saved.state in TERMINAL | {"finalizing"}:
                     raise
-                return await self._terminate(run, context, "failed", str(error))
+                return await self._terminate(run, context, "failed", _failure_label(error))
         return run
 
     async def resume(self, assignment_id: str, *, request_id: str, response: JsonValue) -> ManagedRun:
@@ -562,7 +576,7 @@ class ManagedWorkflowRunner:
             try:
                 decision = self._policy_decision(context, request, value, source="human")
             except PermissionError as error:
-                return await self._terminate(run, context, "failed", str(error))
+                return await self._terminate(run, context, "failed", _failure_label(error))
             run = await self._invoke(run, assignment, responses={request_id: {"kind": kind, "value": value}},
                                      policy_decisions={request_id: decision} if decision is not None else None)
             return await self._advance_automatic(run, assignment)
@@ -678,7 +692,7 @@ class ManagedWorkflowRunner:
             saved = self._runs.get(assignment.assignment_id)
             if saved is not None and saved.state in TERMINAL | {"finalizing"}:
                 raise
-            return await self._terminate(current, context, "failed", str(error) or type(error).__name__)
+            return await self._terminate(current, context, "failed", _failure_label(error))
 
     async def _terminate(
         self, run: ManagedRun, context: ManagedTaskContext,

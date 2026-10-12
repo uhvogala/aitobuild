@@ -62,6 +62,10 @@ class DeveloperTaskBundle:
         return payload
 
 
+class BudgetDeadlineExpired(TimeoutError):
+    """Raised only when a task budget's absolute deadline has actually passed."""
+
+
 class DeveloperTaskBudget:
     def __init__(self, *, path: Path, bundle: DeveloperTaskBundle, create: bool = True,
                  allow_aborted: bool = False) -> None:
@@ -106,7 +110,7 @@ class DeveloperTaskBudget:
         with self._lock:
             remaining = float(self._load()["deadline"]) - time()
         if remaining <= 0:
-            raise TimeoutError("Approved task runtime budget has expired; a new approved task is required")
+            raise BudgetDeadlineExpired("Approved task runtime budget has expired; a new approved task is required")
         return remaining
 
     def abort(self) -> None:
@@ -119,7 +123,7 @@ class DeveloperTaskBudget:
         with self._lock:
             state = self._load()
             if float(state["deadline"]) <= time():
-                raise TimeoutError("Approved task runtime budget has expired; no files were written")
+                raise BudgetDeadlineExpired("Approved task runtime budget has expired; no files were written")
             reserved = sorted(set(state["reserved_paths"]) | set(paths))
             if len(reserved) > self.bundle.policy.max_file_changes:
                 raise PermissionError(f"Task file budget exceeds max_file_changes={self.bundle.policy.max_file_changes}")
