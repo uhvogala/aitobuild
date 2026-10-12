@@ -444,7 +444,7 @@ def test_early_failure_is_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     with pytest.raises(RuntimeError, match="gh unavailable"):
         pilot.main(["start", "--allowed-issue-author", "uhvogala", "--work-root", str(tmp_path)])
     report = json.loads((tmp_path / "artifacts" / "trial4-frozen" / "report.json").read_text())
-    assert report["result"] == "failed" and "gh unavailable" in report["failure"]
+    assert report["result"] == "fail" and "gh unavailable" in report["failure"]
     assert report["ended_at"] and report["sessions"][-1]["ended_at"]
 
 

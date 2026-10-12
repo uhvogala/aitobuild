@@ -346,6 +346,36 @@ def build_factories(
     return service_factory, worker_factory, holder
 
 
+def build_trial_environment(
+    arguments: Any,
+    *,
+    repository: dict[str, Any],
+    seed: Path,
+    base: str,
+    run_dir: Path,
+    secret: str,
+    token: str,
+    automatic: bool = True,
+) -> dict[str, str]:
+    """The trial's whole service environment; tests load it through aitobuild's real configuration."""
+    return trial_environment_values(
+        source=repository_source(
+            repository=repository["full_name"],
+            repository_id=repository["id"],
+            path=seed,
+            verification_command=VERIFY_COMMAND,
+            base_revision=base if automatic else None,
+            issue_author=arguments.allowed_issue_author,
+        ),
+        run_dir=run_dir,
+        endpoint=arguments.endpoint,
+        model=arguments.model,
+        invoke_timeout=arguments.invoke_timeout,
+        secret=secret,
+        token=token,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY)
@@ -456,21 +486,15 @@ def main() -> int:
     secret, token = secrets.token_hex(24), secrets.token_hex(24)
     configure_trial_environment(
         automatic_stages=automatic_stages,
-        values=trial_environment_values(
-            source=repository_source(
-                repository=repository["full_name"],
-                repository_id=repository["id"],
-                path=seed,
-                verification_command=VERIFY_COMMAND,
-                base_revision=base if automatic else None,
-                issue_author=arguments.allowed_issue_author,
-            ),
+        values=build_trial_environment(
+            arguments,
+            repository=repository,
+            seed=seed,
+            base=base,
             run_dir=run_dir,
-            endpoint=arguments.endpoint,
-            model=arguments.model,
-            invoke_timeout=arguments.invoke_timeout,
             secret=secret,
             token=token,
+            automatic=automatic,
         ),
     )
     # The app captures cwd as its service root (excluded from target sources; must be a Git checkout). Use a

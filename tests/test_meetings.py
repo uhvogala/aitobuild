@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
@@ -550,9 +551,21 @@ def test_native_meeting_saved_wait_tamper_fails_closed(tmp_path, damage):
 
 
 @pytest.mark.parametrize("cancel", [False, True])
-def test_native_meeting_timeout_and_cancellation_are_bounded(tmp_path, cancel):
+def test_native_meeting_timeout_and_cancellation_are_bounded(tmp_path, cancel, monkeypatch):
     entered = asyncio.Event()
     drained = []
+    scopes = []
+    real_timeout = asyncio.timeout
+
+    def recording_timeout(delay):
+        # The adapter's own asyncio.timeout scope; recorded so the test can expire it only once the model
+        # request is in flight, instead of racing a tiny wall-clock timeout against setup under load (#29).
+        scope = real_timeout(delay)
+        if sys._getframe(1).f_globals.get("__name__") == "aitobuild.organization_meetings":
+            scopes.append((delay, scope))
+        return scope
+
+    monkeypatch.setattr("aitobuild.organization_meetings.asyncio.timeout", recording_timeout)
 
     async def reply(request):
         entered.set()
@@ -565,16 +578,21 @@ def test_native_meeting_timeout_and_cancellation_are_bounded(tmp_path, cancel):
         async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
             async with AsyncOpenAI(api_key="test", http_client=transport) as client:
                 profile = ModelProfile("openai", OpenAIChatCompletionClient(model="DeepSeek-V4.1-Flash", async_client=client))
-                runner, assignment, meetings, _ = meeting_fixture(tmp_path, profile, timeout=5 if cancel else 0.03)
+                runner, assignment, meetings, _ = meeting_fixture(tmp_path, profile, timeout=300)
                 task = asyncio.create_task(runner.start(assignment.assignment_id, input=BLOCKER))
+                await asyncio.wait_for(entered.wait(), 30)
+                # The model request is in flight inside the adapter's single bounded timeout scope.
+                assert len(scopes) == 1 and 0 < scopes[0][0] <= 300 and not task.done()
+                if not cancel:
+                    scopes[0][1].reschedule(asyncio.get_running_loop().time())
                 if cancel:
-                    await entered.wait()
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
                         await task
                     run = FileRunStore(tmp_path / "runs").get(assignment.assignment_id)
                 else:
-                    run = await task
+                    # Only the expired adapter scope can end the run in time; the configured 300 s timeout cannot.
+                    run = await asyncio.wait_for(task, 30)
                 assert run.state == ("cancelled" if cancel else "failed"), run.error
                 assert run.cleanup_succeeded is True
                 assert drained == [True]

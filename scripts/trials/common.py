@@ -380,12 +380,13 @@ def positive(value: str) -> float:
     return number
 
 
-GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}")
 
 
 def issue_author(value: str) -> str:
     """argparse type for one exact GitHub login: no blanks, wildcards, lists or other patterns."""
-    if not GITHUB_LOGIN.fullmatch(value):
+    # The pattern alone allows up to 77 characters when hyphens are used; GitHub logins are at most 39.
+    if len(value) > 39 or not GITHUB_LOGIN.fullmatch(value):
         raise ValueError("must be exactly one GitHub login (no wildcards, blanks or lists)")
     return value
 
@@ -465,13 +466,18 @@ def trial_environment_values(
 
 def record_early_failure(recorder: Recorder, error: BaseException) -> None:
     """A failure before the service starts still lands in report.json with an end time and the error."""
-    recorder.report["result"] = "failed"
+    recorder.report["result"] = "fail"
     recorder.report["failure"] = f"{type(error).__name__}: {error}"
     recorder.report["ended_at"] = now()
     sessions = recorder.report.get("sessions") or []
     if sessions and "ended_at" not in sessions[-1]:
         sessions[-1]["ended_at"] = recorder.report["ended_at"]
-    recorder.save()
+    try:
+        recorder.save()
+    except Exception as save_error:  # noqa: BLE001 - the caller re-raises the original failure, not this one
+        error.add_note(
+            f"Saving the early failure record also failed: {type(save_error).__name__}: {save_error}"
+        )
 
 
 def configure_trial_environment(
