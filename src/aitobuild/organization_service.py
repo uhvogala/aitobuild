@@ -17,7 +17,8 @@ from aitobuild.agent_tools import DeveloperToolContext
 from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
 from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
-from aitobuild.developer_preview import AutomaticAdmissionDeferred, DeveloperPreview, DeveloperPreviewRegistry, preview_approval_operation
+from aitobuild.developer_preview import (AutomaticAdmissionDeferred, DeveloperPreview, DeveloperPreviewRegistry, is_planned_child,
+                                         preview_approval_operation, published_review_target)
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, EventName, Identifier, OrganizationDefinition
 from aitobuild.organization_assignments import AssignmentProposal, AssignmentService, AssignmentStore, TaskAssignment
 from aitobuild.organization_delivery import _delivery_call
@@ -229,13 +230,17 @@ class ManagedOrganizationService:
         bundle = developer_task_bundle_from_payload(preview.bundle_payload)
         if bundle.task_id.startswith("pm-planning-") or bundle.issue_context is None:
             raise PermissionError("Planning and non-repository tasks always require a human admission")
-        if "planning_assignment" in preview.source_payload or bundle.task_id.startswith(("planned-issue-", "dependent-issue-")):
-            self._check_planned_child(preview)
-            if bundle.issue_context.base_revision is None:
+        # A staged Architect review is eligible only as the admitted parent task whose exact published head it
+        # reviews; the parent then goes through the same planned-child check and trusted base callback.
+        eligibility = self._admitted_review_parent(preview) if published_review_target(preview) is not None else preview
+        if is_planned_child(eligibility):
+            self._check_planned_child(eligibility)
+            parent_issue = developer_task_bundle_from_payload(eligibility.bundle_payload).issue_context
+            if parent_issue is None or parent_issue.base_revision is None:
                 raise PermissionError("Planned child admission requires its plan-pinned base revision")
         if self._task_base is None:
             raise PermissionError("Automatic task admission has no trusted base binding")
-        base = self._task_base(preview)  # planned children: configured repository source required, allowlist replaced by the plan
+        base = self._task_base(eligibility)  # planned children: configured repository source required, allowlist replaced by the plan
         payload = deepcopy(preview.bundle_payload)
         if bundle.issue_context is not None:
             issue_payload = payload.get("issue_context")
@@ -256,6 +261,34 @@ class ManagedOrganizationService:
         if approved is None:
             raise ValueError("Preview disappeared before configured admission")
         return approved
+
+    def _admitted_review_parent(self, preview: DeveloperPreview) -> DeveloperPreview:
+        """The admitted delivery task a staged review inherits eligibility from, bound to its delivery record and
+        the exact published head; anything missing or mismatched fails closed."""
+        target = published_review_target(preview)
+        if target is None or self._reviews is None:
+            raise PermissionError("Review admission requires its trusted review staging binding")
+        parent_id, head_sha = target
+        staged = self._reviews.target_for(preview.preview_id)  # staged receipt, unchanged snapshot, live exact head
+        if (staged.preview_id, staged.head_sha) != (parent_id, head_sha):
+            raise PermissionError("Review admission target differs from its staging receipt")
+        record = self._worker.get(parent_id)
+        if record is None or record.state != "published" or record.publication is None:
+            raise PermissionError("Review admission requires the parent's published delivery record")
+        if record.publication.get("head_sha") != head_sha:
+            raise PermissionError("Review admission requires the exact published head of its parent")
+        parent = self._previews.get(parent_id)
+        if parent is None or not parent.approved or parent.approved_at is None or record.preview_id != parent_id:
+            raise PermissionError("Review admission requires an admitted parent task")
+        if str(parent.bundle_payload.get("task_id", "")).startswith("published-review-"):
+            raise PermissionError("Only an admitted delivery task can pass eligibility to its review")
+        # A correction parent is passed on as is: the trusted base callback refuses it (no issue allowlist and
+        # not a planned child), so re-reviews of corrections stay human unless an operator's own binding says otherwise.
+        if record.bundle_payload != parent.bundle_payload:
+            raise PermissionError("Parent delivery record differs from its admitted task")
+        if preview.bundle_payload.get("issue_context") != parent.bundle_payload.get("issue_context"):
+            raise PermissionError("Review issue and base differ from its admitted parent task")
+        return parent
 
     def _check_planned_child(self, preview: DeveloperPreview) -> None:
         """A PM-planned child qualifies only through a human-admitted planning task and a human issue-creation
