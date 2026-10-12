@@ -517,10 +517,25 @@ resolves the decision with `ApprovalPolicy.resolve`, and passes the exact previe
 it evaluated; `admit_task` refuses unless that preview equals the stored one,
 since the decision digest does not cover `source_payload`. The automatic
 admission limit and dedupe depend on the resolved decision source, not on the
-evidence variant. A new admission source (for example Discussions consent from
+evidence variant, with one deliberate exception for `Consent` evidence (its
+per-issue dedupe, described below). A new admission source (for example Discussions consent from
 #42) adds an evidence variant and its checks to this route; it must not reach
 `_approve_admission` itself or add a parallel path. Changing the route itself
 requires an explicit update to this section first.
+
+Rule: consent admission requires `task_admission` to be `automatic`. Under
+`human` mode a consent is refused, and only the HTTP approve endpoint
+(`Human` evidence) admits a task.
+
+Deliberate exception for `Consent` evidence (#42): a consent decision is
+human-sourced (`source="human"`), so it never counts toward
+`max_automatic_admissions`, like any human approval. It is still reached through
+automated reading of a discussion comment rather than a person acting in the
+service, so it shares the per-issue `(repository_id, issue_id)` dedupe with
+automatic admissions, in both directions: a consent admission is refused when the
+issue was already admitted by consent or automatically, and an automatic
+admission defers when the issue was already admitted by consent. A later task
+for that issue needs a direct human approval.
 
 Policy revisions and the effective stage decision belong in immutable run/effect
 evidence. Changes apply to new work; active runs refuse drift rather than silently
@@ -588,6 +603,798 @@ Meetings are orchestrated using the `GroupChatBuilder`. The framework pauses the
 Meetings are strictly bounded to prevent infinite token loops. A meeting terminates only when:
 * An agent executes a state-changing GitHub tool (e.g., `create_github_issue`, `approve_pr`).
 * A maximum turn limit is reached (triggering human escalation).
+
+### 4.3 Proposed GitHub Discussions Interface
+
+Status: feature plan only; not implemented or activated. This proposal uses the
+pulled `b5d494e` baseline, including the approval-model change merged as `b663498`
+from [PR #31](https://github.com/uhvogala/aitobuild/pull/31), the bounded submit
+follow-ups and meeting-timeout test/trial-harness fixes. These additions do not
+implement consent intake or activate the Discussions workflow.
+Discussions hold ideas, clarification and agent responses;
+Issues and PRs remain the delivery artifacts. The goal is to offer bounded PM
+planning from an ordinary conversation without requiring users to call Python
+or use a special approval command.
+
+#### Existing Contracts and Change Boundary
+
+The recent contributions provide reusable correction/follow-up/pilot harnesses,
+merged-prerequisite pause/resume, signed issue ingress through managed admission,
+author/label allowlists, durable automatic-admission caps, consistent deadline
+errors and stronger durable-file/publication recovery checks. None adds a
+Discussions adapter or freeform external human decision intake. A harness's
+unreviewed scripted approvals are not an authorization model for Discussions.
+Merge remains unsupported; references to merge-like approver gates describe the
+desired identity restriction, not an existing aitobuild merge operation.
+
+Reuse `PlanningAdmission.offer`, `ManagedPlanning`, configured native agents and
+graphs, existing exact stage requests, shared durable writers and the managed
+local worker. Do not replace task/approval/run/budget storage or install a fixed
+PM-to-Developer lifecycle. The example organization remains a definition probe.
+
+The single-approval experience additionally needs a trusted human-consent bridge,
+consent-bound publication adapters and a durable managed issue-amendment operation.
+PR #31 requires human planning admission and an exact human issue-creation decision
+before automatic child admission. A generic automatic PM decision does not meet
+that contract. Preserve direct human provenance for the advertised issue creation;
+use policy evidence for deterministic links and future effects within the consent.
+Read-only planning reconciliation cannot update issues. Keep these additions
+localized to planning publication, item-revision lookup and the decision bridge,
+following the formal approval contracts in section 4.4.
+
+New work belongs primarily in a Discussions GraphQL adapter, conversation/decision
+receipt store, configured native conversation operation and trusted intake bridge.
+Keep application ingress, strict central configuration and explicit service/worker
+factory extensions small and additive. Existing issue ingress, APIs and policies
+must behave unchanged when the integration is absent or disabled.
+
+There is one necessary cross-cutting addition: service decisions currently bind
+the shared operator actor, not an external GitHub commenter. Verified external
+human evidence must survive preview admission, service approval and detached
+queueing. Preserve the actual GitHub approver in human decision evidence and the
+executing service operator separately; do not silently attribute every approval
+to the shared internal token. Add only a trusted adapter capability for this
+evidence, not caller-selectable `actor_id` fields on existing HTTP endpoints.
+
+#### User Experience
+
+1. A user opens a discussion in an enabled category, optionally using a category
+    form for the problem, desired outcome, constraints and success criteria.
+2. The configured conversation agent, normally a PM, asks questions and publishes
+    a versioned brief with open questions. Other configured roles may contribute
+    through explicit routing; one App can label responses with agent/role names.
+3. Under an explicit bounded read-only planning policy, the configured PM prepares
+    the complete proposed plan without asking the user to approve planning first.
+    Save its offer, exact proposed issue titles/bodies/labels and dependency graph.
+    Present one versioned plan explaining the target, scope, limits and actions:
+    create these issues, resolve these links and stage implementation previews.
+    Preparation grants no issue-write or implementation authority.
+4. An authorized user replies naturally, for example, "Approved, create the work
+    items for this plan." Trusted intake records one human consent for that exact
+    bounded publication workflow, not a separate user approval for each stage.
+5. The service creates the approved issues and resolves the approved dependency
+    edges using their actual GitHub IDs/numbers. The trusted bridge records human
+    planning admission and the exact human creation decision from the same consent;
+    a consent-bound policy adapter handles deterministic links. No further human
+    prompt is needed merely because issue numbers became available.
+6. Completed planning posts issue links and staged Developer previews. Existing
+    independent follow-up admission and merged-prerequisite handoff rules apply.
+    The presented consent determines its scope; this initial publication workflow
+    does not also authorize implementation, PR publication or merge. An explicitly
+    presented optional plan-and-delivery bundle can cover the bounded delivery
+    actions in section 4.4; a generic "Approved" never adds an undisclosed bundle.
+7. Later discussion or comments on a linked issue can request revisions. The PM
+    proposes a concrete change set against the current items. One authorized
+    approval of that amendment permits the listed edits and dependency changes
+    to the existing issues, rather than requiring a replacement discussion or
+    creating duplicate issues for every clarification.
+
+Conversation can evolve created work items through approved amendments. Preserve
+old plan/approval/effect receipts as history, not as a prohibition on editing the
+current GitHub items. Active execution scopes remain immutable: an item amendment
+cannot silently change what an already-approved Developer run is implementing.
+New or changed work needs a revised task binding, while unchanged tasks keep their
+original authority and budgets. Each consent may cover several related stages
+of its explicitly presented workflow, never an unspecified future plan.
+
+#### Single Approval and Exact Effect Evidence
+
+Record a human plan consent containing the verified approver, source comment,
+immutable plan digest, target/base, issue keys and exact content, dependency edges,
+allowed deterministic link-body template, child policy, limits, expiry and
+configuration/binding revisions. This is one user-facing decision covering a
+closed set of related publication effects. Do not ask for additional human
+approval of mechanical steps already covered by that decision.
+
+New GitHub issue numbers cannot be approved as literal values before creation.
+Instead, consent authorizes a precise transformation: substitute only IDs/numbers
+from confirmed creation receipts for this plan's approved issue keys in its saved
+dependency template. Save the resulting exact body bytes and resolved identities
+before PATCH. Refuse missing/ambiguous receipts, extra edges, model-rewritten
+content or concurrent issue drift. Material changes require a new amendment;
+number resolution alone does not.
+
+Preserve existing per-stage/effect checkpoints, original budgets, intent-before-write
+and exact evidence. The trusted consent bridge supplies the human planning-admission
+decision and one exact human `pm_issue_creation` decision only after proving that
+the saved request is a permitted projection of the presented plan. Record both
+against the same verified consent without inventing additional human comments.
+A registered policy adapter resolves deterministic link requests, saving exact
+resolved bytes and linking its decision to that consent. All adapters refuse
+requests outside the consent, even in automatic mode. Read-only preparation is
+separately operator-configured; it does not auto-admit a managed planning task.
+
+Single-approval mode is an explicit opt-in workflow binding; it does not weaken
+manual defaults or change unrelated deployments. Activation requires the exact
+consent-aware adapters and compatible stage policy. Do not silently reuse a broad
+automatic approval handler that ignores consent. Disabled stages still refuse;
+automatic decision/admission ceilings still apply. Existing deployments using
+manual stage prompts remain supported, but those prompts are not the intended
+experience for this configured Discussions workflow.
+
+#### Identity and Freeform Approval
+
+Operator configuration contains enabled repository/category bindings, allowed
+conversation participants and a separate approver allowlist scoped by repository
+and supported approval stage. Conversation participation alone grants no approval
+rights. Pin approvers to host-qualified GitHub user IDs; optional login entries
+resolve through trusted GitHub reads before activation and retain that binding.
+Do not authorize using display names, comment text, reactions, `authorAssociation`
+or model-supplied identities. Reject bot, missing/ghost and unverifiable actors.
+
+Freeform approvals are supported; exact commands and user-entered digests are not
+required. A configured native verifier (the PM or a separate agent) receives only
+the bounded human comment and trusted presentation/context of the pending action.
+It returns strict `approve`, `reject` or `clarify` intent with supporting text spans.
+It has no decision/write tools and cannot select actors, change the action or
+approve its own proposal. Model output is interpretation evidence, not authority.
+Do not substitute a confidence score for an explicit, attributable approval.
+
+Trusted code establishes identity and target before interpretation. A direct reply
+to the App's saved plan/amendment comment is the preferred binding. A top-level
+freeform comment may qualify only when its reference is explicit and exactly one
+presented pending consent matches; otherwise ask for clarification. Bind that
+presentation to the plan/change-set digest and its allowed operations, with exact
+preview/assignment/request, stage, target/base/head and policy/binding pins saved
+for each derived effect. Users need not type these machine identifiers.
+
+"Looks interesting", quoted approvals, approval of an older proposal, conflicting
+wording, conditional approval and unclear pronouns do not advance work. Request
+clarification, or a fresh revised proposal when scope changes. An explicit rejection
+is recorded against its exact request; do not silently turn it into cancellation
+of an unrelated task. One human comment can authorize one presented bounded plan
+or amendment spanning several related stages. Do not treat it as approval of other
+proposals merely because the wording also expresses broader enthusiasm.
+
+Immediately before acceptance/consumption, re-read the live comment and referenced
+proposal, verifying author, reply relationship, body/version, deletion status,
+allowlist/policy binding, exact pending request and original budget. Edits or
+deletions invalidate unconsumed evidence and require a fresh evaluation; never
+reinterpret a consumed comment to enlarge its accepted consent. Covered effect
+decisions use that saved consent, not another model interpretation. Deleting a consumed
+approval cannot undo an already-landed effect: preserve the receipt and report it.
+The interval between a GitHub read and a write is not transactional; document
+this limit rather than claiming atomic cross-platform approval/revocation.
+
+The top-level freeform consent is a `human` decision, not `operator_policy`, merely
+because a model classified it. Its exact planning admission and issue-creation
+projections also retain direct human provenance. Automatic decisions for derived
+links and future delivery effects are separately attributed to the consent-bound
+policy, retaining the real consenting human and exact consent relationship.
+Persist both forms of evidence before
+enqueueing/consuming their gates. Restart at an accepted idle boundary uses saved
+evidence without another model call; interrupted interpretation/uncertain effects
+fail closed. Active allowlist or binding drift refuses continuation rather than
+silently changing who may approve.
+
+#### Continued Discussion and Item Amendments
+
+Subscribe to comments on managed, linked issues as well as their originating
+discussion. Both feed the configured conversation workflow and may propose edits
+to existing work items. The issue thread is the natural home for task-specific
+clarification; the discussion remains available for broader cross-issue changes.
+Only operator-bound managed issue identities qualify, and `issue_comment` events
+on PRs must not enter this issue-amendment path.
+
+The PM saves a proposed amendment listing affected issue IDs/numbers, the current
+approved item revision and live title/body/labels, exact desired replacements,
+dependency changes, rationale, task impact and effect/budget limits. Present the
+change set in the originating thread. One clear approval from an authorized user,
+such as "Yes, apply these changes", authorizes the listed updates and deterministic
+link adjustments. Separate issue-update authority must be registered; approval of
+the original creation plan alone is not standing permission for later edits.
+
+Apply changes to the existing issues, preserving their identity and links. Store
+append-only item revisions and per-update intents/receipts; never rewrite original
+creation plans or human decisions. Preserve unrelated live content. Concurrent
+human edits require rereading and a revised proposal rather than overwriting them.
+An approved amendment has its own bounded task/ledger, not an extension or reset
+of the original planning or delivery budget. Uncertain updates reconcile read-only;
+no new amendment may be used to blindly replay a failed or uncertain effect.
+
+Planning child lookup and dependency handoff must understand the latest confirmed,
+approved item revision. Explicitly distinguish authorized amendments from arbitrary
+remote drift; do not simply drop existing exact-content checks. The original plan,
+publication lineage and all historical receipts remain available for audit.
+
+For unstarted work, changes to objective, criteria, dependencies or scope stage a
+new revision-pinned preview and mark the old unstarted preview superseded; preserve
+its evidence and prevent execution under stale approval. A new task needs its own
+authority, which can be included in the same presented amendment only through an
+explicitly supported bounded admission adapter. Publication-only amendments do
+not authorize implementation implicitly.
+
+For active work, descriptive discussion can continue, but a scope-changing
+amendment is blocked until a coordinated stop/drain or completion establishes a
+safe handoff. Do not silently mutate the run, auto-cancel unrelated work or reset
+its ledger. Completed work may gain a separately scoped follow-up task; changing
+the issue text does not retroactively change verified artifacts or certify new
+requirements. Deleting issues, rewriting PRs or merging is outside this feature.
+
+#### Configuration and Agent Boundaries
+
+Add a strict, opt-in Discussions configuration with repository IDs/category IDs,
+participant and stage-specific approver bindings, configured agent/team/workflow
+references, GraphQL credential references, operator-owned planning target/base
+resolution, consent-bound publication/amendment bindings and limits. Missing
+bindings refuse activation. Secrets remain
+environment-backed; explicit factories must bind the effective policy exactly.
+Discussions can live in the delivery repository or a configured product repository;
+cross-repository target mappings are operator-owned, never inferred from comments.
+
+Keep conversation/reply authorization separate from delivery approval. An operator
+explicitly authorizes bounded App responses under a revisioned discussion policy,
+with exact reply intents and receipts; otherwise remote replies cannot be written.
+This standing authorization covers discussion comments only, never issue/PR writes.
+Enforce durable per-thread/global model-call, response-byte, turn, time and
+outstanding-offer limits across restarts, with a stop control. Conversation limits
+are separate from original planning/delivery ledgers; none can reset another.
+
+Use native Agent Framework sessions and configured role instructions; keep replies,
+structured briefs and interpretation outputs within their scoped adapters. Agents
+cannot read credentials, choose arbitrary repositories, run commands or execute
+code from discussion text. Treat human and bot content as untrusted data. Any
+repository context is explicitly bound read-only, and permissions of conversation
+participants bound what may be disclosed. Do not post secrets, private tool logs
+or content from another access scope. Sending discussion content to the configured
+model is an explicit deployment/privacy decision.
+
+#### Transport, Receipts and Recovery
+
+Use the GitHub GraphQL Discussions API for paged thread reads and comment/reply
+mutations. Prefer a GitHub App installed only on configured repositories, with
+Discussions read/write permissions for conversation; issue publication keeps its
+separate approval-enforcing adapter and required permissions. Subscribe to
+`discussion`, `discussion_comment` and `issue_comment` for managed linked issues;
+validate HMAC signatures and the installed repository identity. Persist intake
+before acknowledging and run model work in the background, not inside webhook
+response latency.
+
+Discussion events go to a distinct configured intake path; do not pass them
+through the issue-task extractor or label an unsigned/internal payload as a
+verified GitHub actor. Reuse transport signature validation without widening
+existing issue automatic-admission guards. Ignore App-authored events for model
+invocation, deduplicate delivery IDs and handle edits/deletions and out-of-order
+events through authoritative reads. Bounded reconciliation covers missed events;
+GitHub currently documents discussion webhooks as public preview.
+
+Separate durable conversation/intake state from definition and managed-run storage.
+Save source discussion/comment IDs and URLs, exact bounded source bytes/digests,
+human author IDs, context selection, brief/item revisions, agent/binding pins,
+verifier output, human consents, derived stage/effect relationships, superseded
+unstarted previews, presentation/request/operation pins, deadlines, consumed
+decisions and remote reply/update intents/receipts. Use shared atomic/fsynced
+writers, explicit file permissions, symlink refusal and local locks; do not claim
+distributed ownership.
+
+Offer identities derive from discussion identity plus the frozen brief/target
+revision, not webhook delivery IDs or mutable thread timestamps. Duplicate
+notifications or bot status comments must not create fresh offers. Partial local
+offer staging recovers metadata through existing idempotent contracts. Never
+recreate missing initialized ledgers or previews from thread text. After uncertain
+comment publication, use GET-only reconciliation of exact saved markers/content;
+GraphQL `clientMutationId` is correlation, not an exactly-once guarantee. Ambiguous
+or absent effects need inspection, not blind mutation retries.
+
+#### Delivery Slices and Acceptance
+
+1. Add strict contracts/configuration, mocked GraphQL transport and durable intake,
+    conversation/presentation/decision receipts. Cover pagination, identity,
+    signatures, disabled/unbound activation, dedupe, stale events and bot loops.
+2. Add configured bounded native conversation and automatic unapproved offers.
+    Add explicitly authorized read-only plan preparation before the single human
+    prompt. Validate readiness, exact target/base/child-policy binding, offer dedupe,
+    full plan presentations and restart without model/write replay.
+3. Add whitelisted freeform plan consent and exact consent-bound PM publication.
+    Prove that one human approval creates the approved issues and resolved links,
+    with no second prompt for issue-number substitution. Propagate actual human
+    admission/creation evidence and derived link-policy evidence through
+    preview/service/worker receipts. Publication-only consent must not trigger
+    PR #31's automatic child eligibility as implicit delivery authorization.
+4. Add the durable managed amendment operation and linked-issue comment intake.
+    Prove single-approval edits of existing issues, approved item revision lookup,
+    dependency updates, stale-preview supersession and active-task handoff refusal.
+    Other delivery stages retain their current interfaces until their bounded
+    consent adapters are explicitly registered and tested; merge stays excluded.
+5. Extend the reusable trial harness with a freshly authorized disposable-target
+    Discussions scenario, not its approve-everything helper. Demonstrate human
+    conversation, one approved plan producing linked issues, continued discussion
+    and issue-thread amendments updating those same items, and separate Developer
+    admission. Preserve artifacts and clean up local resources. This is a scoped
+    live integration trial, not hosted/distributed certification.
+
+Required negative coverage includes non-allowlisted/renamed/spoofed actors,
+quoted or injected approval text, ambiguity and conditional/negative intent,
+multiple/stale pending requests, changed/removed source comments or presentations,
+consumed-comment reuse, stage escalation, scope/base/head or policy drift,
+automatic/disabled mode mismatches, expiry/cancellation, queue-time revocation,
+tampered/lost receipts and uncertain remote writes. No such case may publish
+issues, authorize implementation or reset budgets. Also refuse additions outside
+the consent, fabricated issue-number mappings, changed link templates, attempts
+to treat creation consent as later update authority, stale amendment baselines,
+concurrent human edits, unlinked/PR comment intake and silent active-scope changes.
+Positive cases must show exactly one user approval per plan or amendment, the real
+whitelisted human, exact source/consent/effect relationships, approved updates
+without duplicate issues and unchanged historical evidence/budgets. Restart must
+not repeat an approval prompt, a model call or an uncertain effect.
+
+Run focused adapter/admission/worker tests after each runtime slice, then repository
+pytest/Ruff/mypy gates and the mock copied-fixture simulation. Recheck baseline CI
+on the selected implementation revision; the previously observed `5c1c2fb` meeting
+timeout/drain failure is historical evidence, not proof of a current failure or fix.
+Update current-state setup docs only as capabilities become implemented. The
+minimum accepted feature is conversation -> frozen offer -> verified freeform
+plan consent -> automatically created/linked issues and unapproved implementation
+previews -> approved amendments from Discussions or issue comments updating those
+same items, with unchanged delivery verification, original budgets, role ceilings
+and merge refusal. One user-facing approval is not the same as one unaudited write.
+
+### 4.4 Proposed Bounded Human Consent and Delivery Approval
+
+Status: consent evidence foundation implemented as an inactive library; runtime
+approval integration and delivery remain proposed, not activated or permission to
+merge. It extends section 4.3 to remove repeated human work without erasing exact
+approvals, verification, configurable workflows or immutable execution scopes.
+The evidence types below now have an initial implementation; `PreparedPlan`,
+`ConsentUsage`, promotion and managed decision adapters remain proposed contracts.
+These are not new HTTP APIs or activated JSON settings.
+
+#### PR #31 Baseline and Compatibility
+
+PR #31 is merged as `b663498` and its `_check_planned_child` implementation is now
+in the local `b5d494e` checkout. Retain that guard rather than implementing a second
+human-plan eligibility path. The pull also includes bounded submit follow-ups and
+the meeting-timeout test fix; validate the selected baseline with the repository
+gates rather than treating the old CI failure as an unresolved prerequisite.
+
+The code establishes these rules:
+
+- Unapproved `pm-planning-*` tasks and tasks without repository issue context
+  cannot enter through automatic task admission; they need human admission.
+- Planned/dependent children qualify through trusted stored planning evidence,
+  not issue-author/label lookup: a completed parent, matching published plan,
+  human-admitted planning preview and exactly one approved human creation decision
+  matching `workflow_input_digest(ManagedPlanning.approval_data(plan, publication))`.
+- Child admission remains an `operator_policy` decision with the frozen child
+  base and the existing durable admission cap. Generic automatic issue creation
+  does not qualify a child through this human-plan path.
+- Existing route/publication/handoff checks still establish actual child ownership,
+  complete effects and remote identity/content. The new guard does not replace them.
+
+Retain these protections. Human plan approval establishes child eligibility under
+the PR's configured policy, not blanket authority for future work. For newly
+consent-bound plans, require an additional explicit delivery grant before child
+admission; otherwise a publication-only consent could accidentally start work.
+Legacy workflows retain their documented configured behavior, but their old
+decisions must not be upgraded into new broader consents by inference.
+
+#### PR Baseline Alignment
+
+This branch is rebased onto master `f7918b7e8b7ee8c7cd5b19225926592bf9049aae`
+(2026-10-12), which contains every PR below plus the single admission route
+(#43, `32399942ba11fb63fd7e913a816289e6b65340ec`) and its guard follow-ups (#46).
+Heads are the reviewed heads that were merged; the merge commit follows.
+
+| PR, merged head and merge commit | Effect on this plan |
+| --- | --- |
+| [#36](https://github.com/uhvogala/aitobuild/pull/36), `51f42c4f9f389d8af4205873e8d54e77756d632b` → `b0946e2` | Bounded asynchronous lock acquisition after local cancellation supports the stop/drain contract. Cross-worker contention still refuses immediately; this adds no retry or approval authority. |
+| [#37](https://github.com/uhvogala/aitobuild/pull/37), `6b876f4b917b08b6287b35ba04cf08bf153586a2` → `3c7f978` | A staged Architect review derives automatic admission eligibility from its exact admitted, published parent. Reuse that lineage path and its one-automatic-review-per-parent/head guard; it does not authorize COMMENT publication, corrections or single-consent delivery by itself. |
+| [#38](https://github.com/uhvogala/aitobuild/pull/38), `1d6df5896956ceecbff1cdfa8fbd90ca1e66bb1f` → `a5418b2` | Durable correction-proposal failure counts/errors, reminder revalidation and real script-entrypoint allowlist tests reinforce existing bounds. They do not change the human approval model or activate automatic correction admission. |
+| [#39](https://github.com/uhvogala/aitobuild/pull/39), `711985d3550f9431b483012dbfd57f19e6d968f0` → `4d404cf` | A shared planned-child classifier, public validated read-only receipt accessors and exact dependent-handoff assignment checks provide the preferred admission foundation. They retain PR #31's direct human planning/creation requirement. |
+| [#40](https://github.com/uhvogala/aitobuild/pull/40), `c292132aa6e574d7d8572c376b08fdb4efbd6849` → `325e57b` | The pilot forwards `human_admission=True` only for planning to the merged #35 helper, which calls the gated approval endpoint and records a human operator action. Other phases retain `False`. This fixes harness compatibility with #31, not correction/re-review admission or attributable production consent. |
+
+PRs #37 and #39 explicitly require separate human approval-model sign-off before
+merge. ReviewBot or CI success does not supply it. Their shared changes in
+`app.py`, `developer_preview.py` and `organization_service.py` overlap: prefer
+integrating #39's shared classification and validated readers first, then rebasing
+#37 onto that result. Preserve one classifier, not two slightly different rules.
+The independent #36/#38 safeguards can be integrated separately after review.
+Do not automatically merge, rebase or cherry-pick any of them as planning work.
+
+Merged #40 is independent of #37/#39 and depends on the `HandsOff.child` argument
+from merged [#35](https://github.com/uhvogala/aitobuild/pull/35). The fresh
+implementation baseline contains both; do not apply #40 alone to `b5d494e`. Neither
+change makes planning automatically admissible or approves PM issue creation.
+Their trial operator call is not a model/request-controlled human-approval flag.
+The production single-consent bridge must supply the exact attributable human
+admission evidence through the existing gate, followed by the separate exact
+human creation projection covered by the same accepted presentation.
+
+If these PRs are accepted, update the consent integration as follows:
+
+- Use `is_planned_child`, `published_review_target`,
+    `ManagedPlanning.stored_publication` and `ManagedDependencies.stored_handoff`
+    at their existing ownership boundaries. Avoid private receipt-loader calls,
+    copied prefix tests or a second automatic-review admission branch. The public
+    readers retain loader validation; their names alone do not grant authority.
+- Before projecting review admission for a consent-bound parent, join its saved
+    delivery grant, permitted review stage, exact published target/head and original
+    lineage. Then apply #37's staged receipt, admitted-parent bundle/base checks and
+    shared planned-child/allowlist eligibility path. Parent eligibility is necessary,
+    not permission to enlarge a `plan_publish` consent into delivery or review.
+- Keep review admission and head-pinned COMMENT publication separate exact
+    decisions. Reviews consume the existing automatic-admission cap; preserve #37's
+    per-parent/head dedupe across restarts and rejection. A fresh preview ID cannot
+    replenish authority or turn a failed/uncertain review into a safe retry.
+- With #37's normal configured callback, a correction parent does not qualify a
+    re-review automatically. This is a current implementation gap, not the desired
+    policy: add configurable consent-aware lineage admission for both corrections
+    and re-reviews, with the trusted provisioning needed to run them. Until those
+    adapters exist, report the unsupported automatic profile before presentation;
+    do not advertise it and then require undisclosed manual steps. Never fall back
+    to an issue allowlist for correction tasks.
+- Use #36's bounded local lock wait for cancellation/revocation integration and
+    preserve durable cancellation intent, thread drain and immediate busy refusal
+    for other owners. Lock contention is not authority to replay an effect.
+- Preserve #38's persisted failure count/error and pre-reminder revalidation.
+    Version or refuse incompatible saved session/binding state rather than resetting
+    counters when a persisted key changes. Exhausted proposal attempts stop proposal
+    generation; they are not evidence that requirements passed semantic review.
+
+Before adopting the combined baseline, run the focused planned-child, dependent-
+handoff, review-admission, preview-dedupe, worker-cancellation and submit/harness
+tests, including #35/#40's follow-up and pilot planning-admission regressions,
+then normal repository gates. #40's flag-forwarding and AST tests prove wiring,
+not a complete planning run or production consent authentication. Add native
+receipt-backed positive coverage
+for a real published planned child leading to its review, not only #37's isolated
+test that spies on entry to the planned-child guard. For consent integration,
+also prove publication-only refusal, grant-aware review admission/publication,
+head/parent/handoff drift, configured correction/re-review success and refusals,
+per-head dedupe and
+revocation during local/cross-worker contention without changed original budgets.
+Pending-branch CI is not a substitute for these combined and consent-aware checks.
+
+#### Advertised Authorization Bundles
+
+Every presentation selects one operator-supported bundle and states its actual
+actions, limits, target and stop conditions. One verified human response accepts
+that bundle. Do not display a separate prompt for each internal stage.
+
+| Proposed bundle | What one approval covers | What it does not cover |
+| --- | --- | --- |
+| `plan_publish` | Admit the frozen planning request, create its advertised issues, resolve its advertised dependency links, stage unapproved child previews | Child implementation, PR writes, review/correction execution or merge |
+| `plan_deliver` | `plan_publish` plus delivery of explicitly listed child keys, verification, draft publication, head-pinned COMMENT review and any explicitly capped same-PR correction/re-review chain | New issue keys, changed criteria/scope, unrelated tasks or merge |
+| `task_deliver` | One exact existing task through the advertised delivery/review stages and optional capped correction chain | Other tasks, scope expansion or merge |
+| `amend_items` | Exact before/after edits to named managed issues, declared dependency changes and stale unstarted-preview supersession | Active-run mutation or implementation unless a bounded replacement-task grant is explicitly included |
+
+`plan_publish` is the Discussions default. `plan_deliver` is an explicit optional
+profile, never inferred from issue creation or vague enthusiasm. An unsupported
+bundle or unavailable required adapter fails before consent, rather than promising
+single approval and asking for undisclosed stage permissions later.
+
+#### Immutable Contracts and Evidence
+
+Use strict versioned records and existing canonical JSON/digest conventions:
+
+- `PreparedPlan`: a stable ID, frozen request/target/base and child policy,
+  validated `PlanProposal`, exact rendered issue bytes/labels/markers, dependency
+  template, read-only inspection evidence, configuration pins and preparation
+  limits/deadline. It is not an approved managed run or an issue-write permission.
+- `ConsentPresentation`: immutable presentation/source identity, bundle, prepared
+  content digest, authorized issue/task keys, stage/effect set, allowed runtime
+  substitutions, per-task and aggregate limits, expiry and all relevant bindings.
+- `HumanConsent`: exactly one presentation, verified host-qualified human identity,
+  source comment ID/version/bytes/digest, strict interpretation evidence, accepted
+  scope, acceptance time and trusted service identity recorded separately.
+- `ConsentProjection`: consent/presentation IDs, rule/binding revision, exact saved
+  preview or pending request, input and operation digests, parent/item lineage,
+  concrete target/base/head and the resulting existing approval-decision reference.
+- `ConsentUsage`: durable reservations/counts for authorized tasks, calls, changed
+  paths and remote effects across descendants; consumed projection IDs; explicit
+  revocation/exhaustion evidence. It supplements, never replaces, original ledgers.
+
+Each field that affects authority participates in the canonical digest. Derive
+human identity from verified intake, never from record fields supplied by a model
+or an untrusted API caller. Keep human evidence and projection provenance separate
+from `ApprovalDecision`'s stage/mode/source/actor/operation evidence; link them
+durably instead of changing `operator_policy` decisions into fabricated humans.
+
+The bridge may create multiple exact decisions from one human consent only for
+actions that the human actually accepted. In particular, human planning admission
+and the advertised exact issue creation retain `source="human"`. Unknown future
+tool calls, verified snapshots, review bodies and correction pushes use registered
+`operator_policy` adapters, even though their outer mandate came from a human.
+No model approves its own proposal, chooses an actor or expands the grant.
+
+#### Preparation and Promotion
+
+PR #31's planning-admission refusal remains intact. Prepare the draft in an
+explicit bounded read-only conversation/planning operation under operator policy,
+not by auto-admitting a managed `pm-planning-*` preview. Save its offer and draft
+without implementation tools, remote writes or initialized managed-run ownership.
+The preparation budget includes its model work and cannot be reset by redelivery.
+
+Current `ManagedPlanning.propose` renders markers from assignment identity and
+includes admission time, ledger path and runtime pins in `PlanRevision.digest`.
+Therefore pre-consent drafting needs an explicit promotion contract, not an
+assumption that a draft digest already equals the final runtime plan digest:
+
+1. Render opted-in drafts with stable prepared-plan markers before presentation.
+    Keep legacy rendering unchanged. Freeze all issue content and dependency rules.
+2. Persist the accepted consent and its admission projection before admitting the
+    offered planning preview. Admit it as a human decision, not through automatic
+    planning admission; preserve the actual commenter and trusted execution operator.
+3. Under the normal managed assignment/ledger checks, promote the saved proposal
+    without another PM generation. Recheck the exact trusted repository/base and
+    request inspection. Allow only documented runtime attachments: assignment/
+    preview IDs, scope digest, admission timestamp, original budget path/deadline,
+    publication nonce and resulting runtime plan digest. The grant caps the deadline.
+4. Save a promotion receipt binding prepared-content and runtime-plan digests.
+    Prove unchanged titles/bodies/labels/markers, issue keys, criteria, dependency
+    graph, target/base, child policy and configuration/binding pins. Any change
+    outside the runtime attachment whitelist needs a new presentation/consent.
+5. For the exact saved creation request, persist one human projection whose request
+    digest and decision satisfy PR #31's existing human creation check. Admit and
+    enqueue only through trusted service capabilities, not a caller actor override.
+6. Resolve dependency numbers only from confirmed creation receipts. Save exact
+    resolved bytes and a consent-bound link-policy decision before each write.
+
+The creation request must describe the actual selected bundle. Its current
+`implementation="Stage unapproved previews only; no assignment or execution"`
+and separate-link-approval wording cannot be silently reused as evidence for a
+delivery grant. Add a versioned opt-in approval-data contract and update producers,
+digest checks and readers together; do not mutate historical requests or receipts.
+
+#### Policies, Descendants and Recovery
+
+Operator-owned authorization profiles bind supported bundles to configured
+agents/graphs/routes, stage adapters, verified approver action allowlists, target
+repositories, limits and effect-derivation rules. They are a new strict opt-in
+configuration contract, not new universal approval modes. Keep `human`, `automatic`
+and `disabled`, manual defaults, role ceilings and disabled merge unchanged.
+
+The initial single-consent planning profile uses human planning admission and
+`pm_issue_creation="human"`, with consent-bound automatic dependency publication.
+Delivery profiles additionally require compatible automatic bindings for unknown
+Developer tools, draft/review publication and opted-in correction/continuation.
+Descendant task admission must be automatic and grant-aware if advertised as
+unattended. Every required disabled/manual-incompatible or missing binding is
+reported before presentation. An operator's global automatic setting alone is
+not proof of a particular consent, and a consent cannot override a disabled gate.
+
+For a planned child, join the human plan evidence from PR #31 with the saved
+delivery grant, exact authorized key and existing publication/route checks. Each
+child has its own immutable approval, assignment and original ledger; admission
+still counts against `max_automatic_admissions`. Correction/re-review children
+also need exact receipt lineage, verified publication/head bindings and shared
+correction-round ceilings. Do not infer child authority from naming prefixes.
+
+After acceptance of #37/#39, reuse their shared parent-based eligibility and
+validated receipt accessors when applying these extra grant checks. A review's
+consent grant comes from the verified delivery lineage, never from a reconstructed
+issue author or a task-prefix heuristic. The ordinary #37 callback still refuses
+correction re-reviews, but the configured automatic continuation profile must
+resolve that eligibility through trusted correction lineage, without another
+human approval when the accepted delivery grant already covers it.
+
+#### Configurable Correction and Re-Review Continuation
+
+Manual defaults remain available, but correction and re-review are not permanent
+human boundaries. Operator configuration selects a compatible profile using the
+existing `human`, `automatic` and `disabled` stages and the advertised consent:
+
+- **Automatic:** with automatic task admission, Developer tools, correction
+    publication and review publication, registered lineage/provisioning adapters
+    and an explicit correction-round grant, stage and admit the correction, prepare
+    its trusted seed, implement, independently verify, advance the same draft with
+    its exact non-force publication decision, then stage/admit the head-pinned
+    Architect re-review and publish its exact COMMENT. No extra human prompt is
+    required solely because these are new child tasks or a corrected head.
+- **Human:** the operator can choose explicit human gates for correction or review
+    stages. Present those gates honestly; do not advertise that profile as an
+    uninterrupted single-consent workflow. Human mode is a policy choice, not a
+    hardcoded special case for every correction parent.
+- **Disabled:** refuse the disabled correction/re-review action. Do not skip it,
+    fabricate successful review or silently switch to a different authorization path.
+
+Automatic eligibility follows the exact root delivery grant through saved review,
+correction and publication receipts. Verify approved criteria/path scope, same
+repository/PR/public branch, reviewed parent head, verified correction snapshot,
+consumed publication approval and current corrected head before re-review. Give
+each child its own immutable task and original ledger; preserve existing admission
+caps, per-parent/head dedupe, shared round ceilings and aggregate consent limits.
+Do not grant authority based only on an admitted ancestor, prefix or changed label.
+
+The user approves the correction policy and maximum rounds with the advertised
+delivery bundle, not every mechanically derived iteration. Human action is needed
+for changed scope, a new product decision, exhausted limits, revoked/expired
+authority or an unresolved/uncertain effect, not ordinary unchanged-scope
+correction/re-review. A genuine correction proposal still comes from actual review;
+never manufacture defects to keep the loop running. Merge remains unsupported.
+
+Implement trusted seed provisioning alongside this automatic profile, rather than
+deferring a mandatory manual fetch into an allegedly automatic correction cycle.
+Activation checks must prove all required adapters and stage policies are bound.
+No default activation or global permission widening is implied.
+
+Dependent tasks additionally need confirmed human-merged prerequisites and the
+trusted handoff adapter. A future operator-owned provisioning worker may refresh
+the private seed and attest an exact new base before staging a separately pinned
+task under the saved dependency rule. Neither a PM nor task commands select/fetch
+an arbitrary base. Until that adapter exists, report seed/readiness work as a
+manual boundary; do not promise uninterrupted `plan_deliver` for dependent work.
+
+Bound aggregate fan-out, model calls, changed paths, write effects and lifetime
+with durable reservations as well as each task's original limits. Known capacity
+contention defers the same authorized work; it cannot replenish grant or task
+budgets. Admission/decision ceilings and cancellation remain effective. Scope
+changes, unresolved blockers and exhausted correction rounds return to humans.
+Unchanged-scope continuation can use its exact registered policy adapter; arbitrary
+native `human_input` still requires a separately supported trusted response binding.
+
+Consume a source comment once as consent, with one immutable accepted record.
+Consume each request/projection at most once under existing local locks. Persist
+projection intents before updating preview/run/queue stores; metadata-only recovery
+may finish the same recorded projection at a saved idle boundary. A crash cannot
+reinterpret the comment, rerun the PM or authorize a different pending request.
+This is not a cross-store/remote transaction: interrupted running or uncertain
+effects retain evidence, stop and reconcile read-only, never blindly replay.
+
+Reject stale/unconsumed presentations, edited/deleted source evidence, expired
+authority, missing/tampered records or binding drift. For accepted consent, source
+integrity loss stops remaining effects for inspection without rewriting history.
+Explicit verified stop/revocation records block new effects and drain active work
+before releasing ownership; landed writes remain recorded. Revocation or retry
+cannot reset original budgets. A failed run is not rescued by presenting the same
+uncertain effect as a new amendment or silently making a fresh task.
+
+#### Authority Foundation Progress
+
+[src/aitobuild/approval_consent.py](src/aitobuild/approval_consent.py) implements
+strict profiles, presentations, host-qualified human/source records, accepted
+consents and projection evidence, with an explicitly initialized `FileConsentStore`.
+The immutable journal uses canonical digests, shared atomic/fsynced writes, private
+permissions, local locks and symlink refusal. It preserves one consent per source/
+presentation and one projection per exact request, checks compatible stage modes,
+pins profile/content/source evidence and bounds recorded projection reservations.
+Expired evidence remains readable but cannot support new consumption.
+
+[tests/test_approval_consent.py](tests/test_approval_consent.py) covers direct human
+creation versus policy-derived link evidence, authority escalation, stale source/
+policy, duplicate comments/requests, limits, corruption/loss, concurrent consumers,
+expiry and metadata-only recovery after a landed save loses its response.
+
+This library neither authenticates GitHub actors nor interprets comments, proves
+semantic equivalence of an effect to a prepared plan, approves managed tasks or
+publishes anything. All source/profile inputs must come from trusted adapters.
+Producer-side effect checks, trusted human attribution through preview/runner/
+worker, explicit revocation, aggregate execution usage and configuration activation
+are still pending. Existing approvals, PR #31's admission guard and manual defaults
+are unchanged. The opt-in exact-task bridge below begins consent-to-decision
+integration; complete runtime binding and single-consent PM publication remain
+pending.
+
+Validation on the rebased `f7918b7` baseline (2026-10-12): focused consent/policy
+checks passed, then the full suite passed twice with 1,477 tests and two skips,
+Ruff passed and mypy passed for 55 source files. The mock copied-fixture report at
+`/tmp/aitobuild-consent-foundation-simulation-report.json` records `succeeded=true`,
+accepted execution, generated artifact and integer command exit 0; no persistent
+session started or remained active. No dependencies, live model/GitHub writes,
+runtime activation, merge or approval-model defaults changed.
+
+#### Exact Task Admission Progress
+
+On the merged #40 baseline, `ConsentAdmissionEvidence` binds the exact accepted
+human record to a direct-human task-admission projection. `DeveloperPreviewRegistry`
+stores it beside the exact pinned approval decision, validates it on reload and
+preserves it through dispatch. Existing approvals cannot acquire a new consent
+retroactively; legacy approvals without consent evidence retain their behavior.
+
+The explicitly constructed `ConsentTaskAdmission` adapter (`consent_admission.py`)
+supports only one frozen `task_deliver` repository-issue preview. Its trusted
+readers must supply the current effective profile and authoritative source
+snapshot. It checks repository identity, base, bundle and preview-operation
+digests, the exact presented item and task budget ceilings. Presentation keys are
+aliases, not normalized native task IDs. It reserves the exact projection durably
+and rechecks live authority read-only. It never approves a preview itself: it
+hands the evaluated preview and a `Consent` evidence variant to the managed
+service, which admits it through the single route (§2.4). The consent journal is
+the evidence store only; the service's live `ApprovalPolicy` is the authority.
+The service refuses review, correction, planning and non-repository tasks for
+consent, resolves the decision with `approval_policy.resolve(TASK_ADMISSION,
+source="human", ...)` against the live policy and requires it to equal the
+recorded projection decision, so a changed policy refuses rather than adopts the
+consent. Publication-only/PM consents cannot use this adapter to admit delivery.
+Independent local owners share the original one-shot reservation; no new ledger
+or execution budget is created by this adapter.
+
+`reconcile` inspects a matching landed preview approval without writing, dispatching
+or consuming authority, even after expiry/source loss. A saved projection without
+an approved preview is not a successful admission and reconciliation cannot fill
+that gap. Missing journals, drift, corrupt evidence and uncertain save responses
+retain their fail-closed boundaries.
+
+This is library-level task admission, not an activated Discussions or delivery
+profile. Source authentication/intent interpretation, service/runner/worker grant
+binding, PM prepared-plan promotion and creation projections, descendant admission,
+queue-time revocation and aggregate execution usage remain pending. Do not activate
+consent-bound delivery until the required effect and runtime bindings exist. The
+adapter does not turn registered ordinary callbacks into consent-aware callbacks.
+
+Validation: 81 consent checks passed, including restart/dispatch, journal-before-
+approval ordering, shared-store contention, scope/target/base/budget/policy refusals,
+publication-only refusal, post-save drift, corruption, expiry and lost-response
+metadata recovery. Ruff and mypy passed. On the rebased `f7918b7` baseline, which includes the merged
+#36 cancellation fix, 97 consent tests and the full suite (1,477 passes, two
+skips) passed in two consecutive runs. The mock copied-fixture
+report at `/tmp/aitobuild-consent-admission-simulation-report.json` records accepted
+execution, a generated artifact, integer command exit 0 and `succeeded=true`;
+session mode was off and `active_session_id=null`. No dependencies, live external
+writes, runtime activation, commits or pushes were added in this slice.
+
+#### Implementation Slices and Exit Criteria
+
+1. **Authority foundation:** PR #31's guard is now the implementation baseline.
+    Start with strict consent/profile/projection records and durable immutable
+    evidence, then add trusted human attribution through preview, runner and worker.
+    Prove missing/duplicate/spoofed evidence refuses and existing manual flows stay
+    unchanged. Account for the separately accepted #36/#38 safeguards and combined
+    #39/#37 admission foundation described above; do not duplicate their pending
+    implementations. This foundation alone does not activate new approvals or delivery.
+2. **Single-consent PM publication:** bounded read-only preparation, stable-marker
+    rendering, exact promotion, human admission/creation projections and deterministic
+    link policy. One user response creates/links the advertised issues; no second
+    model planning run or human prompt. Publication-only children stay unapproved
+    even with globally automatic admission.
+3. **Bounded task/plan delivery:** grant-aware child admission, aggregate usage and
+    registered automatic delivery/review/correction adapters. One advertised consent
+    reaches a verified, reviewed draft for eligible independent tasks; each internal
+    decision has exact evidence and separate task budgets. Reuse accepted parent-
+    based review eligibility and implement configurable correction/re-review lineage
+    admission plus trusted correction-seed provisioning in this slice. Prove an
+    opted-in automatic cycle needs no additional human action within scope/round
+    limits, while human/disabled profiles retain their gates. Stop at human merge.
+4. **Approved amendments and blockers:** implement section 4.3 item revisions and
+    issue-thread intake against this consent model. One change-set approval edits
+    existing items; replacement tasks require an explicit included grant. Test
+    stale-preview supersession, concurrent human edits and active-scope refusal.
+5. **Remove operational handoffs:** trusted dependency seed provisioning,
+    merge-readiness scheduling and bounded status notifications. Correction seed
+    provisioning belongs to the automatic correction profile in slice 3, not a
+    later manual workaround. Only then advertise
+    automatic dependent delivery. Repeated blocker detection/meetings, proactive
+    maintenance and hosted/distributed operation remain distinct later slices.
+
+Focused acceptance must include PR #31's human-plan positives/negatives plus:
+`plan_publish` versus `plan_deliver`; delivery without a grant; direct human versus
+policy-derived decisions; changed prepared content/markers; invalid promotion
+attachments; duplicate creation projection; fabricated number/head mappings;
+unlisted children or escalated paths/stages; aggregate-cap exhaustion; queue-time
+revocation; source/policy drift; rejected/expired consent; interrupted promotion;
+partial metadata saves; uncertain writes; correction ceilings; and unchanged
+historical approvals, remote artifacts and original ledgers after refusal/restart.
+Correction/re-review acceptance additionally requires a receipt-backed native
+automatic positive across saved waiting/restart boundaries, explicit human-mode
+waiting and disabled-mode refusal, missing-grant/seed/adapter rejection before
+presentation, and no extra user approval or budget reset for a permitted round.
+
+Use native mocked transports and disposable fixtures for each slice, then the
+repository pytest/Ruff/mypy gates and mock copied-fixture simulation. Any live
+acceptance needs a fresh bounded disposable-target authorization and must report
+actual artifact correctness, verification, effect receipts and cleanup. Neither
+green PR CI nor this plan certifies hosted automation or a complete autonomous
+issue-to-PR service. Current-state docs change only when a capability is implemented.
 
 ## 5. System Lifecycle & Workflow Example
 

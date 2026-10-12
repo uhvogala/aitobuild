@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from filelock import FileLock
 
+from aitobuild.approval_consent import ConsentAdmissionEvidence
 from aitobuild.durable_files import atomic_write_text
 from aitobuild.approval_policy import ApprovalDecision, ApprovalStage
 from aitobuild.publish_approvals import snapshot_digest
@@ -32,6 +33,7 @@ class DeveloperPreview:
     approved_at: datetime | None = None
     dispatched_at: datetime | None = None
     approval_policy: ApprovalDecision | None = None
+    consent_approval: ConsentAdmissionEvidence | None = None
 
     @property
     def state(self) -> str:
@@ -65,6 +67,7 @@ def _webhook_issue_identity(bundle: dict[str, Any]) -> tuple[object, object] | N
 
 
 REVIEW_TASK_PREFIX = "published-review-"
+CORRECTION_TASK_PREFIX = "published-correction-"
 
 
 def published_review_target(preview: Any) -> tuple[str, str] | None:
@@ -87,6 +90,21 @@ def _review_identity(bundle: dict[str, Any], source: dict[str, Any]) -> tuple[ob
         return None
     target = source.get("published_review")
     return (target.get("preview_id"), target.get("head_sha")) if isinstance(target, dict) else ("", "")
+
+
+def _matches_apart_from_approval(stored: DeveloperPreview, expected: DeveloperPreview | None) -> bool:
+    """Whether `expected` (read before another owner approved) is the stored preview apart from the fields that
+    approval writes: approved/approved_at/approval_policy/consent_approval, dispatched_at, and the base revision
+    approval pins into an unpinned issue bundle. Everything else, including source_payload, must be identical."""
+    if expected is None:
+        return True
+    bundle = deepcopy(expected.bundle_payload)
+    context, saved = bundle.get("issue_context"), stored.bundle_payload.get("issue_context")
+    if isinstance(context, dict) and isinstance(saved, dict) and context.get("base_revision") is None:
+        context["base_revision"] = saved.get("base_revision")
+    return replace(expected, bundle_payload=bundle, approved=stored.approved, approved_at=stored.approved_at,
+                   approval_policy=stored.approval_policy, consent_approval=stored.consent_approval,
+                   dispatched_at=stored.dispatched_at) == stored
 
 
 class AutomaticAdmissionDeferred(PermissionError):
@@ -140,6 +158,11 @@ class DeveloperPreviewRegistry:
                 if (not item["approved"] or decision.stage != ApprovalStage.TASK_ADMISSION
                         or decision.operation_digest != snapshot_digest(preview_approval_operation(item["preview_id"], item["bundle_payload"]))):
                     raise PermissionError("Saved task policy differs from its exact approved bundle")
+            if item.get("consent_approval") is not None:
+                evidence = ConsentAdmissionEvidence.model_validate(item["consent_approval"])
+                check_consent_admission(item["preview_id"], item["bundle_payload"],
+                                         ApprovalDecision.model_validate(item["approval_policy"])
+                                         if item.get("approval_policy") is not None else None, evidence)
         self._by_id = {
             item["preview_id"]: DeveloperPreview(
                 preview_id=item["preview_id"], dedupe_key=item["dedupe_key"],
@@ -148,6 +171,8 @@ class DeveloperPreviewRegistry:
                 approved_at=datetime.fromisoformat(item["approved_at"]) if item["approved_at"] else None,
                 dispatched_at=datetime.fromisoformat(item["dispatched_at"]) if item.get("dispatched_at") else None,
                 approval_policy=ApprovalDecision.model_validate(item["approval_policy"]) if item.get("approval_policy") is not None else None,
+                consent_approval=ConsentAdmissionEvidence.model_validate(item["consent_approval"])
+                if item.get("consent_approval") is not None else None,
             )
             for item in data["previews"]
         }
@@ -170,6 +195,8 @@ class DeveloperPreviewRegistry:
                     "approved_at": preview.approved_at.isoformat() if preview.approved_at else None,
                     "dispatched_at": preview.dispatched_at.isoformat() if preview.dispatched_at else None,
                     **({"approval_policy": preview.approval_policy.model_dump(mode="json")} if preview.approval_policy is not None else {}),
+                          **({"consent_approval": preview.consent_approval.model_dump(mode="json")}
+                              if preview.consent_approval is not None else {}),
                 }
                 for preview in self._by_id.values()
             ],
@@ -215,12 +242,18 @@ class DeveloperPreviewRegistry:
     def _approve_admission(self, preview_id: str, *, base_revision: str | None = None,
                 approval_policy: ApprovalDecision | None = None,
                 max_automatic_admissions: int | None = None,
-                expected: DeveloperPreview | None = None) -> DeveloperPreview | None:
+                expected: DeveloperPreview | None = None,
+                consent_approval: ConsentAdmissionEvidence | None = None) -> DeveloperPreview | None:
         """Private: call only through organization_service.admit_task (PLAN 2.4; enforced by tests)."""
         with self._transaction(write=True):
             preview = self._by_id.get(preview_id)
             if preview is None:
                 return None
+            if (preview.approved and approval_policy is not None and preview.approval_policy == approval_policy
+                    and preview.consent_approval == consent_approval and _matches_apart_from_approval(preview, expected)):
+                # Exact replay of an admission another owner already landed (same decision, same consent): return it
+                # before the expected-equality check, which a concurrent owner's earlier read would otherwise fail.
+                return deepcopy(preview)
             if expected is not None and preview != expected:
                 raise PermissionError("Admitted preview differs from its stored record")
             bundle = deepcopy(preview.bundle_payload)
@@ -235,9 +268,14 @@ class DeveloperPreviewRegistry:
                 context["base_revision"] = revision
             elif base_revision is not None:
                 raise ValueError("base_revision requires a repository issue task")
+            if consent_approval is not None:
+                consent_approval = ConsentAdmissionEvidence.model_validate(consent_approval.model_dump(mode="json"))
+                check_consent_admission(preview_id, bundle, approval_policy, consent_approval)
             if preview.approved:
                 if approval_policy is not None and preview.approval_policy != approval_policy:
                     raise PermissionError("Saved task approval policy is immutable")
+                if consent_approval is not None and preview.consent_approval != consent_approval:
+                    raise PermissionError("Saved task consent evidence is immutable")
                 return deepcopy(preview)
             if approval_policy is not None:
                 if (approval_policy.stage != ApprovalStage.TASK_ADMISSION
@@ -251,9 +289,11 @@ class DeveloperPreviewRegistry:
                                    and saved.approval_policy.source == "operator_policy")
                     issue = _webhook_issue_identity(bundle)
                     if issue is not None and any(
-                            saved.approved and saved.approval_policy is not None and saved.approval_policy.source == "operator_policy"
-                            and _webhook_issue_identity(saved.bundle_payload) == issue for saved in self._by_id.values()):
-                        raise AutomaticAdmissionDeferred("This issue was already admitted automatically; "
+                            saved.approved and _webhook_issue_identity(saved.bundle_payload) == issue and (
+                                saved.consent_approval is not None  # two-way with the consent dedupe (PLAN 2.4)
+                                or saved.approval_policy is not None and saved.approval_policy.source == "operator_policy")
+                            for saved in self._by_id.values()):
+                        raise AutomaticAdmissionDeferred("This issue was already admitted automatically or by consent; "
                                                          "a later task for it needs a human approval")
                     review = _review_identity(bundle, preview.source_payload)
                     if review is not None and any(
@@ -263,9 +303,21 @@ class DeveloperPreviewRegistry:
                                                          "another review of it needs a human approval")
                     if admitted >= max_automatic_admissions:
                         raise PermissionError("Automatic task admission limit reached; a human approval is required")
+            if consent_approval is not None:
+                # Deliberate exception (PLAN 2.4): consent is human-sourced, so it never counts toward
+                # max_automatic_admissions, but it arrives through automated comment reading, so it keeps the
+                # per-issue dedupe against earlier consent or automatic admissions of the same issue.
+                issue = _webhook_issue_identity(bundle)
+                if issue is not None and any(
+                        saved.approved and _webhook_issue_identity(saved.bundle_payload) == issue and (
+                            saved.consent_approval is not None or saved.approval_policy is not None
+                            and saved.approval_policy.source == "operator_policy")
+                        for saved in self._by_id.values()):
+                    raise PermissionError("This issue was already admitted by consent or automatically; "
+                                          "a later task for it needs a direct human approval")
             approved_preview = replace(
                 preview, bundle_payload=bundle, approved=True, approved_at=datetime.now(tz=UTC),
-                approval_policy=approval_policy,
+                approval_policy=approval_policy, consent_approval=consent_approval,
             )
             self._by_id[preview_id] = approved_preview
             return deepcopy(approved_preview)
@@ -314,3 +366,12 @@ def _unresolved_scope(bundle: dict[str, Any]) -> dict[str, Any]:
 
 def preview_approval_operation(preview_id: str, bundle: dict[str, Any]) -> dict[str, Any]:
     return {"preview_id": preview_id, "bundle": bundle}
+
+
+def check_consent_admission(preview_id: str, bundle: dict[str, Any],
+                             decision: ApprovalDecision | None, evidence: ConsentAdmissionEvidence) -> None:
+    projection = evidence.projection
+    if (projection.preview_id != preview_id or projection.decision != decision or
+            projection.input_digest != snapshot_digest(bundle) or
+            projection.operation_digest != snapshot_digest(preview_approval_operation(preview_id, bundle))):
+        raise PermissionError("Consent admission must bind the exact preview, bundle and decision")
