@@ -108,6 +108,11 @@ require `X-Internal-Token` by default.
 - Cancellation and shutdown must drain threaded stages before ownership/lock
   release. Busy controls return 409; other local owners observe durable cancellation
   intent. Failed worker slots require inspection and restart, not effect replay.
+- Stages that may be `automatic` with their trusted binding: `task_admission`,
+  `developer_tools`, `pm_issue_creation`, `pm_dependency_links`, `draft_publication`,
+  `review_publication`, `meeting_continuation` and `correction`. Draft, review and
+  correction publication can be automatic; `merge` stays `disabled` (no merge
+  operation exists). Defaults stay `human`.
 - PM task approval, exact issue creation and resolved dependency publication are
   separate gates. Actual issue IDs/numbers and final link-body bytes need their
   own saved approval. Complete receipts stage only unapproved Developer previews;

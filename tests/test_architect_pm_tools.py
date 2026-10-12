@@ -933,3 +933,10 @@ def test_pr_review_records_bound_commit_id(adapter_kind: str, monkeypatch: pytes
     assert review.to_dict()["commit_id"] == head.lower()
     if adapter_kind == "gh_cli":
         assert sent and sent[-1].get("commit_id") == head.lower()
+
+
+def test_architect_published_review_tool_schema_is_comment_only(tmp_path: Path) -> None:
+    tool = _tool_map(build_role_tools(context=_context(tmp_path))["architect"])["architect_submit_published_pr_review"]
+    event = tool.parameters()["properties"]["event"]
+    assert event.get("const") == "COMMENT" or event.get("enum") == ["COMMENT"]
+    assert tool.approval_mode == "always_require"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -631,3 +632,51 @@ def test_cancel_queued_job_does_not_prepare_checkout_or_create_budget(tmp_path, 
     assert asyncio.run(worker.cancel(preview_id)).state == "cancelled"
     assert not delivery.budget_path(preview_id).exists()
     assert delivery.get(preview_id) is None and calls == []
+
+def test_admission_refuses_a_preview_without_approval_time(tmp_path, approved_delivery, monkeypatch):
+    _, _, preview_id, _, _ = approved_delivery
+    worker, service, _, calls = make_worker(tmp_path, approved_delivery)
+    preview, route = service.admission(preview_id)
+    monkeypatch.setattr(service, "admission", lambda _: (dataclasses.replace(preview, approved_at=None), route))
+    with pytest.raises(PermissionError, match="approved preview"):
+        worker.enqueue(preview_id)
+    assert worker.store.get(preview_id) is None
+    assert calls == []
+
+
+@pytest.mark.parametrize("child_state", ["queued", "completed"])
+def test_followup_queueing_skips_a_child_that_already_has_a_receipt(tmp_path, approved_delivery, monkeypatch, child_state):
+    _, _, preview_id, _, _ = approved_delivery
+    child = other_preview(approved_delivery)
+    worker, service, _, calls = make_worker(tmp_path, approved_delivery, queue_follow_ups=True)
+    worker.enqueue(preview_id)
+    child_job = worker.enqueue(child.preview_id)
+    if child_state == "completed":
+        running = child_job.model_copy(update={"state": "running"})
+        worker.store.save(running)
+        worker.store.save(running.model_copy(update={"state": "completed"}))
+    scans = []
+
+    def discover(source):
+        if source == preview_id:
+            scans.append(source)
+            return child.preview_id
+        return None
+
+    monkeypatch.setattr(service, "follow_up_preview_id", discover)
+    enqueued = []
+    original = worker.enqueue
+    monkeypatch.setattr(worker, "enqueue", lambda identity, **kwargs: enqueued.append(identity) or original(identity, **kwargs))
+
+    async def exercise():
+        await worker.start()
+        try:
+            assert (await finish(worker, preview_id)).state == "completed"
+            async with asyncio.timeout(5):
+                while len(scans) < 3:
+                    await asyncio.sleep(0.01)
+        finally:
+            await worker.close()
+
+    asyncio.run(exercise())
+    assert child.preview_id not in enqueued

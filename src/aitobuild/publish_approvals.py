@@ -20,7 +20,7 @@ from typing import Annotated, Any, Literal, Self
 from filelock import FileLock
 from pydantic import AwareDatetime, Field, JsonValue, StrictStr, ValidationError, model_validator
 
-from aitobuild.durable_files import atomic_write_text, sync_directory
+from aitobuild.durable_files import atomic_write_text, sync_directory, refuse_symlinks
 from aitobuild.approval_policy import ApprovalDecision, ApprovalStage
 from aitobuild.organization import DefinitionModel
 
@@ -108,8 +108,9 @@ class PublishApprovalStore:
         if not isinstance(preview_id, str) or not preview_id:
             raise ValueError("Publish approval requires a preview identity")
         path = self._directory / (sha256(preview_id.encode()).hexdigest() + ".json")
-        if path.is_symlink() or (self._directory.exists() and self._directory.resolve() != self._directory.absolute()):
+        if self._directory.exists() and self._directory.resolve() != self._directory.absolute():
             raise ValueError("Publish approvals cannot follow symlinks")
+        refuse_symlinks(path)  # the same rule every durable writer applies
         return path
 
     def _read(self, path: Path, preview_id: str) -> PublishApproval | None:

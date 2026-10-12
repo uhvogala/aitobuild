@@ -124,6 +124,12 @@ it never skips its approval gate.
 | `correction` | Review admission and `correction_publication_github`; verified same-PR nonce-bound push snapshot |
 | `merge` | Unsupported; keep disabled. No existing agent or publication tool gains merge authority |
 
+Stages that can be set to `automatic` (each only with its trusted binding above):
+`task_admission`, `developer_tools`, `pm_issue_creation`, `pm_dependency_links`,
+`draft_publication`, `review_publication`, `meeting_continuation` and `correction`.
+Draft, review and correction publication can therefore be automatic. `merge`
+cannot be automatic; it stays `disabled` and has no merge operation.
+
 The explicit `managed_service_factory` receives `context.approval_policy`,
 `context.organization_definition` and `context.task_base_revision_for` in addition
 to existing resources. Pass the policy unchanged as `approval_policy` to
@@ -937,11 +943,11 @@ as our success. Reconciliation, ordinary publish recovery and advance retries sh
 remote head counts as ours only when its sole parent
 is the pinned head, its message matches, and its tree equals the parent tree plus exactly the
 pinned blob/mode changes, so a push that landed settles as `published` even after the budget is
-gone (a truncated tree listing stays `publishing`). After any failure past consume, the live branch head decides the outcome: our exact commit
+gone. If GitHub truncates the recursive tree listing, the matcher walks only the subtrees whose SHAs differ, using non-recursive reads; an unreadable or still-truncated level fails closed and the record stays `publishing`. After any failure past consume, the live branch head decides the outcome: our exact commit
 (tree, sole parent and message) on the open draft reconciles to `published`; the unchanged parent
 fails terminally with `push_outcome: not_applied` and releases that parent head; a different head
 fails terminally with `push_outcome: moved` and keeps holding it; an unreadable head stays
-`publishing`, resumable only under the same approval and operator. A resume settles from GitHub
+`publishing`, resumable only under the same approval and operator. If `gh` fails or times out after the draft PR POST, the adapter re-lists open PRs and adopts one only when exactly one open draft matches the same head ref, head repository, base and title; otherwise the original error is raised and nothing is retried blindly. When the branch landed but no PR exists, the failed publication records `orphan_branch` with an error saying so, for operator cleanup. A resume settles from GitHub
 first, using only the approved snapshot's blob SHAs and modes and no budget or checkout check:
 ours ends `published`, an untouched parent pushes again only while the budget is still valid
 (otherwise it fails as `not_applied` and releases the head), a moved head fails and holds, and an

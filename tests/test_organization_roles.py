@@ -411,7 +411,8 @@ def test_publication_stages_unapproved_head_pinned_review_once(tmp_path, publish
                                      "correction_retry", "correction_retry_retired", "correction_retry_interrupted",
                                      "correction_native", "correction_native_automatic", "correction_native_queued", "correction_native_recovered", "correction_native_rejected",
                                      "correction_native_outside", "correction_native_verification_failure", "correction_native_head_drift",
-                                     "correction_native_followup_retry", "correction_native_two_rounds", "correction_native_publish_bypass", "correction_limit_zero"])
+                                     "correction_native_followup_retry", "correction_native_two_rounds", "correction_native_publish_bypass", "correction_limit_zero",
+                                     "correction_missing_delivery"])
 def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, published_delivery, detached, outcome, monkeypatch, test_config, verification_adapter):
     from aitobuild.organization_reviews import PublishedReviewAdmission, PublishedReviewRoute
     from aitobuild.organization_service import ManagedOrganizationService
@@ -735,6 +736,23 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         return
                     with pytest.raises(PermissionError):
                         reviews.offer_correction(preview.preview_id, waiting)
+                    if outcome == "correction_missing_delivery":
+                        target_id = reviews.target_for(preview.preview_id).preview_id
+                        saved = worker.get
+                        import sys
+
+                        def vanished(pid):
+                            # The delivery disappears only for offer_correction's own read, after the
+                            # earlier staging checks passed (a concurrent loss, not a missing review).
+                            caller = sys._getframe(1).f_code.co_name
+                            return None if pid == target_id and caller == "offer_correction" else saved(pid)
+
+                        monkeypatch.setattr(worker, "get", vanished)
+                        with pytest.raises(PermissionError, match="^Correction requires the saved published delivery$"):
+                            reviews.offer_correction(preview.preview_id, done)
+                        assert len(previews.list_previews(pending_only=True, limit=10)) == 0
+                        assert developer_budget.read_bytes() == before_developer
+                        return
                     if outcome == "correction_partial":
                         save = reviews._save
 
