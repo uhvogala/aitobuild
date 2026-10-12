@@ -361,10 +361,17 @@ class NativeManagedRoles:
             return {"task": json.loads(assignment.bundle_content), "proposal_event": self._proposal_event,
                     "eligible_agents": list(route.delegation.eligible_agents)}
 
-        text = await self._invoke(context, agent, session, (inspect_task,),
-                                  "Return only JSON with agent_id and rationale for the configured proposal route. "
-                                  "This is a read-only proposal, not an assignment, approval or issue write.")
-        proposal = AssignmentProposal.model_validate_json(text)
+        def eligible(value: AssignmentProposal) -> None:
+            if value.agent_id not in route.delegation.eligible_agents:
+                raise PermissionError("Proposed agent is outside the configured eligible agents")
+
+        submit = self._submit_tool(context, session, "pm_submit_assignment_proposal", AssignmentProposal,
+                                   "aitobuild_role_proposal_submission", eligible,
+                                   "Record the one assignment proposal (agent_id, rationale). Write-once.")
+        proposal = await self._invoke_submit(
+            context, agent, session, (inspect_task,), submit=submit,
+            guidance="Call pm_submit_assignment_proposal with agent_id and rationale for the configured proposal route. "
+                     "This is a read-only proposal, not an assignment, approval or issue write.")
         if proposal.agent_id not in route.delegation.eligible_agents:
             raise PermissionError("Native PM proposal is outside the configured eligible agents")
         session.state["aitobuild_role_proposal"] = proposal.model_dump(mode="json")

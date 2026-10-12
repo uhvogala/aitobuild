@@ -100,15 +100,11 @@ def test_native_pm_proposal_is_scoped_read_only_metadata(tmp_path, proposal):
         body = json.loads(request.content)
         bodies.append(body)
         if len(bodies) == 1:
-            message = {"role": "assistant", "content": "I'll inspect the approved task before proposing an agent.", "tool_calls": [{"id": "read", "type": "function", "function": {
-                "name": "pm_inspect_approved_task", "arguments": "{}",
-            }}]}
-            finish = "tool_calls"
-        else:
-            message = {"role": "assistant", "content": json.dumps(proposal) if isinstance(proposal, dict) else proposal}
-            finish = "stop"
-        return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
-                                        "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
+            return _scripted_reply(tool_call("pm_inspect_approved_task", "{}") | {
+                "content": "I'll inspect the approved task before proposing an agent."})
+        if len(bodies) == 2 or str(bodies[-1]["messages"][-1].get("content")).startswith("Error"):
+            return _scripted_reply(tool_call("pm_submit_assignment_proposal", proposal if isinstance(proposal, str) else proposal))
+        return _scripted_reply(text("Submitted."))
 
     async def exercise():
         async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
@@ -131,8 +127,9 @@ def test_native_pm_proposal_is_scoped_read_only_metadata(tmp_path, proposal):
                 assert await make_runner(adapter).start(assignment.assignment_id) == run
 
     asyncio.run(exercise())
-    assert len(bodies) == 2
-    assert [entry["function"]["name"] for entry in bodies[0]["tools"]] == ["pm_inspect_approved_task"]
+    valid = isinstance(proposal, dict) and proposal.get("rationale") == "Fits the approved task"
+    assert len(bodies) == (3 if valid else 4)
+    assert [entry["function"]["name"] for entry in bodies[0]["tools"]] == ["pm_inspect_approved_task", "pm_submit_assignment_proposal"]
 
 
 @pytest.mark.parametrize("proposal,detached", [
