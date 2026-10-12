@@ -220,10 +220,11 @@ store; reopen initialized stores with the default `create=False`, which refuses
 missing state. Source/profile inputs require trusted adapters.
 
 The opt-in `ConsentTaskAdmission` adapter in
-[src/aitobuild/developer_preview.py](src/aitobuild/developer_preview.py) can approve
-one exact frozen repository-issue preview from saved human consent. It requires
-trusted current-profile/source readers, journals the projection before approval
-and persists the human evidence with the preview. Its reconciliation is read-only.
+[src/aitobuild/consent_admission.py](src/aitobuild/consent_admission.py) can admit
+one exact frozen repository-issue preview from saved human consent, as `Consent`
+evidence through the managed service's single admission route (`admit_task`). It
+requires trusted current-profile/source readers, journals the projection before
+approval and persists the human evidence with the preview. Its reconciliation is read-only.
 It is not registered with service/worker factories or HTTP endpoints and does not
 authenticate GitHub users, execute graphs or activate single-consent delivery.
 Discussions intake, PM consent projection and runtime grant/revocation/aggregate

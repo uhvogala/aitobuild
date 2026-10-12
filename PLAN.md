@@ -522,6 +522,16 @@ evidence variant. A new admission source (for example Discussions consent from
 `_approve_admission` itself or add a parallel path. Changing the route itself
 requires an explicit update to this section first.
 
+Deliberate exception for `Consent` evidence (#42): a consent decision is
+human-sourced (`source="human"`), so it never counts toward
+`max_automatic_admissions`, like any human approval. It is still reached through
+automated reading of a discussion comment rather than a person acting in the
+service, so a consent admission keeps the per-issue `(repository_id, issue_id)`
+dedupe: it is refused when the same issue was already admitted by consent or
+automatically, and a later task for that issue needs a direct human approval.
+Consent requires the automatic task-admission policy; under `human` mode only the
+HTTP approve endpoint admits.
+
 Policy revisions and the effective stage decision belong in immutable run/effect
 evidence. Changes apply to new work; active runs refuse drift rather than silently
 adopting a more permissive policy. Automatic continuation consumes the same exact
@@ -975,24 +985,18 @@ decisions must not be upgraded into new broader consents by inference.
 
 #### PR Baseline Alignment
 
-The #36-#39 diffs were checked against the local `b5d494e` baseline. PR #40 is
-based on `e7c8dc54c795005f67075d8482f7d133ac4f6699`, which merges #35's trial
-planning-admission helper. Both reported Python 3.14 checks passed for each of
-the five inspected heads. These are inspection snapshots, not certification of
-subsequently changed heads or their combined result. PR #40 is now merged as
-`325e57b61bac929f550fae1c09db58aa5e01af2b`; the implementation branch
-`feat/bounded-consent-integration` was fast-forwarded to that baseline with local
-work preserved. PRs #36-#39 are not integrated here. Their #36/#38/#39 heads had
-advanced by branch creation and need fresh inspection before adoption. No pending
-PR approval or merge is implied by this implementation work.
+This branch is rebased onto master `f7918b7e8b7ee8c7cd5b19225926592bf9049aae`
+(2026-10-12), which contains every PR below plus the single admission route
+(#43, `32399942ba11fb63fd7e913a816289e6b65340ec`) and its guard follow-ups (#46).
+Heads are the reviewed heads that were merged; the merge commit follows.
 
-| PR and inspected head | Effect on this plan |
+| PR, merged head and merge commit | Effect on this plan |
 | --- | --- |
-| [#36](https://github.com/uhvogala/aitobuild/pull/36), `7e6159cfcc960ffbb8f6e714263fb440230f0d47` | Bounded asynchronous lock acquisition after local cancellation supports the stop/drain contract. Cross-worker contention still refuses immediately; this adds no retry or approval authority. |
-| [#37](https://github.com/uhvogala/aitobuild/pull/37), `6b876f4b917b08b6287b35ba04cf08bf153586a2` | A staged Architect review derives automatic admission eligibility from its exact admitted, published parent. Reuse that lineage path and its one-automatic-review-per-parent/head guard; it does not authorize COMMENT publication, corrections or single-consent delivery by itself. |
-| [#38](https://github.com/uhvogala/aitobuild/pull/38), `27135b344d144323b22f9aa5663240936f6e44fa` | Durable correction-proposal failure counts/errors, reminder revalidation and real script-entrypoint allowlist tests reinforce existing bounds. They do not change the human approval model or activate automatic correction admission. |
-| [#39](https://github.com/uhvogala/aitobuild/pull/39), `6809d97a7ca887b9f754754137f4ea58c1d142e3` | A shared planned-child classifier, public validated read-only receipt accessors and exact dependent-handoff assignment checks provide the preferred admission foundation. They retain PR #31's direct human planning/creation requirement. |
-| [#40](https://github.com/uhvogala/aitobuild/pull/40), `c292132aa6e574d7d8572c376b08fdb4efbd6849` (merged) | The pilot forwards `human_admission=True` only for planning to the merged #35 helper, which calls the gated approval endpoint and records a human operator action. Other phases retain `False`. This fixes harness compatibility with #31, not correction/re-review admission or attributable production consent. |
+| [#36](https://github.com/uhvogala/aitobuild/pull/36), `51f42c4f9f389d8af4205873e8d54e77756d632b` → `b0946e2` | Bounded asynchronous lock acquisition after local cancellation supports the stop/drain contract. Cross-worker contention still refuses immediately; this adds no retry or approval authority. |
+| [#37](https://github.com/uhvogala/aitobuild/pull/37), `6b876f4b917b08b6287b35ba04cf08bf153586a2` → `3c7f978` | A staged Architect review derives automatic admission eligibility from its exact admitted, published parent. Reuse that lineage path and its one-automatic-review-per-parent/head guard; it does not authorize COMMENT publication, corrections or single-consent delivery by itself. |
+| [#38](https://github.com/uhvogala/aitobuild/pull/38), `1d6df5896956ceecbff1cdfa8fbd90ca1e66bb1f` → `a5418b2` | Durable correction-proposal failure counts/errors, reminder revalidation and real script-entrypoint allowlist tests reinforce existing bounds. They do not change the human approval model or activate automatic correction admission. |
+| [#39](https://github.com/uhvogala/aitobuild/pull/39), `711985d3550f9431b483012dbfd57f19e6d968f0` → `4d404cf` | A shared planned-child classifier, public validated read-only receipt accessors and exact dependent-handoff assignment checks provide the preferred admission foundation. They retain PR #31's direct human planning/creation requirement. |
+| [#40](https://github.com/uhvogala/aitobuild/pull/40), `c292132aa6e574d7d8572c376b08fdb4efbd6849` → `325e57b` | The pilot forwards `human_admission=True` only for planning to the merged #35 helper, which calls the gated approval endpoint and records a human operator action. Other phases retain `False`. This fixes harness compatibility with #31, not correction/re-review admission or attributable production consent. |
 
 PRs #37 and #39 explicitly require separate human approval-model sign-off before
 merge. ReviewBot or CI success does not supply it. Their shared changes in
@@ -1292,15 +1296,23 @@ stores it beside the exact pinned approval decision, validates it on reload and
 preserves it through dispatch. Existing approvals cannot acquire a new consent
 retroactively; legacy approvals without consent evidence retain their behavior.
 
-The explicitly constructed `ConsentTaskAdmission` adapter supports only one frozen
-`task_deliver` repository-issue preview. Its trusted readers must supply the current
-effective profile and authoritative source snapshot. It checks repository identity,
-base, bundle and preview-operation digests, the exact presented item and task budget
-ceilings. Presentation keys are aliases, not normalized native task IDs. It reserves
-the exact projection durably, rechecks live authority read-only, then records preview
-approval with the host-qualified human actor. Publication-only/PM consents cannot
-use this adapter to admit delivery. Independent local owners share the original
-one-shot reservation; no new ledger or execution budget is created by this adapter.
+The explicitly constructed `ConsentTaskAdmission` adapter (`consent_admission.py`)
+supports only one frozen `task_deliver` repository-issue preview. Its trusted
+readers must supply the current effective profile and authoritative source
+snapshot. It checks repository identity, base, bundle and preview-operation
+digests, the exact presented item and task budget ceilings. Presentation keys are
+aliases, not normalized native task IDs. It reserves the exact projection durably
+and rechecks live authority read-only. It never approves a preview itself: it
+hands the evaluated preview and a `Consent` evidence variant to the managed
+service, which admits it through the single route (§2.4). The consent journal is
+the evidence store only; the service's live `ApprovalPolicy` is the authority.
+The service refuses review, correction, planning and non-repository tasks for
+consent, resolves the decision with `approval_policy.resolve(TASK_ADMISSION,
+source="human", ...)` against the live policy and requires it to equal the
+recorded projection decision, so a changed policy refuses rather than adopts the
+consent. Publication-only/PM consents cannot use this adapter to admit delivery.
+Independent local owners share the original one-shot reservation; no new ledger
+or execution budget is created by this adapter.
 
 `reconcile` inspects a matching landed preview approval without writing, dispatching
 or consuming authority, even after expiry/source loss. A saved projection without

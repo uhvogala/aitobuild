@@ -14,11 +14,13 @@ from typing import Annotated, Any, Awaitable, Callable, Literal, Mapping, assert
 from pydantic import Field, JsonValue, StrictInt, StrictStr
 
 from aitobuild.agent_tools import DeveloperToolContext
+from aitobuild.approval_consent import ConsentAdmissionEvidence
 from aitobuild.approval_policy import ApprovalDecision, ApprovalPolicy, ApprovalStage
 from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import (AutomaticAdmissionDeferred, DeveloperPreview, DeveloperPreviewRegistry, is_planned_child,
-                                         preview_approval_operation, published_review_target, REVIEW_TASK_PREFIX)
+                                         preview_approval_operation, published_review_target, CORRECTION_TASK_PREFIX,
+                                         REVIEW_TASK_PREFIX)
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, EventName, Identifier, OrganizationDefinition
 from aitobuild.organization_assignments import AssignmentProposal, AssignmentService, AssignmentStore, TaskAssignment
 from aitobuild.organization_delivery import _delivery_call
@@ -61,7 +63,16 @@ class InheritedReview(DefinitionModel):
     kind: Literal["inherited_review"] = "inherited_review"
 
 
-AdmissionEvidence = Annotated[Human | OperatorPolicy | PlannedChild | InheritedReview, Field(discriminator="kind")]
+class Consent(DefinitionModel):
+    """Accepted human consent from a discussion reply (#42): human-sourced, read by an automated adapter, kept as
+    evidence in the consent journal. It covers exactly the frozen preview and base it was shown."""
+    kind: Literal["consent"] = "consent"
+    evidence: ConsentAdmissionEvidence
+    base_revision: Annotated[StrictStr, Field(pattern=r"^[a-f0-9]{40}$")]
+
+
+AdmissionEvidence = Annotated[Human | OperatorPolicy | PlannedChild | InheritedReview | Consent,
+                              Field(discriminator="kind")]
 
 
 def admit_task(previews: DeveloperPreviewRegistry, preview_id: str, evidence: AdmissionEvidence, *,
@@ -77,14 +88,22 @@ def admit_task(previews: DeveloperPreviewRegistry, preview_id: str, evidence: Ad
             if decision is not None or base_revision is not None:
                 raise ValueError("Human admission carries its own base revision and no policy decision")
             base_revision = evidence.base_revision
+            consent = None
         case OperatorPolicy() | PlannedChild() | InheritedReview():
             if decision is None or expected is None:
                 raise PermissionError("Configured admission requires a resolved decision and its evaluated preview")
+            consent = None
+        case Consent():
+            if decision is None or expected is None or decision.source != "human" or base_revision != evidence.base_revision:
+                raise PermissionError("Consent admission requires its live human decision, base and evaluated preview")
+            consent = evidence.evidence
         case _:
             assert_never(evidence)
+    # The limit follows the resolved decision source (human consent never counts); the registry keeps the
+    # per-issue dedupe for consent as the one deliberate exception (PLAN 2.4).
     limit = max_automatic_admissions if decision is not None and decision.source == "operator_policy" else None
     return previews._approve_admission(preview_id, base_revision=base_revision, approval_policy=decision,
-                                       expected=expected, max_automatic_admissions=limit)
+                                       expected=expected, max_automatic_admissions=limit, consent_approval=consent)
 
 
 class ManagedRoute(DefinitionModel):
@@ -200,6 +219,10 @@ class ManagedOrganizationService:
         )
 
     @property
+    def preview_registry(self) -> DeveloperPreviewRegistry:
+        return self._previews
+
+    @property
     def approval_policy(self) -> ApprovalPolicy:
         return self._runner.approval_policy
 
@@ -292,8 +315,50 @@ class ManagedOrganizationService:
             return preview
         return self._admit(preview, self._evidence_for(preview))
 
-    def _admit(self, preview: DeveloperPreview, evidence: OperatorPolicy | PlannedChild | InheritedReview) -> DeveloperPreview:
+    def admit_consent(self, preview: DeveloperPreview, evidence: Consent) -> DeveloperPreview:
+        """Admit the exact preview a consent adapter evaluated, through the one route (PLAN 2.4)."""
+        return self._admit(preview, evidence)
+
+    def _admit_consent(self, preview: DeveloperPreview, evidence: Consent) -> DeveloperPreview:
+        if self.approval_policy.task_admission != "automatic":
+            raise PermissionError("Consent task admission requires the automatic task-admission policy")
+        if preview.source_payload.get("action") == "edited":
+            raise PermissionError("An edited task needs a fresh consent")
+        task_id = str(preview.bundle_payload.get("task_id", ""))
+        if (task_id.startswith((REVIEW_TASK_PREFIX, CORRECTION_TASK_PREFIX)) or published_review_target(preview) is not None
+                or "correction_from_review" in preview.source_payload):
+            raise PermissionError("Consent cannot admit review or correction tasks")
+        bundle = developer_task_bundle_from_payload(preview.bundle_payload)
+        if bundle.task_id.startswith("pm-planning-") or bundle.issue_context is None:
+            raise PermissionError("Planning and non-repository tasks always require a direct human admission")
+        if bundle.issue_context.base_revision not in {None, evidence.base_revision}:
+            raise PermissionError("Consent cannot replace an already pinned task base")
+        payload = deepcopy(preview.bundle_payload)
+        issue_payload = payload.get("issue_context")
+        if not isinstance(issue_payload, dict):
+            raise ValueError("Repository task requires its exact issue payload")
+        issue_payload["base_revision"] = evidence.base_revision
+        decision = self.approval_policy.resolve(
+            ApprovalStage.TASK_ADMISSION, actor_id=evidence.evidence.consent.source.actor.actor_id,
+            operation=preview_approval_operation(preview.preview_id, payload), automatic_supported=True, source="human")
+        if decision != evidence.evidence.projection.decision:
+            raise PermissionError("Consent decision differs from the live approval policy")
+        approved = admit_task(self._previews, preview.preview_id, evidence, base_revision=evidence.base_revision,
+                              decision=decision, expected=preview)
+        if approved is None:
+            raise PermissionError("Consented preview disappeared before admission")
+        return approved
+
+    def _admit(self, preview: DeveloperPreview,
+               evidence: OperatorPolicy | PlannedChild | InheritedReview | Consent) -> DeveloperPreview:
         """Configured-evidence checks; the approval itself goes through the module-level admit_task (PLAN 2.4)."""
+        match evidence:
+            case Consent():
+                return self._admit_consent(preview, evidence)
+            case OperatorPolicy() | PlannedChild() | InheritedReview():
+                pass
+            case _:
+                assert_never(evidence)
         if self._evidence_for(preview) != evidence:
             raise PermissionError("Admission evidence does not match its task")
         bundle = developer_task_bundle_from_payload(preview.bundle_payload)

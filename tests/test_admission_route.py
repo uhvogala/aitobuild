@@ -3,7 +3,8 @@ DeveloperPreviewRegistry._approve_admission.
 
 The scan is static. It catches the name in source text and attribute access (so aliases of it too), in every
 string constant (including implicit concatenation such as "_approve" "_admission"), and in names assembled from
-literals with +, f-strings, str.join or % formatting. A name built fully at runtime (from data, I/O or computed
+literals with +, f-strings, str.join or % formatting. Comments mentioning the name are flagged too, since the
+text scan reads every line. A name built fully at runtime (from data, I/O or computed
 values) cannot be caught statically; review covers that case."""
 import ast
 from pathlib import Path

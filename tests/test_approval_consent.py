@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from conftest import approve_preview, consent_service
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, get_ident
 
 import pytest
 
@@ -15,7 +16,8 @@ from aitobuild.approval_consent import (
 )
 from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
 from aitobuild.dispatcher import DispatcherAgent
-from aitobuild.developer_preview import ConsentTaskAdmission, DeveloperPreviewRegistry, preview_approval_operation
+from aitobuild.consent_admission import ConsentTaskAdmission
+from aitobuild.developer_preview import DeveloperPreviewRegistry, preview_approval_operation
 from aitobuild.publish_approvals import snapshot_digest
 
 
@@ -92,7 +94,7 @@ def preview_consent_fixture(consent_fixture, repository_issue_body, tmp_path):
 
 def test_preview_consent_evidence_survives_restart_and_dispatch(preview_consent_fixture):
     _, _, presentation, registry, preview, evidence = preview_consent_fixture
-    approved = registry.approve(preview.preview_id, base_revision=presentation.base_revision,
+    approved = approve_preview(registry, preview.preview_id, base_revision=presentation.base_revision,
                                 approval_policy=evidence.projection.decision, consent_approval=evidence)
     restarted = DeveloperPreviewRegistry(registry._path)
     assert restarted.get(preview.preview_id) == approved
@@ -100,7 +102,7 @@ def test_preview_consent_evidence_survives_restart_and_dispatch(preview_consent_
     dispatched = restarted.claim_dispatch(preview.preview_id)
     assert dispatched.consent_approval == evidence
     assert DeveloperPreviewRegistry(registry._path).get(preview.preview_id) == dispatched
-    assert restarted.approve(preview.preview_id) == dispatched
+    assert approve_preview(restarted, preview.preview_id) == dispatched
 
 
 @pytest.mark.parametrize("case", ["preview", "bundle", "decision", "base"])
@@ -118,16 +120,16 @@ def test_preview_refuses_consent_for_another_exact_operation(preview_consent_fix
         base = "0" * 40
     before = registry._path.read_bytes()
     with pytest.raises(PermissionError, match="exact preview"):
-        registry.approve(preview.preview_id, base_revision=base, approval_policy=policy, consent_approval=evidence)
+        approve_preview(registry, preview.preview_id, base_revision=base, approval_policy=policy, consent_approval=evidence)
     assert registry._path.read_bytes() == before
     assert not registry.get(preview.preview_id).approved
 
 
 def test_existing_human_approval_cannot_gain_new_consent_evidence(preview_consent_fixture):
     _, _, presentation, registry, preview, evidence = preview_consent_fixture
-    registry.approve(preview.preview_id, base_revision=presentation.base_revision, approval_policy=evidence.projection.decision)
+    approve_preview(registry, preview.preview_id, base_revision=presentation.base_revision, approval_policy=evidence.projection.decision)
     with pytest.raises(PermissionError, match="consent evidence is immutable"):
-        registry.approve(preview.preview_id, approval_policy=evidence.projection.decision, consent_approval=evidence)
+        approve_preview(registry, preview.preview_id, approval_policy=evidence.projection.decision, consent_approval=evidence)
     assert registry.get(preview.preview_id).consent_approval is None
 
 
@@ -161,20 +163,20 @@ def task_admission_fixture(preview_consent_fixture):
     store.present(presentation, profile=profile)
     store.accept(consent, profile=profile, current_source=source)
     inputs = {"profile": profile, "source": source}
-    bridge = ConsentTaskAdmission(previews=registry, store=store, profile=profile,
+    bridge = ConsentTaskAdmission(service=consent_service(registry._path.parent / "svc", registry, profile.policy), store=store, profile=profile,
                                    read_profile=lambda: inputs["profile"], read_source=lambda _: inputs["source"])
     return store, registry, bridge, projection, inputs
 
 
 def test_task_consent_admission_is_journaled_before_approval_and_recovers(task_admission_fixture, monkeypatch):
     store, registry, bridge, projection, _ = task_admission_fixture
-    approve = registry.approve
+    approve = registry._approve_admission
 
     def checked_approve(*args, **kwargs):
         assert store.get_projection(projection.projection_id) == projection
         return approve(*args, **kwargs)
 
-    monkeypatch.setattr(registry, "approve", checked_approve)
+    monkeypatch.setattr(registry, "_approve_admission", checked_approve)
     admitted = bridge.approve(projection)
     assert admitted.approved
     assert admitted.approval_policy.source == "human"
@@ -250,7 +252,7 @@ def test_lost_task_approval_response_recovers_metadata_without_live_authority(ta
     bound_profile = inputs["profile"]
     inputs["source"] = None
     inputs["profile"] = inputs["profile"].model_copy(update={"binding_revision": "changed"})
-    bridge = ConsentTaskAdmission(previews=restarted, store=FileConsentStore(store.path),
+    bridge = ConsentTaskAdmission(service=consent_service(restarted._path.parent / "svc-restarted", restarted, bound_profile.policy), store=FileConsentStore(store.path),
                                    profile=bound_profile,
                                    read_profile=lambda: inputs["profile"], read_source=lambda _: inputs["source"])
     before = registry._path.read_bytes(), store.path.read_bytes()
@@ -295,7 +297,7 @@ def test_task_consent_adapter_refuses_incompatible_stage_profiles(task_admission
     profile = inputs["profile"]
     changed = profile.model_copy(update={"policy": profile.policy.model_copy(update={stage: "human"})})
     with pytest.raises(PermissionError, match="automatic delivery profile"):
-        ConsentTaskAdmission(previews=registry, store=store, profile=changed,
+        ConsentTaskAdmission(service=consent_service(registry._path.parent / "svc", registry, profile.policy), store=store, profile=changed,
                               read_profile=lambda: changed, read_source=lambda _: inputs["source"])
 
 
@@ -331,7 +333,7 @@ def test_valid_consent_records_cannot_authorize_a_different_task(task_admission_
     store = FileConsentStore(tmp_path / "different-task-consent.json", create=True)
     store.present(presentation, profile=profile)
     store.accept(consent, profile=profile, current_source=consent.source)
-    bridge = ConsentTaskAdmission(previews=registry, store=store, profile=profile,
+    bridge = ConsentTaskAdmission(service=consent_service(registry._path.parent / "svc", registry, profile.policy), store=store, profile=profile,
                                    read_profile=lambda: profile, read_source=lambda _: consent.source)
     before = registry._path.read_bytes()
     with pytest.raises(PermissionError):
@@ -365,7 +367,8 @@ def test_shared_task_consent_admission_consumes_one_projection(task_admission_fi
     barrier = Barrier(2)
 
     def admit_from_separate_owner():
-        bridge = ConsentTaskAdmission(previews=DeveloperPreviewRegistry(registry._path),
+        bridge = ConsentTaskAdmission(service=consent_service(registry._path.parent / f"svc-{get_ident()}", DeveloperPreviewRegistry(registry._path),
+                                                       inputs["profile"].policy),
                                        store=FileConsentStore(store.path), profile=inputs["profile"],
                                        read_profile=lambda: inputs["profile"], read_source=lambda _: inputs["source"])
         barrier.wait(timeout=10)
@@ -671,3 +674,105 @@ def test_lock_symlink_and_reused_presentation_comment_are_refused(consent_fixtur
     with pytest.raises(FileNotFoundError):
         FileConsentStore(missing)
     assert not missing.parent.exists()
+
+def _sibling(registry, preview, *, key, task_suffix, issue_id=None):
+    """Another stored preview for the same (or another) issue; same bundle shape as the consented task."""
+    bundle = deepcopy(preview.bundle_payload)
+    bundle["task_id"] = str(bundle["task_id"]) + task_suffix
+    if issue_id is not None:
+        bundle["issue_context"]["issue_id"] = issue_id
+    return registry.create_or_get(dedupe_key=key, bundle_payload=bundle, source_payload=preview.source_payload)
+
+
+def _consent_for(projection, consent, preview, base, policy, projection_id):
+    bundle = deepcopy(preview.bundle_payload)
+    bundle["issue_context"]["base_revision"] = base
+    decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id=consent.source.actor.actor_id,
+                              operation=preview_approval_operation(preview.preview_id, bundle), source="human",
+                              automatic_supported=True)
+    other = projection.model_copy(update={"projection_id": projection_id, "preview_id": preview.preview_id,
+                                          "input_digest": snapshot_digest(bundle),
+                                          "operation_digest": decision.operation_digest, "decision": decision})
+    return ConsentAdmissionEvidence(consent=consent, projection=other)
+
+
+def test_consent_goes_through_the_service_route(task_admission_fixture, monkeypatch):
+    from aitobuild.organization_service import ManagedOrganizationService
+
+    _, _, bridge, projection, _ = task_admission_fixture
+    seen = []
+    original = ManagedOrganizationService._admit
+    monkeypatch.setattr(ManagedOrganizationService, "_admit",
+                        lambda self, preview, evidence: seen.append(evidence.kind) or original(self, preview, evidence))
+    assert bridge.approve(projection).approved
+    assert seen == ["consent"]
+
+
+@pytest.mark.parametrize("prefix", ["published-review-", "published-correction-"])
+def test_consent_refuses_review_and_correction_tasks(task_admission_fixture, prefix):
+    from aitobuild.organization_service import Consent
+
+    store, registry, bridge, projection, inputs = task_admission_fixture
+    preview = registry.get(projection.preview_id)
+    bundle = deepcopy(preview.bundle_payload) | {"task_id": prefix + "0" * 64}
+    staged = registry.create_or_get(dedupe_key="staged-" + prefix, bundle_payload=bundle,
+                                    source_payload={"published_review": {"preview_id": "dp-x", "head_sha": "a" * 40}})
+    evidence = ConsentAdmissionEvidence(consent=store.get_consent(projection.consent_id), projection=projection)
+    with pytest.raises(PermissionError, match="review or correction"):
+        bridge._service.admit_consent(staged, Consent(evidence=evidence, base_revision="c" * 40))
+    assert not registry.get(staged.preview_id).approved
+
+
+def test_consent_decision_must_match_the_live_policy(task_admission_fixture):
+    store, registry, _, projection, inputs = task_admission_fixture
+    live = inputs["profile"].policy.model_copy(update={"max_automatic_admissions": 7})  # new policy revision
+    bridge = ConsentTaskAdmission(service=consent_service(registry._path.parent / "svc-live", registry, live), store=store,
+                                  profile=inputs["profile"], read_profile=lambda: inputs["profile"],
+                                  read_source=lambda _: inputs["source"])
+    with pytest.raises(PermissionError, match="live approval policy"):
+        bridge.approve(projection)
+    assert not registry.get(projection.preview_id).approved
+
+
+def test_consent_skips_the_automatic_limit(task_admission_fixture):
+    store, registry, bridge, projection, inputs = task_admission_fixture
+    policy = inputs["profile"].policy
+    preview = registry.get(projection.preview_id)
+    other = _sibling(registry, preview, key="other-issue", task_suffix="-other", issue_id=999)
+    bundle = deepcopy(other.bundle_payload)
+    bundle["issue_context"]["base_revision"] = "c" * 40
+    automatic = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
+                               operation=preview_approval_operation(other.preview_id, bundle), automatic_supported=True)
+    assert approve_preview(registry, other.preview_id, base_revision="c" * 40, approval_policy=automatic,
+                           max_automatic_admissions=1).approved  # the automatic limit (1) is now used up
+    assert bridge.approve(projection).approved  # human consent does not count toward it
+    later = _sibling(registry, preview, key="later-issue", task_suffix="-later", issue_id=1000)
+    bundle = deepcopy(later.bundle_payload)
+    bundle["issue_context"]["base_revision"] = "c" * 40
+    decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
+                              operation=preview_approval_operation(later.preview_id, bundle), automatic_supported=True)
+    with pytest.raises(PermissionError, match="limit reached"):  # and the consent did not add to the automatic count
+        approve_preview(registry, later.preview_id, base_revision="c" * 40, approval_policy=decision,
+                        max_automatic_admissions=2 - 1)
+
+
+@pytest.mark.parametrize("earlier", ["automatic", "consent"])
+def test_consent_keeps_the_per_issue_dedupe(task_admission_fixture, earlier):
+    store, registry, bridge, projection, inputs = task_admission_fixture
+    policy = inputs["profile"].policy
+    consent = store.get_consent(projection.consent_id)
+    preview = registry.get(projection.preview_id)
+    twin = _sibling(registry, preview, key="same-issue", task_suffix="-twin")  # same (repository_id, issue_id)
+    if earlier == "automatic":
+        bundle = deepcopy(twin.bundle_payload)
+        bundle["issue_context"]["base_revision"] = "c" * 40
+        decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
+                                  operation=preview_approval_operation(twin.preview_id, bundle), automatic_supported=True)
+        approve_preview(registry, twin.preview_id, base_revision="c" * 40, approval_policy=decision)
+    else:
+        evidence = _consent_for(projection, consent, twin, "c" * 40, policy, "twin-projection")
+        approve_preview(registry, twin.preview_id, base_revision="c" * 40, approval_policy=evidence.projection.decision,
+                        consent_approval=evidence)
+    with pytest.raises(PermissionError, match="already admitted by consent or automatically"):
+        bridge.approve(projection)
+    assert not registry.get(projection.preview_id).approved

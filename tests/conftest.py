@@ -95,3 +95,26 @@ def approve_preview(registry: Any, preview_id: str, **kwargs: Any) -> Any:
     """Test-only stand-in for a human or recorded admission: the one place tests reach the private
     DeveloperPreviewRegistry._approve_admission directly (src code must go through admission's admit_task)."""
     return registry._approve_admission(preview_id, **kwargs)
+
+
+def consent_service(state_dir: Path, previews: Any, policy: Any, operator_id: str = "configured-operator") -> Any:
+    """A minimal managed service whose only job here is the single admission route (no routes, no worker use)."""
+    from aitobuild.organization import FileDefinitionStore
+    from aitobuild.organization_assignments import FileAssignmentStore
+    from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
+    from aitobuild.organization_runner import FileRunStore, ManagedOperation
+    from aitobuild.organization_service import ManagedOrganizationService
+
+    async def cleanup(task: Any) -> None:
+        return None
+
+    return ManagedOrganizationService(
+        definitions=FileDefinitionStore(state_dir / "definitions"), assignments=FileAssignmentStore(state_dir / "assignments.json"),
+        runs=FileRunStore(state_dir / "runs"), previews=previews, worker=None, routes=(), cleanup=cleanup,
+        # Placeholder bindings so the delivery profile's automatic stages validate; this service never runs them.
+        operations={"unused": ManagedOperation(lambda context, value: None, on_response=lambda context, original, approved: None,
+                                               approval_stages=tuple(
+            stage for stage in ApprovalStage if policy.mode(stage) != ApprovalPolicy().mode(stage)
+            and stage != ApprovalStage.TASK_ADMISSION))},
+        operator_id=operator_id, binding_revision="consent-v1", approval_policy=policy,
+        task_base_revision_for=lambda preview: None)

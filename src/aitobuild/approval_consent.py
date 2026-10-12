@@ -5,7 +5,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
-from hashlib import sha256
 import json
 from pathlib import Path
 from typing import Annotated, Iterator, Literal, Self
@@ -16,6 +15,7 @@ from pydantic import AfterValidator, AwareDatetime, Field, StrictInt, StrictStr,
 from aitobuild.approval_policy import ApprovalDecision, ApprovalPolicy, ApprovalStage
 from aitobuild.durable_files import atomic_write_text, refuse_symlinks
 from aitobuild.organization import DefinitionModel, Identifier
+from aitobuild.publish_approvals import snapshot_digest
 
 
 Digest = Annotated[StrictStr, Field(pattern=r"^[a-f0-9]{64}$")]
@@ -36,8 +36,7 @@ class _Record(DefinitionModel):
 
     @property
     def digest(self) -> str:
-        content = json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), allow_nan=False)
-        return sha256(content.encode()).hexdigest()
+        return snapshot_digest(self.model_dump(mode="json"))
 
 
 class ConsentBundle(StrEnum):
