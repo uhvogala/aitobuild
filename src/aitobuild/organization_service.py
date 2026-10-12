@@ -279,7 +279,7 @@ class ManagedOrganizationService:
         return True
 
     @staticmethod
-    def _evidence_for(preview: DeveloperPreview) -> AdmissionEvidence:
+    def _evidence_for(preview: DeveloperPreview) -> OperatorPolicy | PlannedChild | InheritedReview:
         if published_review_target(preview) is not None:
             return InheritedReview()
         return PlannedChild() if is_planned_child(preview) else OperatorPolicy()
@@ -287,7 +287,7 @@ class ManagedOrganizationService:
     def _automatic_task_approval(self, preview: DeveloperPreview) -> DeveloperPreview:
         if not self._admission_gate(preview):
             return preview
-        return self.admit_task(preview.preview_id, self._evidence_for(preview))
+        return self._admit(preview, self._evidence_for(preview))
 
     def admit_task(self, preview_id: str, evidence: AdmissionEvidence) -> DeveloperPreview:
         """The one task-admission route (see PLAN 2.4). New admission sources add an evidence variant here."""
@@ -301,6 +301,10 @@ class ManagedOrganizationService:
             raise ValueError("Preview disappeared before configured admission")
         if not self._admission_gate(preview):
             return preview
+        return self._admit(preview, evidence)
+
+    def _admit(self, preview: DeveloperPreview, evidence: OperatorPolicy | PlannedChild | InheritedReview) -> DeveloperPreview:
+        """Body of admit_task for configured evidence, on the exact preview the caller evaluated."""
         if self._evidence_for(preview) != evidence:
             raise PermissionError("Admission evidence does not match its task")
         bundle = developer_task_bundle_from_payload(preview.bundle_payload)
