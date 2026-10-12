@@ -231,13 +231,11 @@ class ManagedOrganizationService:
             raise PermissionError("Planning and non-repository tasks always require a human admission")
         if "planning_assignment" in preview.source_payload or bundle.task_id.startswith(("planned-issue-", "dependent-issue-")):
             self._check_planned_child(preview)
-            base = bundle.issue_context.base_revision
-            if base is None:
+            if bundle.issue_context.base_revision is None:
                 raise PermissionError("Planned child admission requires its plan-pinned base revision")
-        else:
-            if self._task_base is None:
-                raise PermissionError("Automatic task admission has no trusted base binding")
-            base = self._task_base(preview)
+        if self._task_base is None:
+            raise PermissionError("Automatic task admission has no trusted base binding")
+        base = self._task_base(preview)  # planned children: configured repository source required, allowlist replaced by the plan
         payload = deepcopy(preview.bundle_payload)
         if bundle.issue_context is not None:
             issue_payload = payload.get("issue_context")
@@ -276,13 +274,29 @@ class ManagedOrganizationService:
             saved = publication._load_publication(assignment_id, plan)
         except (OSError, ValueError) as error:
             raise PermissionError("Planned child admission requires its stored plan and publication") from error
-        digest = preview.source_payload.get("plan_digest", plan.digest)
+        task_id = str(preview.bundle_payload.get("task_id", ""))
+        if task_id.startswith("dependent-issue-"):
+            if self._dependencies is None:
+                raise PermissionError("Dependent child admission requires its trusted handoff binding")
+            try:
+                digest: object = self._dependencies._load(task_id).plan_digest
+            except (OSError, ValueError) as error:
+                raise PermissionError("Dependent child admission requires its stored handoff record") from error
+        else:
+            digest = preview.source_payload.get("plan_digest")
+            if not isinstance(digest, str):
+                raise PermissionError("Planned child admission requires its stored plan digest")
         if digest != plan.digest or saved.plan_digest != plan.digest or saved.state != "published" or saved.approved_at is None:
             raise PermissionError("Planned child plan digest differs from its stored published plan")
         planning = self._previews.get(str(plan.pins.get("preview_id", "")))
         if (planning is None or not planning.approved or planning.approved_at is None or
-                planning.approved_at.isoformat() != plan.pins.get("approved_at") or
-                planning.approval_policy is not None and planning.approval_policy.source != "human"):
+                planning.approved_at.isoformat() != plan.pins.get("approved_at")):
+            raise PermissionError("Planned child admission requires its exact approved planning task")
+        if planning.approval_policy is None:
+            # The human approve endpoint (dispatcher/registry approve without a policy) saves no decision record;
+            # automatic admission always saves an operator_policy record, so an approved preview without one is human.
+            pass
+        elif planning.approval_policy.source != "human":
             raise PermissionError("Planned child admission requires a human-admitted planning task")
         expected = workflow_input_digest(publication.approval_data(plan, saved))
         matches = [item for item in run.decisions if item.data_digest == expected]

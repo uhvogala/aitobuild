@@ -121,7 +121,9 @@ require `X-Internal-Token` by default.
 - Planning tasks and tasks without a repository issue never auto-admit. A PM-planned
   child auto-admits only through its plan: a human-admitted planning task plus a human
   `pm_issue_creation` decision bound to the child's exact stored plan digest, checked
-  from stored data. Anything missing or mismatched fails closed with 409.
+  from stored data, in a configured repository source with its plan-pinned base.
+  Anything missing or mismatched fails closed with 409. The one-per-issue automatic
+  dedupe also covers planned and dependent-handoff tasks.
 - PM task approval, exact issue creation and resolved dependency publication are
   separate gates. Actual issue IDs/numbers and final link-body bytes need their
   own saved approval. Complete receipts stage only unapproved Developer previews;

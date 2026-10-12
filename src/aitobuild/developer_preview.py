@@ -41,10 +41,16 @@ class DeveloperPreview:
 
 
 
+PER_ISSUE_TASK_PREFIXES = ("ISSUE-", "planned-issue-", "dependent-issue-")
+
+
 def _webhook_issue_identity(bundle: dict[str, Any]) -> tuple[object, object] | None:
-    """Repository/issue IDs of a webhook issue task (staged review/correction tasks are not counted here)."""
+    """Repository/issue IDs of a webhook or PM-planned issue task (staged review/correction tasks are not counted here).
+
+    Planned children and their dependent handoffs share the key, so a handoff on a new base after a failed delivery
+    never auto-admits the same issue again."""
     context = bundle.get("issue_context")
-    if not str(bundle.get("task_id", "")).startswith("ISSUE-") or not isinstance(context, dict):
+    if not str(bundle.get("task_id", "")).startswith(PER_ISSUE_TASK_PREFIXES) or not isinstance(context, dict):
         return None
     return context.get("repository_id"), context.get("issue_id")
 

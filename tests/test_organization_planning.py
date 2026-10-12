@@ -1523,3 +1523,113 @@ def test_planned_child_qualifies_only_through_human_planning_and_issue_creation(
                 assert not calls
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("prefixes", [("dependent-issue-", "dependent-issue-"), ("planned-issue-", "dependent-issue-"),
+                                      ("ISSUE-", "planned-issue-")])
+def test_per_issue_dedupe_covers_planned_and_dependent_handoffs(tmp_path, prefixes):
+    """Handoff A on base 1 is admitted automatically and its delivery fails; handoff B on base 2 for the same
+    repository/issue ID must not be admitted automatically again: it waits for a human."""
+    from aitobuild.developer_isolation import build_developer_task_bundle, DeveloperIssueContext
+    from aitobuild.developer_preview import AutomaticAdmissionDeferred, preview_approval_operation
+
+    previews = DeveloperPreviewRegistry(tmp_path / "previews.json")
+    policy = ApprovalPolicy(task_admission="automatic")
+    staged = []
+    for index, (prefix, base) in enumerate(zip(prefixes, ("1" * 40, "2" * 40))):
+        task_id = prefix + str(index) * 64
+        payload = build_developer_task_bundle(task_id=task_id, objective="Implement", acceptance_criteria=["Passes"],
+            constraints=[], context_files=[], issue_context=DeveloperIssueContext(
+                repository="fixture/widgets", repository_id=101, issue_number=7, issue_id=7007, title="Issue", body="Body",
+                base_branch="main", base_revision=base)).to_payload()
+        staged.append(previews.create_or_get(dedupe_key=task_id, task_key=task_id, bundle_payload=payload,
+                                             source_payload={"planning_assignment": "assignment-x"}))
+    first, second = staged
+    def decide(preview):
+        return policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="operator", automatic_supported=True,
+                              operation=preview_approval_operation(preview.preview_id, preview.bundle_payload))
+    assert previews.approve(first.preview_id, approval_policy=decide(first), max_automatic_admissions=32).approved
+    with pytest.raises(AutomaticAdmissionDeferred):
+        previews.approve(second.preview_id, approval_policy=decide(second), max_automatic_admissions=32)
+    assert not previews.get(second.preview_id).approved
+    assert previews.approve(second.preview_id).approved  # a human can still admit it
+
+
+@pytest.mark.parametrize("case", ["approved_at", "unpublished", "missing_digest", "legacy_human", "no_source", "no_pinned_base",
+                                  "dependent_unbound", "dependent_digest"])
+def test_planned_child_pins_and_sources_fail_closed(tmp_path, approved_delivery, monkeypatch, case):
+    from aitobuild.app import _configured_task_base
+
+    bodies = []
+    policy = ApprovalPolicy(task_admission="automatic", pm_dependency_links="automatic")
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply(bodies))) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service, planning, _, preview, previews, _, _, _ = planning_fixture(
+                    tmp_path, profile, approved_delivery[1], previews=approved_delivery[0], repository="fixture/widgets", repository_id=101,
+                    base_revision=approved_delivery[4], approval_policy=policy, implementation_followups=True,
+                    handoff_operation=ManagedOperation(lambda context, message: None))
+                previews.approve(preview.preview_id)
+                run = await service.consume(preview.preview_id)
+                run = await service.decide(run.assignment_id, request_id=run.pending[0].request_id, approved=True)
+                assert run.state == "completed", run.error
+                first_id, dependent_id = run.outputs[0]["developer_previews"]
+                child = previews.get(first_id)
+                if case == "legacy_human":
+                    # The human approve endpoint saves no policy record: that branch is explicitly human.
+                    assert previews.get(preview.preview_id).approval_policy is None
+                    service._check_planned_child(child)
+                    return
+                if case in {"no_source", "no_pinned_base"}:
+                    source = type("Source", (), {"repository": "fixture/widgets", "repository_id": 101})()
+                    if case == "no_pinned_base":
+                        payload = json.loads(json.dumps(child.bundle_payload))
+                        payload["issue_context"]["base_revision"] = None
+                        child = replace(child, bundle_payload=payload)
+                        with pytest.raises(PermissionError, match="plan-pinned base revision"):
+                            _configured_task_base(child, (source,))
+                        monkeypatch.setattr(previews, "get", lambda key, get=previews.get: child if key == first_id else get(key))
+                        monkeypatch.setattr(service, "_check_planned_child", lambda preview: None)
+                        with pytest.raises(PermissionError, match="plan-pinned base revision"):
+                            service._automatic_task_approval(child)
+                    else:
+                        assert _configured_task_base(child, (source,)) == approved_delivery[4]
+                        with pytest.raises(PermissionError, match="configured repository source"):
+                            _configured_task_base(child, ())
+                    return
+                if case == "dependent_digest":
+                    handoff = previews.get(dependent_id)
+                    handoff = replace(handoff, bundle_payload=handoff.bundle_payload | {"task_id": "dependent-issue-" + "0" * 64},
+                                      source_payload={"planning_assignment": run.assignment_id})
+                    record = type("Handoff", (), {"plan_digest": planning.plans.get(run.assignment_id).digest})()
+                    service._dependencies = type("Dependencies", (), {"_load": lambda self, task_id: record})()
+                    service._check_planned_child(handoff)  # digest read from the stored handoff record
+                    record.plan_digest = "f" * 64
+                    with pytest.raises(PermissionError, match="stored published plan"):
+                        service._check_planned_child(handoff)
+                    return
+                if case == "dependent_unbound":
+                    with pytest.raises(PermissionError, match="trusted handoff binding"):
+                        handoff = previews.get(dependent_id)
+                        service._check_planned_child(replace(handoff, bundle_payload=handoff.bundle_payload | {
+                            "task_id": "dependent-issue-" + "0" * 64}))
+                    return
+                if case == "approved_at":
+                    original = previews.get(preview.preview_id)
+                    from datetime import timedelta
+                    moved = replace(original, approved_at=original.approved_at + timedelta(seconds=1))
+                    monkeypatch.setattr(service._previews, "get", lambda key, get=previews.get: moved if key == preview.preview_id else get(key))
+                    message = "exact approved planning task"
+                elif case == "unpublished":
+                    saved = planning._load_publication(run.assignment_id, planning.plans.get(run.assignment_id))
+                    monkeypatch.setattr(planning, "_load_publication", lambda *args: saved.model_copy(update={"state": "awaiting_links"}))
+                    message = "stored published plan"
+                else:
+                    child = replace(child, source_payload={"planning_assignment": run.assignment_id})
+                    message = "stored plan digest"
+                with pytest.raises(PermissionError, match=message):
+                    service._check_planned_child(child)
+
+    asyncio.run(exercise())
