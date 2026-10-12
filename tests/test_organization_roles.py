@@ -27,6 +27,31 @@ from test_dispatcher import (
 )
 
 
+def _scripted_reply(message, finish=None):
+    finish = finish or ("tool_calls" if message.get("tool_calls") else "stop")
+    return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
+                                    "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
+
+
+_CALLS = iter(range(1, 10**6))
+
+
+def tool_call(name, arguments):
+    return {"role": "assistant", "content": None, "tool_calls": [{"id": f"call-{next(_CALLS)}", "type": "function", "function": {
+        "name": name, "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments)}}]}
+
+
+def text(content):
+    return {"role": "assistant", "content": content}
+
+
+def submit_then_stop(body, name, arguments):
+    """Scripted model: submit once through the named tool, then finish with plain text."""
+    if body["messages"][-1]["role"] == "tool":
+        return _scripted_reply(text("Submitted."))
+    return _scripted_reply(tool_call(name, arguments))
+
+
 def role_fixture(tmp_path, profile, *, role="pm", preview=None, previews=None, budget_path_for=None):
     document = json.loads((Path(__file__).resolve().parents[1] / "config/organization.example.json").read_text())
     selected = "planner" if role == "pm" else "reviewer"
@@ -127,15 +152,10 @@ def test_native_coordinator_assigns_through_trusted_service_once(tmp_path, appro
     def reply(request):
         bodies.append(json.loads(request.content))
         if len(bodies) == 1:
-            message = {"role": "assistant", "content": None, "tool_calls": [{"id": "inspect", "type": "function", "function": {
-                "name": "pm_inspect_approved_task", "arguments": "{}",
-            }}]}
-            finish = "tool_calls"
-        else:
-            message = {"role": "assistant", "content": json.dumps(proposal) if isinstance(proposal, dict) else proposal}
-            finish = "stop"
-        return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
-                                        "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
+            return _scripted_reply(tool_call("pm_inspect_approved_task", "{}"))
+        if len(bodies) == 2 or str(bodies[-1]["messages"][-1].get("content")).startswith("Error"):
+            return _scripted_reply(tool_call("pm_submit_assignment_proposal", proposal if isinstance(proposal, str) else json.dumps(proposal)))
+        return _scripted_reply(text("Submitted."))
 
     async def exercise():
         async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
@@ -189,8 +209,69 @@ def test_native_coordinator_assigns_through_trusted_service_once(tmp_path, appro
                 assert worker.budget_path(preview_id).read_bytes() == before
 
     asyncio.run(exercise())
-    assert len(bodies) == 2
-    assert [entry["function"]["name"] for entry in bodies[0]["tools"]] == ["pm_inspect_approved_task"]
+    valid = isinstance(proposal, dict) and proposal.get("rationale") == "Fits approved scope"
+    # Valid: inspect, submit, final text. Invalid: inspect, then three counted attempts before failing closed.
+    assert len(bodies) == (3 if valid else 4)
+    assert [entry["function"]["name"] for entry in bodies[0]["tools"]] == ["pm_inspect_approved_task", "pm_submit_assignment_proposal"]
+
+
+@pytest.mark.parametrize("script", ["reminder", "retry"])
+def test_native_coordinator_submit_tool_reminder_and_retry_keep_one_invocation(tmp_path, approved_delivery, script):
+    from aitobuild.organization_roles import NativeCoordinatorProposal
+    from test_organization_runner import _service_fixture
+
+    previews, worker, preview_id, _, _ = approved_delivery
+    bodies = []
+    valid = {"agent_id": "developer_one", "rationale": "Fits approved scope"}
+
+    def reply(request):
+        bodies.append(json.loads(request.content))
+        last = bodies[-1]["messages"][-1]
+        if script == "reminder":
+            # Free text first (no submission): the harness must not parse it, and sends one reminder turn.
+            if len(bodies) == 1:
+                return _scripted_reply(text(json.dumps(valid)))
+            return submit_then_stop(bodies[-1], "pm_submit_assignment_proposal", valid)
+        if len(bodies) == 1:
+            return _scripted_reply(tool_call("pm_submit_assignment_proposal", "{not json"))
+        if len(bodies) == 2:
+            return _scripted_reply(tool_call("pm_submit_assignment_proposal", {"agent_id": "outside", "rationale": "x"}))
+        if str(last.get("content")).startswith("Error"):
+            return _scripted_reply(tool_call("pm_submit_assignment_proposal", valid))
+        return _scripted_reply(text("Submitted."))
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
+            async with AsyncOpenAI(api_key="test-key", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+
+                def runtime_for(snapshot):
+                    return bootstrap_organization(snapshot, model_profiles={"default": profile}, default_model_profile="default",
+                                                  state_dir=tmp_path / "coordinator-agents")
+
+                coordinator = NativeCoordinatorProposal(runtime_for=runtime_for, state_dir=tmp_path / "coordinator",
+                                                        previews=previews, budget_path_for=worker.budget_path,
+                                                        event="github.issue.ready", coordinator_id="planner", binding_revision="pm-v1")
+                service, assignments, calls = _service_fixture(tmp_path, approved_delivery, coordinator=coordinator.service_binding)
+                worker.prepare(preview_id)
+                run = await service.consume(preview_id)
+                assert run.state == "completed", run.error
+                assert assignments.get(run.assignment_id).agent_id == "developer_one"
+                assert calls == ["run", "cleanup"]
+                # One receipt (ledger entry) and one session/invocation identity across the reminder turn.
+                receipts = list((tmp_path / "coordinator" / "receipts").glob("*.json"))
+                assert len(receipts) == 1 and json.loads(receipts[0].read_text())["state"] == "proposed"
+                assert len(list((tmp_path / "coordinator" / "sessions").iterdir())) == 1
+                assert len(json.loads((tmp_path / "service-assignments.json").read_text())["assignments"]) == 1
+
+    asyncio.run(exercise())
+    users = [message["content"] for message in bodies[-1]["messages"] if message["role"] == "user"]
+    if script == "reminder":
+        assert len(bodies) == 3 and len(users) == 2 and "pm_submit_assignment_proposal" in users[1]
+    else:
+        assert len(bodies) == 4 and len(users) == 1
+        errors = [m["content"] for m in bodies[-1]["messages"] if m["role"] == "tool"]
+        assert errors[0].startswith("Error") and errors[1].startswith("Error") and "submitted" in errors[2]
 
 
 @pytest.mark.parametrize("scenario", ["capacity", "interrupted", "corrupt", "binding", "revision", "deadline", "symlink", "missing_budget", "event"])
@@ -204,10 +285,7 @@ def test_native_coordinator_receipt_recovery_keeps_original_admission_pins(tmp_p
 
     def reply(request):
         requests.append(json.loads(request.content))
-        return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
-                                        "choices": [{"index": 0, "finish_reason": "stop", "message": {
-                                            "role": "assistant", "content": json.dumps({"agent_id": "developer_one", "rationale": "Fits scope"}),
-                                        }}]})
+        return submit_then_stop(requests[-1], "pm_submit_assignment_proposal", {"agent_id": "developer_one", "rationale": "Fits scope"})
 
     async def exercise():
         async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
@@ -235,7 +313,7 @@ def test_native_coordinator_receipt_recovery_keeps_original_admission_pins(tmp_p
                 with pytest.raises(ValueError, match="capacity"):
                     await service.consume(second.preview_id)
                 assert assignments.for_task("second-coordinated-task") is None
-                assert len(requests) == 2
+                assert len(requests) == 4
                 from hashlib import sha256
 
                 receipt_path = tmp_path / "coordinator" / "receipts" / (sha256(second.preview_id.encode()).hexdigest() + ".json")
@@ -285,7 +363,7 @@ def test_native_coordinator_receipt_recovery_keeps_original_admission_pins(tmp_p
                         assert json.loads(budget_path.read_text()) == initial | ({} if scenario == "event" else {"aborted": True})
                     if scenario == "interrupted":
                         assert json.loads(receipt_path.read_text())["state"] == "failed"
-                assert len(requests) == 2
+                assert len(requests) == 4
 
     asyncio.run(exercise())
 
@@ -310,10 +388,7 @@ def test_native_coordinator_lifecycle_failure_never_claims_or_replays(tmp_path, 
                 await asyncio.Event().wait()
             if scenario == "expired":
                 monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: before["deadline"] + 1)
-            return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
-                                            "choices": [{"index": 0, "finish_reason": "stop", "message": {
-                                                "role": "assistant", "content": json.dumps({"agent_id": "developer_one", "rationale": "Fits scope"}),
-                                            }}]})
+            return submit_then_stop(requests[-1], "pm_submit_assignment_proposal", {"agent_id": "developer_one", "rationale": "Fits scope"})
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
             async with AsyncOpenAI(api_key="test-key", http_client=transport, max_retries=0) as client:
@@ -346,7 +421,7 @@ def test_native_coordinator_lifecycle_failure_never_claims_or_replays(tmp_path, 
                     await service.consume(preview_id)
 
     asyncio.run(exercise())
-    assert len(requests) == (0 if scenario == "runtime" else 1)
+    assert len(requests) == {"runtime": 0, "cancel": 1, "expired": 2}.get(scenario, 1)
 
 
 @pytest.fixture

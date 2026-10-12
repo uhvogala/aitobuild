@@ -33,6 +33,7 @@ class AgentDefinition(DefinitionModel):
     model_profile: Identifier | None = None
     tool_profile: Identifier | None = None
     max_concurrent_runs: Annotated[StrictInt, Field(ge=1, le=64)] = 1
+    max_submit_attempts: Annotated[StrictInt, Field(ge=1, le=10)] = 3
 
     @model_validator(mode="after")
     def validate_instructions(self) -> Self:

@@ -29,6 +29,7 @@ from aitobuild.organization_reviews import PublishedReviewTarget as PublishedRev
 from aitobuild.organization_reviews import CorrectionProposal
 from aitobuild.organization_service import CoordinatorBinding
 from aitobuild.policy import ActionClass, AgentRole
+from aitobuild.submit_tools import build_submit_tool, ensure_framework_error_limit, run_with_reminder
 from aitobuild.tool_outputs import MAX_PROMPT_BYTES, MAX_TOOL_RESULT_BYTES, build_output_guard
 from aitobuild.tools.github import GitHubAdapter, _git_blob_sha
 
@@ -144,7 +145,7 @@ class NativeCoordinatorProposal:
             agent = runtime.agents[self._coordinator]
             if runtime.snapshot != snapshot or not isinstance(agent, Agent) or runtime.modes[self._coordinator] == "mock":
                 raise PermissionError("Coordinator requires the pinned native runtime")
-            message = ("Return only JSON with agent_id and rationale for this configured route. "
+            message = ("Submit agent_id and rationale for this configured route by calling pm_submit_assignment_proposal. "
                        "This is a read-only proposal, not an assignment, approval or issue write.\n"
                        "Eligible agents: " + json.dumps(list(route.delegation.eligible_agents)) +
                        "\nAuthoritative approved task:\n" + content)
@@ -173,13 +174,26 @@ class NativeCoordinatorProposal:
                     finally:
                         del diagnostics[:-128]
 
+                def eligible(value: AssignmentProposal) -> None:
+                    if value.agent_id not in route.delegation.eligible_agents:
+                        raise PermissionError("Proposed agent is outside the configured eligible agents")
+
+                submit = build_submit_tool("pm_submit_assignment_proposal", AssignmentProposal, session,
+                                           "aitobuild_coordinator_proposal", eligible, max_attempts=selected.max_submit_attempts,
+                                           description="Record the one assignment proposal (agent_id, rationale). Write-once.")
+                ensure_framework_error_limit(agent.client, selected.max_submit_attempts)
+
+                async def run_turn(text: str) -> None:
+                    response = await agent.run(text, session=session, tools=(inspect_task, submit.tool), options={"store": False},
+                                               middleware=[guarded_tool, submit.middleware,
+                                                           build_output_guard(path.parent / "outputs" / path.stem)])
+                    revalidate()
+                    if response.user_input_requests:
+                        raise PermissionError("Coordinator cannot accept native approval requests")
+
                 async with asyncio.timeout(min(self._timeout, budget.remaining_seconds())):
-                    response = await agent.run(message, session=session, tools=(inspect_task,), options={"store": False},
-                                               middleware=[guarded_tool, build_output_guard(path.parent / "outputs" / path.stem)])
+                    proposal = await run_with_reminder(submit, message, run_turn, revalidate)
                 revalidate()
-                if response.user_input_requests or len(response.text.encode()) > MAX_PROMPT_BYTES:
-                    raise PermissionError("Coordinator cannot accept native approval requests or oversized proposals")
-                proposal = AssignmentProposal.model_validate_json(response.text)
                 if proposal.agent_id not in route.delegation.eligible_agents:
                     raise PermissionError("Native coordinator proposed an ineligible agent")
                 await self._sessions.set(session_id, session)
