@@ -190,12 +190,20 @@ def test_brief_edit_action() -> None:
     assert action["kind"] == "brief_edit" and action["issue_key"] == "stats-range" and action["at"]
 
 
-def test_recorder_save_is_atomic(tmp_path: Path) -> None:
+def test_recorder_save_uses_atomic_write_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import aitobuild.durable_files as durable_files
+
+    calls: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        durable_files, "atomic_write_text", lambda path, content, **_: calls.append((path, content))
+    )
     recorder = Recorder(tmp_path)
     recorder.report["result"] = "ok"
     recorder.save()
-    assert json.loads((tmp_path / "report.json").read_text())["result"] == "ok"
-    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+    assert len(calls) == 1 and calls[0][0] == tmp_path / "report.json"
+    assert json.loads(calls[0][1])["result"] == "ok"
 
 
 def test_start_without_merge_point_fails() -> None:
@@ -325,3 +333,62 @@ def test_planned_issue_hash_matches_service() -> None:
     )
     issue = pilot.planned_issue_for(payload["task_id"], PLAN)
     assert issue is not None and issue["key"] == "stats-range"
+
+
+def test_merged_keys_ignores_keyed_closed_point() -> None:
+    points: list[dict[str, Any]] = [
+        {"issue_key": None, "state": "MERGED"},
+        {"issue_key": "stats-range", "state": "CLOSED"},
+    ]
+    assert pilot.merged_keys(PLAN, points) == {"stats-min-max"}
+
+
+def seed_clone(tmp_path: Path) -> tuple[Path, Path]:
+    def run(cwd: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    upstream, seed = tmp_path / "upstream", tmp_path / "seed"
+    upstream.mkdir()
+    run(upstream, "init", "-q", "-b", "master")
+    run(upstream, "commit", "-q", "--allow-empty", "-m", "base")
+    subprocess.run(
+        ["git", "clone", "-q", "--branch", "master", str(upstream), str(seed)], check=True
+    )
+    run(upstream, "commit", "-q", "--allow-empty", "-m", "merged PR")
+    return upstream, seed
+
+
+def test_refresh_seed_base_with_master_checked_out(tmp_path: Path) -> None:
+    upstream, seed = seed_clone(tmp_path)
+    merged = pilot.git(upstream, "rev-parse", "HEAD")
+    assert pilot.git(seed, "symbolic-ref", "--short", "HEAD") == "master"
+    assert pilot.refresh_seed_base(seed, "master") == merged
+    assert pilot.git(seed, "rev-parse", "HEAD") == merged
+
+
+def test_refresh_seed_base_refuses_diverged_seed(tmp_path: Path) -> None:
+    _, seed = seed_clone(tmp_path)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(seed),
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "local",
+        ],
+        check=True,
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        pilot.refresh_seed_base(seed, "master")
