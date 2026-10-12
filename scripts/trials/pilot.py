@@ -194,6 +194,25 @@ def classify_planned_child(task_id: str, status_code: int, plan: dict[str, Any])
     raise RuntimeError(f"Planned child {issue['key']} answered {status_code}")
 
 
+def refresh_seed_base(seed: Path, branch: str) -> str:
+    """Bring the seed's checked-out base branch up to the merged remote base.
+
+    Git refuses to fetch into the checked-out branch, so fetch into the remote-tracking ref and fast-forward the
+    clean seed checkout to it; a diverged seed fails instead of being reset."""
+    git(
+        seed,
+        "fetch",
+        "--no-tags",
+        "--quiet",
+        "origin",
+        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+    )
+    if git(seed, "symbolic-ref", "--quiet", "--short", "HEAD") != branch:
+        raise RuntimeError(f"Seed must have {branch} checked out")
+    git(seed, "merge", "--ff-only", "--quiet", f"refs/remotes/origin/{branch}")
+    return git(seed, "rev-parse", f"refs/heads/{branch}")
+
+
 def require_merge_commit_on_base(seed: Path, merge_commit: str, branch: str) -> None:
     """The merge commit GitHub reports must be reachable from the fetched base branch."""
     ancestry = subprocess.run(
@@ -466,14 +485,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         git(service_cwd, "checkout", "--quiet", "--detach", report["service_commit"])
     else:
-        git(
-            seed,
-            "fetch",
-            "--no-tags",
-            "--quiet",
-            "origin",
-            f"+refs/heads/{branch}:refs/heads/{branch}",
-        )
+        refresh_seed_base(seed, branch)
         for point in report.get("merge_points", []):
             pull = gh_json(
                 "pr",
