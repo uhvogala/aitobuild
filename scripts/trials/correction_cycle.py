@@ -90,7 +90,7 @@ ARCHITECT_INSTRUCTIONS = (
     "Review the pinned published draft. Read every changed source file and the pinned-base diff first. "
     "If you find a correctness defect in the changed files, call architect_propose_correction exactly once with "
     "the affected published paths and one precise, bounded objective. If the change is correct, do not propose a "
-    "correction. Finish with a concise review comment summarising what you inspected and found. Never approve or merge."
+    "correction. Finish by calling architect_submit_review with a concise review comment summarising what you inspected and found. Never approve or merge."
 )
 
 

@@ -570,6 +570,10 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                 message, finish = {"role": "assistant", "content": "Correction complete; independent verification required."}, "stop"
             return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
                                             "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
+        last = body["messages"][-1]
+        if last["role"] == "tool" and str(last.get("content")).startswith('{"submitted"'):
+            # Turn end after the write-once review submission; not counted as a review step.
+            return _scripted_reply(text("Submitted."))
         bodies.append(body)
         step = (len(bodies) - 1) % 4 + 1 if native_correcting else len(bodies)
         if step == 3 and correcting and (not queued_followups or len(bodies) <= 4):
@@ -586,8 +590,8 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
             }}]}
             finish = "tool_calls"
         else:
-            message = {"role": "assistant", "content": "Source and pinned-base diff inspected; human merge required."}
-            finish = "stop"
+            return _scripted_reply(tool_call("architect_submit_review", {
+                "body": "Source and pinned-base diff inspected; human merge required."}))
         return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
                                         "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
 
@@ -1498,7 +1502,8 @@ def test_published_review_http_hook_and_metadata_only_retry(tmp_path, published_
 @pytest.mark.parametrize("scenario", ["approved", "preamble", "empty_final", "rejected", "metadata_only", "head_drift", "recovered", "publication_race",
                                       "partial_page", "skip_page", "oversized_output", "body_drift", "evidence_drift", "uncertain_submit", "expired_at_write",
                                       "correction", "correction_outside", "correction_partial", "correction_drift", "body_at_limit", "body_over_limit",
-                                      "repository_context", "context_only", "context_head_drift", "context_corrupt"])
+                                      "repository_context", "context_only", "context_head_drift", "context_corrupt",
+                                      "event_argument", "resubmit_different"])
 def test_native_architect_review_requires_inspection_and_exact_saved_approval(
     tmp_path, published_delivery, monkeypatch, scenario,
 ):
@@ -1591,6 +1596,21 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                     ({"offset": 5} if scenario == "skip_page" and step == 1 else {})),
             }}]}
             finish = "tool_calls"
+        if finish == "stop":
+            # The final review text is submitted through the write-once tool (retried after errors), then the turn ends.
+            last = body["messages"][-1]
+            submits = [entry for entry in body["messages"] if entry["role"] == "tool"
+                       and str(entry.get("content")).startswith('{"submitted"')]
+            if scenario == "resubmit_different" and len(submits) == 1 and last["role"] == "tool" and submits[-1] is last:
+                # A different body after the valid write-once submission is refused; the first body stays bound.
+                return _scripted_reply(tool_call("architect_submit_review", {"body": "A different, unreviewed body"}))
+            if last["role"] == "tool" and (submits and submits[-1] is last or scenario == "resubmit_different" and submits):
+                return _scripted_reply(text("Submitted."))
+            arguments = {"body": message["content"]}
+            if scenario == "event_argument" and not any(entry["role"] == "tool" and str(entry.get("content")).startswith("Error")
+                                                        for entry in body["messages"]):
+                arguments |= {"event": "APPROVE"}
+            return _scripted_reply(tool_call("architect_submit_review", arguments))
         return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
                                         "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
 
@@ -1614,7 +1634,7 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                     assert not waiting.pending and not github.reviews
                     assert json.loads(Path(assignment.budget_path).read_text()) == before | {"aborted": True}
                 elif scenario == "empty_final":
-                    assert waiting.state == "failed" and "final assistant response" in waiting.error
+                    assert waiting.state == "failed" and "attempts" in waiting.error
                     assert not waiting.pending and not github.reviews
                     assert json.loads(Path(assignment.budget_path).read_text()) == before | {"aborted": True}
                 elif scenario in {"metadata_only", "partial_page", "skip_page", "oversized_output", "correction_partial", "context_only", "context_head_drift"}:
@@ -1642,7 +1662,7 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                         roles = adapter()
                         saved = await roles._sessions.get(waiting.session_id)
                         if scenario == "body_drift":
-                            saved.state["aitobuild_comment_body"] = "different text"
+                            saved.state["aitobuild_comment_body"] = {"body": "different text"}
                         elif scenario == "evidence_drift":
                             saved.state["aitobuild_review_inspections"] = {}
                         elif scenario == "correction_drift":
@@ -1680,7 +1700,14 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                         monkeypatch.setattr(worker, "submit_architect_review", expired)
                     done = await make_runner(adapter()).approve(assignment.assignment_id, request_id=waiting.pending[0].request_id,
                                                                approved=scenario != "rejected")
-                    if scenario in {"approved", "preamble", "recovered", "correction", "correction_outside", "body_at_limit", "repository_context", "context_corrupt"}:
+                    if scenario in {"event_argument", "resubmit_different"}:
+                        session = await adapter()._sessions.get(waiting.session_id)
+                        assert session.state["aitobuild_comment_body"] == {"body": expected_comment}
+                        assert session.state["aitobuild_comment_body_submit_attempts"] == 1
+                        tool_results = [entry["content"] for entry in bodies[-1]["messages"] if entry["role"] == "tool"]
+                        assert any(item.startswith("Error") for item in tool_results)
+                    if scenario in {"approved", "preamble", "recovered", "correction", "correction_outside", "body_at_limit", "repository_context",
+                                    "context_corrupt", "event_argument", "resubmit_different"}:
                         assert done.state == "completed", done.error
                         assert github.reviews[0].body == ARCHITECT_REVIEW_BODY_PREFIX + expected_comment
                         assert len(github.reviews) == 1
@@ -1701,7 +1728,7 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
     asyncio.run(exercise())
     assert {entry["function"]["name"] for entry in bodies[0]["tools"]} == {
         "architect_read_published_source", "architect_read_published_diff", "architect_find_repository_files",
-        "architect_read_repository_source", "architect_search_repository_files",
+        "architect_read_repository_source", "architect_search_repository_files", "architect_submit_review",
     } | ({"architect_propose_correction"} if correction_case else set())
 
 

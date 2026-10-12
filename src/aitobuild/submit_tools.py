@@ -66,7 +66,10 @@ class SubmitTool(Generic[ModelT]):
     def result(self) -> ModelT:
         saved = self.submitted
         if saved is None:
-            raise ValueError(f"Agent did not submit a valid {self.name} result")
+            error = self.session.state.get(self.key + "_submit_error")
+            raise ValueError(
+                f"Agent did not submit a valid {self.name} result" + (f": {error}" if error else "")
+            )
         return self.model.model_validate(saved)
 
 
@@ -127,7 +130,11 @@ def build_submit_tool(
         return {"submitted": True, "write_once": True}
 
     submit_tool = tool(
-        submit, name=name, description=description, schema=model.model_json_schema(), approval_mode="never_require"
+        submit,
+        name=name,
+        description=description,
+        schema=model.model_json_schema(),
+        approval_mode="never_require",
     )
     attempts_key = key + "_submit_attempts"
 
@@ -145,6 +152,7 @@ def build_submit_tool(
             await call_next()
         except Exception as error:
             session.state[attempts_key] = used + 1
+            session.state[key + "_submit_error"] = (str(error) or type(error).__name__)[:500]
             if persist is not None:
                 await persist()
             if used + 1 >= max_attempts:

@@ -51,6 +51,12 @@ class _CoordinatorReceipt(DefinitionModel):
         return self
 
 
+class ArchitectReviewSubmission(DefinitionModel):
+    """The Architect's COMMENT body. There is deliberately no event field: reviews are COMMENT-only."""
+
+    body: Annotated[StrictStr, Field(min_length=1, max_length=ARCHITECT_REVIEW_BODY_MAX)]
+
+
 class NativeCoordinatorProposal:
     def __init__(
         self, *, runtime_for: Callable[[DefinitionSnapshot], OrganizationRuntime], state_dir: Path,
@@ -265,38 +271,6 @@ class NativeManagedRoles:
         if session.session_id != context.run.session_id or session.state.get("aitobuild_role_pins") != pins:
             raise PermissionError("Managed role session cannot switch scope, revision, target or owner")
         return session
-
-    async def _invoke(self, context: ManagedTaskContext, agent: Agent, session: AgentSession,
-                      tools: tuple[Any, ...], guidance: str) -> str:
-        message = guidance + "\nAuthoritative approved task:\n" + context.assignment.bundle_content
-        if len(message.encode("utf-8")) > MAX_PROMPT_BYTES:
-            raise ValueError("Managed role prompt exceeds the byte limit")
-        diagnostics = session.state.setdefault("aitobuild_role_diagnostics", [])
-
-        @function_middleware
-        async def guarded_tool(call: FunctionInvocationContext, call_next: Callable) -> None:
-            context.revalidate()
-            try:
-                await call_next()
-            except Exception as error:
-                diagnostics.append({"tool": call.function.name, "error": str(error)[:2000]})
-                raise
-            finally:
-                del diagnostics[:-128]
-
-        async with asyncio.timeout(min(self._timeout, context.remaining_seconds())):
-            response = await agent.run(message, session=session, tools=tools, options={"store": False},
-                                       middleware=[guarded_tool, build_output_guard(self._state_dir / "outputs" / context.run.session_id)])
-        context.revalidate()
-        if response.user_input_requests:
-            raise PermissionError("Unsupported native input cannot become managed role service approval")
-        final_message = response.messages[-1] if response.messages else None
-        if final_message is None or final_message.role != "assistant" or not final_message.text.strip():
-            raise ValueError("Managed role requires a final assistant response")
-        if len(response.text.encode("utf-8")) > MAX_PROMPT_BYTES:
-            raise ValueError("Managed role response exceeds the byte limit")
-        await self._sessions.set(context.run.session_id, session)
-        return final_message.text
 
     def _submit_attempts(self, context: ManagedTaskContext) -> int:
         owner = context.assignment.agent_id
@@ -665,27 +639,43 @@ class NativeManagedRoles:
             return {"correction": proposal, "metadata_only": True}
 
         max_body = ARCHITECT_REVIEW_BODY_MAX - len(ARCHITECT_REVIEW_BODY_PREFIX)
+        worker = self._worker
+        if worker is None:
+            raise RuntimeError("Internal invariant violated: self._worker is not None")
+
+        async def check_review(value: ArchitectReviewSubmission) -> ArchitectReviewSubmission:
+            context.revalidate()
+            self._require_inspections(target, inspections)
+            body = value.body.replace("\x00", "").strip()
+            worker._normalize_architect_review_body(body)
+            if await self._target(context) != target:
+                raise PermissionError("Review target changed before proposal approval")
+            return ArchitectReviewSubmission(body=body)
+
+        # The submit tool is the only writer of aitobuild_comment_body, exactly once; approval binds to it.
+        submit = self._submit_tool(context, session, "architect_submit_review", ArchitectReviewSubmission,
+                                   "aitobuild_comment_body", check_review,
+                                   "Record the one COMMENT review body after inspection. Write-once; COMMENT only, "
+                                   "no event. Publication requires a separate operator approval.")
         guidance = ("Inspect complete source AND diff for each approved changed path at the pinned target below. "
             "Use repository discovery, literal search and source readers for any relevant unchanged files across the whole repository. "
             "Choose enough context to assess architecture, style, established patterns, reuse and behavioral compatibility; "
             "Developer write paths do not limit these immutable repository reads. Context reads do not replace changed-file source/diff inspection. "
-                f"Return COMMENT review text only, at most {max_body} characters including whitespace. "
+                f"Then call architect_submit_review with the COMMENT review body, at most {max_body} characters including whitespace. "
                 "Be concise; never claim metadata alone proves semantic correctness. "
                     "Publication requires a separate operator approval.")
         tools: tuple[Any, ...] = (read_source, read_diff, find_files, read_context, search_files)
         if self._allow_corrections:
             tools += (propose_correction,)
             guidance += " Optionally propose one scoped correction after inspection; this cannot assign, approve or execute a Developer task."
-        text = await self._invoke(context, agent, session, tools, guidance + "\nTarget: " + json.dumps(target, sort_keys=True))
+        submission = await self._invoke_submit(context, agent, session, tools,
+                                               guidance + "\nTarget: " + json.dumps(target, sort_keys=True), submit=submit)
         self._require_inspections(target, inspections)
-        if self._worker is None:
-            raise RuntimeError("Internal invariant violated: self._worker is not None")
-        text = text.replace("\x00", "").strip()
-        self._worker._normalize_architect_review_body(text)
+        text = submission.body
+        worker._normalize_architect_review_body(text)
         if await self._target(context) != target:
             raise PermissionError("Review target changed before proposal approval")
         session.state["aitobuild_comment_state"] = "proposed"
-        session.state["aitobuild_comment_body"] = text
         await self._sessions.set(context.run.session_id, session)
         data: dict[str, Any] = {"target": target, "body": text}
         if session.state.get("aitobuild_correction_proposal") is not None:
@@ -703,7 +693,9 @@ class NativeManagedRoles:
                          "role": "architect", "target": target}
         if self._allow_corrections:
             expected_pins["correction_proposals"] = True
-        data = {"target": target, "body": session.state.get("aitobuild_comment_body") if session else None}
+        saved_body = session.state.get("aitobuild_comment_body") if session else None
+        body = ArchitectReviewSubmission.model_validate(saved_body).body if isinstance(saved_body, dict) else None
+        data = {"target": target, "body": body}
         correction = session.state.get("aitobuild_correction_proposal") if session else None
         if correction is not None:
             proposal = CorrectionProposal.model_validate(correction)

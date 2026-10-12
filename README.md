@@ -527,6 +527,19 @@ certification or multi-user authentication.
 against a pinned `proposal_event`. It returns metadata only: no assignment claim,
 actor identity, issue write or approval is taken from the model.
 
+Structured results are never parsed from free text. Each site gives its agent a typed,
+write-once submit tool (`pm_submit_assignment_proposal` for the coordinator and PM
+proposal, `pm_submit_plan`, `meeting_submit_resolution`, `architect_submit_review`), built
+by `build_submit_tool` in [src/aitobuild/submit_tools.py](src/aitobuild/submit_tools.py).
+Invalid JSON, schema or semantic errors come back to the agent as a tool error and use up
+one attempt; only a valid submission is stored, once, in session state, and a later
+different submission is refused. If the agent ends without submitting, one reminder turn
+runs in the same session under the same timeout. Attempts are counted across both turns
+and set per agent with `max_submit_attempts` (default 3, 1-10, invalid values fail the
+definition load); a value above 3 raises the client's
+`max_consecutive_errors_per_request` to match. The Architect submits only a COMMENT body
+(there is no event argument), and approval is bound to that submitted body.
+
 `architect_review_published` requires delivery/GitHub bindings and an operator-owned
 `review_target_for(context)` returning `PublishedReviewTarget(preview_id=..., head_sha=...)`.
 Use a separately approved review task and original ledger, matching the published
