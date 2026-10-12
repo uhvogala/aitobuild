@@ -33,7 +33,7 @@ class AgentDefinition(DefinitionModel):
     model_profile: Identifier | None = None
     tool_profile: Identifier | None = None
     max_concurrent_runs: Annotated[StrictInt, Field(ge=1, le=64)] = 1
-    max_submit_attempts: Annotated[StrictInt, Field(ge=1, le=10)] = 3
+    max_submit_attempts: Annotated[StrictInt, Field(ge=1, le=3)] = 3
 
     @model_validator(mode="after")
     def validate_instructions(self) -> Self:
@@ -258,6 +258,10 @@ class DefinitionSnapshot:
     def __post_init__(self) -> None:
         definition = parse_organization_definition(self.content)
         if self.content != _canonical_content(definition):
+            raw = json.loads(self.content)
+            if any(isinstance(agent, dict) and "max_submit_attempts" not in agent for agent in raw.get("agents", ())):
+                raise ValueError("Stored definition snapshot predates max_submit_attempts; save the definition again "
+                                 "to pin a new revision (see README)")
             raise ValueError("Stored definition snapshots must use canonical JSON")
         object.__setattr__(self, "organization_id", definition.id)
         object.__setattr__(self, "revision", hashlib.sha256(self.content.encode("utf-8")).hexdigest())

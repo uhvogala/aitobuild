@@ -629,3 +629,33 @@ def test_meeting_resolver_submit_tool_reminder_retry_and_exhaustion(tmp_path, sc
         assert len(resolver) == 3 and len(users) == 1
     else:
         assert len(resolver) == 3 and len(users) == 1
+
+
+@pytest.mark.parametrize("scenario", ["json_text_only", "deadline_before_reminder"])
+def test_meeting_resolver_text_is_never_parsed_and_reminder_respects_deadline(tmp_path, monkeypatch, scenario):
+    requests = []
+    valid = {"outcome": "continue", "rationale": "Within scope", "plan": "Keep the approved scope"}
+    base = meeting_reply(requests, resolution=valid)
+
+    def reply(request):
+        body = json.loads(request.content)
+        if not is_resolver(body):
+            return base(request)
+        requests.append(body)
+        if scenario == "deadline_before_reminder":
+            monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: 10.0 ** 12)
+        return chat_response({"role": "assistant", "content": json.dumps(valid)})
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="DeepSeek-V4.1-Flash", async_client=client))
+                runner, assignment, meetings, _ = meeting_fixture(tmp_path, profile)
+                run = await runner.start(assignment.assignment_id, input=BLOCKER)
+                receipt = meetings.store.get(run.run_id)
+                assert run.state == "failed" and receipt.state == "failed" and receipt.resolution is None
+                assert ("did not submit" if scenario == "json_text_only" else "expired") in receipt.error, receipt.error
+
+    asyncio.run(exercise())
+    resolver = [item for item in requests if is_resolver(item)]
+    assert len(resolver) == (2 if scenario == "json_text_only" else 1)

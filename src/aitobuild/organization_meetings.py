@@ -26,7 +26,7 @@ from aitobuild.organization_runner import (
 from aitobuild.organization_runtime import OrganizationRuntime
 from aitobuild.organization import DefinitionSnapshot
 from aitobuild.policy import AgentRole
-from aitobuild.submit_tools import build_submit_tool, ensure_framework_error_limit, run_with_reminder
+from aitobuild.submit_tools import build_submit_tool, require_framework_error_limit, run_with_reminder
 from aitobuild.tool_outputs import MAX_PROMPT_BYTES
 
 
@@ -295,7 +295,7 @@ class NativeManagedMeetings:
             max_attempts=configured.max_submit_attempts,
             description="Record the one meeting outcome (continue|scope_change|escalate, rationale, plan). Write-once; "
                         "a proposal, never approval.")
-        ensure_framework_error_limit(resolver.client, configured.max_submit_attempts)
+        require_framework_error_limit(resolver.client, configured.max_submit_attempts)
 
         async def turn(text: str) -> None:
             response = await resolver.run(text, session=session, tools=(submit.tool,), middleware=[submit.middleware])
@@ -305,7 +305,8 @@ class NativeManagedMeetings:
         prompt = ("Call meeting_submit_resolution with outcome (continue|scope_change|escalate), rationale and plan. "
                   "This is a proposal, never approval. Scope change or unresolved blockers cannot resume this task.\n" +
                   json.dumps([item.model_dump() for item in current().transcript]))
-        return await run_with_reminder(submit, prompt, turn, lambda: self._check(context, current()))
+        return await run_with_reminder(submit, prompt, turn, lambda: self._check(context, current()),
+                                       context.remaining_seconds)
 
     def approve(self, context: ManagedTaskContext, original: Any, approved: Any) -> dict[str, Any]:
         with self.store.invocation_lock(context.run.run_id):

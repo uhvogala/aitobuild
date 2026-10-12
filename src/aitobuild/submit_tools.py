@@ -26,7 +26,9 @@ from pydantic import BaseModel
 from aitobuild.tool_outputs import MAX_TOOL_RESULT_BYTES
 
 DEFAULT_MAX_SUBMIT_ATTEMPTS = 3
-MAX_SUBMIT_ATTEMPTS = 10
+# The framework counts consecutive tool errors per client and offers no per-run override, so attempts are
+# capped at its default instead of mutating a shared client (see #24 review B2).
+MAX_SUBMIT_ATTEMPTS = 3
 FRAMEWORK_ERROR_LIMIT_KEY = "max_consecutive_errors_per_request"
 FRAMEWORK_DEFAULT_ERROR_LIMIT = 3
 
@@ -73,18 +75,17 @@ class SubmitTool(Generic[ModelT]):
         return self.model.model_validate(saved)
 
 
-def ensure_framework_error_limit(client: Any, max_attempts: int) -> None:
-    """Raise the framework's consecutive tool error limit so it never silently caps submit attempts."""
-    config = getattr(client, "function_invocation_configuration", None)
-    if config is None:
-        if max_attempts > FRAMEWORK_DEFAULT_ERROR_LIMIT:
-            raise RuntimeError(
-                "Submit attempts above the framework default require a configurable client"
-            )
-        return
-    current = config.get(FRAMEWORK_ERROR_LIMIT_KEY, FRAMEWORK_DEFAULT_ERROR_LIMIT)
-    if current < max_attempts:
-        config[FRAMEWORK_ERROR_LIMIT_KEY] = max_attempts
+def require_framework_error_limit(client: Any, max_attempts: int) -> None:
+    """Fail closed if the client's consecutive tool error limit would silently cap submit attempts.
+
+    Read-only: the shared client's configuration is never changed.
+    """
+    config = getattr(client, "function_invocation_configuration", None) or {}
+    limit = config.get(FRAMEWORK_ERROR_LIMIT_KEY, FRAMEWORK_DEFAULT_ERROR_LIMIT)
+    if type(limit) is not int or limit < max_attempts:
+        raise PermissionError(
+            "Client tool error limit is below max_submit_attempts; lower the setting"
+        )
 
 
 def build_submit_tool(
@@ -179,6 +180,7 @@ async def run_with_reminder(
     message: str,
     run: Callable[[str], Awaitable[Any]],
     revalidate: Callable[[], Any],
+    remaining_seconds: Callable[[], float],
 ) -> ModelT:
     """Run once, then at most one reminder turn in the same session if no valid submission was recorded.
 
@@ -191,6 +193,8 @@ async def run_with_reminder(
             checked = revalidate()
             if inspect.isawaitable(checked):
                 await checked
+            # The reminder is a model call too: an expired budget deadline must stop it (BudgetDeadlineExpired).
+            remaining_seconds()
             await run(reminder_text(submit))
     except MiddlewareFailure as error:
         if submit.submitted is None and submit.remaining == 0:

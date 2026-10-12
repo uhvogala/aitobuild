@@ -1368,3 +1368,41 @@ def test_native_plan_reminder_turn_reuses_the_single_run_and_session(tmp_path, a
     asyncio.run(exercise())
     users = [message["content"] for message in bodies[-1]["messages"] if message["role"] == "user"]
     assert len(bodies) == 4 and len(users) == 2 and "pm_submit_plan" in users[1]
+
+
+@pytest.mark.parametrize("scenario", ["json_text_only", "deadline_before_reminder"])
+def test_native_plan_text_is_never_parsed_and_reminder_respects_deadline(tmp_path, approved_delivery, monkeypatch, scenario):
+    bodies = []
+    inspect = native_reply(bodies)
+
+    def reply(request):
+        body = json.loads(request.content)
+        if bodies and body["messages"][-1]["role"] != "tool" or len(bodies) == 1:
+            bodies.append(body)
+            if scenario == "deadline_before_reminder":
+                monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: 10.0 ** 12)
+            return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
+                                            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                                                "role": "assistant", "content": json.dumps(proposal())}}]})
+        return inspect(request)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service, planning, roles, preview, previews, github, restart, _ = planning_fixture(tmp_path, profile, approved_delivery[1])
+                previews.approve(preview.preview_id)
+                run = await service.consume(preview.preview_id)
+                assert run.state == "failed", run.error
+                assert ("did not submit" if scenario == "json_text_only" else "TimeoutError") in run.error, run.error
+                session = await roles._sessions.get(run.session_id)
+                # The failure is recorded instead of sticking at running, and nothing was submitted.
+                assert session.state["aitobuild_plan_state"] == "failed"
+                assert session.state.get("aitobuild_plan_submission") is None and "aitobuild_plan_approval" not in session.state
+                assert not github.issues
+
+    asyncio.run(exercise())
+    users = [message["content"] for message in bodies[-1]["messages"] if message["role"] == "user"]
+    # Inspect, free text, then (json_text_only) one reminder turn; an expired deadline stops before the reminder.
+    assert len(bodies) == (3 if scenario == "json_text_only" else 2)
+    assert len(users) == (2 if scenario == "json_text_only" else 1)

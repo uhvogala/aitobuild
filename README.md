@@ -534,10 +534,15 @@ by `build_submit_tool` in [src/aitobuild/submit_tools.py](src/aitobuild/submit_t
 Invalid JSON, schema or semantic errors come back to the agent as a tool error and use up
 one attempt; only a valid submission is stored, once, in session state, and a later
 different submission is refused. If the agent ends without submitting, one reminder turn
-runs in the same session under the same timeout. Attempts are counted across both turns
-and set per agent with `max_submit_attempts` (default 3, 1-10, invalid values fail the
-definition load); a value above 3 raises the client's
-`max_consecutive_errors_per_request` to match. The Architect submits only a COMMENT body
+runs in the same session under the same timeout, after revalidation and a budget deadline
+check (an expired deadline raises `BudgetDeadlineExpired` without calling the model again).
+Attempts are counted across both turns and set per agent with `max_submit_attempts`
+(default 3, 1-3, invalid values fail the definition load). The cap is 3 because the agent
+framework's `max_consecutive_errors_per_request` is a per-client setting with no per-run
+override, and shared clients are never modified; a client configured below the agent's
+setting fails closed. Adding `max_submit_attempts` changed canonical definition JSON:
+definition snapshots stored before it refuse to load with a specific error, so save the
+definition again to pin a new revision. The Architect submits only a COMMENT body
 (there is no event argument), and approval is bound to that submitted body.
 
 `architect_review_published` requires delivery/GitHub bindings and an operator-owned

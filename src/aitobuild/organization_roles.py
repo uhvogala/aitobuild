@@ -29,7 +29,7 @@ from aitobuild.organization_reviews import PublishedReviewTarget as PublishedRev
 from aitobuild.organization_reviews import CorrectionProposal
 from aitobuild.organization_service import CoordinatorBinding
 from aitobuild.policy import ActionClass, AgentRole
-from aitobuild.submit_tools import ModelT, SubmitTool, build_submit_tool, ensure_framework_error_limit, run_with_reminder
+from aitobuild.submit_tools import ModelT, SubmitTool, build_submit_tool, require_framework_error_limit, run_with_reminder
 from aitobuild.tool_outputs import MAX_PROMPT_BYTES, MAX_TOOL_RESULT_BYTES, build_output_guard
 from aitobuild.tools.github import GitHubAdapter, _git_blob_sha
 
@@ -187,18 +187,18 @@ class NativeCoordinatorProposal:
                 submit = build_submit_tool("pm_submit_assignment_proposal", AssignmentProposal, session,
                                            "aitobuild_coordinator_proposal", eligible, max_attempts=selected.max_submit_attempts,
                                            description="Record the one assignment proposal (agent_id, rationale). Write-once.")
-                ensure_framework_error_limit(agent.client, selected.max_submit_attempts)
+                require_framework_error_limit(agent.client, selected.max_submit_attempts)
 
                 async def run_turn(text: str) -> None:
                     response = await agent.run(text, session=session, tools=(inspect_task, submit.tool), options={"store": False},
                                                middleware=[guarded_tool, submit.middleware,
                                                            build_output_guard(path.parent / "outputs" / path.stem)])
                     revalidate()
-                    if response.user_input_requests:
-                        raise PermissionError("Coordinator cannot accept native approval requests")
+                    if response.user_input_requests or len(response.text.encode()) > MAX_PROMPT_BYTES:
+                        raise PermissionError("Coordinator cannot accept native approval requests or oversized responses")
 
                 async with asyncio.timeout(min(self._timeout, budget.remaining_seconds())):
-                    proposal = await run_with_reminder(submit, message, run_turn, revalidate)
+                    proposal = await run_with_reminder(submit, message, run_turn, revalidate, budget.remaining_seconds)
                 revalidate()
                 if proposal.agent_id not in route.delegation.eligible_agents:
                     raise PermissionError("Native coordinator proposed an ineligible agent")
@@ -293,7 +293,7 @@ class NativeManagedRoles:
         if len(message.encode("utf-8")) > MAX_PROMPT_BYTES:
             raise ValueError("Managed role prompt exceeds the byte limit")
         diagnostics = session.state.setdefault("aitobuild_role_diagnostics", [])
-        ensure_framework_error_limit(agent.client, submit.max_attempts)
+        require_framework_error_limit(agent.client, submit.max_attempts)
 
         @function_middleware
         async def guarded_tool(call: FunctionInvocationContext, call_next: Callable) -> None:
@@ -317,7 +317,7 @@ class NativeManagedRoles:
                 raise ValueError("Managed role response exceeds the byte limit")
 
         async with asyncio.timeout(min(self._timeout, context.remaining_seconds())):
-            result = await run_with_reminder(submit, message, turn, context.revalidate)
+            result = await run_with_reminder(submit, message, turn, context.revalidate, context.remaining_seconds)
         context.revalidate()
         await self._sessions.set(context.run.session_id, session)
         return result
@@ -620,6 +620,9 @@ class NativeManagedRoles:
                 "next_file_offset": next_file if more else None, "next_line_offset": next_line if more else None,
             }, {"kind": "search", "paths": scanned, "pattern": pattern})
 
+        # Deliberately not build_submit_tool: a correction is optional (zero or one per review) and is
+        # metadata attached to the body approval, not the run's required result. It keeps its own write-once check,
+        # and errors here must not use up the review body's submit attempts or trigger a reminder turn.
         @tool(name="architect_propose_correction", approval_mode="never_require")
         async def propose_correction(paths: list[str], objective: str) -> dict[str, Any]:
             context.revalidate()
