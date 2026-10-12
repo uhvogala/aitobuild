@@ -517,7 +517,10 @@ def create_app(
 
     async def _dispatch_metadata(result: Any, *, event_payload: dict[str, Any]) -> dict[str, Any] | None:
         metadata = _metadata_with_runtime_hooks(result, event_payload=event_payload)
-        if metadata is not None and result.route in {"developer.async.webhook", "dedupe"}:
+        # "developer.preview_required" goes through the same admission as /internal/organization/tasks/run:
+        # human mode leaves the preview waiting, automatic mode records its operator_policy decision, and
+        # disabled refuses. Signature checks and the activated repository route still come first.
+        if metadata is not None and result.route in {"developer.async.webhook", "dedupe", "developer.preview_required"}:
             preview_id = metadata.get("preview_id")
             if isinstance(preview_id, str):
                 run = await _consume_managed(preview_id)

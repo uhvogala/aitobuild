@@ -2190,3 +2190,117 @@ def test_every_internal_route_refuses_missing_or_wrong_token(test_config, tmp_pa
                 if response.status_code != 401:
                     failures.append((method, path, bool(headers), response.status_code))
     assert failures == []
+
+
+def _issue_webhook(client, config, body, delivery):
+    content = json.dumps({**body, "action": "opened"}).encode()
+    return client.post("/webhook", content=content, headers={
+        "X-GitHub-Event": "issues", "X-GitHub-Delivery": delivery,
+        "X-Hub-Signature-256": _signature(config.webhook_secret, content),
+    })
+
+
+def _webhook_admission_app(test_config, tmp_path, local_issue_repository, mode, detached=False):
+    from aitobuild.approval_policy import ApprovalPolicy
+
+    source, base = local_issue_repository
+    config = replace(test_config, approvals=ApprovalPolicy(task_admission=mode), developer=replace(
+        test_config.developer, require_preview_before_dispatch=True,
+        repository_sources=(RepositorySourceConfig("fixture/widgets", 101, str(source), (), base),)))
+    calls = []
+    return config, _managed_app(config, tmp_path, calls, detached=detached), calls
+
+
+@pytest.mark.parametrize("detached", [False, True])
+def test_webhook_automatic_admission_uses_operator_policy_once(
+    test_config, tmp_path, repository_issue_body, local_issue_repository, detached, monkeypatch,
+) -> None:
+    from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
+
+    config, app, calls = _webhook_admission_app(test_config, tmp_path, local_issue_repository, "automatic", detached)
+    admissions = []
+    resolve = ApprovalPolicy.resolve
+
+    def counted(self, stage, **kwargs):
+        if stage is ApprovalStage.TASK_ADMISSION:
+            admissions.append(kwargs.get("actor_id"))
+        return resolve(self, stage, **kwargs)
+
+    monkeypatch.setattr(ApprovalPolicy, "resolve", counted)
+    with TestClient(app) as client:
+        service, context = app.state.test_services[0]
+        first = _issue_webhook(client, config, repository_issue_body, "auto-first")
+        assert first.status_code == 200, first.text
+        preview_id = first.json()["metadata"]["preview_id"]
+        if detached:
+            client.portal.call(app.state.test_workers[0].wait_idle, preview_id)
+        approved = context.previews.get(preview_id)
+        assert approved.approved and approved.approval_policy.source == "operator_policy"
+        assert approved.approval_policy.actor_id == "configured-operator"
+        assert approved.approval_policy.policy_revision == config.approvals.revision
+        run = service.status(preview_id)
+        assert run.state == "completed", run.error
+        assert calls == [run.assignment_id, "cleanup"]
+        before = context.worker.budget_path(preview_id).read_bytes()
+        for delivery in ("auto-first", "auto-redelivered"):  # exact replay, then a GitHub redelivery
+            again = _issue_webhook(client, config, repository_issue_body, delivery)
+            assert again.status_code == 200, again.text
+        if detached:
+            client.portal.call(app.state.test_workers[0].wait_idle, preview_id)
+        assert calls == [run.assignment_id, "cleanup"]
+        assert admissions == ["configured-operator"]  # one policy decision across first, replayed and redelivered
+        after = context.previews.get(preview_id)  # no second policy decision
+        assert (after.approved_at, after.approval_policy, after.bundle_payload) == (
+            approved.approved_at, approved.approval_policy, approved.bundle_payload)
+        assert context.worker.budget_path(preview_id).read_bytes() == before
+
+
+def test_webhook_human_admission_waits_for_human_approval(
+    test_config, tmp_path, repository_issue_body, local_issue_repository,
+) -> None:
+    config, app, calls = _webhook_admission_app(test_config, tmp_path, local_issue_repository, "human")
+    client = TestClient(app)
+    response = _issue_webhook(client, config, repository_issue_body, "human-first")
+    assert response.status_code == 200, response.text
+    assert response.json()["route"] == "developer.preview_required"
+    preview_id = response.json()["metadata"]["preview_id"]
+    service, context = app.state.test_services[0]
+    assert not context.previews.get(preview_id).approved and service.status(preview_id) is None and calls == []
+    approved = client.post("/internal/developer/preview/approve", headers=_internal_headers(config), json={
+        "preview_id": preview_id, "base_revision": local_issue_repository[1]})
+    assert approved.status_code == 200, approved.text
+    assert context.previews.get(preview_id).approval_policy is None or \
+        context.previews.get(preview_id).approval_policy.source == "human"
+    assert approved.json()["managed_run"]["state"] == "completed"
+
+
+def test_webhook_disabled_admission_refuses_without_approving(
+    test_config, tmp_path, repository_issue_body, local_issue_repository,
+) -> None:
+    config, app, calls = _webhook_admission_app(test_config, tmp_path, local_issue_repository, "disabled")
+    client = TestClient(app)
+    response = _issue_webhook(client, config, repository_issue_body, "disabled-first")
+    assert response.status_code == 409 and "disabled" in response.json()["detail"]
+    _, context = app.state.test_services[0]
+    assert all(not preview.approved for preview in context.previews.list_previews(pending_only=False, limit=10))
+    assert calls == []
+
+
+@pytest.mark.parametrize("case", ["bad_signature", "other_repository"])
+def test_webhook_automatic_admission_requires_signature_then_activated_repository(
+    test_config, tmp_path, repository_issue_body, local_issue_repository, case,
+) -> None:
+    config, app, calls = _webhook_admission_app(test_config, tmp_path, local_issue_repository, "automatic")
+    client = TestClient(app)
+    _, context = app.state.test_services[0]
+    if case == "bad_signature":
+        content = json.dumps({**repository_issue_body, "action": "opened"}).encode()
+        response = client.post("/webhook", content=content, headers={
+            "X-GitHub-Event": "issues", "X-GitHub-Delivery": "unsigned", "X-Hub-Signature-256": "sha256=" + "0" * 64})
+        assert response.status_code == 401
+    else:
+        repository_issue_body["repository"] = {"id": 999, "full_name": "fixture/other", "default_branch": "main"}
+        response = _issue_webhook(client, config, repository_issue_body, "other-repo")
+        assert response.status_code == 200 and response.json()["route"] == "developer.preview_required"
+    assert all(not preview.approved for preview in context.previews.list_previews(pending_only=False, limit=10))
+    assert calls == []
