@@ -100,14 +100,17 @@ def test_automatic_script_refuses_to_start_without_author(
         module.main()
 
 
-@pytest.mark.parametrize("value", ["", " ", "*", "uh?", "a,b", "a b", "-lead", "x" * 40])
+@pytest.mark.parametrize(
+    "value", ["", " ", "*", "uh?", "a,b", "a b", "-lead", "a-", "a--b", "x" * 40, "a-" * 19 + "bc"]
+)
 def test_issue_author_type_rejects(value: str) -> None:
     with pytest.raises(ValueError):
         common.issue_author(value)
 
 
-def test_issue_author_type_accepts_login() -> None:
-    assert common.issue_author("uhvogala") == "uhvogala"
+@pytest.mark.parametrize("value", ["uhvogala", "a", "a-b", "a-b-c9", "x" * 39, "A1-b2"])
+def test_issue_author_type_accepts_login(value: str) -> None:
+    assert common.issue_author(value) == value
 
 
 def test_require_issue_author() -> None:
@@ -121,7 +124,65 @@ def test_record_early_failure(tmp_path: Path) -> None:
     recorder = common.Recorder(tmp_path)
     recorder.report["sessions"] = [{"command": "resume", "started_at": "t"}]
     common.record_early_failure(recorder, ValueError("boom"))
-    assert (
-        recorder.report["result"] == "failed" and recorder.report["failure"] == "ValueError: boom"
-    )
+    assert recorder.report["result"] == "fail" and recorder.report["failure"] == "ValueError: boom"
     assert recorder.report["sessions"][-1]["ended_at"] == recorder.report["ended_at"]
+
+
+def test_early_failure_keeps_the_original_exception_when_saving_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = common.Recorder(tmp_path)
+
+    def broken_save() -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(recorder, "save", broken_save)
+    original = ValueError("boom")
+    with pytest.raises(ValueError, match="boom") as raised:
+        try:
+            raise original
+        except BaseException as error:
+            common.record_early_failure(recorder, error)
+            raise
+    assert raised.value is original and recorder.report["result"] == "fail"
+    assert any("disk full" in note for note in raised.value.__notes__)
+
+
+BUILDERS = {"correction_cycle": correction_cycle, "followups": followups, "pilot": pilot}
+
+
+@pytest.mark.parametrize("script", sorted(BUILDERS))
+@pytest.mark.parametrize("author", ["uhvogala", None])
+def test_script_config_builder_carries_the_issue_author(
+    script: str, author: str | None, seed: Path, tmp_path: Path, isolated_environment: None
+) -> None:
+    """Calls each script's own builder, so dropping the author there fails here."""
+    import argparse
+
+    from aitobuild.config import load_config
+
+    base = subprocess.run(
+        ["git", "-C", str(seed), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    arguments = argparse.Namespace(
+        allowed_issue_author=author, endpoint="https://e.invalid/", model="m", invoke_timeout=600
+    )
+    values = BUILDERS[script].build_trial_environment(
+        arguments,
+        repository={"full_name": common.DEFAULT_REPOSITORY, "id": 1405327159},
+        seed=seed,
+        base=base,
+        run_dir=tmp_path / "run",
+        secret="s" * 48,
+        token="t" * 48,
+    )
+    common.configure_trial_environment(
+        automatic_stages=common.ALLOWED_AUTOMATIC_STAGES, values=values
+    )
+    if author is None:
+        with pytest.raises(ValueError, match="allowed_issue_authors"):
+            load_config()
+        return
+    (source,) = load_config().developer.repository_sources
+    assert source.allowed_issue_authors == ("uhvogala",)
+    assert source.verification_commands == (SCRIPTS[script],) and source.base_revision == base
