@@ -34,6 +34,10 @@ from aitobuild.tool_outputs import MAX_PROMPT_BYTES, MAX_TOOL_RESULT_BYTES, buil
 from aitobuild.tools.github import GitHubAdapter, _git_blob_sha
 
 
+CORRECTION_ATTEMPTS_KEY = "aitobuild_correction_proposal_submit_attempts"
+CORRECTION_ERROR_KEY = "aitobuild_correction_proposal_submit_error"
+
+
 class _CoordinatorReceipt(DefinitionModel):
     schema_version: Literal[1] = 1
     pins: dict[str, JsonValue]
@@ -629,13 +633,18 @@ class NativeManagedRoles:
         async def propose_correction(paths: list[str], objective: str) -> dict[str, Any]:
             # Bounded like the submit tools (max_submit_attempts): once the failed attempts are used up, further
             # calls are refused as a plain result, so neither the framework error nor iteration limit is the bound.
-            used = session.state.get("aitobuild_correction_attempts", 0)
+            used = session.state.get(CORRECTION_ATTEMPTS_KEY, 0)
             if type(used) is not int or used >= correction_attempts:
-                return {"correction": None, "refused": f"architect_propose_correction used all {correction_attempts} attempts"}
+                return {"correction": None, "refused": (
+                    f"architect_propose_correction used all {correction_attempts} attempts; "
+                    "do not call architect_propose_correction again, finish the review without a correction"
+                ), "last_error": session.state.get(CORRECTION_ERROR_KEY)}
             try:
                 return await check_correction(paths, objective)
-            except Exception:
-                session.state["aitobuild_correction_attempts"] = used + 1
+            except Exception as error:
+                # Same bookkeeping as build_submit_tool: count the failure, keep the last error, persist both.
+                session.state[CORRECTION_ATTEMPTS_KEY] = used + 1
+                session.state[CORRECTION_ERROR_KEY] = (str(error) or type(error).__name__)[:500]
                 await self._sessions.set(context.run.session_id, session)
                 raise
 

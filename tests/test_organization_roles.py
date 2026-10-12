@@ -1570,6 +1570,18 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
         monkeypatch.setattr(worker, "get_published_source", lambda *args, **kwargs: source_reader(*args, **kwargs) | {
             "content": "x" * 7000, "total_bytes": 7000, "truncated": False, "next_offset": None,
         })
+    saved_counts = []
+    if scenario == "correction_exhausted":
+        from aitobuild import organization_roles as roles_module
+
+        original_set = roles_module.FileSessionStore.set
+
+        async def recording_set(self, session_id, session, *args, **kwargs):
+            saved_counts.append((session.state.get("aitobuild_correction_proposal_submit_attempts"),
+                                 session.state.get("aitobuild_correction_proposal_submit_error")))
+            return await original_set(self, session_id, session, *args, **kwargs)
+
+        monkeypatch.setattr(roles_module.FileSessionStore, "set", recording_set)
     bodies = []
     max_body = ARCHITECT_REVIEW_BODY_MAX - len(ARCHITECT_REVIEW_BODY_PREFIX)
     expected_comment = "x" * max_body if scenario == "body_at_limit" else "Scoped source/diff inspected; retain human merge authority."
@@ -1751,12 +1763,17 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                         assert any(item.startswith("Error") for item in tool_results)
                     if scenario == "correction_exhausted":
                         session = await adapter()._sessions.get(waiting.session_id)
-                        assert session.state["aitobuild_correction_attempts"] == 3
+                        assert session.state["aitobuild_correction_proposal_submit_attempts"] == 3
+                        assert "inspected published paths" in session.state["aitobuild_correction_proposal_submit_error"]
+                        # Each failure is saved when it happens, not only by a later write.
+                        failures = [count for count, _ in saved_counts if count is not None]
+                        assert failures[:3] == [1, 2, 3], saved_counts
                         assert "aitobuild_correction_proposal" not in session.state
                         results = [entry["content"] for entry in bodies[-1]["messages"] if entry["role"] == "tool"
                                    and entry.get("tool_call_id") == "correction"]
                         assert [item.startswith("Error") for item in results] == [True, True, True, False, False], results
-                        assert all("used all 3 attempts" in item for item in results[3:]), results
+                        assert all("used all 3 attempts" in item and "do not call architect_propose_correction again" in item
+                                   for item in results[3:]), results
                     if scenario in {"approved", "preamble", "recovered", "correction", "correction_outside", "correction_exhausted",
                                     "body_at_limit", "repository_context",
                                     "context_corrupt", "event_argument", "resubmit_different"}:

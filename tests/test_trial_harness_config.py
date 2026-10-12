@@ -186,3 +186,43 @@ def test_script_config_builder_carries_the_issue_author(
     (source,) = load_config().developer.repository_sources
     assert source.allowed_issue_authors == ("uhvogala",)
     assert source.verification_commands == (SCRIPTS[script],) and source.base_revision == base
+
+
+class _BuiltEnvironment(Exception):
+    pass
+
+
+@pytest.mark.parametrize("script", sorted(BUILDERS))
+def test_script_main_passes_the_allowed_author_to_its_builder(
+    script: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_environment: None
+) -> None:
+    """Runs each script's real main() up to its builder, so main dropping the author fails here."""
+    import json
+    import types
+
+    module = BUILDERS[script]
+    repo = {"id": 1405327159, "full_name": common.DEFAULT_REPOSITORY, "default_branch": "master"}
+    monkeypatch.setattr(module, "gh_json", lambda *_: repo)
+    monkeypatch.setattr(module, "git", lambda *_: "0" * 40)
+    monkeypatch.setattr(module, "subprocess", types.SimpleNamespace(run=lambda *_, **__: None))
+    seen: list[str | None] = []
+    real = module.build_trial_environment
+
+    def spy(arguments, **options):
+        seen.append(arguments.allowed_issue_author)
+        return real(arguments, **options)
+
+    def configured(*, automatic_stages, values):
+        raise _BuiltEnvironment(json.dumps(values))
+
+    monkeypatch.setattr(module, "build_trial_environment", spy)
+    monkeypatch.setattr(module, "configure_trial_environment", configured)
+    argv = ["--allowed-issue-author", "uhvogala", "--work-root", str(tmp_path)]
+    with pytest.raises(_BuiltEnvironment) as built:
+        if script == "pilot":
+            module.main(["start", *argv])
+        else:
+            monkeypatch.setattr(sys, "argv", [script, "--approval-mode", "automatic", *argv])
+            module.main()
+    assert seen == ["uhvogala"]
+    assert "allowed_issue_authors" in str(built.value) and "uhvogala" in str(built.value)
