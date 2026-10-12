@@ -502,6 +502,16 @@ supported trusted merge binding exists. Automatic mode is an operator policy
 decision for the exact saved operation, not permission for a model to approve
 itself. Disabled means refusal, not approval bypass.
 
+Task admission has exactly one route. A human approval goes through the dispatcher's
+approve endpoint; every configured or evidence-based admission goes through
+`OrganizationService._automatic_task_approval` (`organization_service.py`), which
+calls the trusted base binding `_configured_task_base` (`app.py`) and then
+`DeveloperPreviewRegistry.approve`. Any new admission source (planned children
+from #31, review inheritance from #37, Discussions consent from #42, or later
+ones) only passes evidence into that route; it must not call
+`DeveloperPreviewRegistry.approve` itself or add a parallel admission path.
+Changing the route itself requires an explicit update to this section first.
+
 Policy revisions and the effective stage decision belong in immutable run/effect
 evidence. Changes apply to new work; active runs refuse drift rather than silently
 adopting a more permissive policy. Automatic continuation consumes the same exact
