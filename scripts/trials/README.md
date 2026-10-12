@@ -120,4 +120,4 @@ git-ignored); delete `runs/trial4-*` once the pilot is finished.
 
 `resume` refuses a seed with uncommitted changes, a seed without the base branch checked out and a seed whose base
 branch diverged from origin (git's error is included). Any failure, including one before the service starts, is
-recorded in `report.json` as `result: failed` with the error and an end time.
+recorded in `report.json` as `result: fail` with the error and an end time.

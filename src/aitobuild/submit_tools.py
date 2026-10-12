@@ -190,6 +190,8 @@ async def run_with_reminder(
     try:
         await run(message)
         if submit.submitted is None and submit.remaining > 0:
+            # Backstop: the organization roles also revalidate after each turn, but other callers of
+            # run_with_reminder don't have to, so never start the reminder turn against stale state.
             checked = revalidate()
             if inspect.isawaitable(checked):
                 await checked
