@@ -502,15 +502,19 @@ supported trusted merge binding exists. Automatic mode is an operator policy
 decision for the exact saved operation, not permission for a model to approve
 itself. Disabled means refusal, not approval bypass.
 
-Task admission has exactly one route. A human approval goes through the dispatcher's
-approve endpoint; every configured or evidence-based admission goes through
-`OrganizationService._automatic_task_approval` (`organization_service.py`), which
-calls the trusted base binding `_configured_task_base` (`app.py`) and then
-`DeveloperPreviewRegistry.approve`. Any new admission source (planned children
-from #31, review inheritance from #37, Discussions consent from #42, or later
-ones) only passes evidence into that route; it must not call
-`DeveloperPreviewRegistry.approve` itself or add a parallel admission path.
-Changing the route itself requires an explicit update to this section first.
+Task admission has exactly one route: `admit_task` in `organization_service.py`,
+the only caller of `DeveloperPreviewRegistry.approve` (a test scans `src` for
+any other caller). Human approvals (the HTTP approve endpoint) and configured
+admissions both enter it with typed evidence, a closed tagged union: `Human`,
+`OperatorPolicy`, `PlannedChild` (#31) and `InheritedReview` (#37). Configured
+evidence is checked by `OrganizationService.admit_task`, which applies the
+trusted base binding `_configured_task_base` (`app.py`) and resolves the decision
+with `ApprovalPolicy.resolve`; the automatic admission limit and dedupe depend on
+that resolved decision source, not on the evidence variant. A new admission
+source (for example Discussions consent from #42) adds an evidence variant and
+its checks to this route; it must not call `DeveloperPreviewRegistry.approve`
+itself or add a parallel path. Changing the route itself requires an explicit
+update to this section first.
 
 Policy revisions and the effective stage decision belong in immutable run/effect
 evidence. Changes apply to new work; active runs refuse drift rather than silently
