@@ -84,3 +84,28 @@ Once the report has been checked, remove it with `rm -rf <work-root>/runs/<trial
 
 Webhook secret and internal token are random per run and never written to disk. Nothing here
 merges, closes or force-pushes anything.
+
+## `pilot.py` (trial 4: small M5 pilot with human merge points)
+
+A PM planning request produces a few dependent issues. The pilot delivers them one merge point at a time and
+never merges: the service merge stage stays disabled, ReviewBot okays the exact head in Common (recorded in
+`report.metrics` as a bot standing in for the human merge review) and a person merges. The same locks as the other
+harnesses apply (only `task_admission`/`developer_tools` may be automatic, `--repository` locked, approvals of
+human stages are given by the script and recorded).
+
+```bash
+# 1. plan, then deliver + review every independent issue; stops with result=paused_at_merge_point
+uv run python scripts/trials/pilot.py start --sudo-docker
+# 2. after the PR in report.merge_points is merged by a person
+uv run python scripts/trials/pilot.py resume --sudo-docker --run-dir /workspace/trials/runs/trial4-<stamp> \
+    [--brief-edit-what "..." --brief-edit-why "..."]
+```
+
+`resume` restarts the service on the saved state, refreshes every merge point from GitHub, provisions the merged
+base into the local seed (an operator action), picks the next dependent issue in plan order whose prerequisites are
+all merged, offers it through `POST /internal/organization/dependencies/offer`, delivers and reviews it and stops at
+the next merge point. It refuses to continue while any merge point is still open. Dependent children are staged by
+planning but answer 409 until that handoff exists; `start` skips them. If a person edits a PM-written brief before
+resuming, pass `--brief-edit-what/--brief-edit-why`; it lands in `report.operator_actions` as `brief_edit`.
+Repeat `resume` until the plan is done. Runs and artifacts live under `--work-root` (outside the checkout,
+git-ignored); delete `runs/trial4-*` once the pilot is finished.

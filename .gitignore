@@ -17,3 +17,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# Live trial output (scripts/trials) must never be committed
+runs/
+artifacts/

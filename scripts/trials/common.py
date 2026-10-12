@@ -24,6 +24,7 @@ DEFAULT_REPOSITORY = "uhvogala/aitobuild_example"
 DEFAULT_ENDPOINT = "https://aitobuild-agents2-resource.cognitiveservices.azure.com/openai/v1"
 #: The only stages a trial may set to automatic (ReviewBot condition). Everything else stays human; merge disabled.
 ALLOWED_AUTOMATIC_STAGES = ("task_admission", "developer_tools")
+POLICY_LIMIT_KEYS = frozenset({"max_automatic_decisions", "max_automatic_admissions"})
 HUMAN_STAGES = ("draft_publication", "review_publication")
 ALL_STAGES = (
     "task_admission",
@@ -61,7 +62,11 @@ class Recorder:
         print(f"[{line['at']}] {kind} " + json.dumps(fields, default=str)[:400], flush=True)
 
     def save(self) -> None:
-        (self.directory / "report.json").write_text(json.dumps(self.report, indent=2, default=str))
+        from aitobuild.durable_files import atomic_write_text
+
+        atomic_write_text(
+            self.directory / "report.json", json.dumps(self.report, indent=2, default=str)
+        )
 
 
 def git(directory: Path, *arguments: str) -> str:
@@ -407,7 +412,7 @@ def check_policy(policy: Any, automatic_stages: tuple[str, ...]) -> dict[str, An
         for stage in ALL_STAGES
     }
     actual = {stage: modes.get(stage) for stage in ALL_STAGES}
-    unknown = set(modes) - set(ALL_STAGES) - {"max_automatic_decisions"}
+    unknown = set(modes) - set(ALL_STAGES) - POLICY_LIMIT_KEYS
     if actual != expected or unknown or set(automatic_stages) - set(ALLOWED_AUTOMATIC_STAGES):
         raise SystemExit(f"Unexpected approval policy {modes}; expected {expected}")
     return {"modes": modes, "revision": policy.revision}
