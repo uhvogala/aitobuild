@@ -679,18 +679,63 @@ def test_budget_locator_drift_cannot_create_replacement_ledger(tmp_path):
     assert FileRunStore(tmp_path / "runs").get(assignment.assignment_id).state == "finalizing"
 
 
-def test_deadline_bounds_native_invocation_and_preserves_reservations(tmp_path):
-    from time import time
+class _FakeClock:
+    def __init__(self, now):
+        self.now = now
 
-    async def operation(context, message):
-        await asyncio.Event().wait()
+    def __call__(self):
+        return self.now
 
-    runner, assignment, *_ = runner_fixture(tmp_path, {"definition_probe": ManagedOperation(operation)})
+
+def _deadline_fixture(tmp_path, monkeypatch, operation):
+    import aitobuild.developer_isolation as isolation
+
+    clock = _FakeClock(1_000_000.0)
+    monkeypatch.setattr(isolation, "time", clock)
+    runner, assignment, service, *_ = runner_fixture(tmp_path, {"definition_probe": ManagedOperation(operation)})
     path = Path(assignment.budget_path)
     budget = json.loads(path.read_text())
-    budget["deadline"] = time() + 0.1
+    budget["deadline"] = clock.now + 60
     budget["reserved_paths"] = ["src/one.py"]
     path.write_text(json.dumps(budget))
+    return runner, assignment, service, clock, path, budget
+
+
+async def _never(context, message):
+    await asyncio.Event().wait()
+
+
+def test_deadline_expired_before_admission_refuses_as_timeout_and_keeps_ledger(tmp_path, monkeypatch):
+    runner, assignment, service, clock, path, budget = _deadline_fixture(tmp_path, monkeypatch, _never)
+    admissions = []
+    original = service.revalidate
+    monkeypatch.setattr(service, "revalidate", lambda identity: admissions.append(identity) or original(identity))
+    clock.now = budget["deadline"] + 1
+    with pytest.raises(TimeoutError):
+        asyncio.run(runner.start(assignment.assignment_id))
+    assert admissions == []
+    assert FileRunStore(tmp_path / "runs").get(assignment.assignment_id) is None
+    assert json.loads(path.read_text()) == budget
+
+
+def test_deadline_expiring_during_admission_reports_timeout_and_keeps_reservations(tmp_path, monkeypatch):
+    runner, assignment, service, clock, path, budget = _deadline_fixture(tmp_path, monkeypatch, _never)
+    original = service.revalidate
+
+    def admit_then_expire(identity):
+        record = original(identity)
+        clock.now = budget["deadline"] + 1
+        return record
+
+    monkeypatch.setattr(service, "revalidate", admit_then_expire)
+    failed = asyncio.run(runner.start(assignment.assignment_id))
+    assert failed.state == "failed" and failed.error == "TimeoutError"
+    assert json.loads(path.read_text()) == budget | {"aborted": True}
+
+
+def test_deadline_bounds_native_invocation_and_preserves_reservations(tmp_path, monkeypatch):
+    runner, assignment, service, clock, path, budget = _deadline_fixture(tmp_path, monkeypatch, _never)
+    clock.now = budget["deadline"] - 0.001  # frozen clock: every check sees the same tiny remaining budget
     failed = asyncio.run(runner.start(assignment.assignment_id))
     assert failed.state == "failed" and failed.error == "TimeoutError"
     assert json.loads(path.read_text()) == budget | {"aborted": True}
