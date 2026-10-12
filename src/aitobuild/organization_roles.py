@@ -29,7 +29,7 @@ from aitobuild.organization_reviews import PublishedReviewTarget as PublishedRev
 from aitobuild.organization_reviews import CorrectionProposal
 from aitobuild.organization_service import CoordinatorBinding
 from aitobuild.policy import ActionClass, AgentRole
-from aitobuild.submit_tools import build_submit_tool, ensure_framework_error_limit, run_with_reminder
+from aitobuild.submit_tools import ModelT, SubmitTool, build_submit_tool, ensure_framework_error_limit, run_with_reminder
 from aitobuild.tool_outputs import MAX_PROMPT_BYTES, MAX_TOOL_RESULT_BYTES, build_output_guard
 from aitobuild.tools.github import GitHubAdapter, _git_blob_sha
 
@@ -298,6 +298,56 @@ class NativeManagedRoles:
         await self._sessions.set(context.run.session_id, session)
         return final_message.text
 
+    def _submit_attempts(self, context: ManagedTaskContext) -> int:
+        owner = context.assignment.agent_id
+        return next(agent.max_submit_attempts for agent in context.snapshot.definition.agents if agent.id == owner)
+
+    def _submit_tool(
+        self, context: ManagedTaskContext, session: AgentSession, name: str, model: type[ModelT], key: str,
+        extra_check: Callable[[Any], Any] | None, description: str,
+    ) -> SubmitTool[ModelT]:
+        async def persist() -> None:
+            await self._sessions.set(context.run.session_id, session)
+
+        return build_submit_tool(name, model, session, key, extra_check, max_attempts=self._submit_attempts(context),
+                                 description=description, persist=persist)
+
+    async def _invoke_submit(self, context: ManagedTaskContext, agent: Agent, session: AgentSession,
+                             tools: tuple[Any, ...], guidance: str, submit: SubmitTool[ModelT]) -> ModelT:
+        """Run the owner once plus at most one reminder turn under one timeout; return its write-once submission."""
+        message = guidance + "\nAuthoritative approved task:\n" + context.assignment.bundle_content
+        if len(message.encode("utf-8")) > MAX_PROMPT_BYTES:
+            raise ValueError("Managed role prompt exceeds the byte limit")
+        diagnostics = session.state.setdefault("aitobuild_role_diagnostics", [])
+        ensure_framework_error_limit(agent.client, submit.max_attempts)
+
+        @function_middleware
+        async def guarded_tool(call: FunctionInvocationContext, call_next: Callable) -> None:
+            context.revalidate()
+            try:
+                await call_next()
+            except Exception as error:
+                diagnostics.append({"tool": call.function.name, "error": str(error)[:2000]})
+                raise
+            finally:
+                del diagnostics[:-128]
+
+        async def turn(text: str) -> None:
+            response = await agent.run(text, session=session, tools=tools + (submit.tool,), options={"store": False},
+                                       middleware=[guarded_tool, submit.middleware,
+                                                   build_output_guard(self._state_dir / "outputs" / context.run.session_id)])
+            context.revalidate()
+            if response.user_input_requests:
+                raise PermissionError("Unsupported native input cannot become managed role service approval")
+            if len(response.text.encode("utf-8")) > MAX_PROMPT_BYTES:
+                raise ValueError("Managed role response exceeds the byte limit")
+
+        async with asyncio.timeout(min(self._timeout, context.remaining_seconds())):
+            result = await run_with_reminder(submit, message, turn, context.revalidate)
+        context.revalidate()
+        await self._sessions.set(context.run.session_id, session)
+        return result
+
     async def propose(self, context: ManagedTaskContext, message: Any) -> dict[str, Any]:
         agent = self._agent(context, AgentRole.PM)
         route = next((route for route in context.snapshot.definition.routes if self._proposal_event in route.events), None)
@@ -332,7 +382,17 @@ class NativeManagedRoles:
             raise PermissionError("Saved planning invocation cannot replay")
         session.state["aitobuild_plan_state"] = "running"
         await self._sessions.set(context.run.session_id, session)
+        try:
+            return await self._plan(context, agent, planning, request, session)
+        except BaseException as error:
+            # Never leave the one-shot plan stuck at "running": record the failure, which still blocks replay.
+            session.state["aitobuild_plan_state"] = "failed"
+            session.state["aitobuild_plan_error"] = (str(error) or type(error).__name__)[:2000]
+            await self._sessions.set(context.run.session_id, session)
+            raise
 
+    async def _plan(self, context: ManagedTaskContext, agent: Agent, planning: ManagedPlanning, request: Any,
+                    session: AgentSession) -> WorkflowInput:
         @tool(name="pm_inspect_planning_request", approval_mode="never_require")
         async def inspect_request() -> dict[str, Any]:
             evidence = await _delivery_call(lambda: planning.inspect(context))
@@ -342,13 +402,20 @@ class NativeManagedRoles:
             await self._sessions.set(context.run.session_id, session)
             return evidence
 
-        text = await self._invoke(context, agent, session, (inspect_request,),
-                                  "Inspect the approved planning request and pinned repository/base. Return JSON only: "
-                                  "{issues: [{key, title, objective, acceptance_criteria, dependencies, labels}]}. "
-                                  "Keys are local identifiers; dependencies reference these keys and must be acyclic. "
-                                  "Never provide repository, actor, assignee, approval or commands. This is a proposal only. "
-                                  "Limits: " + request.scope.limits.model_dump_json())
-        proposal = PlanProposal.model_validate_json(text)
+        def check_plan(value: PlanProposal) -> None:
+            if not isinstance(session.state.get("aitobuild_plan_inspections"), dict):
+                raise PermissionError("Inspect the planning request with pm_inspect_planning_request before submitting")
+            value.check_limits(request.scope.limits)
+
+        submit = self._submit_tool(context, session, "pm_submit_plan", PlanProposal, "aitobuild_plan_submission", check_plan,
+                                   "Record the one issue plan proposal. Write-once; invalid plans return an error to fix.")
+        proposal = await self._invoke_submit(
+            context, agent, session, (inspect_request,), submit=submit,
+            guidance="Inspect the approved planning request and pinned repository/base, then call pm_submit_plan with "
+                     "{issues: [{key, title, objective, acceptance_criteria, dependencies, labels}]}. "
+                     "Keys are local identifiers; dependencies reference these keys and must be acyclic. "
+                     "Never provide repository, actor, assignee, approval or commands. This is a proposal only. "
+                     "Limits: " + request.scope.limits.model_dump_json())
         evidence = session.state.get("aitobuild_plan_inspections")
         if not isinstance(evidence, dict):
             raise PermissionError("Planning requires saved complete request and target inspection")

@@ -203,9 +203,15 @@ def native_reply(bodies, document=None, *, inspect=True):
                 "name": "pm_inspect_planning_request", "arguments": "{}",
             }}]}
             finish = "tool_calls"
-        else:
-            message = {"role": "assistant", "content": json.dumps(document if document is not None else proposal())}
+        elif bodies[-1]["messages"][-1]["role"] == "tool" and not str(bodies[-1]["messages"][-1].get("content")).startswith("Error") \
+                and len(bodies) > (2 if inspect else 1):
+            message = {"role": "assistant", "content": "Submitted."}
             finish = "stop"
+        else:
+            arguments = document if isinstance(document, str) else json.dumps(document if document is not None else proposal())
+            message = {"role": "assistant", "content": None, "tool_calls": [{"id": f"submit-{len(bodies)}", "type": "function",
+                                                                         "function": {"name": "pm_submit_plan", "arguments": arguments}}]}
+            finish = "tool_calls"
         return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
                                         "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
     return reply
@@ -291,8 +297,8 @@ def test_native_planning_exact_publication_restart_and_unapproved_handoff(tmp_pa
                 assert len(github.issues["example/target"]) == 2
 
     asyncio.run(exercise())
-    assert len(bodies) == 2
-    assert [tool["function"]["name"] for tool in bodies[0]["tools"]] == ["pm_inspect_planning_request"]
+    assert len(bodies) == 3
+    assert [tool["function"]["name"] for tool in bodies[0]["tools"]] == ["pm_inspect_planning_request", "pm_submit_plan"]
 
 
 @pytest.mark.parametrize("detached", [False, True])
@@ -345,7 +351,7 @@ def test_native_pm_automatic_create_and_exact_resolved_links(tmp_path, approved_
                 before = service.budget_path(preview.preview_id).read_bytes()
                 assert await restart()[0].consume(preview.preview_id) == run
                 assert restart()[1].independent_preview_ids(run) == planning.independent_preview_ids(run)
-                assert len(checked) == 3 and len(bodies) == 2
+                assert len(checked) == 3 and len(bodies) == 3
                 assert service.budget_path(preview.preview_id).read_bytes() == before
 
     asyncio.run(exercise())
@@ -423,7 +429,7 @@ def test_pm_independent_followup_queueing_retains_separate_task_admission(tmp_pa
                 assert calls == ([first_id, third_id] if automatic else [])
                 assert restart()[0].planning_follow_up_preview_ids(preview.preview_id) == (first_id, third_id)
                 assert service.budget_path(preview.preview_id).read_bytes() == before
-                assert len(github.issues["fixture/widgets"]) == 3 and len(bodies) == 2
+                assert len(github.issues["fixture/widgets"]) == 3 and len(bodies) == 3
                 assert not background.diagnostics()["errors"]
 
     asyncio.run(exercise())
@@ -475,7 +481,7 @@ def test_pm_independent_followup_refuses_changed_or_incomplete_evidence(tmp_path
                     changed = run.model_copy(update={field: value})
                     with pytest.raises(PermissionError):
                         planning.independent_preview_ids(changed)
-                    assert not calls and len(bodies) == 2
+                    assert not calls and len(bodies) == 3
                     return
                 elif case in {"issue_drift", "closed"}:
                     issue = github.issues["fixture/widgets"][1]
@@ -486,7 +492,7 @@ def test_pm_independent_followup_refuses_changed_or_incomplete_evidence(tmp_path
                     service._runner.approval_policy = policy.model_copy(update={"task_admission": "disabled"})
                 with pytest.raises((ValueError, PermissionError, FileNotFoundError)):
                     service.admission(dependent_id if case == "dependent" else first_id)
-                assert not calls and len(bodies) == 2 and len(github.issues["fixture/widgets"]) == 2
+                assert not calls and len(bodies) == 3 and len(github.issues["fixture/widgets"]) == 2
                 assert service.budget_path(preview.preview_id).read_bytes() == parent_budget
                 assert not approved_delivery[1].budget_path(first_id).exists()
                 if case not in {"child_scope", "missing_preview"}:
@@ -660,7 +666,7 @@ def test_dependency_handoff_stages_only_immutable_unapproved_scope(tmp_path, app
                 assert len(github.issues["example/target"]) == len(document["issues"])
 
     asyncio.run(exercise())
-    assert len(bodies) == 2
+    assert len(bodies) == 3
 
 
 @pytest.mark.parametrize("case", ["no_inspection", "malformed", "authority", "limit", "repository", "cancel", "reject", "scope", "approval", "session_pins", "expired", "deadline", "missing_budget"])
@@ -684,6 +690,9 @@ def test_native_planning_fails_closed_without_writes_or_model_replay(tmp_path, a
                 waiting = await service.consume(preview.preview_id)
                 if case in {"no_inspection", "malformed", "authority", "limit", "repository"}:
                     assert waiting.state == "failed", waiting.error
+                    session = await roles._sessions.get(waiting.session_id)
+                    # The one-shot plan records its failure instead of staying stuck at "running".
+                    assert session.state["aitobuild_plan_state"] == "failed" and session.state["aitobuild_plan_error"]
                     assert await restart()[0].consume(preview.preview_id) == waiting
                     assert not github.issues
                     return
@@ -731,7 +740,8 @@ def test_native_planning_fails_closed_without_writes_or_model_replay(tmp_path, a
                     assert not budget_path.exists()
 
     asyncio.run(exercise())
-    assert len(bodies) <= 2
+    # Invalid submissions use up all three attempts (plus the inspection turn) before failing closed.
+    assert len(bodies) == {"malformed": 4, "authority": 4, "limit": 4, "no_inspection": 3, "repository": 5}.get(case, 3), len(bodies)
 
 
 @pytest.mark.parametrize("effect", ["create_landed", "create_absent", "link_landed", "link_absent", "duplicate", "remote_drift", "receipt_save"])
@@ -805,7 +815,7 @@ def test_uncertain_issue_writes_reconcile_read_only_without_duplicate_creation(t
                 assert json.loads(ledger)["aborted"] is True
 
     asyncio.run(exercise())
-    assert len(bodies) == 2
+    assert len(bodies) == 3
 
 
 def test_cli_issue_reconciliation_pages_and_write_time_guards(monkeypatch):
@@ -936,7 +946,7 @@ def test_partial_developer_staging_recovers_metadata_without_repeating_writes(tm
                 assert all(not previews.get(preview_id).approved for preview_id in result["developer_previews"])
 
     asyncio.run(exercise())
-    assert len(bodies) == 2
+    assert len(bodies) == 3
 
 
 def test_dependency_rendering_does_not_rewrite_issue_objective():
@@ -1008,7 +1018,7 @@ def test_managed_planning_http_requires_exact_task_create_and_link_approvals(tmp
             assert len(github.issues["example/target"]) == 2
     finally:
         asyncio.run(client.close())
-    assert len(bodies) == 2
+    assert len(bodies) == 3
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -1086,7 +1096,7 @@ def test_dependency_http_offer_and_approval_fail_closed(tmp_path, test_config, m
             assert response.status_code == 409 and not worker.budget_path(fresh_id).exists(), response.text
     finally:
         asyncio.run(client.close())
-    assert len(bodies) == 2
+    assert len(bodies) == 3
 
 
 @pytest.mark.parametrize("mode", ["direct", "detached", "archived"])
@@ -1208,7 +1218,7 @@ def test_dependency_admission_uses_real_pinned_checkout_and_separate_budget(tmp_
                 assert calls == [fresh_id]
 
     asyncio.run(exercise())
-    assert len(bodies) == 2
+    assert len(bodies) == 3
 
 
 @pytest.mark.parametrize("case", ["reject", "drift", "write_drift", "expired", "approval"])
@@ -1259,7 +1269,7 @@ def test_resolved_dependency_approval_cannot_be_bypassed(tmp_path, approved_deli
                 assert not any(item.bundle_payload["task_id"].startswith("planned-issue-") for item in previews.list_previews(pending_only=False, limit=50))
 
     asyncio.run(exercise())
-    assert len(bodies) == 2
+    assert len(bodies) == 3
 
 @pytest.mark.parametrize("field,value", [("base_branch", "../main"), ("base_branch", "refs/heads/main"),
                                          ("base_branch", "main.lock"), ("head_branch", "a..b")])
@@ -1322,3 +1332,39 @@ def test_mock_issue_publication_refuses_empty_marker_like_real_adapter(monkeypat
     for adapter in (mock, real):
         with pytest.raises(ValueError, match="requires a marker"):
             adapter.find_issue_publication(repository="example/target", marker="")
+
+
+def test_native_plan_reminder_turn_reuses_the_single_run_and_session(tmp_path, approved_delivery):
+    bodies = []
+    submit = native_reply(bodies)
+
+    def reply(request):
+        body = json.loads(request.content)
+        if len(bodies) == 1 and body["messages"][-1]["role"] == "tool":
+            # After inspection the model answers in free text; the harness must not parse it.
+            bodies.append(body)
+            return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
+                                            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                                                "role": "assistant", "content": json.dumps(proposal())}}]})
+        return submit(request)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service, planning, roles, preview, previews, github, restart, _ = planning_fixture(tmp_path, profile, approved_delivery[1])
+                previews.approve(preview.preview_id)
+                waiting = await service.consume(preview.preview_id)
+                assert waiting.state == "waiting", waiting.error
+                session = await roles._sessions.get(waiting.session_id)
+                assert session.state["aitobuild_plan_state"] == "proposed"
+                assert session.state.get("aitobuild_plan_submission_submit_attempts", 0) == 0 and session.state["aitobuild_plan_submission"]
+                # One run ledger entry and one session/invocation identity for main turn plus reminder.
+                assert len(list((tmp_path / "planning-runs").rglob("run.json"))) == 1
+                assert [path.name for path in (tmp_path / "planning-roles" / "sessions").iterdir()] == [waiting.session_id + ".json"]
+                assert len(waiting.decisions) == 0 and len(waiting.pending) == 1
+                assert not github.issues
+
+    asyncio.run(exercise())
+    users = [message["content"] for message in bodies[-1]["messages"] if message["role"] == "user"]
+    assert len(bodies) == 4 and len(users) == 2 and "pm_submit_plan" in users[1]

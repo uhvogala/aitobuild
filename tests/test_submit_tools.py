@@ -121,10 +121,8 @@ def test_invalid_json_and_schema_errors_use_attempts_and_allow_retry():
         ["{not json", {"agent_id": "Bad!", "rationale": "x"}, VALID]
     )
     assert result == AssignmentProposal(**VALID) and submit.attempts == 2
-    assert [m["content"] for m in bodies[-1]["messages"] if m["role"] == "tool"][:2] == [
-        "Error: Argument parsing failed.",
-        "Error: Argument parsing failed.",
-    ]
+    results = [m["content"] for m in bodies[-1]["messages"] if m["role"] == "tool"]
+    assert all(item.startswith("Error") for item in results[:2]) and "submitted" in results[2]
 
 
 def test_attempts_exhaust_fail_closed_even_with_valid_followup():

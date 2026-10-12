@@ -127,7 +127,7 @@ def build_submit_tool(
         return {"submitted": True, "write_once": True}
 
     submit_tool = tool(
-        submit, name=name, description=description, schema=model, approval_mode="never_require"
+        submit, name=name, description=description, schema=model.model_json_schema(), approval_mode="never_require"
     )
     attempts_key = key + "_submit_attempts"
 
