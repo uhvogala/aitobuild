@@ -27,6 +27,31 @@ from test_dispatcher import (
 )
 
 
+def _scripted_reply(message, finish=None):
+    finish = finish or ("tool_calls" if message.get("tool_calls") else "stop")
+    return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
+                                    "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
+
+
+_CALLS = iter(range(1, 10**6))
+
+
+def tool_call(name, arguments):
+    return {"role": "assistant", "content": None, "tool_calls": [{"id": f"call-{next(_CALLS)}", "type": "function", "function": {
+        "name": name, "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments)}}]}
+
+
+def text(content):
+    return {"role": "assistant", "content": content}
+
+
+def submit_then_stop(body, name, arguments):
+    """Scripted model: submit once through the named tool, then finish with plain text."""
+    if body["messages"][-1]["role"] == "tool":
+        return _scripted_reply(text("Submitted."))
+    return _scripted_reply(tool_call(name, arguments))
+
+
 def role_fixture(tmp_path, profile, *, role="pm", preview=None, previews=None, budget_path_for=None):
     document = json.loads((Path(__file__).resolve().parents[1] / "config/organization.example.json").read_text())
     selected = "planner" if role == "pm" else "reviewer"
@@ -75,15 +100,11 @@ def test_native_pm_proposal_is_scoped_read_only_metadata(tmp_path, proposal):
         body = json.loads(request.content)
         bodies.append(body)
         if len(bodies) == 1:
-            message = {"role": "assistant", "content": "I'll inspect the approved task before proposing an agent.", "tool_calls": [{"id": "read", "type": "function", "function": {
-                "name": "pm_inspect_approved_task", "arguments": "{}",
-            }}]}
-            finish = "tool_calls"
-        else:
-            message = {"role": "assistant", "content": json.dumps(proposal) if isinstance(proposal, dict) else proposal}
-            finish = "stop"
-        return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
-                                        "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
+            return _scripted_reply(tool_call("pm_inspect_approved_task", "{}") | {
+                "content": "I'll inspect the approved task before proposing an agent."})
+        if len(bodies) == 2 or str(bodies[-1]["messages"][-1].get("content")).startswith("Error"):
+            return _scripted_reply(tool_call("pm_submit_assignment_proposal", proposal if isinstance(proposal, str) else proposal))
+        return _scripted_reply(text("Submitted."))
 
     async def exercise():
         async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
@@ -106,8 +127,9 @@ def test_native_pm_proposal_is_scoped_read_only_metadata(tmp_path, proposal):
                 assert await make_runner(adapter).start(assignment.assignment_id) == run
 
     asyncio.run(exercise())
-    assert len(bodies) == 2
-    assert [entry["function"]["name"] for entry in bodies[0]["tools"]] == ["pm_inspect_approved_task"]
+    valid = isinstance(proposal, dict) and proposal.get("rationale") == "Fits the approved task"
+    assert len(bodies) == (3 if valid else 4)
+    assert [entry["function"]["name"] for entry in bodies[0]["tools"]] == ["pm_inspect_approved_task", "pm_submit_assignment_proposal"]
 
 
 @pytest.mark.parametrize("proposal,detached", [
@@ -127,15 +149,10 @@ def test_native_coordinator_assigns_through_trusted_service_once(tmp_path, appro
     def reply(request):
         bodies.append(json.loads(request.content))
         if len(bodies) == 1:
-            message = {"role": "assistant", "content": None, "tool_calls": [{"id": "inspect", "type": "function", "function": {
-                "name": "pm_inspect_approved_task", "arguments": "{}",
-            }}]}
-            finish = "tool_calls"
-        else:
-            message = {"role": "assistant", "content": json.dumps(proposal) if isinstance(proposal, dict) else proposal}
-            finish = "stop"
-        return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
-                                        "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
+            return _scripted_reply(tool_call("pm_inspect_approved_task", "{}"))
+        if len(bodies) == 2 or str(bodies[-1]["messages"][-1].get("content")).startswith("Error"):
+            return _scripted_reply(tool_call("pm_submit_assignment_proposal", proposal if isinstance(proposal, str) else json.dumps(proposal)))
+        return _scripted_reply(text("Submitted."))
 
     async def exercise():
         async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
@@ -189,8 +206,69 @@ def test_native_coordinator_assigns_through_trusted_service_once(tmp_path, appro
                 assert worker.budget_path(preview_id).read_bytes() == before
 
     asyncio.run(exercise())
-    assert len(bodies) == 2
-    assert [entry["function"]["name"] for entry in bodies[0]["tools"]] == ["pm_inspect_approved_task"]
+    valid = isinstance(proposal, dict) and proposal.get("rationale") == "Fits approved scope"
+    # Valid: inspect, submit, final text. Invalid: inspect, then three counted attempts before failing closed.
+    assert len(bodies) == (3 if valid else 4)
+    assert [entry["function"]["name"] for entry in bodies[0]["tools"]] == ["pm_inspect_approved_task", "pm_submit_assignment_proposal"]
+
+
+@pytest.mark.parametrize("script", ["reminder", "retry"])
+def test_native_coordinator_submit_tool_reminder_and_retry_keep_one_invocation(tmp_path, approved_delivery, script):
+    from aitobuild.organization_roles import NativeCoordinatorProposal
+    from test_organization_runner import _service_fixture
+
+    previews, worker, preview_id, _, _ = approved_delivery
+    bodies = []
+    valid = {"agent_id": "developer_one", "rationale": "Fits approved scope"}
+
+    def reply(request):
+        bodies.append(json.loads(request.content))
+        last = bodies[-1]["messages"][-1]
+        if script == "reminder":
+            # Free text first (no submission): the harness must not parse it, and sends one reminder turn.
+            if len(bodies) == 1:
+                return _scripted_reply(text(json.dumps(valid)))
+            return submit_then_stop(bodies[-1], "pm_submit_assignment_proposal", valid)
+        if len(bodies) == 1:
+            return _scripted_reply(tool_call("pm_submit_assignment_proposal", "{not json"))
+        if len(bodies) == 2:
+            return _scripted_reply(tool_call("pm_submit_assignment_proposal", {"agent_id": "outside", "rationale": "x"}))
+        if str(last.get("content")).startswith("Error"):
+            return _scripted_reply(tool_call("pm_submit_assignment_proposal", valid))
+        return _scripted_reply(text("Submitted."))
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
+            async with AsyncOpenAI(api_key="test-key", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+
+                def runtime_for(snapshot):
+                    return bootstrap_organization(snapshot, model_profiles={"default": profile}, default_model_profile="default",
+                                                  state_dir=tmp_path / "coordinator-agents")
+
+                coordinator = NativeCoordinatorProposal(runtime_for=runtime_for, state_dir=tmp_path / "coordinator",
+                                                        previews=previews, budget_path_for=worker.budget_path,
+                                                        event="github.issue.ready", coordinator_id="planner", binding_revision="pm-v1")
+                service, assignments, calls = _service_fixture(tmp_path, approved_delivery, coordinator=coordinator.service_binding)
+                worker.prepare(preview_id)
+                run = await service.consume(preview_id)
+                assert run.state == "completed", run.error
+                assert assignments.get(run.assignment_id).agent_id == "developer_one"
+                assert calls == ["run", "cleanup"]
+                # One receipt (ledger entry) and one session/invocation identity across the reminder turn.
+                receipts = list((tmp_path / "coordinator" / "receipts").glob("*.json"))
+                assert len(receipts) == 1 and json.loads(receipts[0].read_text())["state"] == "proposed"
+                assert len(list((tmp_path / "coordinator" / "sessions").iterdir())) == 1
+                assert len(json.loads((tmp_path / "service-assignments.json").read_text())["assignments"]) == 1
+
+    asyncio.run(exercise())
+    users = [message["content"] for message in bodies[-1]["messages"] if message["role"] == "user"]
+    if script == "reminder":
+        assert len(bodies) == 3 and len(users) == 2 and "pm_submit_assignment_proposal" in users[1]
+    else:
+        assert len(bodies) == 4 and len(users) == 1
+        errors = [m["content"] for m in bodies[-1]["messages"] if m["role"] == "tool"]
+        assert errors[0].startswith("Error") and errors[1].startswith("Error") and "submitted" in errors[2]
 
 
 @pytest.mark.parametrize("scenario", ["capacity", "interrupted", "corrupt", "binding", "revision", "deadline", "symlink", "missing_budget", "event"])
@@ -204,10 +282,7 @@ def test_native_coordinator_receipt_recovery_keeps_original_admission_pins(tmp_p
 
     def reply(request):
         requests.append(json.loads(request.content))
-        return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
-                                        "choices": [{"index": 0, "finish_reason": "stop", "message": {
-                                            "role": "assistant", "content": json.dumps({"agent_id": "developer_one", "rationale": "Fits scope"}),
-                                        }}]})
+        return submit_then_stop(requests[-1], "pm_submit_assignment_proposal", {"agent_id": "developer_one", "rationale": "Fits scope"})
 
     async def exercise():
         async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
@@ -235,7 +310,7 @@ def test_native_coordinator_receipt_recovery_keeps_original_admission_pins(tmp_p
                 with pytest.raises(ValueError, match="capacity"):
                     await service.consume(second.preview_id)
                 assert assignments.for_task("second-coordinated-task") is None
-                assert len(requests) == 2
+                assert len(requests) == 4
                 from hashlib import sha256
 
                 receipt_path = tmp_path / "coordinator" / "receipts" / (sha256(second.preview_id.encode()).hexdigest() + ".json")
@@ -285,7 +360,7 @@ def test_native_coordinator_receipt_recovery_keeps_original_admission_pins(tmp_p
                         assert json.loads(budget_path.read_text()) == initial | ({} if scenario == "event" else {"aborted": True})
                     if scenario == "interrupted":
                         assert json.loads(receipt_path.read_text())["state"] == "failed"
-                assert len(requests) == 2
+                assert len(requests) == 4
 
     asyncio.run(exercise())
 
@@ -310,10 +385,7 @@ def test_native_coordinator_lifecycle_failure_never_claims_or_replays(tmp_path, 
                 await asyncio.Event().wait()
             if scenario == "expired":
                 monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: before["deadline"] + 1)
-            return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
-                                            "choices": [{"index": 0, "finish_reason": "stop", "message": {
-                                                "role": "assistant", "content": json.dumps({"agent_id": "developer_one", "rationale": "Fits scope"}),
-                                            }}]})
+            return submit_then_stop(requests[-1], "pm_submit_assignment_proposal", {"agent_id": "developer_one", "rationale": "Fits scope"})
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
             async with AsyncOpenAI(api_key="test-key", http_client=transport, max_retries=0) as client:
@@ -346,7 +418,7 @@ def test_native_coordinator_lifecycle_failure_never_claims_or_replays(tmp_path, 
                     await service.consume(preview_id)
 
     asyncio.run(exercise())
-    assert len(requests) == (0 if scenario == "runtime" else 1)
+    assert len(requests) == {"runtime": 0, "cancel": 1, "expired": 2}.get(scenario, 1)
 
 
 @pytest.fixture
@@ -498,6 +570,10 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                 message, finish = {"role": "assistant", "content": "Correction complete; independent verification required."}, "stop"
             return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
                                             "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
+        last = body["messages"][-1]
+        if last["role"] == "tool" and str(last.get("content")).startswith('{"submitted"'):
+            # Turn end after the write-once review submission; not counted as a review step.
+            return _scripted_reply(text("Submitted."))
         bodies.append(body)
         step = (len(bodies) - 1) % 4 + 1 if native_correcting else len(bodies)
         if step == 3 and correcting and (not queued_followups or len(bodies) <= 4):
@@ -514,8 +590,8 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
             }}]}
             finish = "tool_calls"
         else:
-            message = {"role": "assistant", "content": "Source and pinned-base diff inspected; human merge required."}
-            finish = "stop"
+            return _scripted_reply(tool_call("architect_submit_review", {
+                "body": "Source and pinned-base diff inspected; human merge required."}))
         return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
                                         "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
 
@@ -1426,7 +1502,8 @@ def test_published_review_http_hook_and_metadata_only_retry(tmp_path, published_
 @pytest.mark.parametrize("scenario", ["approved", "preamble", "empty_final", "rejected", "metadata_only", "head_drift", "recovered", "publication_race",
                                       "partial_page", "skip_page", "oversized_output", "body_drift", "evidence_drift", "uncertain_submit", "expired_at_write",
                                       "correction", "correction_outside", "correction_partial", "correction_drift", "body_at_limit", "body_over_limit",
-                                      "repository_context", "context_only", "context_head_drift", "context_corrupt"])
+                                      "repository_context", "context_only", "context_head_drift", "context_corrupt",
+                                      "event_argument", "resubmit_different", "json_text_only", "deadline_before_reminder"])
 def test_native_architect_review_requires_inspection_and_exact_saved_approval(
     tmp_path, published_delivery, monkeypatch, scenario,
 ):
@@ -1519,6 +1596,26 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                     ({"offset": 5} if scenario == "skip_page" and step == 1 else {})),
             }}]}
             finish = "tool_calls"
+        if finish == "stop":
+            if scenario in {"json_text_only", "deadline_before_reminder"}:
+                # Valid-looking final text with no tool call is never parsed or stored.
+                if scenario == "deadline_before_reminder":
+                    monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: FAR_FUTURE)
+                return _scripted_reply(text(json.dumps({"body": expected_comment})))
+            # The final review text is submitted through the write-once tool (retried after errors), then the turn ends.
+            last = body["messages"][-1]
+            submits = [entry for entry in body["messages"] if entry["role"] == "tool"
+                       and str(entry.get("content")).startswith('{"submitted"')]
+            if scenario == "resubmit_different" and len(submits) == 1 and last["role"] == "tool" and submits[-1] is last:
+                # A different body after the valid write-once submission is refused; the first body stays bound.
+                return _scripted_reply(tool_call("architect_submit_review", {"body": "A different, unreviewed body"}))
+            if last["role"] == "tool" and (submits and submits[-1] is last or scenario == "resubmit_different" and submits):
+                return _scripted_reply(text("Submitted."))
+            arguments = {"body": message["content"]}
+            if scenario == "event_argument" and not any(entry["role"] == "tool" and str(entry.get("content")).startswith("Error")
+                                                        for entry in body["messages"]):
+                arguments |= {"event": "APPROVE"}
+            return _scripted_reply(tool_call("architect_submit_review", arguments))
         return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
                                         "choices": [{"index": 0, "message": message, "finish_reason": finish}]})
 
@@ -1541,8 +1638,19 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                     assert waiting.state == "failed" and f"exceeds {max_body} characters" in waiting.error
                     assert not waiting.pending and not github.reviews
                     assert json.loads(Path(assignment.budget_path).read_text()) == before | {"aborted": True}
+                elif scenario in {"json_text_only", "deadline_before_reminder"}:
+                    assert waiting.state == "failed" and not waiting.pending and not github.reviews
+                    assert ("did not submit" if scenario == "json_text_only" else "TimeoutError") in waiting.error, waiting.error
+                    finals = [item for item in bodies if item["messages"][-1]["role"] != "tool" or
+                              "architect_submit_review" in item["messages"][-1].get("content", "")]
+                    users = [entry for entry in bodies[-1]["messages"] if entry["role"] == "user"]
+                    # json_text_only: one reminder turn then failure; deadline: the model is never called again.
+                    assert len(users) == (2 if scenario == "json_text_only" else 1), finals
+                    saved = await adapter()._sessions.get(waiting.session_id)
+                    assert saved is None or ("aitobuild_comment_body" not in saved.state and
+                                             "aitobuild_comment_state" not in saved.state)
                 elif scenario == "empty_final":
-                    assert waiting.state == "failed" and "final assistant response" in waiting.error
+                    assert waiting.state == "failed" and "attempts" in waiting.error
                     assert not waiting.pending and not github.reviews
                     assert json.loads(Path(assignment.budget_path).read_text()) == before | {"aborted": True}
                 elif scenario in {"metadata_only", "partial_page", "skip_page", "oversized_output", "correction_partial", "context_only", "context_head_drift"}:
@@ -1570,7 +1678,7 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                         roles = adapter()
                         saved = await roles._sessions.get(waiting.session_id)
                         if scenario == "body_drift":
-                            saved.state["aitobuild_comment_body"] = "different text"
+                            saved.state["aitobuild_comment_body"] = {"body": "different text"}
                         elif scenario == "evidence_drift":
                             saved.state["aitobuild_review_inspections"] = {}
                         elif scenario == "correction_drift":
@@ -1608,7 +1716,14 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
                         monkeypatch.setattr(worker, "submit_architect_review", expired)
                     done = await make_runner(adapter()).approve(assignment.assignment_id, request_id=waiting.pending[0].request_id,
                                                                approved=scenario != "rejected")
-                    if scenario in {"approved", "preamble", "recovered", "correction", "correction_outside", "body_at_limit", "repository_context", "context_corrupt"}:
+                    if scenario in {"event_argument", "resubmit_different"}:
+                        session = await adapter()._sessions.get(waiting.session_id)
+                        assert session.state["aitobuild_comment_body"] == {"body": expected_comment}
+                        assert session.state["aitobuild_comment_body_submit_attempts"] == 1
+                        tool_results = [entry["content"] for entry in bodies[-1]["messages"] if entry["role"] == "tool"]
+                        assert any(item.startswith("Error") for item in tool_results)
+                    if scenario in {"approved", "preamble", "recovered", "correction", "correction_outside", "body_at_limit", "repository_context",
+                                    "context_corrupt", "event_argument", "resubmit_different"}:
                         assert done.state == "completed", done.error
                         assert github.reviews[0].body == ARCHITECT_REVIEW_BODY_PREFIX + expected_comment
                         assert len(github.reviews) == 1
@@ -1629,7 +1744,7 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
     asyncio.run(exercise())
     assert {entry["function"]["name"] for entry in bodies[0]["tools"]} == {
         "architect_read_published_source", "architect_read_published_diff", "architect_find_repository_files",
-        "architect_read_repository_source", "architect_search_repository_files",
+        "architect_read_repository_source", "architect_search_repository_files", "architect_submit_review",
     } | ({"architect_propose_correction"} if correction_case else set())
 
 
@@ -1780,3 +1895,102 @@ def test_published_source_and_diff_use_immutable_pins(published_delivery, monkey
         else:
             assert "-previous content" in diff["diff"] and "\\ No newline at end of file" in diff["diff"]
     assert budget_path.read_bytes() == before_budget
+
+FAR_FUTURE = 10.0 ** 12
+
+
+@pytest.mark.parametrize("scenario", ["json_text_only", "oversized_text"])
+def test_native_coordinator_never_parses_final_text_and_bounds_responses(tmp_path, approved_delivery, scenario):
+    from aitobuild.organization_roles import NativeCoordinatorProposal
+    from aitobuild.tool_outputs import MAX_PROMPT_BYTES
+    from test_organization_runner import _service_fixture
+
+    previews, worker, preview_id, _, _ = approved_delivery
+    bodies = []
+    valid = {"agent_id": "developer_one", "rationale": "Fits approved scope"}
+
+    def reply(request):
+        bodies.append(json.loads(request.content))
+        if scenario == "oversized_text":
+            return _scripted_reply(text("x" * (MAX_PROMPT_BYTES + 1)))
+        return _scripted_reply(text(json.dumps(valid)))
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
+            async with AsyncOpenAI(api_key="test-key", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+
+                def runtime_for(snapshot):
+                    return bootstrap_organization(snapshot, model_profiles={"default": profile}, default_model_profile="default",
+                                                  state_dir=tmp_path / "coordinator-agents")
+
+                coordinator = NativeCoordinatorProposal(runtime_for=runtime_for, state_dir=tmp_path / "coordinator",
+                                                        previews=previews, budget_path_for=worker.budget_path,
+                                                        event="github.issue.ready", coordinator_id="planner", binding_revision="pm-v1")
+                service, assignments, _ = _service_fixture(tmp_path, approved_delivery, coordinator=coordinator.service_binding)
+                worker.prepare(preview_id)
+                match = "oversized" if scenario == "oversized_text" else "did not submit"
+                with pytest.raises((ValueError, PermissionError), match=match):
+                    await service.consume(preview_id)
+                assert assignments.for_task(previews.get(preview_id).bundle_payload["task_id"]) is None
+                receipt = json.loads(next((tmp_path / "coordinator" / "receipts").glob("*.json")).read_text())
+                assert receipt["state"] == "failed" and receipt.get("proposal") is None
+
+    asyncio.run(exercise())
+    # JSON-looking text is never parsed: one reminder turn, then failure. Oversized text fails on the first turn.
+    assert len(bodies) == (1 if scenario == "oversized_text" else 2)
+
+
+@pytest.mark.parametrize("scenario", ["json_text_only", "deadline_before_reminder", "oversized_text"])
+def test_native_pm_proposal_text_reminder_deadline_and_size(tmp_path, monkeypatch, scenario):
+    from aitobuild.tool_outputs import MAX_PROMPT_BYTES
+
+    bodies = []
+    valid = {"agent_id": "developer_one", "rationale": "Fits the approved task"}
+
+    def reply(request):
+        bodies.append(json.loads(request.content))
+        if scenario == "oversized_text":
+            return _scripted_reply(text("x" * (MAX_PROMPT_BYTES + 1)))
+        if scenario == "deadline_before_reminder":
+            # The budget deadline passes after turn 1; the reminder must not call the model.
+            monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: FAR_FUTURE)
+        return _scripted_reply(text(json.dumps(valid)))
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
+            async with AsyncOpenAI(api_key="test-key", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                assignment, runtime_for, make_runner, _ = role_fixture(tmp_path, profile)
+                adapter = NativeManagedRoles(runtime_for=runtime_for, state_dir=tmp_path / "roles", proposal_event="github.issue.ready")
+                run = await make_runner(adapter).start(assignment.assignment_id)
+                assert run.state == "failed"
+                expected = {"json_text_only": "did not submit", "oversized_text": "exceeds the byte limit",
+                            "deadline_before_reminder": "TimeoutError"}[scenario]
+                assert expected in run.error, run.error
+                session = await adapter._sessions.get(run.session_id)
+                assert session is None or "aitobuild_role_proposal" not in session.state and \
+                    session.state.get("aitobuild_pm_proposal") is None
+
+    asyncio.run(exercise())
+    assert len(bodies) == (2 if scenario == "json_text_only" else 1)
+
+
+def test_pm_reminder_deadline_check_raises_budget_deadline_expired(tmp_path, monkeypatch):
+    """Directly at the role site: the reminder's deadline check raises BudgetDeadlineExpired."""
+    from aitobuild.developer_isolation import BudgetDeadlineExpired
+    from aitobuild import organization_roles
+
+    seen = []
+    original = organization_roles.run_with_reminder
+
+    async def spy(*args, **kwargs):
+        try:
+            return await original(*args, **kwargs)
+        except BaseException as error:
+            seen.append(error)
+            raise
+
+    monkeypatch.setattr(organization_roles, "run_with_reminder", spy)
+    test_native_pm_proposal_text_reminder_deadline_and_size(tmp_path, monkeypatch, "deadline_before_reminder")
+    assert len(seen) == 1 and isinstance(seen[0], BudgetDeadlineExpired)

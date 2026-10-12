@@ -29,6 +29,7 @@ from aitobuild.organization_reviews import PublishedReviewTarget as PublishedRev
 from aitobuild.organization_reviews import CorrectionProposal
 from aitobuild.organization_service import CoordinatorBinding
 from aitobuild.policy import ActionClass, AgentRole
+from aitobuild.submit_tools import ModelT, SubmitTool, build_submit_tool, require_framework_error_limit, run_with_reminder
 from aitobuild.tool_outputs import MAX_PROMPT_BYTES, MAX_TOOL_RESULT_BYTES, build_output_guard
 from aitobuild.tools.github import GitHubAdapter, _git_blob_sha
 
@@ -48,6 +49,12 @@ class _CoordinatorReceipt(DefinitionModel):
                 (self.state == "failed") != (self.error is not None)):
             raise ValueError("Coordinator receipt requires consistent pins and outcome")
         return self
+
+
+class ArchitectReviewSubmission(DefinitionModel):
+    """The Architect's COMMENT body. There is deliberately no event field: reviews are COMMENT-only."""
+
+    body: Annotated[StrictStr, Field(min_length=1, max_length=ARCHITECT_REVIEW_BODY_MAX)]
 
 
 class NativeCoordinatorProposal:
@@ -144,7 +151,7 @@ class NativeCoordinatorProposal:
             agent = runtime.agents[self._coordinator]
             if runtime.snapshot != snapshot or not isinstance(agent, Agent) or runtime.modes[self._coordinator] == "mock":
                 raise PermissionError("Coordinator requires the pinned native runtime")
-            message = ("Return only JSON with agent_id and rationale for this configured route. "
+            message = ("Submit agent_id and rationale for this configured route by calling pm_submit_assignment_proposal. "
                        "This is a read-only proposal, not an assignment, approval or issue write.\n"
                        "Eligible agents: " + json.dumps(list(route.delegation.eligible_agents)) +
                        "\nAuthoritative approved task:\n" + content)
@@ -173,13 +180,26 @@ class NativeCoordinatorProposal:
                     finally:
                         del diagnostics[:-128]
 
+                def eligible(value: AssignmentProposal) -> None:
+                    if value.agent_id not in route.delegation.eligible_agents:
+                        raise PermissionError("Proposed agent is outside the configured eligible agents")
+
+                submit = build_submit_tool("pm_submit_assignment_proposal", AssignmentProposal, session,
+                                           "aitobuild_coordinator_proposal", eligible, max_attempts=selected.max_submit_attempts,
+                                           description="Record the one assignment proposal (agent_id, rationale). Write-once.")
+                require_framework_error_limit(agent.client, selected.max_submit_attempts)
+
+                async def run_turn(text: str) -> None:
+                    response = await agent.run(text, session=session, tools=(inspect_task, submit.tool), options={"store": False},
+                                               middleware=[guarded_tool, submit.middleware,
+                                                           build_output_guard(path.parent / "outputs" / path.stem)])
+                    revalidate()
+                    if response.user_input_requests or len(response.text.encode()) > MAX_PROMPT_BYTES:
+                        raise PermissionError("Coordinator cannot accept native approval requests or oversized responses")
+
                 async with asyncio.timeout(min(self._timeout, budget.remaining_seconds())):
-                    response = await agent.run(message, session=session, tools=(inspect_task,), options={"store": False},
-                                               middleware=[guarded_tool, build_output_guard(path.parent / "outputs" / path.stem)])
+                    proposal = await run_with_reminder(submit, message, run_turn, revalidate, budget.remaining_seconds)
                 revalidate()
-                if response.user_input_requests or len(response.text.encode()) > MAX_PROMPT_BYTES:
-                    raise PermissionError("Coordinator cannot accept native approval requests or oversized proposals")
-                proposal = AssignmentProposal.model_validate_json(response.text)
                 if proposal.agent_id not in route.delegation.eligible_agents:
                     raise PermissionError("Native coordinator proposed an ineligible agent")
                 await self._sessions.set(session_id, session)
@@ -252,12 +272,28 @@ class NativeManagedRoles:
             raise PermissionError("Managed role session cannot switch scope, revision, target or owner")
         return session
 
-    async def _invoke(self, context: ManagedTaskContext, agent: Agent, session: AgentSession,
-                      tools: tuple[Any, ...], guidance: str) -> str:
+    def _submit_attempts(self, context: ManagedTaskContext) -> int:
+        owner = context.assignment.agent_id
+        return next(agent.max_submit_attempts for agent in context.snapshot.definition.agents if agent.id == owner)
+
+    def _submit_tool(
+        self, context: ManagedTaskContext, session: AgentSession, name: str, model: type[ModelT], key: str,
+        extra_check: Callable[[Any], Any] | None, description: str,
+    ) -> SubmitTool[ModelT]:
+        async def persist() -> None:
+            await self._sessions.set(context.run.session_id, session)
+
+        return build_submit_tool(name, model, session, key, extra_check, max_attempts=self._submit_attempts(context),
+                                 description=description, persist=persist)
+
+    async def _invoke_submit(self, context: ManagedTaskContext, agent: Agent, session: AgentSession,
+                             tools: tuple[Any, ...], guidance: str, submit: SubmitTool[ModelT]) -> ModelT:
+        """Run the owner once plus at most one reminder turn under one timeout; return its write-once submission."""
         message = guidance + "\nAuthoritative approved task:\n" + context.assignment.bundle_content
         if len(message.encode("utf-8")) > MAX_PROMPT_BYTES:
             raise ValueError("Managed role prompt exceeds the byte limit")
         diagnostics = session.state.setdefault("aitobuild_role_diagnostics", [])
+        require_framework_error_limit(agent.client, submit.max_attempts)
 
         @function_middleware
         async def guarded_tool(call: FunctionInvocationContext, call_next: Callable) -> None:
@@ -270,19 +306,21 @@ class NativeManagedRoles:
             finally:
                 del diagnostics[:-128]
 
+        async def turn(text: str) -> None:
+            response = await agent.run(text, session=session, tools=tools + (submit.tool,), options={"store": False},
+                                       middleware=[guarded_tool, submit.middleware,
+                                                   build_output_guard(self._state_dir / "outputs" / context.run.session_id)])
+            context.revalidate()
+            if response.user_input_requests:
+                raise PermissionError("Unsupported native input cannot become managed role service approval")
+            if len(response.text.encode("utf-8")) > MAX_PROMPT_BYTES:
+                raise ValueError("Managed role response exceeds the byte limit")
+
         async with asyncio.timeout(min(self._timeout, context.remaining_seconds())):
-            response = await agent.run(message, session=session, tools=tools, options={"store": False},
-                                       middleware=[guarded_tool, build_output_guard(self._state_dir / "outputs" / context.run.session_id)])
+            result = await run_with_reminder(submit, message, turn, context.revalidate, context.remaining_seconds)
         context.revalidate()
-        if response.user_input_requests:
-            raise PermissionError("Unsupported native input cannot become managed role service approval")
-        final_message = response.messages[-1] if response.messages else None
-        if final_message is None or final_message.role != "assistant" or not final_message.text.strip():
-            raise ValueError("Managed role requires a final assistant response")
-        if len(response.text.encode("utf-8")) > MAX_PROMPT_BYTES:
-            raise ValueError("Managed role response exceeds the byte limit")
         await self._sessions.set(context.run.session_id, session)
-        return final_message.text
+        return result
 
     async def propose(self, context: ManagedTaskContext, message: Any) -> dict[str, Any]:
         agent = self._agent(context, AgentRole.PM)
@@ -297,10 +335,17 @@ class NativeManagedRoles:
             return {"task": json.loads(assignment.bundle_content), "proposal_event": self._proposal_event,
                     "eligible_agents": list(route.delegation.eligible_agents)}
 
-        text = await self._invoke(context, agent, session, (inspect_task,),
-                                  "Return only JSON with agent_id and rationale for the configured proposal route. "
-                                  "This is a read-only proposal, not an assignment, approval or issue write.")
-        proposal = AssignmentProposal.model_validate_json(text)
+        def eligible(value: AssignmentProposal) -> None:
+            if value.agent_id not in route.delegation.eligible_agents:
+                raise PermissionError("Proposed agent is outside the configured eligible agents")
+
+        submit = self._submit_tool(context, session, "pm_submit_assignment_proposal", AssignmentProposal,
+                                   "aitobuild_role_proposal_submission", eligible,
+                                   "Record the one assignment proposal (agent_id, rationale). Write-once.")
+        proposal = await self._invoke_submit(
+            context, agent, session, (inspect_task,), submit=submit,
+            guidance="Call pm_submit_assignment_proposal with agent_id and rationale for the configured proposal route. "
+                     "This is a read-only proposal, not an assignment, approval or issue write.")
         if proposal.agent_id not in route.delegation.eligible_agents:
             raise PermissionError("Native PM proposal is outside the configured eligible agents")
         session.state["aitobuild_role_proposal"] = proposal.model_dump(mode="json")
@@ -318,7 +363,17 @@ class NativeManagedRoles:
             raise PermissionError("Saved planning invocation cannot replay")
         session.state["aitobuild_plan_state"] = "running"
         await self._sessions.set(context.run.session_id, session)
+        try:
+            return await self._plan(context, agent, planning, request, session)
+        except BaseException as error:
+            # Never leave the one-shot plan stuck at "running": record the failure, which still blocks replay.
+            session.state["aitobuild_plan_state"] = "failed"
+            session.state["aitobuild_plan_error"] = (str(error) or type(error).__name__)[:2000]
+            await self._sessions.set(context.run.session_id, session)
+            raise
 
+    async def _plan(self, context: ManagedTaskContext, agent: Agent, planning: ManagedPlanning, request: Any,
+                    session: AgentSession) -> WorkflowInput:
         @tool(name="pm_inspect_planning_request", approval_mode="never_require")
         async def inspect_request() -> dict[str, Any]:
             evidence = await _delivery_call(lambda: planning.inspect(context))
@@ -328,13 +383,20 @@ class NativeManagedRoles:
             await self._sessions.set(context.run.session_id, session)
             return evidence
 
-        text = await self._invoke(context, agent, session, (inspect_request,),
-                                  "Inspect the approved planning request and pinned repository/base. Return JSON only: "
-                                  "{issues: [{key, title, objective, acceptance_criteria, dependencies, labels}]}. "
-                                  "Keys are local identifiers; dependencies reference these keys and must be acyclic. "
-                                  "Never provide repository, actor, assignee, approval or commands. This is a proposal only. "
-                                  "Limits: " + request.scope.limits.model_dump_json())
-        proposal = PlanProposal.model_validate_json(text)
+        def check_plan(value: PlanProposal) -> None:
+            if not isinstance(session.state.get("aitobuild_plan_inspections"), dict):
+                raise PermissionError("Inspect the planning request with pm_inspect_planning_request before submitting")
+            value.check_limits(request.scope.limits)
+
+        submit = self._submit_tool(context, session, "pm_submit_plan", PlanProposal, "aitobuild_plan_submission", check_plan,
+                                   "Record the one issue plan proposal. Write-once; invalid plans return an error to fix.")
+        proposal = await self._invoke_submit(
+            context, agent, session, (inspect_request,), submit=submit,
+            guidance="Inspect the approved planning request and pinned repository/base, then call pm_submit_plan with "
+                     "{issues: [{key, title, objective, acceptance_criteria, dependencies, labels}]}. "
+                     "Keys are local identifiers; dependencies reference these keys and must be acyclic. "
+                     "Never provide repository, actor, assignee, approval or commands. This is a proposal only. "
+                     "Limits: " + request.scope.limits.model_dump_json())
         evidence = session.state.get("aitobuild_plan_inspections")
         if not isinstance(evidence, dict):
             raise PermissionError("Planning requires saved complete request and target inspection")
@@ -558,6 +620,9 @@ class NativeManagedRoles:
                 "next_file_offset": next_file if more else None, "next_line_offset": next_line if more else None,
             }, {"kind": "search", "paths": scanned, "pattern": pattern})
 
+        # Deliberately not build_submit_tool: a correction is optional (zero or one per review) and is
+        # metadata attached to the body approval, not the run's required result. It keeps its own write-once check,
+        # and errors here must not use up the review body's submit attempts or trigger a reminder turn.
         @tool(name="architect_propose_correction", approval_mode="never_require")
         async def propose_correction(paths: list[str], objective: str) -> dict[str, Any]:
             context.revalidate()
@@ -577,27 +642,43 @@ class NativeManagedRoles:
             return {"correction": proposal, "metadata_only": True}
 
         max_body = ARCHITECT_REVIEW_BODY_MAX - len(ARCHITECT_REVIEW_BODY_PREFIX)
+        worker = self._worker
+        if worker is None:
+            raise RuntimeError("Internal invariant violated: self._worker is not None")
+
+        async def check_review(value: ArchitectReviewSubmission) -> ArchitectReviewSubmission:
+            context.revalidate()
+            self._require_inspections(target, inspections)
+            body = value.body.replace("\x00", "").strip()
+            worker._normalize_architect_review_body(body)
+            if await self._target(context) != target:
+                raise PermissionError("Review target changed before proposal approval")
+            return ArchitectReviewSubmission(body=body)
+
+        # The submit tool is the only writer of aitobuild_comment_body, exactly once; approval binds to it.
+        submit = self._submit_tool(context, session, "architect_submit_review", ArchitectReviewSubmission,
+                                   "aitobuild_comment_body", check_review,
+                                   "Record the one COMMENT review body after inspection. Write-once; COMMENT only, "
+                                   "no event. Publication requires a separate operator approval.")
         guidance = ("Inspect complete source AND diff for each approved changed path at the pinned target below. "
             "Use repository discovery, literal search and source readers for any relevant unchanged files across the whole repository. "
             "Choose enough context to assess architecture, style, established patterns, reuse and behavioral compatibility; "
             "Developer write paths do not limit these immutable repository reads. Context reads do not replace changed-file source/diff inspection. "
-                f"Return COMMENT review text only, at most {max_body} characters including whitespace. "
+                f"Then call architect_submit_review with the COMMENT review body, at most {max_body} characters including whitespace. "
                 "Be concise; never claim metadata alone proves semantic correctness. "
                     "Publication requires a separate operator approval.")
         tools: tuple[Any, ...] = (read_source, read_diff, find_files, read_context, search_files)
         if self._allow_corrections:
             tools += (propose_correction,)
             guidance += " Optionally propose one scoped correction after inspection; this cannot assign, approve or execute a Developer task."
-        text = await self._invoke(context, agent, session, tools, guidance + "\nTarget: " + json.dumps(target, sort_keys=True))
+        submission = await self._invoke_submit(context, agent, session, tools,
+                                               guidance + "\nTarget: " + json.dumps(target, sort_keys=True), submit=submit)
         self._require_inspections(target, inspections)
-        if self._worker is None:
-            raise RuntimeError("Internal invariant violated: self._worker is not None")
-        text = text.replace("\x00", "").strip()
-        self._worker._normalize_architect_review_body(text)
+        text = submission.body
+        worker._normalize_architect_review_body(text)
         if await self._target(context) != target:
             raise PermissionError("Review target changed before proposal approval")
         session.state["aitobuild_comment_state"] = "proposed"
-        session.state["aitobuild_comment_body"] = text
         await self._sessions.set(context.run.session_id, session)
         data: dict[str, Any] = {"target": target, "body": text}
         if session.state.get("aitobuild_correction_proposal") is not None:
@@ -615,7 +696,9 @@ class NativeManagedRoles:
                          "role": "architect", "target": target}
         if self._allow_corrections:
             expected_pins["correction_proposals"] = True
-        data = {"target": target, "body": session.state.get("aitobuild_comment_body") if session else None}
+        saved_body = session.state.get("aitobuild_comment_body") if session else None
+        body = ArchitectReviewSubmission.model_validate(saved_body).body if isinstance(saved_body, dict) else None
+        data = {"target": target, "body": body}
         correction = session.state.get("aitobuild_correction_proposal") if session else None
         if correction is not None:
             proposal = CorrectionProposal.model_validate(correction)

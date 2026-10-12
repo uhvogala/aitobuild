@@ -125,16 +125,36 @@ def meeting_fixture(tmp_path, profile, *, timeout=180, binding=None):
     return runner, assignment, meetings, adapter
 
 
-def meeting_reply(requests, outcome="continue"):
+def is_resolver(body):
+    return any(tool["function"]["name"] == "meeting_submit_resolution" for tool in body.get("tools", ()))
+
+
+def resolver_message(body, resolution):
+    """Scripted resolver: submit through the tool (retrying after errors), then finish with plain text."""
+    last = body["messages"][-1]
+    if last["role"] == "tool" and not str(last.get("content")).startswith("Error"):
+        return {"role": "assistant", "content": "Submitted."}
+    return {"role": "assistant", "content": None, "tool_calls": [{"id": "resolve-" + str(len(body["messages"])), "type": "function",
+            "function": {"name": "meeting_submit_resolution",
+                         "arguments": resolution if isinstance(resolution, str) else json.dumps(resolution)}}]}
+
+
+def chat_response(message):
+    return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1,
+        "model": "DeepSeek-V4.1-Flash", "choices": [{"index": 0, "message": message,
+        "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}]})
+
+
+def meeting_reply(requests, outcome="continue", resolution=None):
     def reply(request):
-        requests.append(json.loads(request.content))
-        content = "The existing criteria permit resolving the signed-input blocker without changing files or scope."
-        if len(requests) == 3:
-            content = json.dumps({"outcome": outcome, "rationale": "The agreed approach preserves approved criteria",
-                                  "plan": "Preserve the original scope and use direct signed-integer assertions"})
-        return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1,
-            "model": "DeepSeek-V4.1-Flash", "choices": [{"index": 0, "finish_reason": "stop",
-            "message": {"role": "assistant", "content": content}}]})
+        body = json.loads(request.content)
+        requests.append(body)
+        if is_resolver(body):
+            return chat_response(resolver_message(body, resolution if resolution is not None else {
+                "outcome": outcome, "rationale": "The agreed approach preserves approved criteria",
+                "plan": "Preserve the original scope and use direct signed-integer assertions"}))
+        return chat_response({"role": "assistant", "content":
+            "The existing criteria permit resolving the signed-input blocker without changing files or scope."})
     return reply
 
 
@@ -159,7 +179,7 @@ def test_native_meeting_exact_approval_restart_does_not_replay(tmp_path, approve
                 assert [item.author for item in receipt.transcript] == ["task", "planner", "developer_one"]
                 assert waiting.pending[0].kind == "service_approval"
                 assert waiting.pending[0].data == meetings._approval(receipt)
-                assert len(requests) == 3
+                assert len(requests) == 4
                 assert Path(assignment.budget_path).read_bytes() == before
                 restarted = adapter()
                 runner, *_ = runner_fixture(tmp_path, {"definition_probe": restarted.operations["meeting_resolve_blocker"]},
@@ -171,7 +191,7 @@ def test_native_meeting_exact_approval_restart_does_not_replay(tmp_path, approve
                 assert receipt.state == ("resolved" if approved else "rejected")
                 assert receipt.decision == run.decisions[0]
                 assert receipt.decision.actor_id == "operator"
-                assert len(requests) == 3
+                assert len(requests) == 4
                 assert await runner.start(assignment.assignment_id, input=BLOCKER) == run
                 after = json.loads(Path(assignment.budget_path).read_text())
                 assert after == (json.loads(before) if approved else json.loads(before) | {"aborted": True})
@@ -181,7 +201,10 @@ def test_native_meeting_exact_approval_restart_does_not_replay(tmp_path, approve
                     await runner.approve(assignment.assignment_id, request_id=waiting.pending[0].request_id, approved=approved)
 
     asyncio.run(exercise())
-    assert all(request["model"] == "DeepSeek-V4.1-Flash" and not request.get("tools") for request in requests)
+    # Discussion turns have no tools; the resolver gets only its write-once submit tool.
+    assert all(request["model"] == "DeepSeek-V4.1-Flash" for request in requests)
+    assert all(not request.get("tools") for request in requests if not is_resolver(request))
+    assert [tool["function"]["name"] for tool in requests[2]["tools"]] == ["meeting_submit_resolution"]
 
 
 @pytest.mark.parametrize("entrypoint", ["runner", "service", "worker"])
@@ -226,13 +249,14 @@ def test_configured_blocker_meeting_to_verified_draft(
     monkeypatch.setattr("aitobuild.developer_delivery.shell_request", shell_reply)
 
     def reply(request):
-        requests.append(json.loads(request.content))
+        body = json.loads(request.content)
+        requests.append(body)
+        if is_resolver(body):
+            return chat_response(resolver_message(body, {"outcome": "continue",
+                "rationale": "Existing criteria are sufficient", "plan": "Implement the unchanged approved probe contract"}))
         if len(requests) <= 3:
             message = {"role": "assistant", "content": "Use the approved probe contract without adding scope."}
-        elif len(requests) == 4:
-            message = {"role": "assistant", "content": json.dumps({"outcome": "continue",
-                "rationale": "Existing criteria are sufficient", "plan": "Implement the unchanged approved probe contract"})}
-        elif len(requests) == 5:
+        elif len(requests) == 6:
             message = {"role": "assistant", "content": None, "tool_calls": [{"id": "probe", "type": "function",
                 "function": {"name": "developer_write_file", "arguments": json.dumps({
                     "path": "src/probe.py", "content": "def probe():\n    return True\n", "approved": True})}}]}
@@ -320,7 +344,7 @@ def test_configured_blocker_meeting_to_verified_draft(
                 assignment = assignments.for_task(previews.get(preview_id).bundle_payload["task_id"])
                 if scenario == "automatic":
                     assert waiting.state == "completed", waiting.error
-                    assert len(requests) == 6 and len(verified) == 1 and len(github.branch_commits) == 1
+                    assert len(requests) == 7 and len(verified) == 1 and len(github.branch_commits) == 1
                     assert worker.get(preview_id).state == "published"
                     assert meetings.store.get(waiting.run_id).state == "resolved"
                     assert [item.approval_policy.stage for item in waiting.decisions] == [
@@ -328,10 +352,10 @@ def test_configured_blocker_meeting_to_verified_draft(
                     assert all(item.approval_policy.source == "operator_policy" for item in waiting.decisions)
                     assert waiting.cleanup_succeeded is True and not (source / "src/probe.py").exists()
                     assert json.loads(worker.budget_path(preview_id).read_text()) == before | {"reserved_paths": ["src/probe.py"]}
-                    assert await invoke() == waiting and len(requests) == 6
+                    assert await invoke() == waiting and len(requests) == 7
                     return
                 assert waiting.state == "waiting", waiting.error
-                assert len(requests) == 4 and worker.get(preview_id).state == "prepared"
+                assert len(requests) == 5 and worker.get(preview_id).state == "prepared"
                 assert not verified and not github.branch_commits
                 assert json.loads(worker.budget_path(preview_id).read_text()) == before
                 receipt = meetings.store.get(waiting.run_id)
@@ -339,12 +363,12 @@ def test_configured_blocker_meeting_to_verified_draft(
                 next_run = await invoke(assignment.assignment_id, request_id=waiting.pending[0].request_id, approved=scenario != "rejected")
                 if scenario == "rejected":
                     assert next_run.state == "failed", next_run.error
-                    assert len(requests) == 4 and not verified and not github.branch_commits
+                    assert len(requests) == 5 and not verified and not github.branch_commits
                     return
                 assert next_run.state == "waiting", next_run.error
-                assert len(requests) == 5
-                prompt = json.dumps(requests[4]["messages"])
-                assert assignment.bundle_content in requests[4]["messages"][-1]["content"]
+                assert len(requests) == 6
+                prompt = json.dumps(requests[5]["messages"])
+                assert assignment.bundle_content in requests[5]["messages"][-1]["content"]
                 assert "Operator-approved meeting plan" in prompt and receipt.resolution.plan in prompt
                 if scenario == "plan_tamper":
                     path = meetings.store._path(waiting.run_id)
@@ -355,7 +379,7 @@ def test_configured_blocker_meeting_to_verified_draft(
                 if scenario == "plan_tamper":
                     assert completed.state == "failed", completed.error
                     assert "operator decision" in completed.error
-                    assert len(requests) == 5 and not verified and not github.branch_commits
+                    assert len(requests) == 6 and not verified and not github.branch_commits
                     return
                 assert completed.state == "waiting" and completed.pending[0].approval_stage == ApprovalStage.DRAFT_PUBLICATION
                 assert worker.get(preview_id).state == "verified" and not github.branch_commits
@@ -371,13 +395,14 @@ def test_configured_blocker_meeting_to_verified_draft(
                 assert len(completed.decisions) == 3 and all(item.data_digest for item in completed.decisions)
                 assert all(item.actor_id == "operator" for item in completed.decisions)
                 assert json.loads(worker.budget_path(preview_id).read_text()) == before | {"reserved_paths": ["src/probe.py"]}
-                assert await invoke() == completed and len(requests) == 6
+                assert await invoke() == completed and len(requests) == 7
                 session = await FileSessionStore(tmp_path / "native" / "sessions").get(completed.session_id)
                 assert session.state["aitobuild_managed_cleanup_succeeded"] is True
                 assert session.state["aitobuild_managed_diagnostics"] == []
 
     asyncio.run(exercise())
-    assert all(not request.get("tools") for request in requests[:4])
+    assert all(not request.get("tools") for request in requests[:3])
+    assert all(is_resolver(request) for request in requests[3:5])
     assert all(request["model"] == "DeepSeek-V4.1-Flash" for request in requests)
 
 
@@ -386,16 +411,15 @@ def test_native_meeting_refuses_untrusted_or_unbounded_execution(tmp_path, defec
     requests = []
     valid_reply = meeting_reply(requests)
 
+    resolution = {"outcome": "continue", "rationale": "Within scope", "plan": "Keep scope"}
+    bad = {"invalid_json": "Approved!", "model_approval": json.dumps(resolution | {"approved": True})}.get(defect)
+    bad_reply = meeting_reply(requests, resolution=bad) if bad else valid_reply
+
     def reply(request):
-        response = valid_reply(request)
+        response = bad_reply(request)
         payload = response.json()
         if defect == "oversized":
             payload["choices"][0]["message"]["content"] = "x" * 33000
-        elif len(requests) == 3 and defect == "invalid_json":
-            payload["choices"][0]["message"]["content"] = "Approved!"
-        elif len(requests) == 3 and defect == "model_approval":
-            proposal = json.loads(payload["choices"][0]["message"]["content"])
-            payload["choices"][0]["message"]["content"] = json.dumps(proposal | {"approved": True})
         return httpx.Response(200, json=payload)
 
     async def exercise():
@@ -461,7 +485,7 @@ def test_native_meeting_saved_evidence_and_interrupted_work_never_replay(tmp_pat
                 assert json.loads(Path(assignment.budget_path).read_text())["aborted"] is True
 
     asyncio.run(exercise())
-    assert len(requests) == 3
+    assert len(requests) == 4
 
 
 @pytest.mark.parametrize("outcome", ["scope_change", "escalate"])
@@ -480,7 +504,7 @@ def test_native_meeting_unresolved_outcomes_stop_without_continuation(tmp_path, 
                 assert not run.pending and not run.decisions and receipt.decision is None
                 assert json.loads(Path(assignment.budget_path).read_text())["aborted"] is True
                 assert await runner.start(assignment.assignment_id, input=BLOCKER) == run
-                assert len(requests) == 3
+                assert len(requests) == 4
 
     asyncio.run(exercise())
 
@@ -519,7 +543,7 @@ def test_native_meeting_saved_wait_tamper_fails_closed(tmp_path, damage):
                     target.write_text("{}")
                 run = await runner.approve(assignment.assignment_id, request_id=waiting.pending[0].request_id, approved=True)
                 assert run.state == "failed", run.error
-                assert len(requests) == 3
+                assert len(requests) == 4
                 assert await runner.start(assignment.assignment_id, input=BLOCKER) == run
 
     asyncio.run(exercise())
@@ -558,3 +582,80 @@ def test_native_meeting_timeout_and_cancellation_are_bounded(tmp_path, cancel):
                 assert json.loads(Path(assignment.budget_path).read_text())["aborted"] is True
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("script", ["reminder", "retry", "exhausted"])
+def test_meeting_resolver_submit_tool_reminder_retry_and_exhaustion(tmp_path, script):
+    requests = []
+    valid = {"outcome": "continue", "rationale": "Within scope", "plan": "Keep the approved scope"}
+    base = meeting_reply(requests, resolution=valid)
+
+    def reply(request):
+        body = json.loads(request.content)
+        if not is_resolver(body):
+            return base(request)
+        requests.append(body)
+        resolver_calls = sum(is_resolver(item) for item in requests)
+        if script == "reminder" and resolver_calls == 1:
+            return chat_response({"role": "assistant", "content": json.dumps(valid)})
+        if script == "retry" and resolver_calls == 1:
+            return chat_response(resolver_message(body, {"outcome": "approve", "rationale": "x", "plan": "y"}))
+        if script == "exhausted":
+            return chat_response(resolver_message(body, "{not json"))
+        return chat_response(resolver_message(body, valid))
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="DeepSeek-V4.1-Flash", async_client=client))
+                runner, assignment, meetings, _ = meeting_fixture(tmp_path, profile)
+                run = await runner.start(assignment.assignment_id, input=BLOCKER)
+                receipts = [path for path in (tmp_path / "meetings" / "receipts").glob("*.json")]
+                # One meeting receipt and one run, whatever the number of resolver turns.
+                assert len(receipts) == 1 and len(list((tmp_path / "runs").rglob("run.json"))) == 1
+                receipt = meetings.store.get(run.run_id)
+                if script == "exhausted":
+                    assert run.state == "failed" and receipt.state == "failed" and "attempts" in receipt.error
+                    return
+                assert run.state == "waiting", run.error
+                assert receipt.state == "proposed" and receipt.resolution.plan == valid["plan"]
+
+    asyncio.run(exercise())
+    resolver = [item for item in requests if is_resolver(item)]
+    users = [message["content"] for message in resolver[-1]["messages"] if message["role"] == "user"]
+    if script == "reminder":
+        assert len(resolver) == 3 and len(users) == 2 and "meeting_submit_resolution" in users[1]
+    elif script == "retry":
+        assert len(resolver) == 3 and len(users) == 1
+    else:
+        assert len(resolver) == 3 and len(users) == 1
+
+
+@pytest.mark.parametrize("scenario", ["json_text_only", "deadline_before_reminder"])
+def test_meeting_resolver_text_is_never_parsed_and_reminder_respects_deadline(tmp_path, monkeypatch, scenario):
+    requests = []
+    valid = {"outcome": "continue", "rationale": "Within scope", "plan": "Keep the approved scope"}
+    base = meeting_reply(requests, resolution=valid)
+
+    def reply(request):
+        body = json.loads(request.content)
+        if not is_resolver(body):
+            return base(request)
+        requests.append(body)
+        if scenario == "deadline_before_reminder":
+            monkeypatch.setattr("aitobuild.developer_isolation.time", lambda: 10.0 ** 12)
+        return chat_response({"role": "assistant", "content": json.dumps(valid)})
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="DeepSeek-V4.1-Flash", async_client=client))
+                runner, assignment, meetings, _ = meeting_fixture(tmp_path, profile)
+                run = await runner.start(assignment.assignment_id, input=BLOCKER)
+                receipt = meetings.store.get(run.run_id)
+                assert run.state == "failed" and receipt.state == "failed" and receipt.resolution is None
+                assert ("did not submit" if scenario == "json_text_only" else "expired") in receipt.error, receipt.error
+
+    asyncio.run(exercise())
+    resolver = [item for item in requests if is_resolver(item)]
+    assert len(resolver) == (2 if scenario == "json_text_only" else 1)

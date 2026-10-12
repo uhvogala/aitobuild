@@ -26,6 +26,7 @@ from aitobuild.organization_runner import (
 from aitobuild.organization_runtime import OrganizationRuntime
 from aitobuild.organization import DefinitionSnapshot
 from aitobuild.policy import AgentRole
+from aitobuild.submit_tools import build_submit_tool, require_framework_error_limit, run_with_reminder
 from aitobuild.tool_outputs import MAX_PROMPT_BYTES
 
 
@@ -267,15 +268,7 @@ class NativeManagedMeetings:
                             len(receipt.transcript) != binding.limits.max_rounds + 1:
                         raise ValueError("Native meeting requires terminal completion and a complete saved conversation")
                     self._check(context, receipt)
-                    response = await agents[binding.resolver].run(
-                        "Return only JSON: {outcome: continue|scope_change|escalate, rationale: string, plan: string}. "
-                        "This is a proposal, never approval. Scope change or unresolved blockers cannot resume this task.\n" +
-                        json.dumps([item.model_dump() for item in receipt.transcript]),
-                    )
-                    final = response.messages[-1] if response.messages else None
-                    if response.user_input_requests or final is None or final.role != "assistant":
-                        raise PermissionError("Meeting resolver requires final assistant JSON without native input")
-                    resolution = MeetingResolution.model_validate_json(final.text)
+                    resolution = await self._resolution(context, binding, agents[binding.resolver], lambda: receipt)
                 self._check(context, receipt)
                 receipt = MeetingReceipt.model_validate(receipt.model_dump() | {
                     "resolution": resolution, "state": "proposed" if resolution.outcome == "continue" else "escalated"})
@@ -291,6 +284,29 @@ class NativeManagedMeetings:
                         "state": "cancelled" if isinstance(error, asyncio.CancelledError) else "failed",
                         "error": (str(error) or type(error).__name__)[:2000]}))
                 raise
+
+    async def _resolution(self, context: ManagedTaskContext, binding: MeetingBinding, resolver: Agent,
+                          current: Callable[[], MeetingReceipt]) -> MeetingResolution:
+        """Ask the resolver to submit the outcome through a write-once tool, with at most one reminder turn."""
+        configured = next(agent for agent in context.snapshot.definition.agents if agent.id == binding.resolver)
+        session = resolver.create_session()
+        submit = build_submit_tool(
+            "meeting_submit_resolution", MeetingResolution, session, "aitobuild_meeting_resolution",
+            max_attempts=configured.max_submit_attempts,
+            description="Record the one meeting outcome (continue|scope_change|escalate, rationale, plan). Write-once; "
+                        "a proposal, never approval.")
+        require_framework_error_limit(resolver.client, configured.max_submit_attempts)
+
+        async def turn(text: str) -> None:
+            response = await resolver.run(text, session=session, tools=(submit.tool,), middleware=[submit.middleware])
+            if response.user_input_requests:
+                raise PermissionError("Meeting resolver cannot accept native input requests")
+
+        prompt = ("Call meeting_submit_resolution with outcome (continue|scope_change|escalate), rationale and plan. "
+                  "This is a proposal, never approval. Scope change or unresolved blockers cannot resume this task.\n" +
+                  json.dumps([item.model_dump() for item in current().transcript]))
+        return await run_with_reminder(submit, prompt, turn, lambda: self._check(context, current()),
+                                       context.remaining_seconds)
 
     def approve(self, context: ManagedTaskContext, original: Any, approved: Any) -> dict[str, Any]:
         with self.store.invocation_lock(context.run.run_id):

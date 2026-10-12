@@ -527,6 +527,24 @@ certification or multi-user authentication.
 against a pinned `proposal_event`. It returns metadata only: no assignment claim,
 actor identity, issue write or approval is taken from the model.
 
+Structured results are never parsed from free text. Each site gives its agent a typed,
+write-once submit tool (`pm_submit_assignment_proposal` for the coordinator and PM
+proposal, `pm_submit_plan`, `meeting_submit_resolution`, `architect_submit_review`), built
+by `build_submit_tool` in [src/aitobuild/submit_tools.py](src/aitobuild/submit_tools.py).
+Invalid JSON, schema or semantic errors come back to the agent as a tool error and use up
+one attempt; only a valid submission is stored, once, in session state, and a later
+different submission is refused. If the agent ends without submitting, one reminder turn
+runs in the same session under the same timeout, after revalidation and a budget deadline
+check (an expired deadline raises `BudgetDeadlineExpired` without calling the model again).
+Attempts are counted across both turns and set per agent with `max_submit_attempts`
+(default 3, 1-3, invalid values fail the definition load). The cap is 3 because the agent
+framework's `max_consecutive_errors_per_request` is a per-client setting with no per-run
+override, and shared clients are never modified; a client configured below the agent's
+setting fails closed. Adding `max_submit_attempts` changed canonical definition JSON:
+definition snapshots stored before it refuse to load with a specific error, so save the
+definition again to pin a new revision. The Architect submits only a COMMENT body
+(there is no event argument), and approval is bound to that submitted body.
+
 `architect_review_published` requires delivery/GitHub bindings and an operator-owned
 `review_target_for(context)` returning `PublishedReviewTarget(preview_id=..., head_sha=...)`.
 Use a separately approved review task and original ledger, matching the published
