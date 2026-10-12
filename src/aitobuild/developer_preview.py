@@ -10,11 +10,15 @@ import json
 from pathlib import Path
 import re
 from threading import RLock
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from uuid import uuid4
 
 from filelock import FileLock
 
+from aitobuild.approval_consent import (
+    ConsentAdmissionEvidence, ConsentBundle, ConsentProfile, ConsentProjection, ConsentSource,
+    FileConsentStore, HumanConsent,
+)
 from aitobuild.durable_files import atomic_write_text
 from aitobuild.approval_policy import ApprovalDecision, ApprovalStage
 from aitobuild.publish_approvals import snapshot_digest
@@ -32,6 +36,7 @@ class DeveloperPreview:
     approved_at: datetime | None = None
     dispatched_at: datetime | None = None
     approval_policy: ApprovalDecision | None = None
+    consent_approval: ConsentAdmissionEvidence | None = None
 
     @property
     def state(self) -> str:
@@ -140,6 +145,11 @@ class DeveloperPreviewRegistry:
                 if (not item["approved"] or decision.stage != ApprovalStage.TASK_ADMISSION
                         or decision.operation_digest != snapshot_digest(preview_approval_operation(item["preview_id"], item["bundle_payload"]))):
                     raise PermissionError("Saved task policy differs from its exact approved bundle")
+            if item.get("consent_approval") is not None:
+                evidence = ConsentAdmissionEvidence.model_validate(item["consent_approval"])
+                _check_consent_admission(item["preview_id"], item["bundle_payload"],
+                                         ApprovalDecision.model_validate(item["approval_policy"])
+                                         if item.get("approval_policy") is not None else None, evidence)
         self._by_id = {
             item["preview_id"]: DeveloperPreview(
                 preview_id=item["preview_id"], dedupe_key=item["dedupe_key"],
@@ -148,6 +158,8 @@ class DeveloperPreviewRegistry:
                 approved_at=datetime.fromisoformat(item["approved_at"]) if item["approved_at"] else None,
                 dispatched_at=datetime.fromisoformat(item["dispatched_at"]) if item.get("dispatched_at") else None,
                 approval_policy=ApprovalDecision.model_validate(item["approval_policy"]) if item.get("approval_policy") is not None else None,
+                consent_approval=ConsentAdmissionEvidence.model_validate(item["consent_approval"])
+                if item.get("consent_approval") is not None else None,
             )
             for item in data["previews"]
         }
@@ -170,6 +182,8 @@ class DeveloperPreviewRegistry:
                     "approved_at": preview.approved_at.isoformat() if preview.approved_at else None,
                     "dispatched_at": preview.dispatched_at.isoformat() if preview.dispatched_at else None,
                     **({"approval_policy": preview.approval_policy.model_dump(mode="json")} if preview.approval_policy is not None else {}),
+                          **({"consent_approval": preview.consent_approval.model_dump(mode="json")}
+                              if preview.consent_approval is not None else {}),
                 }
                 for preview in self._by_id.values()
             ],
@@ -215,7 +229,8 @@ class DeveloperPreviewRegistry:
     def _approve_admission(self, preview_id: str, *, base_revision: str | None = None,
                 approval_policy: ApprovalDecision | None = None,
                 max_automatic_admissions: int | None = None,
-                expected: DeveloperPreview | None = None) -> DeveloperPreview | None:
+                expected: DeveloperPreview | None = None,
+                consent_approval: ConsentAdmissionEvidence | None = None) -> DeveloperPreview | None:
         """Private: call only through organization_service.admit_task (PLAN 2.4; enforced by tests)."""
         with self._transaction(write=True):
             preview = self._by_id.get(preview_id)
@@ -235,9 +250,14 @@ class DeveloperPreviewRegistry:
                 context["base_revision"] = revision
             elif base_revision is not None:
                 raise ValueError("base_revision requires a repository issue task")
+            if consent_approval is not None:
+                consent_approval = ConsentAdmissionEvidence.model_validate(consent_approval.model_dump(mode="json"))
+                _check_consent_admission(preview_id, bundle, approval_policy, consent_approval)
             if preview.approved:
                 if approval_policy is not None and preview.approval_policy != approval_policy:
                     raise PermissionError("Saved task approval policy is immutable")
+                if consent_approval is not None and preview.consent_approval != consent_approval:
+                    raise PermissionError("Saved task consent evidence is immutable")
                 return deepcopy(preview)
             if approval_policy is not None:
                 if (approval_policy.stage != ApprovalStage.TASK_ADMISSION
@@ -265,7 +285,7 @@ class DeveloperPreviewRegistry:
                         raise PermissionError("Automatic task admission limit reached; a human approval is required")
             approved_preview = replace(
                 preview, bundle_payload=bundle, approved=True, approved_at=datetime.now(tz=UTC),
-                approval_policy=approval_policy,
+                approval_policy=approval_policy, consent_approval=consent_approval,
             )
             self._by_id[preview_id] = approved_preview
             return deepcopy(approved_preview)
@@ -314,3 +334,101 @@ def _unresolved_scope(bundle: dict[str, Any]) -> dict[str, Any]:
 
 def preview_approval_operation(preview_id: str, bundle: dict[str, Any]) -> dict[str, Any]:
     return {"preview_id": preview_id, "bundle": bundle}
+
+
+def _check_consent_admission(preview_id: str, bundle: dict[str, Any],
+                             decision: ApprovalDecision | None, evidence: ConsentAdmissionEvidence) -> None:
+    projection = evidence.projection
+    if (projection.preview_id != preview_id or projection.decision != decision or
+            projection.input_digest != snapshot_digest(bundle) or
+            projection.operation_digest != snapshot_digest(preview_approval_operation(preview_id, bundle))):
+        raise PermissionError("Consent admission must bind the exact preview, bundle and decision")
+
+
+class ConsentTaskAdmission:
+    """Opt-in exact task admission; profile/source readers must be trusted operator adapters."""
+
+    def __init__(self, *, previews: DeveloperPreviewRegistry, store: FileConsentStore,
+                 profile: ConsentProfile, read_profile: Callable[[], ConsentProfile],
+                 read_source: Callable[[HumanConsent], ConsentSource | None]) -> None:
+        self._previews = previews
+        self._store = store
+        self._profile = ConsentProfile.model_validate(profile.model_dump(mode="json"))
+        required = {ApprovalStage.TASK_ADMISSION, ApprovalStage.DEVELOPER_TOOLS,
+                    ApprovalStage.DRAFT_PUBLICATION, ApprovalStage.REVIEW_PUBLICATION}
+        if (ConsentBundle.TASK_DELIVER not in self._profile.bundles or
+                not required.issubset(self._profile.stages) or
+                any(self._profile.policy.mode(stage) != "automatic" for stage in required)):
+            raise PermissionError("Task consent admission requires its configured automatic delivery profile")
+        self._read_profile = read_profile
+        self._read_source = read_source
+
+    def _current_profile(self) -> ConsentProfile:
+        profile = ConsentProfile.model_validate(self._read_profile().model_dump(mode="json"))
+        if profile != self._profile:
+            raise PermissionError("Task consent profile changed during admission")
+        return profile
+
+    def approve(self, projection: ConsentProjection) -> DeveloperPreview:
+        projection = ConsentProjection.model_validate(projection.model_dump(mode="json"))
+        consent = self._store.get_consent(projection.consent_id)
+        if consent is None:
+            raise PermissionError("Task admission requires saved accepted human consent")
+        presentation = self._store.get_presentation(consent.presentation_id)
+        if presentation is None or presentation.bundle != ConsentBundle.TASK_DELIVER:
+            raise PermissionError("This adapter supports only exact task-delivery consent")
+        profile = self._current_profile()
+        profile.check(presentation)
+        evidence = ConsentAdmissionEvidence(consent=consent, projection=projection)
+        preview = self._previews.get(projection.preview_id)
+        if preview is None:
+            raise PermissionError("Consented preview is missing")
+        bundle = deepcopy(preview.bundle_payload)
+        context = bundle.get("issue_context")
+        if not isinstance(context, dict):
+            raise PermissionError("Task consent requires an exact repository issue")
+        if context.get("base_revision") not in {None, presentation.base_revision}:
+            raise PermissionError("Task consent base differs from the frozen presentation")
+        context["base_revision"] = presentation.base_revision
+        task = developer_task_bundle_from_payload(bundle)
+        if (context.get("repository"), context.get("repository_id")) != (profile.repository, profile.repository_id):
+            raise PermissionError("Task consent repository differs from the configured target")
+        if (task.policy.max_file_changes > presentation.limits.max_changed_paths or
+                task.policy.max_runtime_minutes * 60 > presentation.limits.max_seconds):
+            raise PermissionError("Task budget exceeds its advertised consent limits")
+        item = presentation.items[0]
+        if (item.content_digest != snapshot_digest(bundle) or
+                projection.item_keys != (item.key,) or
+                presentation.prepared_digest != snapshot_digest(preview_approval_operation(preview.preview_id, bundle))):
+            raise PermissionError("Task consent differs from its frozen preview scope")
+        _check_consent_admission(preview.preview_id, bundle, projection.decision, evidence)
+        if preview.approved and preview.consent_approval != evidence:
+            raise PermissionError("Existing task approval cannot acquire a different consent")
+        self._store.record_projection(projection, profile=self._current_profile(),
+                                      current_source=self._read_source(consent))
+        saved = self._store.check_projection(projection.projection_id, profile=self._current_profile(),
+                                             current_source=self._read_source(consent))
+        if saved != projection:
+            raise PermissionError("Task admission projection changed before approval")
+        approved = self._previews._approve_admission(preview.preview_id, base_revision=presentation.base_revision,
+                                          approval_policy=projection.decision, consent_approval=evidence)
+        if approved is None:
+            raise PermissionError("Consented preview disappeared before admission")
+        return approved
+
+    def reconcile(self, projection_id: str) -> DeveloperPreview | None:
+        """Inspect landed approval metadata without revalidating or consuming live authority."""
+        projection = self._store.get_projection(projection_id)
+        if projection is None:
+            return None
+        consent = self._store.get_consent(projection.consent_id)
+        if consent is None:
+            raise PermissionError("Admission projection lost its accepted human consent")
+        evidence = ConsentAdmissionEvidence(consent=consent, projection=projection)
+        preview = self._previews.get(projection.preview_id)
+        if preview is None or not preview.approved:
+            return None
+        _check_consent_admission(preview.preview_id, preview.bundle_payload, preview.approval_policy, evidence)
+        if preview.consent_approval != evidence:
+            raise PermissionError("Saved admission differs from its consent projection")
+        return preview

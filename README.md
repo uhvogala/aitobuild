@@ -212,6 +212,23 @@ receipt-backed independent PM children and review/correction follow-ups; this is
 not automatic dependency scheduling or a complete unattended lifecycle. Existing supervised live
 acceptance does not establish live automatic-mode or hosted/distributed acceptance.
 
+A consent evidence foundation is available in
+[src/aitobuild/approval_consent.py](src/aitobuild/approval_consent.py). Its strict
+profiles, presentations and human/projection records use a private, locked,
+atomic journal. Initialize `FileConsentStore(path, create=True)` only for a new
+store; reopen initialized stores with the default `create=False`, which refuses
+missing state. Source/profile inputs require trusted adapters.
+
+The opt-in `ConsentTaskAdmission` adapter in
+[src/aitobuild/developer_preview.py](src/aitobuild/developer_preview.py) can approve
+one exact frozen repository-issue preview from saved human consent. It requires
+trusted current-profile/source readers, journals the projection before approval
+and persists the human evidence with the preview. Its reconciliation is read-only.
+It is not registered with service/worker factories or HTTP endpoints and does not
+authenticate GitHub users, execute graphs or activate single-consent delivery.
+Discussions intake, PM consent projection and runtime grant/revocation/aggregate
+usage enforcement remain planned; those bindings are required before activation.
+
 ### Organization definition foundation
 
 [config/organization.example.json](config/organization.example.json) describes
