@@ -21,6 +21,7 @@ from aitobuild.app import create_app
 from aitobuild.config import RepositorySourceConfig, load_config
 from aitobuild.developer_isolation import IsolationTool, build_developer_task_bundle, default_developer_isolation_policy
 from aitobuild.runtime import FrameworkAvailability, FrameworkBindings, RuntimeBootstrap
+from conftest import approve_preview
 
 
 def _signature(secret: str, payload: bytes) -> str:
@@ -1751,7 +1752,7 @@ def test_native_developer_approval_executes_only_the_saved_operation(
             preview = dispatcher.developer_preview_registry.create_or_get(
                 dedupe_key="native-scoped-write", bundle_payload=bundle.to_payload(), source_payload={},
             )
-            dispatcher.developer_preview_registry._approve_admission(preview.preview_id)
+            approve_preview(dispatcher.developer_preview_registry, preview.preview_id)
             preview_id = preview.preview_id
             monkeypatch.setattr(app_module, "DispatcherAgent", lambda **kwargs: dispatcher)
         first = _create_app_with_fake_agent(test_config, monkeypatch, native_agent())
@@ -1856,7 +1857,7 @@ def test_native_task_uses_only_an_approved_persisted_preview(
         dedupe_key="native-task", bundle_payload=bundle.to_payload(), source_payload={},
     )
     if approved:
-        dispatcher.developer_preview_registry._approve_admission(preview.preview_id)
+        approve_preview(dispatcher.developer_preview_registry, preview.preview_id)
     monkeypatch.setattr(app_module, "DispatcherAgent", lambda **kwargs: dispatcher)
     original_builder = app_module.build_role_tools
     policies = []

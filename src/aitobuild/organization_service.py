@@ -68,9 +68,10 @@ def admit_task(previews: DeveloperPreviewRegistry, preview_id: str, evidence: Ad
                base_revision: str | None = None, decision: ApprovalDecision | None = None,
                max_automatic_admissions: int | None = None,
                expected: DeveloperPreview | None = None) -> DeveloperPreview | None:
-    """The only caller of DeveloperPreviewRegistry._approve_admission (PLAN 2.4); `expected` is the exact preview
-    the configured checks evaluated and must equal the stored one, since the decision digest omits source_payload. Configured evidence is checked by
-    OrganizationService.admit_task first; the limit and dedupe follow the resolved decision source."""
+    """The only caller of DeveloperPreviewRegistry._approve_admission (PLAN 2.4). Configured evidence is checked by
+    ManagedOrganizationService._admit first; `expected` is the exact preview those checks evaluated and must equal
+    the stored one, since the decision digest omits source_payload. The limit and dedupe follow the resolved
+    decision source."""
     match evidence:
         case Human():
             if decision is not None or base_revision is not None:
@@ -82,8 +83,8 @@ def admit_task(previews: DeveloperPreviewRegistry, preview_id: str, evidence: Ad
         case _:
             assert_never(evidence)
     limit = max_automatic_admissions if decision is not None and decision.source == "operator_policy" else None
-    return previews._approve_admission(preview_id, base_revision=base_revision, approval_policy=decision, expected=expected,
-                            max_automatic_admissions=limit)
+    return previews._approve_admission(preview_id, base_revision=base_revision, approval_policy=decision,
+                                       expected=expected, max_automatic_admissions=limit)
 
 
 class ManagedRoute(DefinitionModel):

@@ -16,6 +16,7 @@ from aitobuild.organization_runner import FileRunStore, ManagedOperation, Workfl
 from aitobuild.organization_worker import FileWorkerStore, ManagedOrganizationWorker
 from test_dispatcher import approved_delivery as approved_delivery
 from test_organization_runner import _service_fixture
+from conftest import approve_preview
 
 
 def make_worker(tmp_path, approved_delivery, operation=None, **options):
@@ -35,7 +36,7 @@ def other_preview(approved_delivery, *, approve=True):
     payload = json.loads(json.dumps(previews.get(preview_id).bundle_payload))
     payload["task_id"] = "other-worker-task"
     preview = previews.create_or_get(dedupe_key="other-worker-task", bundle_payload=payload, source_payload={})
-    return previews._approve_admission(preview.preview_id, base_revision=revision) if approve else preview
+    return approve_preview(previews, preview.preview_id, base_revision=revision) if approve else preview
 
 
 @pytest.mark.parametrize("kind,value", [("service_approval", True), ("human_input", "answer")])
@@ -326,7 +327,7 @@ def test_followup_queueing_preserves_approval_and_terminal_parent(tmp_path, appr
             assert (await finish(worker, preview_id)).state == "completed"
             before = delivery.budget_path(preview_id).read_bytes()
             if case == "already_failed":
-                approved_delivery[0]._approve_admission(child.preview_id, base_revision=approved_delivery[4])
+                approve_preview(approved_delivery[0], child.preview_id, base_revision=approved_delivery[4])
                 child_job = worker.enqueue(child.preview_id)
                 worker.store.save(child_job.model_copy(update={"state": "failed", "error": "Saved terminal failure"}))
             await asyncio.wait_for(discovered.wait(), timeout=5)

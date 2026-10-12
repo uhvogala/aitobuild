@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from conftest import approve_preview
 from dataclasses import replace
 from hashlib import sha256
 import json
@@ -59,7 +60,7 @@ def correction_chain(implemented_delivery, verification_adapter, monkeypatch):
             "correction_from_review": review_id,
             "published_review": {"preview_id": target_id, "head_sha": target.publication["head_sha"]},
         })
-        worker._previews._approve_admission(preview.preview_id)
+        approve_preview(worker._previews, preview.preview_id)
         record = worker.prepare(preview.preview_id)
         assert record.state == "prepared", record.error
         parsed = developer_task_bundle_from_payload(record.bundle_payload)

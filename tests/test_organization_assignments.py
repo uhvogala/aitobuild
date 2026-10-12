@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from conftest import approve_preview
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -119,7 +120,7 @@ def approved_task(tmp_path, previews, task="task-one", approve=True, budget=True
         dedupe_key="delivery-" + task, bundle_payload=bundle.to_payload(), source_payload={}, task_key=task,
     )
     if approve:
-        preview = previews._approve_admission(preview.preview_id, base_revision="a" * 40)
+        preview = approve_preview(previews, preview.preview_id, base_revision="a" * 40)
     if budget:
         DeveloperTaskBudget(path=tmp_path / "budgets" / (preview.preview_id + ".json"),
                             bundle=developer_task_bundle_from_payload(preview.bundle_payload))

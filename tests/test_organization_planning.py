@@ -29,6 +29,7 @@ from aitobuild.organization_service import ManagedOrganizationService
 from aitobuild.tools.github import GhCliGitHubAdapter, MockGitHubAdapter
 from test_dispatcher import approved_delivery as approved_delivery
 from test_dispatcher import verification_adapter as verification_adapter
+from conftest import approve_preview
 
 
 @pytest.mark.parametrize("case", ["merged", "draft", "closed_unmerged", "head", "fork", "base", "branch_head", "missing_merge",
@@ -228,7 +229,7 @@ def test_native_planning_exact_publication_restart_and_unapproved_handoff(tmp_pa
                 service, planning, _, preview, previews, github, restart, policy = planning_fixture(tmp_path, profile, approved_delivery[1])
                 assert await service.consume(preview.preview_id) is None
                 assert not planning.admission.budget_path(preview.preview_id).exists()
-                previews._approve_admission(preview.preview_id)
+                approve_preview(previews, preview.preview_id)
                 if detached:
                     from aitobuild.organization_worker import FileWorkerStore, ManagedOrganizationWorker
 
@@ -312,7 +313,7 @@ def test_native_pm_automatic_create_and_exact_resolved_links(tmp_path, approved_
                 profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
                 service, planning, _, preview, previews, github, restart, _ = planning_fixture(
                     tmp_path, profile, approved_delivery[1], approval_policy=policy)
-                previews._approve_admission(preview.preview_id)
+                approve_preview(previews, preview.preview_id)
                 checked = []
 
                 def effect(method, stage):
@@ -378,7 +379,7 @@ def test_pm_independent_followup_queueing_retains_separate_task_admission(tmp_pa
                     tmp_path, profile, approved_delivery[1], previews=approved_delivery[0], repository="fixture/widgets", repository_id=101,
                     base_revision=approved_delivery[4], approval_policy=policy, implementation_followups=True,
                     handoff_operation=ManagedOperation(lambda context, message: calls.append(context.assignment.preview_id) or "done"))
-                previews._approve_admission(preview.preview_id)
+                approve_preview(previews, preview.preview_id)
                 background = ManagedOrganizationWorker(service=service, store=FileWorkerStore(tmp_path / "pm-followups.json"),
                                                        queue_follow_ups=True, poll_seconds=0.01)
                 scanned = asyncio.Event()
@@ -461,7 +462,7 @@ def test_pm_independent_followup_refuses_changed_or_incomplete_evidence(tmp_path
                     tmp_path, profile, approved_delivery[1], previews=approved_delivery[0], repository="fixture/widgets", repository_id=101,
                     base_revision=approved_delivery[4], approval_policy=policy, implementation_followups=True,
                     handoff_operation=ManagedOperation(lambda context, message: calls.append("implementation")))
-                previews._approve_admission(preview.preview_id)  # planning always needs a human admission
+                approve_preview(previews, preview.preview_id)  # planning always needs a human admission
                 run = await service.consume(preview.preview_id)
                 assert run.state == "completed" and run.cleanup_succeeded is True, run.error
                 first_id, dependent_id = run.outputs[0]["developer_previews"]
@@ -528,13 +529,13 @@ def test_dependency_handoff_stages_only_immutable_unapproved_scope(tmp_path, app
             async with AsyncOpenAI(api_key="test", http_client=transport) as client:
                 profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
                 service, planning, _, preview, previews, github, restart, _ = planning_fixture(tmp_path, profile, approved_delivery[1])
-                previews._approve_admission(preview.preview_id)
+                approve_preview(previews, preview.preview_id)
                 run = await service.consume(preview.preview_id)
                 run = await service.decide(run.assignment_id, request_id=run.pending[0].request_id, approved=True)
                 run = await service.decide(run.assignment_id, request_id=run.pending[0].request_id, approved=True)
                 assert run.state == "completed", run.error
                 first_id, second_id = run.outputs[0]["developer_previews"][:2]
-                parent = previews._approve_admission(first_id)
+                parent = approve_preview(previews, first_id)
                 original = previews.get(second_id)
                 frozen_source = json.dumps(original.bundle_payload, sort_keys=True)
                 pm_budget = service.budget_path(preview.preview_id).read_bytes()
@@ -568,7 +569,7 @@ def test_dependency_handoff_stages_only_immutable_unapproved_scope(tmp_path, app
                 elif case == "cleanup":
                     delivery = replace(delivery, verification={"cleanup_succeeded": False, "commands": [{"exit_code": 0}]})
                 elif case == "original_approved":
-                    previews._approve_admission(second_id)
+                    approve_preview(previews, second_id)
 
                 def manager():
                     return ManagedDependencies(planning=restart()[1], worker=approved_delivery[1], state_dir=tmp_path / "dependency-handoffs", routes=(route,))
@@ -646,7 +647,7 @@ def test_dependency_handoff_stages_only_immutable_unapproved_scope(tmp_path, app
                                 else:
                                     manager().offer(**arguments)
                         else:
-                            previews._approve_admission(fresh.preview_id)
+                            approve_preview(previews, fresh.preview_id)
                             assert manager().route_for(previews.get(fresh.preview_id)) == route
                             assert not approved_delivery[1].budget_path(fresh.preview_id).exists()
                             if case == "chain":
@@ -694,7 +695,7 @@ def test_native_planning_fails_closed_without_writes_or_model_replay(tmp_path, a
                 profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
                 service, planning, roles, preview, previews, github, restart, _ = planning_fixture(
                     tmp_path, profile, approved_delivery[1], limits=PlanningLimits(max_issues=1 if case == "limit" else 8))
-                previews._approve_admission(preview.preview_id)
+                approve_preview(previews, preview.preview_id)
                 if case == "repository":
                     github.repository_ids["example/target"] = 99
                 waiting = await service.consume(preview.preview_id)
@@ -766,7 +767,7 @@ def test_uncertain_issue_writes_reconcile_read_only_without_duplicate_creation(t
             async with AsyncOpenAI(api_key="test", http_client=transport) as client:
                 profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
                 service, planning, _, preview, previews, github, restart, _ = planning_fixture(tmp_path, profile, approved_delivery[1])
-                previews._approve_admission(preview.preview_id)
+                approve_preview(previews, preview.preview_id)
                 waiting = await service.consume(preview.preview_id)
                 assert waiting.state == "waiting", waiting.error
                 original_create, original_update = github.create_issue, github.update_issue
@@ -875,7 +876,7 @@ def test_planning_admission_keeps_original_scope_and_ledger(tmp_path, approved_d
     admission = planning.admission
     request = admission.request_for(preview.preview_id)
     path = admission._path(str(preview.bundle_payload["task_id"]))
-    previews._approve_admission(preview.preview_id)
+    approve_preview(previews, preview.preview_id)
     admission.prepare(preview.preview_id)
     ledger = admission.budget_path(preview.preview_id)
     initial = ledger.read_bytes()
@@ -930,7 +931,7 @@ def test_partial_developer_staging_recovers_metadata_without_repeating_writes(tm
             async with AsyncOpenAI(api_key="test", http_client=transport) as client:
                 profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
                 service, planning, _, preview, previews, github, restart, _ = planning_fixture(tmp_path, profile, approved_delivery[1])
-                previews._approve_admission(preview.preview_id)
+                approve_preview(previews, preview.preview_id)
                 waiting = await service.consume(preview.preview_id)
                 create = previews.create_or_get
                 calls = []
@@ -1074,7 +1075,7 @@ def test_dependency_http_offer_and_approval_fail_closed(tmp_path, test_config, m
             assert http.post("/internal/developer/preview/approve", headers=headers, json={"preview_id": second_id}).status_code == 409
             assert not registry.get(second_id).approved
             assert http.post("/internal/developer/delivery/prepare", headers=headers, json={"preview_id": second_id}).status_code == 409
-            parent = registry._approve_admission(first_id)
+            parent = approve_preview(registry, first_id)
             raw = {"number": 7, "state": "closed", "draft": False, "merged": True,
                    "head": {"sha": "d" * 40, "ref": "aitobuild/issue-1", "repo": {"id": 1, "full_name": "example/target"}},
                    "base": {"ref": "main", "repo": {"id": 1, "full_name": "example/target"}}, "merge_commit_sha": "c" * 40,
@@ -1134,13 +1135,13 @@ def test_dependency_admission_uses_real_pinned_checkout_and_separate_budget(tmp_
                 service, planning, _, preview, previews, github, restart, _ = planning_fixture(tmp_path, profile, delivery,
                     previews=registry, dependencies_enabled=True, repository="fixture/widgets", repository_id=101,
                     base_revision=base, handoff_operation=ManagedOperation(probe))
-                registry._approve_admission(preview.preview_id)
+                approve_preview(registry, preview.preview_id)
                 run = await service.consume(preview.preview_id)
                 for _ in range(2):
                     run = await service.decide(run.assignment_id, request_id=run.pending[0].request_id, approved=True)
                 assert run.state == "completed", run.error
                 first_id, original_id = run.outputs[0]["developer_previews"]
-                registry._approve_admission(first_id)
+                approve_preview(registry, first_id)
                 parent = delivery.prepare(first_id)
                 bundle = developer_task_bundle_from_payload(parent.bundle_payload)
                 budget = DeveloperTaskBudget(path=delivery.budget_path(first_id), bundle=bundle, create=False)
@@ -1181,7 +1182,7 @@ def test_dependency_admission_uses_real_pinned_checkout_and_separate_budget(tmp_
                     staged = fresh.offer(**arguments)
                     fresh_id = staged["handoff_preview"]["preview_id"]
                     assert not registry.get(fresh_id).approved and not fresh_worker.budget_path(fresh_id).exists()
-                    registry._approve_admission(fresh_id)
+                    approve_preview(registry, fresh_id)
                     assert fresh.route_for(registry.get(fresh_id)) is not None
                     assert fresh_worker.prepare(fresh_id).base_revision == merged
                     assert fresh_worker.budget_path(fresh_id) != delivery.budget_path(first_id)
@@ -1196,7 +1197,7 @@ def test_dependency_admission_uses_real_pinned_checkout_and_separate_budget(tmp_
                 fresh_id = staged["handoff_preview"]["preview_id"]
                 assert await service.consume(fresh_id) is None and not delivery.budget_path(fresh_id).exists()
                 await service.check_preview_approval(fresh_id)
-                registry._approve_admission(fresh_id)
+                approve_preview(registry, fresh_id)
                 selection = AssignmentProposal(agent_id="developer_one", rationale="Fresh explicit dependent implementation approval")
                 service = restart()[0]
                 if mode == "direct":
@@ -1240,7 +1241,7 @@ def test_resolved_dependency_approval_cannot_be_bypassed(tmp_path, approved_deli
             async with AsyncOpenAI(api_key="test", http_client=transport) as client:
                 profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
                 service, planning, roles, preview, previews, github, restart, _ = planning_fixture(tmp_path, profile, approved_delivery[1])
-                previews._approve_admission(preview.preview_id)
+                approve_preview(previews, preview.preview_id)
                 waiting = await service.consume(preview.preview_id)
                 links = await service.decide(waiting.assignment_id, request_id=waiting.pending[0].request_id, approved=True)
                 assert links.state == "waiting"
@@ -1363,7 +1364,7 @@ def test_native_plan_reminder_turn_reuses_the_single_run_and_session(tmp_path, a
             async with AsyncOpenAI(api_key="test", http_client=transport) as client:
                 profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
                 service, planning, roles, preview, previews, github, restart, _ = planning_fixture(tmp_path, profile, approved_delivery[1])
-                previews._approve_admission(preview.preview_id)
+                approve_preview(previews, preview.preview_id)
                 waiting = await service.consume(preview.preview_id)
                 assert waiting.state == "waiting", waiting.error
                 session = await roles._sessions.get(waiting.session_id)
@@ -1401,7 +1402,7 @@ def test_native_plan_text_is_never_parsed_and_reminder_respects_deadline(tmp_pat
             async with AsyncOpenAI(api_key="test", http_client=transport) as client:
                 profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
                 service, planning, roles, preview, previews, github, restart, _ = planning_fixture(tmp_path, profile, approved_delivery[1])
-                previews._approve_admission(preview.preview_id)
+                approve_preview(previews, preview.preview_id)
                 run = await service.consume(preview.preview_id)
                 assert run.state == "failed", run.error
                 assert ("did not submit" if scenario == "json_text_only" else "TimeoutError") in run.error, run.error
@@ -1451,9 +1452,9 @@ def test_planned_child_qualifies_only_through_human_planning_and_issue_creation(
                 if case == "planning_operator_policy":
                     decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="operator", automatic_supported=True,
                                               operation=preview_approval_operation(preview.preview_id, preview.bundle_payload))
-                    previews._approve_admission(preview.preview_id, approval_policy=decision)
+                    approve_preview(previews, preview.preview_id, approval_policy=decision)
                 else:
-                    previews._approve_admission(preview.preview_id)  # the human planning admission
+                    approve_preview(previews, preview.preview_id)  # the human planning admission
                 run = await service.consume(preview.preview_id)
                 if run.state == "waiting":
                     run = await service.decide(run.assignment_id, request_id=run.pending[0].request_id, approved=True)
@@ -1548,11 +1549,11 @@ def test_per_issue_dedupe_covers_planned_and_dependent_handoffs(tmp_path, prefix
     def decide(preview):
         return policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="operator", automatic_supported=True,
                               operation=preview_approval_operation(preview.preview_id, preview.bundle_payload))
-    assert previews._approve_admission(first.preview_id, approval_policy=decide(first), max_automatic_admissions=32).approved
+    assert approve_preview(previews, first.preview_id, approval_policy=decide(first), max_automatic_admissions=32).approved
     with pytest.raises(AutomaticAdmissionDeferred):
-        previews._approve_admission(second.preview_id, approval_policy=decide(second), max_automatic_admissions=32)
+        approve_preview(previews, second.preview_id, approval_policy=decide(second), max_automatic_admissions=32)
     assert not previews.get(second.preview_id).approved
-    assert previews._approve_admission(second.preview_id).approved  # a human can still admit it
+    assert approve_preview(previews, second.preview_id).approved  # a human can still admit it
 
 
 @pytest.mark.parametrize("case", ["approved_at", "unpublished", "missing_digest", "legacy_human", "no_source", "no_pinned_base",
@@ -1572,7 +1573,7 @@ def test_planned_child_pins_and_sources_fail_closed(tmp_path, approved_delivery,
                     tmp_path, profile, approved_delivery[1], previews=approved_delivery[0], repository="fixture/widgets", repository_id=101,
                     base_revision=approved_delivery[4], approval_policy=policy, implementation_followups=True,
                     handoff_operation=ManagedOperation(lambda context, message: None))
-                previews._approve_admission(preview.preview_id)
+                approve_preview(previews, preview.preview_id)
                 run = await service.consume(preview.preview_id)
                 run = await service.decide(run.assignment_id, request_id=run.pending[0].request_id, approved=True)
                 assert run.state == "completed", run.error

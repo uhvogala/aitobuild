@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from conftest import approve_preview
 import asyncio
 from dataclasses import replace
 import json
@@ -306,7 +307,7 @@ def test_native_coordinator_receipt_recovery_keeps_original_admission_pins(tmp_p
                 payload = json.loads(json.dumps(previews.get(preview_id).bundle_payload))
                 payload["task_id"] = "second-coordinated-task"
                 second = previews.create_or_get(dedupe_key="second", bundle_payload=payload, source_payload={})
-                second = previews._approve_admission(second.preview_id, base_revision=revision)
+                second = approve_preview(previews, second.preview_id, base_revision=revision)
                 with pytest.raises(ValueError, match="capacity"):
                     await service.consume(second.preview_id)
                 assert assignments.for_task("second-coordinated-task") is None
@@ -747,7 +748,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                     assert developer_budget.read_bytes() == before_developer
                     return
                 assert await current.consume(staged.preview_id) is None and not bodies
-                preview = previews._approve_admission(staged.preview_id)
+                preview = approve_preview(previews, staged.preview_id)
                 if detached:
                     background = ManagedOrganizationWorker(service=current, store=FileWorkerStore(tmp_path / "review-worker.json"))
                     assert background.enqueue(preview.preview_id).state == "queued"
@@ -797,7 +798,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         with pytest.raises(PermissionError, match="disabled"):
                             await service().offer_correction(preview.preview_id)
                         correction = reviews.offer_correction(preview.preview_id, done)
-                        previews._approve_admission(correction.preview_id)
+                        approve_preview(previews, correction.preview_id)
                         with pytest.raises(PermissionError, match="disabled"):
                             service().admission(correction.preview_id)
                         assert worker.get(correction.preview_id) is None
@@ -944,7 +945,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         refused_retire = client.post(operator_calls[2][0], headers=headers, json=operator_calls[2][1])
                         assert refused_retire.status_code == 409 and "mock reads are refused" in refused_retire.json()["detail"]
                         assert worker._approvals.get(correction.preview_id) is None
-                    previews._approve_admission(correction.preview_id)
+                    approve_preview(previews, correction.preview_id)
                     if native_correcting:
                         original = worker.get(published_id)
                         original_commits = len(github.branch_commits)
@@ -1101,7 +1102,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
 
                             session = await FileSessionStore(tmp_path / "correction-native" / "sessions").get(record.session_id)
                             assert session.state["aitobuild_managed_diagnostics"]
-                        previews._approve_admission(rereview_id)
+                        approve_preview(previews, rereview_id)
                         reviewing = await service().consume(rereview_id)
                         assert reviewing.state == "waiting", reviewing.error
                         reviewed = await service().decide(reviewing.assignment_id, request_id=reviewing.pending[0].request_id, approved=True)
@@ -1256,7 +1257,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                                 with pytest.raises(ValueError, match="attempt chain"):
                                     reviews._load()
                                 journal_path.write_bytes(original_journal)
-                            previews._approve_admission(retry.preview_id)
+                            approve_preview(previews, retry.preview_id)
                             assert (await service().consume(retry.preview_id)).state == "completed"
                             implement_and_verify(retry.preview_id)
                             staged_retry = await service().stage_correction_publication(retry.preview_id)
@@ -1412,7 +1413,7 @@ def test_staged_review_recovery_retains_scope_and_original_ledger(tmp_path, publ
                 admission().route_for(staged.preview_id)
             assert not reviews.budget_path(staged.preview_id).exists()
         else:
-            previews._approve_admission(staged.preview_id)
+            approve_preview(previews, staged.preview_id)
             path = reviews.budget_path(staged.preview_id)
             if scenario == "interrupted_initialization":
                 monkeypatch.setattr("aitobuild.organization_reviews.DeveloperTaskBudget", lambda **kwargs: (_ for _ in ()).throw(OSError("interrupted")))
@@ -1553,7 +1554,7 @@ def test_native_architect_review_requires_inspection_and_exact_saved_approval(
             monkeypatch.setattr(github, "get_blob", context_blob)
     previews = DeveloperPreviewRegistry(tmp_path / "review-previews.json")
     preview = previews.create_or_get(dedupe_key="review", bundle_payload=payload, source_payload={})
-    preview = previews._approve_admission(preview.preview_id, base_revision=publication.base_revision)
+    preview = approve_preview(previews, preview.preview_id, base_revision=publication.base_revision)
     def budget_path_for(preview_id):
         return tmp_path / "review-budgets" / (preview_id + ".json")
     DeveloperTaskBudget(path=budget_path_for(preview.preview_id), bundle=developer_task_bundle_from_payload(preview.bundle_payload))
@@ -2135,12 +2136,12 @@ def test_review_inherits_automatic_admission_only_from_its_admitted_parent(tmp_p
         decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
                                   operation=preview_approval_operation(twin.preview_id, twin.bundle_payload), automatic_supported=True)
         with pytest.raises(AutomaticAdmissionDeferred, match="already had an automatic review"):
-            previews._approve_admission(twin.preview_id, approval_policy=decision, max_automatic_admissions=5)
+            approve_preview(previews, twin.preview_id, approval_policy=decision, max_automatic_admissions=5)
         other_head = previews.create_or_get(dedupe_key="other-head", source_payload={"published_review": {
             "preview_id": published_id, "head_sha": "f" * 40}}, bundle_payload=staged.bundle_payload | {"task_id": "published-review-other"})
         decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
                                   operation=preview_approval_operation(other_head.preview_id, other_head.bundle_payload), automatic_supported=True)
-        assert previews._approve_admission(other_head.preview_id, approval_policy=decision, max_automatic_admissions=5).approved
+        assert approve_preview(previews, other_head.preview_id, approval_policy=decision, max_automatic_admissions=5).approved
         return
     if case == "direct_callback":
         with pytest.raises(PermissionError, match="only through its admitted parent"):
@@ -2196,7 +2197,7 @@ def test_review_inherits_automatic_admission_only_from_its_admitted_parent(tmp_p
                                       bundle_payload=staged.bundle_payload | {"task_id": "published-review-used"})
         decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
                                   operation=preview_approval_operation(used.preview_id, used.bundle_payload), automatic_supported=True)
-        assert previews._approve_admission(used.preview_id, approval_policy=decision, max_automatic_admissions=1).approved
+        assert approve_preview(previews, used.preview_id, approval_policy=decision, max_automatic_admissions=1).approved
     elif case == "parent_without_approval_time":
         patch_get(service._previews, "get", published_id, replace(parent, approved_at=None))
     elif case == "record_for_other_preview":
@@ -2225,3 +2226,39 @@ class SimpleWorker:
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
+
+
+def test_configured_admission_refuses_a_forged_source_payload(tmp_path, published_delivery):
+    """_admit hands admit_task the exact preview it evaluated; a preview whose source_payload was changed after it was
+    stored (the decision digest does not cover source_payload) is refused, never approved against a fresh read."""
+    from aitobuild.app import _configured_task_base
+    from aitobuild.approval_policy import ApprovalPolicy
+    from aitobuild.config import RepositorySourceConfig
+    from aitobuild.organization_reviews import PublishedReviewAdmission, PublishedReviewRoute
+    from aitobuild.organization_service import ManagedOrganizationService
+
+    worker, published_id, _, github, _ = published_delivery
+    definitions, snapshot = review_definition(tmp_path)
+    previews = worker._previews
+    reviews = PublishedReviewAdmission(
+        definitions=definitions, previews=previews, worker=worker, github=github, state_dir=tmp_path / "review-admission",
+        routes=(PublishedReviewRoute(repository="fixture/widgets", repository_id=101, organization_id=snapshot.organization_id,
+                                     revision=snapshot.revision, event="published.review"),))
+    sources = (RepositorySourceConfig("fixture/widgets", 101, "unused", (), None, ("fixture-author",)),)
+
+    async def cleanup(task):
+        return None
+
+    service = ManagedOrganizationService(
+        definitions=definitions, assignments=FileAssignmentStore(tmp_path / "assignments.json"), runs=FileRunStore(tmp_path / "runs"),
+        previews=previews, worker=worker, routes=(), reviews=reviews, operations={}, cleanup=cleanup,
+        operator_id="configured-operator", binding_revision="reviews-v1",
+        approval_policy=ApprovalPolicy(task_admission="automatic", max_automatic_admissions=5),
+        task_base_revision_for=lambda preview: _configured_task_base(preview, sources))
+    staged = reviews.offer(published_id)
+    assert staged is not None and not staged.approved
+    forged = replace(staged, source_payload=staged.source_payload | {"forged": "not in the stored record"})
+    with pytest.raises(PermissionError, match="differs from its stored record"):
+        service._automatic_task_approval(forged)
+    assert not previews.get(staged.preview_id).approved
+    assert service._automatic_task_approval(staged).approved  # the stored preview itself is still admitted
