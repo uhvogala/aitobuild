@@ -6,7 +6,7 @@ from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
-from threading import Barrier, get_ident
+from threading import Barrier, Event
 
 import pytest
 
@@ -363,24 +363,39 @@ def test_task_consent_expiry_blocks_consumption_but_not_metadata_reconciliation(
 
 
 def test_shared_task_consent_admission_consumes_one_projection(task_admission_fixture):
+    """Owner B reads the preview, then pauses until owner A has approved it; B must get A's admission as a replay."""
     store, registry, _, projection, inputs = task_admission_fixture
-    barrier = Barrier(2)
+    b_read, a_done = Event(), Event()
 
-    def admit_from_separate_owner():
-        bridge = ConsentTaskAdmission(service=consent_service(registry._path.parent / f"svc-{get_ident()}", DeveloperPreviewRegistry(registry._path),
-                                                       inputs["profile"].policy),
-                                       store=FileConsentStore(store.path), profile=inputs["profile"],
-                                       read_profile=lambda: inputs["profile"], read_source=lambda _: inputs["source"])
-        barrier.wait(timeout=10)
-        return bridge.approve(projection)
+    def bridge_for(previews, name):
+        return ConsentTaskAdmission(service=consent_service(registry._path.parent / f"svc-{name}", previews,
+                                                            inputs["profile"].policy),
+                                    store=FileConsentStore(store.path), profile=inputs["profile"],
+                                    read_profile=lambda: inputs["profile"], read_source=lambda _: inputs["source"])
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(admit_from_separate_owner) for _ in range(2)]
-        admitted = [future.result(timeout=15) for future in futures]
-    assert admitted[0] == admitted[1]
-    assert admitted[0].approved
+    b_previews = DeveloperPreviewRegistry(registry._path)
+    original_get = b_previews.get
+
+    def get_then_pause(preview_id):
+        preview = original_get(preview_id)
+        if not b_read.is_set():
+            b_read.set()
+            assert a_done.wait(timeout=10)
+        return preview
+
+    b_previews.get = get_then_pause
+    owner_b = bridge_for(b_previews, "b")
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(owner_b.approve, projection)
+        assert b_read.wait(timeout=10)
+        try:
+            first = bridge_for(DeveloperPreviewRegistry(registry._path), "a").approve(projection)
+        finally:
+            a_done.set()
+        replay = pending.result(timeout=15)
+    assert first.approved and replay == first
     assert len(json.loads(store.path.read_text())["record"]["projections"]) == 1
-    assert registry.get(projection.preview_id) == admitted[0]
+    assert registry.get(projection.preview_id) == first
 
 
 @pytest.mark.parametrize("case", ["consent", "digest", "time", "stage", "actor", "policy_source"])
@@ -793,3 +808,74 @@ def test_consent_keeps_the_per_issue_dedupe(task_admission_fixture, earlier):
     with pytest.raises(PermissionError, match="already admitted by consent or automatically"):
         bridge.approve(projection)
     assert not registry.get(projection.preview_id).approved
+
+
+def _consent_args(store, projection):
+    from aitobuild.organization_service import Consent
+
+    evidence = ConsentAdmissionEvidence(consent=store.get_consent(projection.consent_id), projection=projection)
+    return Consent(evidence=evidence, base_revision="c" * 40)
+
+
+def test_replay_still_compares_the_expected_preview(task_admission_fixture):
+    from dataclasses import replace
+
+    from aitobuild.organization_service import admit_task
+
+    store, registry, bridge, projection, _ = task_admission_fixture
+    before = registry.get(projection.preview_id)  # unapproved read, as a concurrent owner would hold it
+    admitted = bridge.approve(projection)
+    consent = _consent_args(store, projection)
+    stripped = replace(admitted, approved=False, approved_at=None, approval_policy=None, consent_approval=None)
+    for expected in (before, stripped):  # differ only in the fields approval writes
+        assert admit_task(registry, projection.preview_id, consent, base_revision="c" * 40,
+                          decision=projection.decision, expected=expected) == admitted
+    forged = replace(before, source_payload=before.source_payload | {"forged": True})
+    with pytest.raises(PermissionError, match="differs from its stored record"):
+        admit_task(registry, projection.preview_id, consent, base_revision="c" * 40, decision=projection.decision,
+                   expected=forged)
+
+
+def test_replay_refuses_a_different_decision(task_admission_fixture):
+    store, registry, bridge, projection, inputs = task_admission_fixture
+    before = registry.get(projection.preview_id)
+    bridge.approve(projection)
+    automatic = _automatic(registry, inputs["profile"].policy, before)
+    with pytest.raises(PermissionError):
+        approve_preview(registry, before.preview_id, base_revision="c" * 40, approval_policy=automatic, expected=before)
+
+
+@pytest.mark.parametrize("case", ["planning", "non_repo", "edited", "human_mode", "pinned_base", "decision_source"])
+def test_service_refuses_consent_for(task_admission_fixture, case):
+    from aitobuild.approval_policy import ApprovalPolicy
+    from aitobuild.organization_service import admit_task
+
+    store, registry, bridge, projection, inputs = task_admission_fixture
+    preview = registry.get(projection.preview_id)
+    service = bridge._service
+    consent = _consent_args(store, projection)
+    bundle = deepcopy(preview.bundle_payload)
+    source = preview.source_payload
+    expected = {"planning": "Planning and non-repository", "non_repo": "Planning and non-repository",
+                "edited": "edited task", "human_mode": "automatic task-admission policy",
+                "pinned_base": "already pinned task base", "decision_source": "live human decision"}[case]
+    if case == "planning":
+        bundle["task_id"] = "pm-planning-" + "0" * 64
+    elif case == "non_repo":
+        bundle.pop("issue_context")
+    elif case == "edited":
+        source = source | {"action": "edited"}
+    elif case == "pinned_base":
+        bundle["issue_context"]["base_revision"] = "d" * 40
+    elif case == "human_mode":
+        service = consent_service(registry._path.parent / "svc-human", registry, ApprovalPolicy())
+    if case == "decision_source":
+        decision = _automatic(registry, inputs["profile"].policy, preview)  # operator_policy, not human
+        with pytest.raises(PermissionError, match=expected):
+            admit_task(registry, preview.preview_id, consent, base_revision="c" * 40, decision=decision, expected=preview)
+        target = preview
+    else:
+        target = registry.create_or_get(dedupe_key="refuse-" + case, bundle_payload=bundle, source_payload=source)
+        with pytest.raises(PermissionError, match=expected):
+            service.admit_consent(target, consent)
+    assert not registry.get(target.preview_id).approved

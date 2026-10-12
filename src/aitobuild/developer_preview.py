@@ -92,6 +92,21 @@ def _review_identity(bundle: dict[str, Any], source: dict[str, Any]) -> tuple[ob
     return (target.get("preview_id"), target.get("head_sha")) if isinstance(target, dict) else ("", "")
 
 
+def _matches_apart_from_approval(stored: DeveloperPreview, expected: DeveloperPreview | None) -> bool:
+    """Whether `expected` (read before another owner approved) is the stored preview apart from the fields that
+    approval writes: approved/approved_at/approval_policy/consent_approval, dispatched_at, and the base revision
+    approval pins into an unpinned issue bundle. Everything else, including source_payload, must be identical."""
+    if expected is None:
+        return True
+    bundle = deepcopy(expected.bundle_payload)
+    context, saved = bundle.get("issue_context"), stored.bundle_payload.get("issue_context")
+    if isinstance(context, dict) and isinstance(saved, dict) and context.get("base_revision") is None:
+        context["base_revision"] = saved.get("base_revision")
+    return replace(expected, bundle_payload=bundle, approved=stored.approved, approved_at=stored.approved_at,
+                   approval_policy=stored.approval_policy, consent_approval=stored.consent_approval,
+                   dispatched_at=stored.dispatched_at) == stored
+
+
 class AutomaticAdmissionDeferred(PermissionError):
     """Automatic admission does not apply; the preview stays unapproved and waits for a human approval."""
 
@@ -234,6 +249,11 @@ class DeveloperPreviewRegistry:
             preview = self._by_id.get(preview_id)
             if preview is None:
                 return None
+            if (preview.approved and approval_policy is not None and preview.approval_policy == approval_policy
+                    and preview.consent_approval == consent_approval and _matches_apart_from_approval(preview, expected)):
+                # Exact replay of an admission another owner already landed (same decision, same consent): return it
+                # before the expected-equality check, which a concurrent owner's earlier read would otherwise fail.
+                return deepcopy(preview)
             if expected is not None and preview != expected:
                 raise PermissionError("Admitted preview differs from its stored record")
             bundle = deepcopy(preview.bundle_payload)

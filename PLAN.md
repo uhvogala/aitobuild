@@ -517,7 +517,8 @@ resolves the decision with `ApprovalPolicy.resolve`, and passes the exact previe
 it evaluated; `admit_task` refuses unless that preview equals the stored one,
 since the decision digest does not cover `source_payload`. The automatic
 admission limit and dedupe depend on the resolved decision source, not on the
-evidence variant. A new admission source (for example Discussions consent from
+evidence variant, with one deliberate exception for `Consent` evidence (its
+per-issue dedupe, described below). A new admission source (for example Discussions consent from
 #42) adds an evidence variant and its checks to this route; it must not reach
 `_approve_admission` itself or add a parallel path. Changing the route itself
 requires an explicit update to this section first.
@@ -1284,9 +1285,9 @@ are unchanged. The opt-in exact-task bridge below begins consent-to-decision
 integration; complete runtime binding and single-consent PM publication remain
 pending.
 
-Validation on the pulled `b5d494e` baseline: focused consent/policy checks passed,
-then the full suite passed with 1,370 tests and two skips, Ruff passed and mypy
-passed for 54 source files. The mock copied-fixture report at
+Validation on the rebased `f7918b7` baseline (2026-10-12): focused consent/policy
+checks passed, then the full suite passed twice with 1,477 tests and two skips,
+Ruff passed and mypy passed for 55 source files. The mock copied-fixture report at
 `/tmp/aitobuild-consent-foundation-simulation-report.json` records `succeeded=true`,
 accepted execution, generated artifact and integer command exit 0; no persistent
 session started or remained active. No dependencies, live model/GitHub writes,
@@ -1334,10 +1335,9 @@ adapter does not turn registered ordinary callbacks into consent-aware callbacks
 Validation: 81 consent checks passed, including restart/dispatch, journal-before-
 approval ordering, shared-store contention, scope/target/base/budget/policy refusals,
 publication-only refusal, post-save drift, corruption, expiry and lost-response
-metadata recovery. Ruff and mypy passed. The full run had 1,416 passes, two skips
-and the existing worker cancellation lock failure targeted by pending #36; its
-isolated rerun passed. That full-run failure is not reported as a green gate, and
-the worker was not modified or its pending fix merged. The mock copied-fixture
+metadata recovery. Ruff and mypy passed. On the rebased `f7918b7` baseline, which includes the merged
+#36 cancellation fix,  consent tests and the full suite (1,477 passes, two
+skips) passed in two consecutive runs. The mock copied-fixture
 report at `/tmp/aitobuild-consent-admission-simulation-report.json` records accepted
 execution, a generated artifact, integer command exit 0 and `succeeded=true`;
 session mode was off and `active_session_id=null`. No dependencies, live external
