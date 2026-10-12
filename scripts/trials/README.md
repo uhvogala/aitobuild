@@ -25,8 +25,28 @@ One service run drives the whole cycle through the authenticated ASGI app
    then `/publish`, `correction` stage). Publication stages the re-review.
 9. Operator approves the re-review task and its exact COMMENT.
 
-All approval stages stay `human`; the harness refuses to start otherwise. Any failure is recorded,
+**Unreviewed approvals:** in human mode the harness approves EVERY pending human-stage request,
+including each Developer tool request (file edits, writes and shell commands), automatically and without a
+person looking at it. Each decision is recorded with its stage, timestamp and a digest/preview of the exact
+data so it can be audited after the run, but nothing is inspected before approval. Use it only on the
+disposable target.
+
+All approval stages stay `human` by default, and the harness refuses to start with any other policy. Any failure is recorded,
 not retried: re-run from a fresh issue instead of replaying writes or resetting budgets.
+
+### Automatic mode (trial 1)
+
+`--approval-mode automatic` binds the central policy (`AITOBUILD_APPROVAL_*` overrides read by
+`load_config()`, passed unchanged to `ManagedOrganizationService`, plus `task_base_revision_for` with an
+operator-pinned `base_revision` on the seed source). Only `task_admission` and `developer_tools` may be
+automatic (`--automatic-stage` narrows the set). Any other stage is refused before anything is created.
+`draft_publication`, `review_publication`, `correction` and the rest stay `human`, and `merge` stays `disabled`.
+In this mode the harness never approves admission or tool requests. If a policy-automatic stage waits for a
+human, that is recorded as a stall and the run stops. The signed webhook does not dispatch an unapproved
+preview, so when no worker picked the root task up, the harness sends `POST /internal/organization/tasks/run`
+and records it as an operator trigger (it carries no approval). After the run it reads the saved previews and
+runs and records whether each decision came from `operator_policy` or `human`. It also records the policy
+revision pin and the count against `max_automatic_decisions`.
 
 ### Prerequisites
 
@@ -41,9 +61,11 @@ not retried: re-run from a fresh issue instead of replaying writes or resetting 
 
 ```bash
 .venv/bin/python scripts/trials/correction_cycle.py --sudo-docker \
-	[--repository uhvogala/aitobuild_example] [--model grok-4.6] [--work-root /workspace/trials]
+	[--approval-mode human|automatic] [--model grok-4.6] [--work-root /workspace/trials]
 ```
 
+The target is locked to `uhvogala/aitobuild_example`. Any other `--repository` needs
+`--allow-other-repository`. `--poll-seconds`, `--stage-timeout` and `--invoke-timeout` must be positive.
 `--work-root` must be outside the service checkout. Each run creates:
 
 - `<work-root>/runs/trial3-<stamp>/seed`: private clone of the target used as the trusted seed.
@@ -52,6 +74,13 @@ not retried: re-run from a fresh issue instead of replaying writes or resetting 
 - `<work-root>/runs/trial3-<stamp>/state`: service state (previews, ledgers, deliveries, sessions).
 - `<work-root>/artifacts/trial3-<stamp>/report.json` and `events.jsonl`: approvals (stage, request,
   timestamp, digest of the exact approved data), manual steps, stalls, PR/issue links and the result.
+
+Shared pieces (`Recorder`, `Operator`, environment setup, policy checks, evidence collection) live in
+`scripts/trials/common.py` for reuse by later trials.
+
+Cleanup: `runs/<trial>/` holds seeds, service clones, private checkouts and agent sessions (hundreds of MB).
+Once the report has been checked, remove it with `rm -rf <work-root>/runs/<trial>`. Keep
+`artifacts/<trial>/`. Trial issues and draft PRs on the target are left open for inspection.
 
 Webhook secret and internal token are random per run and never written to disk. Nothing here
 merges, closes or force-pushes anything.
