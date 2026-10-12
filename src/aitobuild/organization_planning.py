@@ -411,6 +411,10 @@ class ManagedPlanning:
                 "dependency_publication": "Resolved dependency links require a separate exact operator approval",
                 "implementation": "Stage unapproved previews only; no assignment or execution"}
 
+    def stored_publication(self, assignment_id: str, plan: PlanRevision) -> _PlanPublication:
+        """Read-only, fully validated publication receipt for a stored plan (raises on any inconsistency)."""
+        return self._load_publication(assignment_id, plan)
+
     def _load_publication(self, assignment_id: str, plan: PlanRevision) -> _PlanPublication:
         saved = _PlanPublication.model_validate_json(self.publications.path(assignment_id).read_text())
         scope = PlanningScope.model_validate(plan.pins["scope"])
