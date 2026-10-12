@@ -20,6 +20,7 @@ approved by this script without a person looking at it; each approval is recorde
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
 from collections.abc import Iterable, Sequence
 from datetime import datetime
 import json
@@ -98,6 +99,10 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     if (arguments.command == "resume") != (arguments.run_dir is not None):
         parser.error("--run-dir is required for resume and not accepted for start")
+    for name in ("brief_edit_what", "brief_edit_why"):
+        value = getattr(arguments, name)
+        if value is not None and not value.strip():
+            parser.error(f"--{name.replace('_', '-')} must not be blank")
     if (arguments.brief_edit_what is None) != (arguments.brief_edit_why is None):
         parser.error("--brief-edit-what and --brief-edit-why must be given together")
     if arguments.brief_edit_what is not None and arguments.command != "resume":
@@ -148,6 +153,53 @@ def next_handoff(plan: dict[str, Any], merge_points: Iterable[dict[str, Any]]) -
     return None
 
 
+class MergePointError(RuntimeError):
+    """A merge point that cannot be trusted: merged at an unreviewed head or without a merge commit."""
+
+
+def check_merge_point(point: dict[str, Any], pull: dict[str, Any]) -> str:
+    """Return the PR state after checking a MERGED PR merged exactly the head that was reviewed and okayed."""
+    state = str(pull["state"])
+    if state != "MERGED":
+        return state
+    if pull.get("headRefOid") != point.get("head_sha"):
+        raise MergePointError(
+            f"PR #{point.get('pull_number')} merged at {pull.get('headRefOid')}, "
+            f"not the reviewed head {point.get('head_sha')}"
+        )
+    if not (pull.get("mergeCommit") or {}).get("oid"):
+        raise MergePointError(f"PR #{point.get('pull_number')} is MERGED without a merge commit")
+    return state
+
+
+def planned_issue_for(task_id: str, plan: dict[str, Any]) -> dict[str, Any] | None:
+    """Map a ``planned-issue-*`` task id back to its plan issue (same derivation as organization_planning)."""
+    assignment = plan["planning_assignment_id"]
+    for issue in plan["issues"]:
+        digest = sha256(f"{assignment}:{issue['key']}".encode()).hexdigest()
+        if task_id == "planned-issue-" + digest:
+            return dict(issue)
+    return None
+
+
+def classify_planned_child(task_id: str, status_code: int, plan: dict[str, Any]) -> str:
+    """``deliver`` for an admissible child, ``blocked`` only for a 409 on a planned dependent; anything else fails."""
+    issue = planned_issue_for(task_id, plan)
+    if issue is None:
+        raise RuntimeError(f"Planned child {task_id} does not map to an issue of this plan")
+    if status_code == 200:
+        return "deliver"
+    if status_code == 409 and issue["dependencies"]:
+        return "blocked"
+    raise RuntimeError(f"Planned child {issue['key']} answered {status_code}")
+
+
+def require_merge_points(report: dict[str, Any]) -> None:
+    """``start`` must end at a merge point; a plan whose children were all blocked or skipped is a failure."""
+    if not report.get("merge_points"):
+        raise RuntimeError("start reached no merge point")
+
+
 def brief_edit_action(issue_key: str, what: str, why: str) -> dict[str, Any]:
     return {
         "at": now(),
@@ -195,13 +247,13 @@ def build(repository: str, repository_id: int, state_root: Path, invoke_timeout:
                 ),
             )
 
-    service_module.ManagedOrganizationService = WithDependencies  # type: ignore[misc]
-    followups.PLANNER_INSTRUCTIONS = PLANNER_INSTRUCTIONS
     service_factory, worker_factory, holder = followups.build_factories(
         repository=repository,
         repository_id=repository_id,
         state_root=state_root,
         invoke_timeout=invoke_timeout,
+        service_class=WithDependencies,
+        planner_instructions=PLANNER_INSTRUCTIONS,
     )
     holder["planning_holder"] = planning_holder
     return service_factory, worker_factory, holder
@@ -375,10 +427,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         git(service_cwd, "checkout", "--quiet", "--detach", report["service_commit"])
     else:
-        for point in report.get("merge_points", []):
-            point["state"] = gh_json(
-                "pr", "view", str(point["pull_number"]), "-R", repo["full_name"], "--json", "state"
-            )["state"]
         git(
             seed,
             "fetch",
@@ -387,6 +435,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             "origin",
             f"+refs/heads/{branch}:refs/heads/{branch}",
         )
+        for point in report.get("merge_points", []):
+            pull = gh_json(
+                "pr",
+                "view",
+                str(point["pull_number"]),
+                "-R",
+                repo["full_name"],
+                "--json",
+                "state,headRefOid,mergeCommit",
+            )
+            point["state"] = check_merge_point(point, pull)
+            if point["state"] == "MERGED":
+                point["merge_commit"] = pull["mergeCommit"]["oid"]
+                ancestry = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(seed),
+                        "merge-base",
+                        "--is-ancestor",
+                        point["merge_commit"],
+                        branch,
+                    ]
+                )
+                if ancestry.returncode != 0:
+                    raise MergePointError(
+                        f"Merge commit {point['merge_commit']} is not on {branch}"
+                    )
         report["operator_actions"].append(
             {
                 "at": now(),
@@ -494,19 +570,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ],
                 }
                 recorder.save()
-                for preview_id in hands.planned_children():
+                hands.planned_children()  # waits until planning has staged its children
+                listing = client.get(
+                    "/internal/developer/previews",
+                    params={"pending_only": "false", "limit": 500},
+                    headers=operator.headers,
+                ).json()["items"]
+                for item in listing:
+                    task_id = str(item["bundle"].get("task_id", ""))
+                    if not task_id.startswith("planned-issue-"):
+                        continue
+                    preview_id = item["preview_id"]
+                    code = client.get(
+                        f"/internal/organization/tasks/{preview_id}", headers=operator.headers
+                    ).status_code
                     # Dependents are staged too but answer 409 until a fresh dependency handoff is approved.
-                    if (
-                        client.get(
-                            f"/internal/organization/tasks/{preview_id}", headers=operator.headers
-                        ).status_code
-                        == 409
-                    ):
+                    if classify_planned_child(task_id, code, report["plan"]) == "blocked":
                         report.setdefault("blocked_dependents", []).append(preview_id)
                         continue
                     deliver_to_merge_point(
                         operator, hands, report, client, seed, preview_id, preview_id[:11], None
                     )
+                require_merge_points(report)
             else:
                 handoff_key = next_handoff(report["plan"], report.get("merge_points", []))
                 if handoff_key is None:

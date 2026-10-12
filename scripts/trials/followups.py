@@ -67,7 +67,7 @@ OBJECTIVE = (
 )
 
 
-def organization_document() -> dict[str, Any]:
+def organization_document(planner_instructions: str = PLANNER_INSTRUCTIONS) -> dict[str, Any]:
     delivery = {
         "format": "python_graph",
         "start": "implement",
@@ -109,7 +109,7 @@ def organization_document() -> dict[str, Any]:
         "schema_version": 1,
         "id": "trialorg",
         "agents": [
-            {"id": "planner", "role": "pm", "instructions": PLANNER_INSTRUCTIONS},
+            {"id": "planner", "role": "pm", "instructions": planner_instructions},
             {"id": "developer_one", "role": "developer", "instructions": DEVELOPER_INSTRUCTIONS},
             {"id": "reviewer", "role": "architect", "instructions": ARCHITECT_INSTRUCTIONS},
         ],
@@ -161,8 +161,15 @@ def organization_document() -> dict[str, Any]:
 
 
 def build_factories(
-    *, repository: str, repository_id: int, state_root: Path, invoke_timeout: float
+    *,
+    repository: str,
+    repository_id: int,
+    state_root: Path,
+    invoke_timeout: float,
+    service_class: Any = None,
+    planner_instructions: str = PLANNER_INSTRUCTIONS,
 ):
+    """``service_class`` may be a ManagedOrganizationService subclass (pilot.py adds the dependency binding)."""
     from aitobuild.agent_tools import DeveloperToolContext
     from aitobuild.config import RuntimeConfig
     from aitobuild.organization import FileDefinitionStore, parse_organization_definition
@@ -191,7 +198,7 @@ def build_factories(
             raise ValueError("Trial requires gh_cli GitHub and container_session execution")
         definitions = FileDefinitionStore(state_root / "definitions")
         snapshot = definitions.save(
-            parse_organization_definition(json.dumps(organization_document()))
+            parse_organization_definition(json.dumps(organization_document(planner_instructions)))
         )
         profile = create_model_profile(
             RuntimeConfig(
@@ -289,7 +296,7 @@ def build_factories(
             )
             await (bindings.cleanup(task) if role == AgentRole.DEVELOPER else roles.cleanup(task))
 
-        service = ManagedOrganizationService(
+        service = (service_class or ManagedOrganizationService)(
             definitions=definitions,
             assignments=FileAssignmentStore(state_root / "assignments.json"),
             runs=FileRunStore(state_root / "runs"),
