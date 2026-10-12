@@ -1556,7 +1556,8 @@ def test_per_issue_dedupe_covers_planned_and_dependent_handoffs(tmp_path, prefix
 
 
 @pytest.mark.parametrize("case", ["approved_at", "unpublished", "missing_digest", "legacy_human", "no_source", "no_pinned_base",
-                                  "dependent_unbound", "dependent_digest"])
+                                  "dependent_unbound", "dependent_digest", "dependent_assignment",
+                                  "published_without_approved_at", "planning_assignment_only"])
 def test_planned_child_pins_and_sources_fail_closed(tmp_path, approved_delivery, monkeypatch, case):
     from aitobuild.app import _configured_task_base
 
@@ -1599,16 +1600,53 @@ def test_planned_child_pins_and_sources_fail_closed(tmp_path, approved_delivery,
                         with pytest.raises(PermissionError, match="configured repository source"):
                             _configured_task_base(child, ())
                     return
-                if case == "dependent_digest":
+                if case in {"dependent_digest", "dependent_assignment"}:
                     handoff = previews.get(dependent_id)
                     handoff = replace(handoff, bundle_payload=handoff.bundle_payload | {"task_id": "dependent-issue-" + "0" * 64},
                                       source_payload={"planning_assignment": run.assignment_id})
-                    record = type("Handoff", (), {"plan_digest": planning.plans.get(run.assignment_id).digest})()
-                    service._dependencies = type("Dependencies", (), {"_load": lambda self, task_id: record})()
+                    record = type("Handoff", (), {"plan_digest": planning.plans.get(run.assignment_id).digest,
+                                                  "planning_assignment_id": run.assignment_id})()
+                    service._dependencies = type("Dependencies", (), {"stored_handoff": lambda self, task_id: record})()
                     service._check_planned_child(handoff)  # digest read from the stored handoff record
-                    record.plan_digest = "f" * 64
-                    with pytest.raises(PermissionError, match="stored published plan"):
+                    if case == "dependent_digest":
+                        record.plan_digest = "f" * 64
+                        message = "stored published plan"
+                    else:
+                        # Same plan digest, but the handoff record was written for another planning assignment.
+                        record.planning_assignment_id = "other-planning-assignment"
+                        message = "different planning assignment"
+                    with pytest.raises(PermissionError, match=message):
                         service._check_planned_child(handoff)
+                    return
+                if case == "planning_assignment_only":
+                    # No planned/dependent task-ID prefix: the planning_assignment marker alone must route the task
+                    # through the plan check in the service and skip the issue allowlist in the app binding.
+                    from aitobuild.developer_preview import is_planned_child
+
+                    marked = replace(child, bundle_payload=child.bundle_payload | {"task_id": "ISSUE-marked"})
+                    assert is_planned_child(marked) and not is_planned_child(replace(marked, source_payload={}))
+                    source = type("Source", (), {"repository": "fixture/widgets", "repository_id": 101,
+                                                 "allowed_issue_authors": (), "required_issue_labels": ()})()
+                    assert _configured_task_base(marked, (source,)) == approved_delivery[4]
+                    with pytest.raises(PermissionError, match="allowlisted issue author"):
+                        _configured_task_base(replace(marked, source_payload={}), (source,))
+                    checked = []
+                    monkeypatch.setattr(service, "_check_planned_child", lambda preview: checked.append(preview.preview_id))
+                    monkeypatch.setattr(service, "_task_base", None)
+                    with pytest.raises(PermissionError, match="trusted base binding"):
+                        service._automatic_task_approval(marked)
+                    assert checked == [marked.preview_id]
+                    return
+                if case == "published_without_approved_at":
+                    # The loader makes this state impossible: a non-pending publication must carry approved_at.
+                    path = planning.publications.path(run.assignment_id)
+                    stored = json.loads(path.read_text())
+                    assert stored["state"] == "published" and stored["approved_at"]
+                    path.write_text(json.dumps(stored | {"approved_at": None}))
+                    with pytest.raises(PermissionError, match="consumed approval differ"):
+                        planning.stored_publication(run.assignment_id, planning.plans.get(run.assignment_id))
+                    with pytest.raises(PermissionError, match="stored plan and publication"):
+                        service._check_planned_child(child)
                     return
                 if case == "dependent_unbound":
                     with pytest.raises(PermissionError, match="trusted handoff binding"):
@@ -1623,8 +1661,8 @@ def test_planned_child_pins_and_sources_fail_closed(tmp_path, approved_delivery,
                     monkeypatch.setattr(service._previews, "get", lambda key, get=previews.get: moved if key == preview.preview_id else get(key))
                     message = "exact approved planning task"
                 elif case == "unpublished":
-                    saved = planning._load_publication(run.assignment_id, planning.plans.get(run.assignment_id))
-                    monkeypatch.setattr(planning, "_load_publication", lambda *args: saved.model_copy(update={"state": "awaiting_links"}))
+                    saved = planning.stored_publication(run.assignment_id, planning.plans.get(run.assignment_id))
+                    monkeypatch.setattr(planning, "stored_publication", lambda *args: saved.model_copy(update={"state": "awaiting_links"}))
                     message = "stored published plan"
                 else:
                     child = replace(child, source_payload={"planning_assignment": run.assignment_id})

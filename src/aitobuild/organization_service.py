@@ -18,7 +18,7 @@ from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
 from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import (AutomaticAdmissionDeferred, DeveloperPreview, DeveloperPreviewRegistry, is_planned_child,
-                                         preview_approval_operation, published_review_target)
+                                         preview_approval_operation, published_review_target, REVIEW_TASK_PREFIX)
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, EventName, Identifier, OrganizationDefinition
 from aitobuild.organization_assignments import AssignmentProposal, AssignmentService, AssignmentStore, TaskAssignment
 from aitobuild.organization_delivery import _delivery_call
@@ -278,12 +278,16 @@ class ManagedOrganizationService:
         if record.publication.get("head_sha") != head_sha:
             raise PermissionError("Review admission requires the exact published head of its parent")
         parent = self._previews.get(parent_id)
+        # approved and approved_at are separate stored fields, and the delivery record is addressed by its directory,
+        # so each is checked on its own (both have tests).
         if parent is None or not parent.approved or parent.approved_at is None or record.preview_id != parent_id:
             raise PermissionError("Review admission requires an admitted parent task")
-        if str(parent.bundle_payload.get("task_id", "")).startswith("published-review-"):
+        parent_task = str(parent.bundle_payload.get("task_id", ""))
+        if parent_task.startswith(REVIEW_TASK_PREFIX):
             raise PermissionError("Only an admitted delivery task can pass eligibility to its review")
         # A correction parent is passed on as is: the trusted base callback refuses it (no issue allowlist and
-        # not a planned child), so re-reviews of corrections stay human unless an operator's own binding says otherwise.
+        # not a planned child), so re-reviews of corrections stay human unless an operator's own binding says
+        # otherwise (the queued native correction cycle relies on that binding).
         if record.bundle_payload != parent.bundle_payload:
             raise PermissionError("Parent delivery record differs from its admitted task")
         if preview.bundle_payload.get("issue_context") != parent.bundle_payload.get("issue_context"):
@@ -304,7 +308,7 @@ class ManagedOrganizationService:
             raise PermissionError("Planned child admission requires its completed planning run")
         try:
             plan = publication.plans.get(assignment_id)
-            saved = publication._load_publication(assignment_id, plan)
+            saved = publication.stored_publication(assignment_id, plan)
         except (OSError, ValueError) as error:
             raise PermissionError("Planned child admission requires its stored plan and publication") from error
         task_id = str(preview.bundle_payload.get("task_id", ""))
@@ -312,14 +316,18 @@ class ManagedOrganizationService:
             if self._dependencies is None:
                 raise PermissionError("Dependent child admission requires its trusted handoff binding")
             try:
-                digest: object = self._dependencies._load(task_id).plan_digest
+                handoff = self._dependencies.stored_handoff(task_id)
             except (OSError, ValueError) as error:
                 raise PermissionError("Dependent child admission requires its stored handoff record") from error
+            if handoff.planning_assignment_id != assignment_id:
+                raise PermissionError("Dependent child handoff belongs to a different planning assignment")
+            digest: object = handoff.plan_digest
         else:
             digest = preview.source_payload.get("plan_digest")
             if not isinstance(digest, str):
                 raise PermissionError("Planned child admission requires its stored plan digest")
-        if digest != plan.digest or saved.plan_digest != plan.digest or saved.state != "published" or saved.approved_at is None:
+        # stored_publication refuses a non-pending publication without approved_at, so "published" implies it.
+        if digest != plan.digest or saved.plan_digest != plan.digest or saved.state != "published":
             raise PermissionError("Planned child plan digest differs from its stored published plan")
         planning = self._previews.get(str(plan.pins.get("preview_id", "")))
         if (planning is None or not planning.approved or planning.approved_at is None or

@@ -1322,7 +1322,22 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                             repeated, _ = await service().publish_correction(correction.preview_id, approval_digest=staged["digest"],
                                                                            github=github, allow_mock_publication=True)
                             assert repeated == published_correction
-                            assert reviews.offer(correction.preview_id) is not None
+                            re_review = reviews.offer(correction.preview_id)
+                            assert re_review is not None
+                            # End to end: the staged review of a published correction never inherits automatic admission,
+                            # even with automatic task admission and an allowlisting base binding.
+                            from aitobuild.app import _configured_task_base
+                            from aitobuild.approval_policy import ApprovalPolicy
+                            from aitobuild.config import RepositorySourceConfig
+
+                            automatic = service()
+                            monkeypatch.setattr(automatic._runner, "approval_policy",
+                                                ApprovalPolicy(task_admission="automatic", max_automatic_admissions=5))
+                            sources = (RepositorySourceConfig("fixture/widgets", 101, "unused", (), None, ("fixture-author",)),)
+                            automatic._task_base = lambda candidate: _configured_task_base(candidate, sources)
+                            with pytest.raises(PermissionError, match="allowlisted issue author"):
+                                automatic._automatic_task_approval(re_review)
+                            assert not previews.get(re_review.preview_id).approved
                         if outcome == "correction_missing_budget":
                             budget.path.unlink()
                             assert worker.prepare(correction.preview_id).state == "failed"
@@ -2052,7 +2067,8 @@ def test_native_pm_proposal_text_reminder_deadline_and_size(tmp_path, monkeypatc
 
 @pytest.mark.parametrize("case", ["allowlisted", "not_allowlisted", "direct_callback", "parent_unapproved", "parent_is_review",
                                   "missing_record", "unpublished_record", "head_mismatch", "record_bundle_differs", "issue_differs",
-                                  "staged_target_mismatch", "planned_parent", "limit", "no_review_binding", "correction_stays_human"])
+                                  "staged_target_mismatch", "planned_parent", "limit", "no_review_binding", "correction_stays_human",
+                                  "parent_without_approval_time", "record_for_other_preview", "malformed_target"])
 def test_review_inherits_automatic_admission_only_from_its_admitted_parent(tmp_path, published_delivery, case, monkeypatch):
     """A staged Architect review is admitted automatically only as the admitted task whose exact published head it
     reviews, through the same trusted base callback (allowlist / planned child); every mismatch fails closed."""
@@ -2134,6 +2150,9 @@ def test_review_inherits_automatic_admission_only_from_its_admitted_parent(tmp_p
         "planned_parent": "planned check reached",
         "limit": "admission limit reached",
         "no_review_binding": "trusted review staging binding",
+        "parent_without_approval_time": "admitted parent task",
+        "record_for_other_preview": "admitted parent task",
+        "malformed_target": "exact published review target",
     }[case]
     candidate = staged
     if case == "parent_unapproved":
@@ -2161,6 +2180,12 @@ def test_review_inherits_automatic_admission_only_from_its_admitted_parent(tmp_p
         decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="configured-operator",
                                   operation=preview_approval_operation(used.preview_id, used.bundle_payload), automatic_supported=True)
         assert previews.approve(used.preview_id, approval_policy=decision, max_automatic_admissions=1).approved
+    elif case == "parent_without_approval_time":
+        patch_get(service._previews, "get", published_id, replace(parent, approved_at=None))
+    elif case == "record_for_other_preview":
+        monkeypatch.setattr(service, "_worker", SimpleWorker(worker, {published_id: replace(record, preview_id="other-preview")}))
+    elif case == "malformed_target":
+        candidate = replace(staged, source_payload={"published_review": {"preview_id": published_id}})
     elif case == "planned_parent":
         patch_get(service._previews, "get", published_id, replace(parent, source_payload=parent.source_payload | {"planning_assignment": "p"}))
 

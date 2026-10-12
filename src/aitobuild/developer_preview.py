@@ -42,6 +42,15 @@ class DeveloperPreview:
 
 
 PER_ISSUE_TASK_PREFIXES = ("ISSUE-", "planned-issue-", "dependent-issue-")
+PLANNED_CHILD_TASK_PREFIXES = ("planned-issue-", "dependent-issue-")
+
+
+def is_planned_child(preview: Any) -> bool:
+    """The one rule for a PM-planned child (or its dependent handoff): it names a planning assignment or carries a
+    planned/dependent task ID. Automatic admission sends such tasks through the plan check instead of the
+    issue allowlist, so both the service and the app's base binding must use this same rule."""
+    task_id = str(preview.bundle_payload.get("task_id", ""))
+    return "planning_assignment" in preview.source_payload or task_id.startswith(PLANNED_CHILD_TASK_PREFIXES)
 
 
 def _webhook_issue_identity(bundle: dict[str, Any]) -> tuple[object, object] | None:
@@ -56,12 +65,6 @@ def _webhook_issue_identity(bundle: dict[str, Any]) -> tuple[object, object] | N
 
 
 REVIEW_TASK_PREFIX = "published-review-"
-
-
-def is_planned_child(preview: Any) -> bool:
-    """The one rule for a PM-planned child or its dependent handoff (shared by app and managed service)."""
-    task_id = str(preview.bundle_payload.get("task_id", ""))
-    return "planning_assignment" in preview.source_payload or task_id.startswith(("planned-issue-", "dependent-issue-"))
 
 
 def published_review_target(preview: Any) -> tuple[str, str] | None:

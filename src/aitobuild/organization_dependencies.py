@@ -72,6 +72,10 @@ class ManagedDependencies:
             raise PermissionError("Dependency handoff receipts cannot follow symlinks")
         return path
 
+    def stored_handoff(self, task_id: str) -> DependencyHandoff:
+        """Read-only, address-checked handoff record for a dependent task."""
+        return self._load(task_id)
+
     def _load(self, task_id: str) -> DependencyHandoff:
         record = DependencyHandoff.model_validate_json(self._path(task_id).read_text())
         if record.task_id != task_id or record.identity != task_id or json.loads(record.bundle_content)["task_id"] != task_id:
@@ -80,7 +84,7 @@ class ManagedDependencies:
 
     def _source(self, assignment_id: str, issue_key: str) -> tuple[PlanRevision, DeveloperPreview, dict[str, DeveloperPreview]]:
         plan = self.planning.plans.get(assignment_id)
-        publication = self.planning._load_publication(assignment_id, plan)
+        publication = self.planning.stored_publication(assignment_id, plan)
         if (plan.pins.get("assignment_id") != assignment_id or publication.state != "published" or
                 publication.approved_at is None or publication.link_approved_at is None or
                 publication.operator_id != self.planning.admission.operator_id or
@@ -265,7 +269,7 @@ class ManagedDependencies:
                 raise PermissionError("Planned task requires its trusted publication receipt")
             assignment_id = str(preview.source_payload["planning_assignment"])
             plan = self.planning.plans.get(assignment_id)
-            saved = self.planning._load_publication(assignment_id, plan)
+            saved = self.planning.stored_publication(assignment_id, plan)
             if preview.preview_id not in saved.developer_previews:
                 raise PermissionError("Planned task is not an exact published child")
             index = saved.developer_previews.index(preview.preview_id)
