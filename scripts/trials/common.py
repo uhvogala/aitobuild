@@ -20,6 +20,13 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from aitobuild.developer_preview import (
+    CORRECTION_TASK_PREFIX,
+    PLANNED_CHILD_TASK_PREFIXES,
+    PLANNING_TASK_PREFIX,
+    REVIEW_TASK_PREFIX,
+)
+
 HELSINKI = ZoneInfo("Europe/Helsinki")
 DEFAULT_REPOSITORY = "uhvogala/aitobuild_example"
 DEFAULT_ENDPOINT = "https://aitobuild-agents2-resource.cognitiveservices.azure.com/openai/v1"
@@ -304,13 +311,6 @@ def expected_evidence_kind(
 ) -> str:
     """The admit_task evidence kind a task gets under automatic task admission: planning (#31) and corrections
     (correction: human) stay human-admitted."""
-    from aitobuild.developer_preview import (
-        CORRECTION_TASK_PREFIX,
-        PLANNED_CHILD_TASK_PREFIXES,
-        PLANNING_TASK_PREFIX,
-        REVIEW_TASK_PREFIX,
-    )
-
     if task_id.startswith(PLANNING_TASK_PREFIX):
         return "human"
     if task_id.startswith(CORRECTION_TASK_PREFIX) or "correction_from_review" in (source_payload or {}):

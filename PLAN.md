@@ -529,7 +529,9 @@ refuses every automatic source (`OperatorPolicy`, `PlannedChild`, `InheritedRevi
 (`published-correction-*` or a `correction_from_review` source) unless the operator configured
 `correction: automatic`. That mode keeps automatic correction admission available for the
 configured correction cycle. The check reads the same policy snapshot whose revision the
-admission decision is bound to. Consent never admits either kind.
+admission decision is bound to. Both refusals run before evidence dispatch, so they cover
+every non-`Human` source; `Consent` is refused for planning and for corrections in every mode,
+including `correction: automatic`.
 
 Rule: consent admission requires `task_admission` to be `automatic`. Under
 `human` mode a consent is refused, and only the HTTP approve endpoint

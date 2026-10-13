@@ -221,7 +221,7 @@ def test_configured_kind_with_human_decision_is_refused(tmp_path) -> None:
     data = json.loads((tmp_path / "previews.json").read_text())
     policy = data["previews"][0]["approval_policy"] | {"source": "human", "mode": "human"}
     _rewrite(tmp_path / "previews.json", approval_policy=policy)
-    with pytest.raises((ValueError, PermissionError)):
+    with pytest.raises(ValueError, match="contradicts"):
         DeveloperPreviewRegistry(tmp_path / "previews.json").get(stored.preview_id)
     # the kind check alone (independent of policy validation) refuses a human-sourced decision for a configured kind
     from aitobuild.developer_preview import _evidence_kind_consistent
@@ -396,4 +396,34 @@ def test_correction_mode_follows_the_policy_snapshot_the_decision_is_bound_to(tm
         with pytest.raises(PermissionError, match="Correction tasks require a human admission"):
             service._admit(item, OperatorPolicy())
         assert not previews.get(item.preview_id).approved
-    assert reads[0] == first
+    assert reads == [first]  # exactly one policy read per admission
+
+
+def _consent_for(preview):
+    """A Consent evidence object; the refusal runs before any consent content is checked."""
+    from aitobuild.organization_service import Consent
+    return Consent.model_construct(kind="consent", evidence=None, base_revision="b" * 40)
+
+
+@pytest.mark.parametrize("correction", ["human", "automatic"])
+def test_consent_never_admits_a_planning_task(tmp_path, monkeypatch, correction) -> None:
+    previews, stored = _store(tmp_path, task_id="pm-planning-" + "a" * 64)
+    service = _policy_service(tmp_path, previews, "human")
+    monkeypatch.setattr(service._runner, "approval_policy", ApprovalPolicy(
+        task_admission="automatic", max_automatic_admissions=5, correction=correction))
+    with pytest.raises(PermissionError, match="Planning tasks always require a human admission"):
+        service.admit_consent(stored, _consent_for(stored))
+    assert not previews.get(stored.preview_id).approved
+
+
+@pytest.mark.parametrize("correction", ["human", "disabled", "automatic"])
+@pytest.mark.parametrize("task_id,source", CORRECTIONS)
+def test_consent_never_admits_a_correction_task(tmp_path, monkeypatch, correction, task_id, source) -> None:
+    previews = DeveloperPreviewRegistry(tmp_path / "previews.json")
+    item = _issue_preview(previews, "corr", task_id, source or {"action": "opened"})
+    service = _policy_service(tmp_path, previews, "human")
+    monkeypatch.setattr(service._runner, "approval_policy", ApprovalPolicy(
+        task_admission="automatic", max_automatic_admissions=5, correction=correction))
+    with pytest.raises(PermissionError, match="Correction tasks require a human admission"):
+        service.admit_consent(item, _consent_for(item))
+    assert not previews.get(item.preview_id).approved

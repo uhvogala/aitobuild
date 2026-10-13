@@ -357,17 +357,20 @@ class ManagedOrganizationService:
         # One policy snapshot governs this admission: the correction-mode check, the resolved decision (bound to this
         # snapshot's revision) and the automatic limit all read it, so a config change mid-admission cannot split them.
         policy = self.approval_policy
+        # Every evidence that reaches _admit is non-Human (Human only enters admit_task from the HTTP approve
+        # endpoint), so these refusals cover OperatorPolicy, PlannedChild, InheritedReview and Consent alike.
+        if str(preview.bundle_payload.get("task_id", "")).startswith(PLANNING_TASK_PREFIX):
+            # #31: only a direct human admission admits a planning task, whichever caller reached _admit.
+            raise PermissionError("Planning tasks always require a human admission")
+        if is_correction_task(preview) and (isinstance(evidence, Consent) or policy.correction != "automatic"):
+            # A correction is admitted automatically only under correction: automatic in this snapshot (the queued
+            # native correction cycle); Consent never admits a correction in any mode (PLAN 2.4).
+            raise PermissionError("Correction tasks require a human admission unless correction is automatic")
         match evidence:
             case Consent():
                 return self._admit_consent(preview, evidence)
             case OperatorPolicy() | PlannedChild() | InheritedReview():
-                if str(preview.bundle_payload.get("task_id", "")).startswith(PLANNING_TASK_PREFIX):
-                    # #31: no automatic source ever admits a planning task, whichever caller reached _admit.
-                    raise PermissionError("Planning tasks always require a human admission")
-                if is_correction_task(preview) and policy.correction != "automatic":
-                    # Unless the operator configured correction: automatic, no automatic source admits a correction
-                    # task, whatever the binding (the queued native correction cycle needs the automatic mode).
-                    raise PermissionError("Correction tasks require a human admission unless correction is automatic")
+                pass
             case _:
                 assert_never(evidence)
         if self._evidence_for(preview) != evidence:
