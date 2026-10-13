@@ -354,6 +354,9 @@ class ManagedOrganizationService:
     def _admit(self, preview: DeveloperPreview,
                evidence: OperatorPolicy | PlannedChild | InheritedReview | Consent) -> DeveloperPreview:
         """Configured-evidence checks; the approval itself goes through the module-level admit_task (PLAN 2.4)."""
+        # One policy snapshot governs this admission: the correction-mode check, the resolved decision (bound to this
+        # snapshot's revision) and the automatic limit all read it, so a config change mid-admission cannot split them.
+        policy = self.approval_policy
         match evidence:
             case Consent():
                 return self._admit_consent(preview, evidence)
@@ -361,7 +364,7 @@ class ManagedOrganizationService:
                 if str(preview.bundle_payload.get("task_id", "")).startswith(PLANNING_TASK_PREFIX):
                     # #31: no automatic source ever admits a planning task, whichever caller reached _admit.
                     raise PermissionError("Planning tasks always require a human admission")
-                if is_correction_task(preview) and self.approval_policy.correction != "automatic":
+                if is_correction_task(preview) and policy.correction != "automatic":
                     # Unless the operator configured correction: automatic, no automatic source admits a correction
                     # task, whatever the binding (the queued native correction cycle needs the automatic mode).
                     raise PermissionError("Correction tasks require a human admission unless correction is automatic")
@@ -398,11 +401,12 @@ class ManagedOrganizationService:
             issue_payload["base_revision"] = base.lower() if isinstance(base, str) else base
         elif base is not None:
             raise PermissionError("Non-repository admission cannot add a repository base")
-        decision = self.approval_policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id=self.operator_id,
-            operation=preview_approval_operation(preview.preview_id, payload), automatic_supported=True)
+        decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id=self.operator_id,
+            operation=preview_approval_operation(preview.preview_id, payload), automatic_supported=True,
+            expected_revision=policy.revision)
         try:
             approved = admit_task(self._previews, preview.preview_id, evidence, base_revision=base, decision=decision, expected=preview,
-                                  max_automatic_admissions=self.approval_policy.max_automatic_admissions)
+                                  max_automatic_admissions=policy.max_automatic_admissions)
         except AutomaticAdmissionDeferred:
             return preview  # one automatic admission per repository/issue ID; later tasks wait for a human
         if approved is None:

@@ -366,3 +366,34 @@ def test_corrections_must_be_human_admitted(task_id, source) -> None:
     assert admission_problem("c", task_id, POLICY, "human", AUTO, REV, source)
     assert admission_problem("c", task_id, None, None, AUTO, REV, source)
 
+
+
+@pytest.mark.parametrize("first,later,admitted", [("automatic", "human", True), ("human", "automatic", False)])
+def test_correction_mode_follows_the_policy_snapshot_the_decision_is_bound_to(tmp_path, monkeypatch, first, later,
+                                                                                admitted) -> None:
+    """Config flips mid-admission: the first policy read governs both the correction check and the decision."""
+    from aitobuild.organization_service import ManagedOrganizationService
+
+    previews = DeveloperPreviewRegistry(tmp_path / "previews.json")
+    item = _issue_preview(previews, "corr", CORRECTIONS[0][0])
+    service = _policy_service(tmp_path, previews, "human")
+    service._task_base = lambda candidate: "b" * 40
+    policies = {mode: ApprovalPolicy(task_admission="automatic", max_automatic_admissions=5, correction=mode)
+                for mode in ("automatic", "human")}
+    reads: list[str] = []
+
+    def flipping(self):
+        mode = first if not reads else later
+        reads.append(mode)
+        return policies[mode]
+
+    monkeypatch.setattr(ManagedOrganizationService, "approval_policy", property(flipping))
+    if admitted:
+        result = service._admit(item, OperatorPolicy())
+        assert result.approved and result.approval_policy is not None
+        assert result.approval_policy.policy_revision == policies["automatic"].revision
+    else:
+        with pytest.raises(PermissionError, match="Correction tasks require a human admission"):
+            service._admit(item, OperatorPolicy())
+        assert not previews.get(item.preview_id).approved
+    assert reads[0] == first
