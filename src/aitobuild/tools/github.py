@@ -2155,8 +2155,9 @@ def require_adoptable_pull(*, title: str | None, body: str | None, draft: bool, 
                            expected_title: str, expected_body: str, writer: str) -> None:
     """Adopt an existing task-branch PR only by its delivery marker, the exact approved title/body receipt
     and our own writer as author. Anything else on the task branch is refused, never adopted or duplicated."""
+    # The exact body receipt implies the found PR carries the same marker as the expected body.
     if (DELIVERY_MARKER.search(expected_body) is None or (body or "").strip() != expected_body
-            or DELIVERY_MARKER.search(body or "") is None or (title or "") != expected_title or draft is not True
+            or (title or "") != expected_title or draft is not True
             or not is_own_author(author, writer)):
         raise PermissionError("Existing task pull request lacks this publication's marker, exact receipt or "
                               "author; it is not adopted")

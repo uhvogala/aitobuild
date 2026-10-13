@@ -580,7 +580,9 @@ MARKED_BODY = "Automated draft\n<!-- aitobuild-delivery:" + "e" * 64 + " -->"
     (True, "open", MARKED_BODY, None, "refused"),
     (True, "open", "Automated draft", "aitobuild-bot", "refused"),
     (True, "open", MARKED_BODY + "\nedited", "aitobuild-bot", "refused"),
-], ids=["ours", "not_draft", "closed", "copied_marker_foreign_author", "no_author", "no_marker", "receipt_differs"])
+    (True, "open", "Automated draft", "aitobuild-bot", "unmarked_request"),
+], ids=["ours", "not_draft", "closed", "copied_marker_foreign_author", "no_author", "no_marker", "receipt_differs",
+        "unmarked_publication"])
 def test_ghcli_recovers_existing_task_pr_without_local_number(monkeypatch, draft, state, body, author, outcome) -> None:
     from aitobuild.policy import AgentRole
 
@@ -606,7 +608,8 @@ def test_ghcli_recovers_existing_task_pr_without_local_number(monkeypatch, draft
 
     monkeypatch.setattr(adapter, "_api", api)
     arguments = dict(role=AgentRole.DEVELOPER, repository="fixture/widgets", title="Trial",
-                     body=MARKED_BODY, head_branch="aitobuild/issue-7-task", base_ref="main",
+                     body="Automated draft" if outcome == "unmarked_request" else MARKED_BODY,
+                     head_branch="aitobuild/issue-7-task", base_ref="main",
                      issue_number=7, approved=True, require_human_approval_for_repo_writes=True)
     if outcome == "adopted":
         pull = adapter.create_or_update_draft_pull_request(**arguments)
