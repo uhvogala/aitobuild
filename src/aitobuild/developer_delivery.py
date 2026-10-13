@@ -114,6 +114,13 @@ def _failed_publication(record: DeliveryPreparation, error: str) -> DeliveryPrep
                    updated_at=datetime.now(tz=UTC).isoformat())
 
 
+def delivery_marker(preview_id: str, bundle_payload: dict[str, Any]) -> str:
+    """The PR-body marker binding a draft to its exact admitted task (preview id + bundle digest).
+    Adoption of an existing PR on the task branch requires it plus the exact receipt and our author."""
+    bundle_digest = sha256(json.dumps(bundle_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return f"<!-- aitobuild-delivery:{sha256(f'{preview_id}:{bundle_digest}'.encode()).hexdigest()} -->"
+
+
 class DeveloperDeliveryWorker:
     def __init__(
         self, *, preview_registry: DeveloperPreviewRegistry, state_dir: Path,
@@ -1510,6 +1517,7 @@ class DeveloperDeliveryWorker:
             f"- base revision: `{record.base_revision}`\n"
             f"{verification_block}\n\n"
             f"Closes #{issue.issue_number}\n"
+            f"{delivery_marker(record.preview_id, record.bundle_payload)}\n"
         )
         commit_message = f"aitobuild: implement #{issue.issue_number} {issue.title}".strip()
         return title[:200], body, commit_message[:200]
