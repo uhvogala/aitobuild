@@ -95,20 +95,148 @@ def test_invalid_persisted_kind_is_refused(tmp_path, bad, approved) -> None:
         DeveloperPreviewRegistry(path).get(stored.preview_id)
 
 
+def _service(tmp_path, previews):
+    from conftest import consent_service
+    return consent_service(tmp_path / "svc", previews, ApprovalPolicy(task_admission="automatic", max_automatic_admissions=5))
+
+
 @pytest.mark.parametrize("evidence", [OperatorPolicy(), PlannedChild(), InheritedReview()])
 def test_planning_admission_without_human_source_is_refused(tmp_path, evidence) -> None:
-    """#31: _admit refuses every automatic source for a planning task before any other check (the one place)."""
-    from types import SimpleNamespace
-
-    from aitobuild.organization_service import ManagedOrganizationService
-
+    """#31 through a real ManagedOrganizationService: _admit refuses every automatic source for planning."""
     previews, stored = _store(tmp_path, task_id="pm-planning-" + "a" * 64)
+    service = _service(tmp_path, previews)
+    with pytest.raises(PermissionError, match="Planning tasks always require a human admission"):
+        service._admit(stored, evidence)
     with pytest.raises(PermissionError, match="human admission"):
-        ManagedOrganizationService._admit(SimpleNamespace(), stored, evidence)  # type: ignore[arg-type]
+        service._automatic_task_approval(stored)  # the public automatic path refuses it too
     after = previews.get(stored.preview_id)
     assert after is not None and not after.approved and after.evidence_kind is None
     approved = admit_task(previews, stored.preview_id, Human())
     assert approved is not None and approved.approved and approved.evidence_kind == "human"
+
+
+CORRECTIONS = [("published-correction-" + "c" * 64, None), ("ISSUE-77", {"correction_from_review": "dp-review"})]
+
+
+def _policy_service(tmp_path, previews, correction: str):
+    from conftest import consent_service
+    policy = ApprovalPolicy(task_admission="automatic", max_automatic_admissions=5, correction=correction)
+    return consent_service(tmp_path / "svc", previews, policy)
+
+
+@pytest.mark.parametrize("correction", ["human", "disabled"])
+@pytest.mark.parametrize("task_id,source", CORRECTIONS)
+@pytest.mark.parametrize("evidence", [OperatorPolicy(), PlannedChild(), InheritedReview()])
+def test_correction_admission_without_human_source_is_refused(tmp_path, correction, task_id, source, evidence) -> None:
+    previews = DeveloperPreviewRegistry(tmp_path / "previews.json")
+    item = _issue_preview(previews, "corr", task_id, source or {"action": "opened"})
+    service = _policy_service(tmp_path, previews, correction)
+    with pytest.raises(PermissionError, match="Correction tasks require a human admission"):
+        service._admit(item, evidence)
+    after = previews.get(item.preview_id)
+    assert after is not None and not after.approved and after.evidence_kind is None
+
+
+@pytest.mark.parametrize("task_id,source", CORRECTIONS)
+def test_correction_automatic_path_refused_under_human_and_human_still_admits(tmp_path, task_id, source) -> None:
+    previews = DeveloperPreviewRegistry(tmp_path / "previews.json")
+    item = _issue_preview(previews, "corr", task_id, source or {"action": "opened"})
+    service = _policy_service(tmp_path, previews, "human")
+    with pytest.raises(PermissionError, match="Correction tasks require a human admission"):
+        service._automatic_task_approval(item)
+    approved = admit_task(previews, item.preview_id, Human(base_revision="b" * 40))
+    assert approved is not None and approved.approved and approved.evidence_kind == "human"
+
+
+@pytest.mark.parametrize("task_id,source", CORRECTIONS)
+def test_correction_automatic_admits_through_policy_and_human_still_admits(tmp_path, monkeypatch, task_id, source) -> None:
+    previews = DeveloperPreviewRegistry(tmp_path / "previews.json")
+    item = _issue_preview(previews, "corr", task_id, source or {"action": "opened"})
+    service = _policy_service(tmp_path, previews, "human")
+    # Constructing correction: automatic needs live review/publication bindings; the admission check only reads the
+    # policy, so switch the runner's policy the way the existing end-to-end review test does.
+    monkeypatch.setattr(service._runner, "approval_policy", ApprovalPolicy(
+        task_admission="automatic", max_automatic_admissions=5, correction="automatic"))
+    service._task_base = lambda candidate: "b" * 40
+    admitted = service._automatic_task_approval(item)
+    assert admitted.approved and admitted.evidence_kind == "operator_policy"
+    assert admitted.approval_policy is not None and admitted.approval_policy.source == "operator_policy"
+    other = _issue_preview(previews, "corr-2", task_id + "-2", source or {"action": "opened"})
+    human = admit_task(previews, other.preview_id, Human(base_revision="b" * 40))
+    assert human is not None and human.evidence_kind == "human"
+
+
+def test_non_correction_issue_task_still_reaches_later_checks(tmp_path) -> None:
+    """Control: an ordinary issue task is not refused by the correction/planning check (it fails later instead)."""
+    previews = DeveloperPreviewRegistry(tmp_path / "previews.json")
+    plain = _issue_preview(previews, "plain", "ISSUE-88")
+    service = _service(tmp_path, previews)
+    with pytest.raises((PermissionError, ValueError)) as raised:
+        service._admit(plain, OperatorPolicy())
+    assert "always require a human admission" not in str(raised.value)
+
+
+# --- persisted evidence_kind consistency -------------------------------------------------------------------------
+
+def _rewrite(path, **fields):
+    data = json.loads(path.read_text())
+    for key, value in fields.items():
+        if value is None:
+            data["previews"][0].pop(key, None)
+        else:
+            data["previews"][0][key] = value
+    path.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize("kind", ["operator_policy", "planned_child", "inherited_review", "consent"])
+def test_human_record_relabelled_as_other_kind_is_refused(tmp_path, kind) -> None:
+    previews, stored = _store(tmp_path)
+    admit_task(previews, stored.preview_id, Human())
+    _rewrite(tmp_path / "previews.json", evidence_kind=kind)
+    with pytest.raises(ValueError, match="contradicts"):
+        DeveloperPreviewRegistry(tmp_path / "previews.json").get(stored.preview_id)
+
+
+@pytest.mark.parametrize("kind", ["human", "consent"])
+def test_automatic_record_relabelled_is_refused(tmp_path, kind) -> None:
+    previews, stored = _store(tmp_path)
+    admit_task(previews, stored.preview_id, PlannedChild(), decision=_decision(stored), expected=stored)
+    _rewrite(tmp_path / "previews.json", evidence_kind=kind)
+    with pytest.raises(ValueError, match="contradicts"):
+        DeveloperPreviewRegistry(tmp_path / "previews.json").get(stored.preview_id)
+
+
+@pytest.mark.parametrize("kind", ["operator_policy", "planned_child", "inherited_review"])
+def test_configured_kinds_with_their_decision_load(tmp_path, kind) -> None:
+    previews, stored = _store(tmp_path)
+    admit_task(previews, stored.preview_id, OperatorPolicy(), decision=_decision(stored), expected=stored)
+    _rewrite(tmp_path / "previews.json", evidence_kind=kind)
+    loaded = DeveloperPreviewRegistry(tmp_path / "previews.json").get(stored.preview_id)
+    assert loaded is not None and loaded.evidence_kind == kind
+
+
+def test_configured_kind_with_human_decision_is_refused(tmp_path) -> None:
+    previews, stored = _store(tmp_path)
+    admit_task(previews, stored.preview_id, OperatorPolicy(), decision=_decision(stored), expected=stored)
+    data = json.loads((tmp_path / "previews.json").read_text())
+    policy = data["previews"][0]["approval_policy"] | {"source": "human", "mode": "human"}
+    _rewrite(tmp_path / "previews.json", approval_policy=policy)
+    with pytest.raises((ValueError, PermissionError)):
+        DeveloperPreviewRegistry(tmp_path / "previews.json").get(stored.preview_id)
+    # the kind check alone (independent of policy validation) refuses a human-sourced decision for a configured kind
+    from aitobuild.developer_preview import _evidence_kind_consistent
+    assert not _evidence_kind_consistent("planned_child", {"source": "human"}, None)
+    assert not _evidence_kind_consistent("planned_child", {"source": "operator_policy"}, {"x": 1})
+    assert _evidence_kind_consistent("consent", {"source": "human"}, {"x": 1})
+    assert not _evidence_kind_consistent("human", None, {"x": 1})
+
+
+def test_legacy_none_kind_with_any_decision_still_loads(tmp_path) -> None:
+    previews, stored = _store(tmp_path)
+    admit_task(previews, stored.preview_id, OperatorPolicy(), decision=_decision(stored), expected=stored)
+    _rewrite(tmp_path / "previews.json", evidence_kind=None)
+    loaded = DeveloperPreviewRegistry(tmp_path / "previews.json").get(stored.preview_id)
+    assert loaded is not None and loaded.approved and loaded.evidence_kind is None
 
 
 # --- legacy records (evidence_kind None) never count as automatic evidence ---------------------------------------
@@ -219,6 +347,16 @@ def test_human_task_admission_mode_has_no_admission_verdict() -> None:
 def test_correction_by_source_payload_expects_human() -> None:
     assert expected_evidence_kind("ISSUE-1", {"correction_from_review": {}}) == "human"
     assert expected_evidence_kind("ISSUE-1", {"other": 1}) == "operator_policy"
+
+
+@pytest.mark.parametrize("task_id,source", [("published-correction-x", None), ("ISSUE-9", {"correction_from_review": {}})])
+def test_corrections_accept_automatic_evidence_when_correction_is_automatic(task_id, source) -> None:
+    modes = AUTO | {"correction": "automatic"}
+    assert expected_evidence_kind(task_id, source, True) == "operator_policy"
+    assert admission_problem("c", task_id, POLICY, "operator_policy", modes, REV, source) is None
+    assert admission_problem("c", task_id, None, "human", modes, REV, source)
+    assert admission_problem("c", task_id, POLICY, "operator_policy", AUTO | {"correction": "human"}, REV, source)
+    assert expected_evidence_kind("pm-planning-x", None, True) == "human"
 
 
 @pytest.mark.parametrize("task_id,source", [("published-correction-x", None), ("ISSUE-9", {"correction_from_review": {}})])

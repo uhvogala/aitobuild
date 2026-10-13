@@ -299,16 +299,26 @@ def finish(report: dict[str, Any], recorder: Recorder) -> int:
     return 0 if report["result"] == "pass" else 1
 
 
-def expected_evidence_kind(task_id: str, source_payload: dict[str, Any] | None = None) -> str:
+def expected_evidence_kind(
+    task_id: str, source_payload: dict[str, Any] | None = None, correction_automatic: bool = False
+) -> str:
     """The admit_task evidence kind a task gets under automatic task admission: planning (#31) and corrections
     (correction: human) stay human-admitted."""
-    if task_id.startswith(("pm-planning-", "published-correction-")) or "correction_from_review" in (
-        source_payload or {}
-    ):
+    from aitobuild.developer_preview import (
+        CORRECTION_TASK_PREFIX,
+        PLANNED_CHILD_TASK_PREFIXES,
+        PLANNING_TASK_PREFIX,
+        REVIEW_TASK_PREFIX,
+    )
+
+    if task_id.startswith(PLANNING_TASK_PREFIX):
         return "human"
-    if task_id.startswith("published-review-"):
+    if task_id.startswith(CORRECTION_TASK_PREFIX) or "correction_from_review" in (source_payload or {}):
+        # correction: automatic lets the service admit corrections automatically; otherwise they stay human.
+        return "operator_policy" if correction_automatic else "human"
+    if task_id.startswith(REVIEW_TASK_PREFIX):
         return "inherited_review"
-    if task_id.startswith(("planned-issue-", "dependent-issue-")):
+    if task_id.startswith(PLANNED_CHILD_TASK_PREFIXES):
         return "planned_child"
     return "operator_policy"
 
@@ -327,7 +337,7 @@ def admission_problem(
     pinned revision through its expected evidence kind (planned child, inherited review, operator policy)."""
     if modes.get("task_admission") != "automatic":
         return None
-    want = expected_evidence_kind(task_id, source_payload)
+    want = expected_evidence_kind(task_id, source_payload, modes.get("correction") == "automatic")
     if want == "human":
         if admission is not None or evidence_kind != "human":
             return f"{phase}: planning/correction task not human-admitted (evidence={evidence_kind})"

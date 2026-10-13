@@ -20,6 +20,7 @@ from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryW
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import (AutomaticAdmissionDeferred, DeveloperPreview, DeveloperPreviewRegistry, is_planned_child,
                                          preview_approval_operation, published_review_target, CORRECTION_TASK_PREFIX,
+                                         PLANNING_TASK_PREFIX, is_correction_task,
                                          REVIEW_TASK_PREFIX)
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, EventName, Identifier, OrganizationDefinition
 from aitobuild.organization_assignments import AssignmentProposal, AssignmentService, AssignmentStore, TaskAssignment
@@ -357,9 +358,13 @@ class ManagedOrganizationService:
             case Consent():
                 return self._admit_consent(preview, evidence)
             case OperatorPolicy() | PlannedChild() | InheritedReview():
-                if str(preview.bundle_payload.get("task_id", "")).startswith("pm-planning-"):
+                if str(preview.bundle_payload.get("task_id", "")).startswith(PLANNING_TASK_PREFIX):
                     # #31: no automatic source ever admits a planning task, whichever caller reached _admit.
                     raise PermissionError("Planning tasks always require a human admission")
+                if is_correction_task(preview) and self.approval_policy.correction != "automatic":
+                    # Unless the operator configured correction: automatic, no automatic source admits a correction
+                    # task, whatever the binding (the queued native correction cycle needs the automatic mode).
+                    raise PermissionError("Correction tasks require a human admission unless correction is automatic")
             case _:
                 assert_never(evidence)
         if self._evidence_for(preview) != evidence:

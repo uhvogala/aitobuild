@@ -49,8 +49,27 @@ class DeveloperPreview:
 AdmissionEvidenceKind = Literal["human", "operator_policy", "planned_child", "inherited_review", "consent"]
 ADMISSION_EVIDENCE_KINDS: frozenset[str] = frozenset(get_args(AdmissionEvidenceKind))
 
+PLANNING_TASK_PREFIX = "pm-planning-"
+REVIEW_TASK_PREFIX = "published-review-"
+CORRECTION_TASK_PREFIX = "published-correction-"
 PER_ISSUE_TASK_PREFIXES = ("ISSUE-", "planned-issue-", "dependent-issue-")
 PLANNED_CHILD_TASK_PREFIXES = ("planned-issue-", "dependent-issue-")
+
+
+def is_correction_task(preview: Any) -> bool:
+    """A same-PR correction task: the correction task ID or a correction_from_review source."""
+    return (str(preview.bundle_payload.get("task_id", "")).startswith(CORRECTION_TASK_PREFIX)
+            or "correction_from_review" in preview.source_payload)
+
+
+def _evidence_kind_consistent(kind: str, policy: Any, consent: Any) -> bool:
+    """A recorded evidence kind must agree with what the record carries: human has no decision and no consent,
+    consent carries its consent evidence, and every configured kind carries an operator_policy decision."""
+    if kind == "human":
+        return policy is None and consent is None
+    if kind == "consent":
+        return consent is not None
+    return consent is None and isinstance(policy, dict) and policy.get("source") == "operator_policy"
 
 
 def is_planned_child(preview: Any) -> bool:
@@ -72,8 +91,6 @@ def _webhook_issue_identity(bundle: dict[str, Any]) -> tuple[object, object] | N
     return context.get("repository_id"), context.get("issue_id")
 
 
-REVIEW_TASK_PREFIX = "published-review-"
-CORRECTION_TASK_PREFIX = "published-correction-"
 
 
 def published_review_target(preview: Any) -> tuple[str, str] | None:
@@ -165,6 +182,9 @@ class DeveloperPreviewRegistry:
             kind = item.get("evidence_kind")
             if kind is not None and (kind not in ADMISSION_EVIDENCE_KINDS or not item["approved"]):
                 raise ValueError("Invalid persisted admission evidence kind")
+            if kind is not None and not _evidence_kind_consistent(
+                    kind, item.get("approval_policy"), item.get("consent_approval")):
+                raise ValueError("Persisted admission evidence kind contradicts its recorded decision")
             if item.get("approval_policy") is not None:
                 decision = ApprovalDecision.model_validate(item["approval_policy"])
                 if (not item["approved"] or decision.stage != ApprovalStage.TASK_ADMISSION
