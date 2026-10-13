@@ -1725,6 +1725,7 @@ def test_transient_create_error_adopts_the_landed_issue_without_repeating_the_wr
                     assert len(github.issues["example/target"]) == len(document["issues"])
                     saved = planning._load_publication(waiting.assignment_id, planning.plans.get(waiting.assignment_id))
                     assert saved.state == "published" and all(item.state == "linked" for item in saved.effects)
+                    assert [item.adopted for item in saved.effects] == [True] + [False] * (len(saved.effects) - 1)
                 else:
                     assert done.state == "failed", done.error
                     assert len(writes) == 1
@@ -1732,5 +1733,39 @@ def test_transient_create_error_adopts_the_landed_issue_without_repeating_the_wr
                     with pytest.raises(PermissionError):
                         restart()[1].reconcile(waiting.assignment_id)
                     assert len(writes) == 1
+
+    asyncio.run(exercise())
+
+
+def test_issue_effect_records_without_adopted_still_load():
+    from aitobuild.organization_planning import _IssueEffect
+    legacy = {"key": "a", "content": {"marker": "m"}, "state": "created", "receipt": {"number": 1}}
+    assert _IssueEffect.model_validate(legacy).adopted is False
+    assert _IssueEffect.model_validate(legacy | {"adopted": True}).adopted is True
+
+
+def test_existing_marker_before_creation_refuses_without_writing(tmp_path, approved_delivery, monkeypatch):
+    """A marker already on GitHub before the first create means an unknown earlier write; never create beside it."""
+    from aitobuild.policy import AgentRole
+    bodies = []
+    document = proposal()
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply(bodies, document))) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service, planning, _, preview, previews, github, _, _ = planning_fixture(tmp_path, profile, approved_delivery[1])
+                approve_preview(previews, preview.preview_id)
+                waiting = await service.consume(preview.preview_id)
+                assert waiting.state == "waiting", waiting.error
+                first = planning.plans.get(waiting.assignment_id).issues[0]
+                github.create_issue(role=AgentRole.PM, repository="example/target", title=first["title"], body=first["body"],
+                                    labels=tuple(first["labels"]), approved=True, require_human_approval_for_repo_writes=True)
+                writes = []
+                original_create = github.create_issue
+                monkeypatch.setattr(github, "create_issue", lambda **kwargs: writes.append(kwargs) or original_create(**kwargs))
+                done = await service.decide(waiting.assignment_id, request_id=waiting.pending[0].request_id, approved=True)
+                assert done.state == "failed" and "marker already exists" in str(done.error), done.error
+                assert writes == [] and len(github.issues["example/target"]) == 1
 
     asyncio.run(exercise())

@@ -953,6 +953,9 @@ class GhCliGitHubAdapter:
         method: str = "GET",
         payload: dict[str, Any] | None = None,
     ) -> Any:
+        # Read retry bound (#41): with the defaults (4 attempts, 0.5 s base doubling, 8 s cap, jitter scaling each
+        # delay into [0.5, 1.0)), one read sleeps at most 0.5 + 1 + 2 = 3.5 s in total, plus up to 4 gh calls of up to
+        # 60 s each. The retry loop does not consult the task budget deadline; callers' budget checks run around it.
         # Only reads are retried (#41). A write can fail with a 5xx after GitHub applied it, so writes surface
         # GitHubTransientError at once and callers reconcile by reading (e.g. publication markers).
         attempts = self.read_attempts if method == "GET" else 1

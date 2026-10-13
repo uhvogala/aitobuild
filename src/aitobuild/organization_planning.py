@@ -326,6 +326,9 @@ class _IssueEffect(DefinitionModel):
     content: dict[str, Any]
     state: Literal["creating", "created", "linking", "linked"]
     receipt: dict[str, Any] | None = None
+    # True when the issue was adopted by marker after an uncertain (5xx) create instead of returned by the create
+    # call (#41). Defaults False so records persisted before this field still load.
+    adopted: bool = False
 
 
 class _PlanPublication(DefinitionModel):
@@ -544,8 +547,12 @@ class ManagedPlanning:
                     # the one issue carrying this effect's marker and exact content, otherwise fail with the effect
                     # still "creating" so reconcile/operator inspection decides.
                     issue = self._landed_issue(record.scope, content)
+                    adopted = True
+                else:
+                    adopted = False
                 receipt = self._receipt(issue, content, record.scope)
-                saved = saved.model_copy(update={"effects": (*saved.effects[:-1], effect.model_copy(update={"state": "created", "receipt": receipt}))})
+                saved = saved.model_copy(update={"effects": (*saved.effects[:-1], effect.model_copy(
+                    update={"state": "created", "receipt": receipt, "adopted": adopted}))})
                 self._save_publication(saved)
             if creating and any(issue.dependencies for issue in plan.proposal.issues):
                 data = self._link_data(plan, saved, uuid4().hex)
