@@ -271,7 +271,7 @@ def test_runner_resumes_only_the_exact_recorded_approval(
     assert asyncio.run(runner._interrupted_continuation(run, context)) is None
 
 
-@pytest.mark.parametrize("tamper", ["state", "correction_task", "correction_source", "preview_id", "original_base", "record_base",
+@pytest.mark.parametrize("tamper", ["state", "correction_task", "correction_source", "no_preview", "preview_id", "original_base", "record_base",
                                     "approved_at", "original_body"])
 def test_delivery_hook_requires_the_exact_publishing_record(
     tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, tamper,
@@ -291,6 +291,8 @@ def test_delivery_hook_requires_the_exact_publishing_record(
     elif tamper == "record_base":
         monkeypatch.setattr(worker, "get", lambda preview_id: dc_replace(
             record, publication={**record.publication, "base_sha": "0" * 40}))
+    elif tamper == "no_preview":
+        monkeypatch.setattr(worker, "preview", lambda preview_id: None)
     elif tamper in {"correction_task", "correction_source"}:
         from types import SimpleNamespace
         preview = worker.preview(context.assignment.preview_id)
