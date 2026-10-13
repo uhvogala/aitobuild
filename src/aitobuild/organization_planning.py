@@ -22,7 +22,7 @@ from aitobuild.durable_files import atomic_write_text
 from aitobuild.organization import DefinitionModel, DefinitionStore, EventName, Identifier
 from aitobuild.organization_runner import ManagedRun, ManagedTaskContext
 from aitobuild.policy import AgentRole
-from aitobuild.tools.github import GitHubAdapter, GitHubIssue, GitHubTransientError, normalize_repository_name
+from aitobuild.tools.github import GitHubAdapter, GitHubIssue, GitHubTransientError, is_own_author, normalize_repository_name
 
 
 def canonical(value: Any) -> str:
@@ -591,6 +591,10 @@ class ManagedPlanning:
             context.revalidate()
             return self._stage(plan, saved)
 
+    def _require_own_issue(self, issue: GitHubIssue) -> None:
+        if not is_own_author(issue.author, self.github.writer_login()):
+            raise PermissionError("Marker-matched issue was not written by this service's GitHub identity")
+
     def _landed_issue(self, scope: PlanningScope, content: dict[str, Any]) -> GitHubIssue:
         try:
             matches = self.github.find_issue_publication(repository=scope.repository, marker=str(content["marker"]),
@@ -599,6 +603,7 @@ class ManagedPlanning:
             raise PermissionError("Issue creation is uncertain and its marker lookup failed; no write repeated") from error
         if len(matches) != 1:
             raise PermissionError("Issue creation is uncertain and did not land exactly once; no write repeated")
+        self._require_own_issue(matches[0])
         return matches[0]  # publish() then checks it against the exact approved content via _receipt
 
     def reconcile(self, assignment_id: str) -> dict[str, Any]:
@@ -616,12 +621,17 @@ class ManagedPlanning:
                                                             max_pages=self.lookup_max_pages)
                 if len(matches) != 1:
                     raise PermissionError("Uncertain or ambiguous issue creation cannot repeat")
+                self._require_own_issue(matches[0])
                 receipt = self._receipt(matches[0], effect.content, scope)
                 if effect.receipt is not None and (receipt["number"], receipt["issue_id"]) != (
                         effect.receipt["number"], effect.receipt["issue_id"]):
                     raise PermissionError("Published issue identity changed")
                 final = self._linked_content(plan, next(item for item in plan.issues if item["key"] == effect.key), saved)
-                effect = effect.model_copy(update={"receipt": receipt, "state": "linked" if final == effect.content else "created"})
+                effect = effect.model_copy(update={
+                    "receipt": receipt, "state": "linked" if final == effect.content else "created",
+                    # Found by marker with no saved receipt: the issue was adopted, not returned by our create.
+                    "adopted": effect.adopted or effect.receipt is None,
+                })
                 saved = saved.model_copy(update={"effects": (*saved.effects[:index], effect, *saved.effects[index + 1:])})
                 self._save_publication(saved)
             if (len(saved.effects) != len(plan.issues) or any(effect.state != "linked" for effect in saved.effects) or
