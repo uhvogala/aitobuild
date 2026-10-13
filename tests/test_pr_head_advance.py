@@ -672,3 +672,20 @@ def test_gh_pr_create_timeout_adopts_only_the_exact_created_draft(created, adopt
         with pytest.raises(RuntimeError, match="deadline exceeded"):
             _gh(fake, monkeypatch).create_or_update_draft_pull_request(**arguments)
     assert [call for call in fake.calls if call[0] != "GET"] == [("POST", f"repos/{REPO}/pulls")]
+
+
+def test_gh_pr_create_timeout_propagates_a_transient_writer_identity_error(monkeypatch) -> None:
+    """A transient GET /user failure must not read as 'no PR was created'."""
+    class FlakyIdentity(TimedOutCreateGitHub):
+        def __call__(self, endpoint: str, *, method: str = "GET", payload: dict | None = None) -> Any:
+            if endpoint == "user":
+                raise RuntimeError("gh api failed for GET user: (HTTP 502)")
+            return super().__call__(endpoint, method=method, payload=payload)
+
+    fake = FlakyIdentity(created=[_created_pull()])
+    with pytest.raises(RuntimeError, match="HTTP 502"):
+        _gh(fake, monkeypatch).create_or_update_draft_pull_request(
+            role=AgentRole.DEVELOPER, repository=REPO, title="T", body=CREATED_BODY,
+            head_branch="aitobuild/issue-8-task", base_ref="main", issue_number=8, approved=True,
+            require_human_approval_for_repo_writes=True)
+    assert [call for call in fake.calls if call[0] != "GET"] == [("POST", f"repos/{REPO}/pulls")]

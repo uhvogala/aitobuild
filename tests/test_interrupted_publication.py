@@ -271,7 +271,7 @@ def test_runner_resumes_only_the_exact_recorded_approval(
     assert asyncio.run(runner._interrupted_continuation(run, context)) is None
 
 
-@pytest.mark.parametrize("tamper", ["state", "correction_task", "preview_id", "original_base", "record_base",
+@pytest.mark.parametrize("tamper", ["state", "correction_task", "correction_source", "preview_id", "original_base", "record_base",
                                     "approved_at", "original_body"])
 def test_delivery_hook_requires_the_exact_publishing_record(
     tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, tamper,
@@ -291,17 +291,36 @@ def test_delivery_hook_requires_the_exact_publishing_record(
     elif tamper == "record_base":
         monkeypatch.setattr(worker, "get", lambda preview_id: dc_replace(
             record, publication={**record.publication, "base_sha": "0" * 40}))
-    elif tamper == "correction_task":
+    elif tamper in {"correction_task", "correction_source"}:
         from types import SimpleNamespace
-        bindings = hook.__self__
-        monkeypatch.setattr(bindings, "_check", lambda context: None)
-        assignment = context.assignment
-        context = SimpleNamespace(run=context.run, assignment=SimpleNamespace(
-            preview_id=assignment.preview_id, task_id="published-correction-" + assignment.task_id,
-            bundle_content=assignment.bundle_content, approved_at=assignment.approved_at))
+        preview = worker.preview(context.assignment.preview_id)
+        assert hook(context, original) is True
+        # #54 is_correction_task: a correction task id, or an ISSUE-* task whose source is a correction_from_review.
+        bundle = dict(preview.bundle_payload)
+        source = dict(preview.source_payload)
+        if tamper == "correction_task":
+            bundle["task_id"] = "published-correction-" + str(bundle["task_id"])
+        else:
+            assert not str(bundle["task_id"]).startswith("published-correction-")
+            source["correction_from_review"] = "dp-review"
+        fake = SimpleNamespace(bundle_payload=bundle, source_payload=source)
+        monkeypatch.setattr(worker, "preview", lambda preview_id: fake)
     else:
         key, value = {"preview_id": ("preview_id", "dp-other"), "original_base": ("base_sha", "0" * 40),
                       "approved_at": ("approved_at", "2020-01-01T00:00:00+00:00"),
                       "original_body": ("body", "changed")}[tamper]
         original = original | {key: value}
     assert hook(context, original) is False
+
+
+def test_delivery_marker_is_stable_and_uses_the_shared_snapshot_digest():
+    from aitobuild.developer_delivery import delivery_marker
+    from aitobuild.publish_approvals import snapshot_digest
+    from hashlib import sha256
+    payload = {"task_id": "ISSUE-7", "objective": "x", "acceptance_criteria": ["a"]}
+    expected = sha256(f"dp-1:{snapshot_digest(payload)}".encode()).hexdigest()
+    assert delivery_marker("dp-1", payload) == f"<!-- aitobuild-delivery:{expected} -->"
+    assert delivery_marker("dp-1", dict(reversed(list(payload.items())))) == delivery_marker("dp-1", payload)
+    assert delivery_marker("dp-1", payload) == (
+        "<!-- aitobuild-delivery:" + sha256(("dp-1:" + sha256(
+            b'{"acceptance_criteria":["a"],"objective":"x","task_id":"ISSUE-7"}').hexdigest()).encode()).hexdigest() + " -->")

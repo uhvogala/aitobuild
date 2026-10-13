@@ -20,6 +20,7 @@ from aitobuild.agent_tools import DeveloperToolContext, build_developer_tools
 from aitobuild.approval_policy import ApprovalStage
 from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget
+from aitobuild.developer_preview import is_correction_task
 from aitobuild.organization import DefinitionSnapshot
 from aitobuild.organization_runner import ManagedOperation, ManagedTaskContext, WorkflowInput
 from aitobuild.organization_runtime import OrganizationRuntime
@@ -340,7 +341,11 @@ class ManagedDeliveryBindings:
         """
         self._check(context)
         assignment = context.assignment
-        if self._github is None or assignment.task_id.startswith("published-correction-") or not isinstance(original, dict):
+        if self._github is None or not isinstance(original, dict):
+            return False
+        preview = self._worker.preview(assignment.preview_id)
+        # Corrections (task id prefix or a correction_from_review source, #54) never resume through publish().
+        if preview is None or is_correction_task(preview):
             return False
         record = self._worker.get(assignment.preview_id)
         if record is None or record.state != "publishing" or not isinstance(record.publication, dict):

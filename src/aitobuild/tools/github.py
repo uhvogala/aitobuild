@@ -1812,7 +1812,8 @@ class GhCliGitHubAdapter:
             require_adoptable_pull(title=matches[0].get("title"), body=matches[0].get("body"),
                                    draft=matches[0].get("draft"), author=(matches[0].get("user") or {}).get("login"),
                                    expected_title=title, expected_body=body, writer=self.writer_login())
-        except Exception:
+        except PermissionError:
+            # Not our exact PR: report "not adopted". A transient writer-identity failure propagates instead.
             return None
         return _pull_request_from_api(matches[0], repository=repo, changed_files=())
 

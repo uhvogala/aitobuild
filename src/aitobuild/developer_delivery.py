@@ -117,7 +117,7 @@ def _failed_publication(record: DeliveryPreparation, error: str) -> DeliveryPrep
 def delivery_marker(preview_id: str, bundle_payload: dict[str, Any]) -> str:
     """The PR-body marker binding a draft to its exact admitted task (preview id + bundle digest).
     Adoption of an existing PR on the task branch requires it plus the exact receipt and our author."""
-    bundle_digest = sha256(json.dumps(bundle_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    bundle_digest = snapshot_digest(bundle_payload)
     return f"<!-- aitobuild-delivery:{sha256(f'{preview_id}:{bundle_digest}'.encode()).hexdigest()} -->"
 
 
@@ -684,6 +684,10 @@ class DeveloperDeliveryWorker:
                 or not isinstance(review_id, str) or not review_id):
             raise PermissionError("Correction chain link is missing or invalid; publication is refused")
         return target["preview_id"], review_id
+
+    def preview(self, preview_id: str) -> Any:
+        """The immutable approved preview behind a delivery (read-only)."""
+        return self._previews.get(preview_id)
 
     def _load_preview_record(self, preview_id: str) -> DeliveryPreparation | None:
         directory = self._task_dir(preview_id)
