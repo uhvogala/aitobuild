@@ -1674,7 +1674,7 @@ def test_planned_child_pins_and_sources_fail_closed(tmp_path, approved_delivery,
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("effect", ["landed", "absent", "lookup_down", "drifted"])
+@pytest.mark.parametrize("effect", ["landed", "absent", "lookup_down", "drifted", "duplicate"])
 def test_transient_create_error_adopts_the_landed_issue_without_repeating_the_write(tmp_path, approved_delivery, monkeypatch, effect):
     """#41: a 5xx on issue creation may arrive after GitHub created it. The create is never repeated; the run adopts
     the single issue carrying the effect's marker and exact content and continues with the rest of the plan."""
@@ -1698,6 +1698,8 @@ def test_transient_create_error_adopts_the_landed_issue_without_repeating_the_wr
                     if len(writes) == 1:
                         if effect != "absent":
                             issue = original_create(**kwargs)
+                            if effect == "duplicate":
+                                original_create(**kwargs)
                             if effect == "drifted":
                                 github.issues["example/target"][issue.number] = replace(issue, title="Changed remote")
                         raise GitHubTransientError("gh api failed for POST repos/example/target/issues: (HTTP 502)")
@@ -1726,7 +1728,7 @@ def test_transient_create_error_adopts_the_landed_issue_without_repeating_the_wr
                 else:
                     assert done.state == "failed", done.error
                     assert len(writes) == 1
-                    assert len(github.issues.get("example/target", {})) == (0 if effect == "absent" else 1)
+                    assert len(github.issues.get("example/target", {})) == {"absent": 0, "duplicate": 2}.get(effect, 1)
                     with pytest.raises(PermissionError):
                         restart()[1].reconcile(waiting.assignment_id)
                     assert len(writes) == 1

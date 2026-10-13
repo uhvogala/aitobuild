@@ -41,10 +41,10 @@ def test_transient_read_is_retried_then_succeeds(monkeypatch, status):
 
 def test_exhausted_read_retries_fail_cleanly_with_capped_backoff(monkeypatch):
     sleeps: list[float] = []
-    calls = scripted(monkeypatch, ["gh: (HTTP 502)"] * 4)
+    calls = scripted(monkeypatch, ["gh: (HTTP 502)"] * 5)
     with pytest.raises(GitHubTransientError, match="HTTP 502"):
-        adapter(sleeps)._api(f"repos/{REPO}/issues?state=all&per_page=100&page=1")
-    assert len(calls) == 4 and sleeps == [0.5, 1.0, 2.0]
+        adapter(sleeps, attempts=5)._api(f"repos/{REPO}/issues?state=all&per_page=100&page=1")
+    assert len(calls) == 5 and sleeps == [0.5, 1.0, 2.0, 2.0]
 
 
 def test_backoff_is_jittered_within_bounds(monkeypatch):

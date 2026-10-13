@@ -592,8 +592,7 @@ class ManagedPlanning:
             raise PermissionError("Issue creation is uncertain and its marker lookup failed; no write repeated") from error
         if len(matches) != 1:
             raise PermissionError("Issue creation is uncertain and did not land exactly once; no write repeated")
-        self._receipt(matches[0], content, scope)
-        return matches[0]
+        return matches[0]  # publish() then checks it against the exact approved content via _receipt
 
     def reconcile(self, assignment_id: str) -> dict[str, Any]:
         plan = self.plans.get(assignment_id)
