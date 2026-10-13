@@ -7,9 +7,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from hashlib import sha1, sha256
 import json
+import random
 from pathlib import PurePosixPath
 import re
 from subprocess import CalledProcessError, TimeoutExpired, run
+import time
 from typing import Any, Literal, Protocol
 from urllib.parse import urlencode
 from uuid import uuid4
@@ -22,6 +24,23 @@ from aitobuild.policy import (
 )
 
 AdvanceOutcome = Literal["parent", "ours", "moved"]
+
+# GitHub gateway/availability errors that a later identical request can succeed past.
+TRANSIENT_HTTP_STATUSES = frozenset({502, 503, 504})
+_HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
+
+
+class GitHubTransientError(RuntimeError):
+    """A GitHub 502/503/504. For a read it is raised only after bounded retries; a write is never retried, so the
+    caller must treat the write as uncertain (it may have landed) and reconcile by reading, never by repeating it."""
+
+
+def transient_http_status(detail: str) -> int | None:
+    match = _HTTP_STATUS.search(detail)
+    if match is None:
+        return None
+    status = int(match.group(1))
+    return status if status in TRANSIENT_HTTP_STATUSES else None
 
 
 def normalize_repository_name(repository: str) -> str:
@@ -890,7 +909,16 @@ class GhCliGitHubAdapter:
         default_repository: str | None = None,
         allowed_repositories: tuple[str, ...] | frozenset[str] | None = None,
         enforce_allowlist: bool = True,
+        read_attempts: int = 4,
+        backoff_base: float = 0.5,
+        backoff_cap: float = 8.0,
+        sleep: Callable[[float], object] = time.sleep,
+        jitter: Callable[[], float] = random.random,
     ) -> None:
+        if type(read_attempts) is not int or read_attempts < 1 or backoff_base < 0 or backoff_cap < backoff_base:
+            raise ValueError("GitHub read retries require at least one attempt and a bounded backoff")
+        self.read_attempts, self.backoff_base, self.backoff_cap = read_attempts, backoff_base, backoff_cap
+        self._sleep, self._jitter = sleep, jitter
         self.default_repository = (
             normalize_repository_name(default_repository) if default_repository else None
         )
@@ -925,6 +953,27 @@ class GhCliGitHubAdapter:
         method: str = "GET",
         payload: dict[str, Any] | None = None,
     ) -> Any:
+        # Read retry bound (#41): with the defaults (4 attempts, 0.5 s base doubling, 8 s cap, jitter scaling each
+        # delay into [0.5, 1.0)), one read sleeps at most 0.5 + 1 + 2 = 3.5 s in total, plus up to 4 gh calls of up to
+        # 60 s each. The retry loop does not consult the task budget deadline; callers' budget checks run around it.
+        # Only reads are retried (#41). A write can fail with a 5xx after GitHub applied it, so writes surface
+        # GitHubTransientError at once and callers reconcile by reading (e.g. publication markers).
+        attempts = self.read_attempts if method == "GET" else 1
+        text = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                text = self._api_once(endpoint, method=method, payload=payload)
+                break
+            except GitHubTransientError:
+                if attempt >= attempts:
+                    raise
+                delay = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
+                self._sleep(delay * (0.5 + self._jitter() / 2))
+        if not text:
+            return {}
+        return json.loads(text)
+
+    def _api_once(self, endpoint: str, *, method: str, payload: dict[str, Any] | None) -> str:
         command = ["gh", "api", "-X", method, endpoint]
         input_text = None
         if payload is not None:
@@ -943,11 +992,11 @@ class GhCliGitHubAdapter:
             raise RuntimeError(f"gh api timed out for {method} {endpoint}") from exc
         except CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
-            raise RuntimeError(f"gh api failed for {method} {endpoint}: {detail}") from exc
-        text = completed.stdout.strip()
-        if not text:
-            return {}
-        return json.loads(text)
+            message = f"gh api failed for {method} {endpoint}: {detail}"
+            if transient_http_status(detail) is not None:
+                raise GitHubTransientError(message) from exc
+            raise RuntimeError(message) from exc
+        return completed.stdout.strip()
 
     def _matching_publish_head(
         self, *, repository: str, branch: str, base_sha: str, commit_message: str,

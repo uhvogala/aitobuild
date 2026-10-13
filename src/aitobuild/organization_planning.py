@@ -22,7 +22,7 @@ from aitobuild.durable_files import atomic_write_text
 from aitobuild.organization import DefinitionModel, DefinitionStore, EventName, Identifier
 from aitobuild.organization_runner import ManagedRun, ManagedTaskContext
 from aitobuild.policy import AgentRole
-from aitobuild.tools.github import GitHubAdapter, GitHubIssue, normalize_repository_name
+from aitobuild.tools.github import GitHubAdapter, GitHubIssue, GitHubTransientError, normalize_repository_name
 
 
 def canonical(value: Any) -> str:
@@ -326,6 +326,9 @@ class _IssueEffect(DefinitionModel):
     content: dict[str, Any]
     state: Literal["creating", "created", "linking", "linked"]
     receipt: dict[str, Any] | None = None
+    # True when the issue was adopted by marker after an uncertain (5xx) create instead of returned by the create
+    # call (#41). Defaults False so records persisted before this field still load.
+    adopted: bool = False
 
 
 class _PlanPublication(DefinitionModel):
@@ -534,12 +537,22 @@ class ManagedPlanning:
                 effect = _IssueEffect(key=content["key"], content=content, state="creating")
                 saved = saved.model_copy(update={"effects": (*saved.effects, effect)})
                 self._save_publication(saved)
-                issue = self.github.create_issue(role=AgentRole.PM, repository=record.scope.repository,
-                                                 title=str(content["title"]), body=str(content["body"]), labels=tuple(content["labels"]),
-                                                 approved=True, require_human_approval_for_repo_writes=True,
-                                                 before_write=before_write)
+                try:
+                    issue = self.github.create_issue(role=AgentRole.PM, repository=record.scope.repository,
+                                                     title=str(content["title"]), body=str(content["body"]),
+                                                     labels=tuple(content["labels"]), approved=True,
+                                                     require_human_approval_for_repo_writes=True, before_write=before_write)
+                except GitHubTransientError:
+                    # A 5xx on a create may arrive after GitHub created the issue. Never repeat the write (#41): adopt
+                    # the one issue carrying this effect's marker and exact content, otherwise fail with the effect
+                    # still "creating" so reconcile/operator inspection decides.
+                    issue = self._landed_issue(record.scope, content)
+                    adopted = True
+                else:
+                    adopted = False
                 receipt = self._receipt(issue, content, record.scope)
-                saved = saved.model_copy(update={"effects": (*saved.effects[:-1], effect.model_copy(update={"state": "created", "receipt": receipt}))})
+                saved = saved.model_copy(update={"effects": (*saved.effects[:-1], effect.model_copy(
+                    update={"state": "created", "receipt": receipt, "adopted": adopted}))})
                 self._save_publication(saved)
             if creating and any(issue.dependencies for issue in plan.proposal.issues):
                 data = self._link_data(plan, saved, uuid4().hex)
@@ -577,6 +590,16 @@ class ManagedPlanning:
                 self._save_publication(saved)
             context.revalidate()
             return self._stage(plan, saved)
+
+    def _landed_issue(self, scope: PlanningScope, content: dict[str, Any]) -> GitHubIssue:
+        try:
+            matches = self.github.find_issue_publication(repository=scope.repository, marker=str(content["marker"]),
+                                                         max_pages=self.lookup_max_pages)
+        except GitHubTransientError as error:
+            raise PermissionError("Issue creation is uncertain and its marker lookup failed; no write repeated") from error
+        if len(matches) != 1:
+            raise PermissionError("Issue creation is uncertain and did not land exactly once; no write repeated")
+        return matches[0]  # publish() then checks it against the exact approved content via _receipt
 
     def reconcile(self, assignment_id: str) -> dict[str, Any]:
         plan = self.plans.get(assignment_id)
