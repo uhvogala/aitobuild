@@ -629,11 +629,17 @@ class TimedOutCreateGitHub(FreshBranchGitHub):
             self.calls.append((method, endpoint))
             self.posted = True
             raise RuntimeError("gh: context deadline exceeded")
+        if endpoint == "user":
+            return {"login": "aitobuild-bot"}
         return super().__call__(endpoint, method=method, payload=payload)
 
 
+CREATED_BODY = "Closes #8\n<!-- aitobuild-delivery:" + "f" * 64 + " -->"
+
+
 def _created_pull(**overrides: Any) -> dict[str, Any]:
-    pull = {"number": 2, "title": "T", "body": "Closes #8", "state": "open", "draft": True,
+    pull = {"number": 2, "title": "T", "body": CREATED_BODY, "state": "open", "draft": True,
+            "user": {"login": "aitobuild-bot"},
             "head": {"ref": "aitobuild/issue-8-task", "sha": "c" * 40, "repo": {"full_name": REPO}},
             "base": {"ref": "main"}}
     pull.update(overrides)
@@ -650,11 +656,13 @@ def _created_pull(**overrides: Any) -> dict[str, Any]:
     ([_created_pull(head={"ref": "aitobuild/issue-8-task", "sha": "c" * 40, "repo": {"full_name": "fork/elsewhere"}})], False),
     ([_created_pull(base={"ref": "release"})], False),
     ([_created_pull(state="closed")], False),
+    ([_created_pull(user={"login": "intruder"})], False),
+    ([_created_pull(body="Closes #8")], False),
 ], ids=["accepted", "not_created", "ambiguous", "other_title", "not_draft", "other_head", "other_repo", "other_base",
-        "closed"])
+        "closed", "copied_marker_foreign_author", "no_marker"])
 def test_gh_pr_create_timeout_adopts_only_the_exact_created_draft(created, adopted, monkeypatch) -> None:
     fake = TimedOutCreateGitHub(created=created)
-    arguments = dict(role=AgentRole.DEVELOPER, repository=REPO, title="T", body="Closes #8",
+    arguments = dict(role=AgentRole.DEVELOPER, repository=REPO, title="T", body=CREATED_BODY,
                      head_branch="aitobuild/issue-8-task", base_ref="main", issue_number=8, approved=True,
                      require_human_approval_for_repo_writes=True)
     if adopted:

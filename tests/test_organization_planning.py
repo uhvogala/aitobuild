@@ -755,7 +755,8 @@ def test_native_planning_fails_closed_without_writes_or_model_replay(tmp_path, a
     assert len(bodies) == {"malformed": 4, "authority": 4, "limit": 4, "no_inspection": 3, "repository": 5}.get(case, 3), len(bodies)
 
 
-@pytest.mark.parametrize("effect", ["create_landed", "create_absent", "link_landed", "link_absent", "duplicate", "remote_drift", "receipt_save"])
+@pytest.mark.parametrize("effect", ["create_landed", "create_absent", "link_landed", "link_absent", "duplicate", "remote_drift", "receipt_save",
+                                    "foreign_author"])
 def test_uncertain_issue_writes_reconcile_read_only_without_duplicate_creation(tmp_path, approved_delivery, monkeypatch, effect):
     bodies = []
     document = proposal()
@@ -782,6 +783,8 @@ def test_uncertain_issue_writes_reconcile_read_only_without_duplicate_creation(t
                         original_create(**kwargs)
                     if effect == "remote_drift":
                         github.issues["example/target"][issue.number] = replace(issue, title="Changed remote")
+                    if effect == "foreign_author":  # #51: exact marker and content, but someone else wrote it
+                        github.issues["example/target"][issue.number] = replace(issue, author="intruder")
                     if effect not in {"link_landed", "link_absent", "receipt_save"}:
                         raise OSError("Create response uncertain")
                     return issue
@@ -815,6 +818,9 @@ def test_uncertain_issue_writes_reconcile_read_only_without_duplicate_creation(t
                 if effect in {"create_landed", "link_landed", "receipt_save"}:
                     result = restart()[1].reconcile(waiting.assignment_id)
                     assert result["state"] == "published"
+                    saved = planning._load_publication(waiting.assignment_id, planning.plans.get(waiting.assignment_id))
+                    # Reconcile marks an effect it found only by marker (no saved receipt) as adopted.
+                    assert saved.effects[0].adopted is (effect in {"create_landed", "receipt_save"})
                     for preview_id in result["developer_previews"]:
                         assert not previews.get(preview_id).approved
                     assert restart()[1].reconcile(waiting.assignment_id) == result
@@ -1674,7 +1680,7 @@ def test_planned_child_pins_and_sources_fail_closed(tmp_path, approved_delivery,
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("effect", ["landed", "absent", "lookup_down", "drifted", "duplicate"])
+@pytest.mark.parametrize("effect", ["landed", "absent", "lookup_down", "drifted", "duplicate", "foreign_author"])
 def test_transient_create_error_adopts_the_landed_issue_without_repeating_the_write(tmp_path, approved_delivery, monkeypatch, effect):
     """#41: a 5xx on issue creation may arrive after GitHub created it. The create is never repeated; the run adopts
     the single issue carrying the effect's marker and exact content and continues with the rest of the plan."""
@@ -1702,6 +1708,8 @@ def test_transient_create_error_adopts_the_landed_issue_without_repeating_the_wr
                                 original_create(**kwargs)
                             if effect == "drifted":
                                 github.issues["example/target"][issue.number] = replace(issue, title="Changed remote")
+                            if effect == "foreign_author":
+                                github.issues["example/target"][issue.number] = replace(issue, author="intruder")
                         raise GitHubTransientError("gh api failed for POST repos/example/target/issues: (HTTP 502)")
                     return original_create(**kwargs)
 

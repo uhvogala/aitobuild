@@ -569,20 +569,35 @@ def test_ghcli_adapter_enforces_allowlist(monkeypatch: pytest.MonkeyPatch) -> No
         GhCliGitHubAdapter(allowed_repositories=())
 
 
-@pytest.mark.parametrize("draft,state", [(True, "open"), (False, "open"), (True, "closed")])
-def test_ghcli_recovers_existing_task_pr_without_local_number(monkeypatch, draft, state) -> None:
+MARKED_BODY = "Automated draft\n<!-- aitobuild-delivery:" + "e" * 64 + " -->"
+
+
+@pytest.mark.parametrize("draft,state,body,author,outcome", [
+    (True, "open", MARKED_BODY, "aitobuild-bot", "adopted"),
+    (False, "open", MARKED_BODY, "aitobuild-bot", "not_draft"),
+    (True, "closed", MARKED_BODY, "aitobuild-bot", "not_draft"),
+    (True, "open", MARKED_BODY, "someone-else", "refused"),
+    (True, "open", MARKED_BODY, None, "refused"),
+    (True, "open", "Automated draft", "aitobuild-bot", "refused"),
+    (True, "open", MARKED_BODY + "\nedited", "aitobuild-bot", "refused"),
+], ids=["ours", "not_draft", "closed", "copied_marker_foreign_author", "no_author", "no_marker", "receipt_differs"])
+def test_ghcli_recovers_existing_task_pr_without_local_number(monkeypatch, draft, state, body, author, outcome) -> None:
     from aitobuild.policy import AgentRole
 
     adapter = GhCliGitHubAdapter(allowed_repositories=("fixture/widgets",))
-    raw = {"number": 8, "title": "Trial", "body": "Original", "state": state, "draft": draft,
+    raw = {"number": 8, "title": "Trial", "body": body, "state": state, "draft": draft,
            "head": {"ref": "aitobuild/issue-7-task", "sha": "b" * 40,
                     "repo": {"full_name": "fixture/widgets"}}, "base": {"ref": "main"}}
+    if author is not None:
+        raw["user"] = {"login": author}
     calls = []
 
     def api(endpoint, *, method="GET", payload=None):
         calls.append((method, endpoint))
         if method == "POST":
             raise AssertionError("Recovery must not create a second PR")
+        if endpoint == "user":
+            return {"login": "AItobuild-Bot"}
         if "/pulls?" in endpoint:
             return [raw]
         if endpoint.endswith("/files?per_page=100"):
@@ -591,14 +606,14 @@ def test_ghcli_recovers_existing_task_pr_without_local_number(monkeypatch, draft
 
     monkeypatch.setattr(adapter, "_api", api)
     arguments = dict(role=AgentRole.DEVELOPER, repository="fixture/widgets", title="Trial",
-                     body="Updated", head_branch="aitobuild/issue-7-task", base_ref="main",
+                     body=MARKED_BODY, head_branch="aitobuild/issue-7-task", base_ref="main",
                      issue_number=7, approved=True, require_human_approval_for_repo_writes=True)
-    if draft and state == "open":
+    if outcome == "adopted":
         pull = adapter.create_or_update_draft_pull_request(**arguments)
-        assert pull.number == 8 and pull.body == "Updated"
+        assert pull.number == 8 and pull.body == MARKED_BODY and pull.author == "aitobuild-bot"
         assert any(method == "PATCH" for method, _ in calls)
     else:
-        with pytest.raises(ValueError, match="open draft"):
+        with pytest.raises((ValueError, PermissionError), match="open draft|not adopted" if outcome == "not_draft" else "not adopted"):
             adapter.create_or_update_draft_pull_request(**arguments)
         assert all(method == "GET" for method, _ in calls)
 
