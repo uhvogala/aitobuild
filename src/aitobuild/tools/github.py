@@ -2151,7 +2151,7 @@ def is_own_author(author: str | None, writer: str) -> bool:
             and author.strip().casefold() == writer.strip().casefold())
 
 
-def require_adoptable_pull(*, title: str | None, body: str | None, draft: bool, author: str | None,
+def require_adoptable_pull(*, title: str | None, body: str | None, draft: object, author: str | None,
                            expected_title: str, expected_body: str, writer: str) -> None:
     """Adopt an existing task-branch PR only by its delivery marker, the exact approved title/body receipt
     and our own writer as author. Anything else on the task branch is refused, never adopted or duplicated."""
