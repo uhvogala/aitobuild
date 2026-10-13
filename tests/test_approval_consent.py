@@ -733,7 +733,9 @@ def test_consent_refuses_review_and_correction_tasks(task_admission_fixture, pre
     staged = registry.create_or_get(dedupe_key="staged-" + prefix, bundle_payload=bundle,
                                     source_payload={"published_review": {"preview_id": "dp-x", "head_sha": "a" * 40}})
     evidence = ConsentAdmissionEvidence(consent=store.get_consent(projection.consent_id), projection=projection)
-    with pytest.raises(PermissionError, match="review or correction"):
+    # Corrections now stop at the shared _admit refusal (before consent dispatch); reviews at _admit_consent.
+    with pytest.raises(PermissionError, match="review or correction" if prefix == "published-review-"
+                       else "Correction tasks require a human admission"):
         bridge._service.admit_consent(staged, Consent(evidence=evidence, base_revision="c" * 40))
     assert not registry.get(staged.preview_id).approved
 
@@ -882,7 +884,7 @@ def test_service_refuses_consent_for(task_admission_fixture, case):
     consent = _consent_args(store, projection)
     bundle = deepcopy(preview.bundle_payload)
     source = preview.source_payload
-    expected = {"planning": "Planning and non-repository", "non_repo": "Planning and non-repository",
+    expected = {"planning": "Planning tasks always require a human admission", "non_repo": "Planning and non-repository",
                 "edited": "edited task", "human_mode": "automatic task-admission policy",
                 "pinned_base": "already pinned task base", "decision_source": "live human decision"}[case]
     if case == "planning":

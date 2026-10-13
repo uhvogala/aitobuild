@@ -523,6 +523,16 @@ per-issue dedupe, described below). A new admission source (for example Discussi
 `_approve_admission` itself or add a parallel path. Changing the route itself
 requires an explicit update to this section first.
 
+Rule: planning and correction tasks are human-admitted. `ManagedOrganizationService._admit`
+refuses every automatic source (`OperatorPolicy`, `PlannedChild`, `InheritedReview`) for a
+`pm-planning-*` task (#31), and in the same place refuses them for a correction task
+(`published-correction-*` or a `correction_from_review` source) unless the operator configured
+`correction: automatic`. That mode keeps automatic correction admission available for the
+configured correction cycle. The check reads the same policy snapshot whose revision the
+admission decision is bound to. Both refusals run before evidence dispatch, so they cover
+every non-`Human` source; `Consent` is refused for planning and for corrections in every mode,
+including `correction: automatic`.
+
 Rule: consent admission requires `task_admission` to be `automatic`. Under
 `human` mode a consent is refused, and only the HTTP approve endpoint
 (`Human` evidence) admits a task.

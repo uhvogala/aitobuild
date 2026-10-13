@@ -20,6 +20,7 @@ from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryW
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import (AutomaticAdmissionDeferred, DeveloperPreview, DeveloperPreviewRegistry, is_planned_child,
                                          preview_approval_operation, published_review_target, CORRECTION_TASK_PREFIX,
+                                         PLANNING_TASK_PREFIX, is_correction_task,
                                          REVIEW_TASK_PREFIX)
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, EventName, Identifier, OrganizationDefinition
 from aitobuild.organization_assignments import AssignmentProposal, AssignmentService, AssignmentStore, TaskAssignment
@@ -353,13 +354,23 @@ class ManagedOrganizationService:
     def _admit(self, preview: DeveloperPreview,
                evidence: OperatorPolicy | PlannedChild | InheritedReview | Consent) -> DeveloperPreview:
         """Configured-evidence checks; the approval itself goes through the module-level admit_task (PLAN 2.4)."""
+        # One policy snapshot governs this admission: the correction-mode check, the resolved decision (bound to this
+        # snapshot's revision) and the automatic limit all read it, so a config change mid-admission cannot split them.
+        policy = self.approval_policy
+        # Every evidence that reaches _admit is non-Human (Human only enters admit_task from the HTTP approve
+        # endpoint), so these refusals cover OperatorPolicy, PlannedChild, InheritedReview and Consent alike.
+        if str(preview.bundle_payload.get("task_id", "")).startswith(PLANNING_TASK_PREFIX):
+            # #31: only a direct human admission admits a planning task, whichever caller reached _admit.
+            raise PermissionError("Planning tasks always require a human admission")
+        if is_correction_task(preview) and (isinstance(evidence, Consent) or policy.correction != "automatic"):
+            # A correction is admitted automatically only under correction: automatic in this snapshot (the queued
+            # native correction cycle); Consent never admits a correction in any mode (PLAN 2.4).
+            raise PermissionError("Correction tasks require a human admission unless correction is automatic")
         match evidence:
             case Consent():
                 return self._admit_consent(preview, evidence)
             case OperatorPolicy() | PlannedChild() | InheritedReview():
-                if str(preview.bundle_payload.get("task_id", "")).startswith("pm-planning-"):
-                    # #31: no automatic source ever admits a planning task, whichever caller reached _admit.
-                    raise PermissionError("Planning tasks always require a human admission")
+                pass
             case _:
                 assert_never(evidence)
         if self._evidence_for(preview) != evidence:
@@ -393,11 +404,12 @@ class ManagedOrganizationService:
             issue_payload["base_revision"] = base.lower() if isinstance(base, str) else base
         elif base is not None:
             raise PermissionError("Non-repository admission cannot add a repository base")
-        decision = self.approval_policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id=self.operator_id,
-            operation=preview_approval_operation(preview.preview_id, payload), automatic_supported=True)
+        decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id=self.operator_id,
+            operation=preview_approval_operation(preview.preview_id, payload), automatic_supported=True,
+            expected_revision=policy.revision)
         try:
             approved = admit_task(self._previews, preview.preview_id, evidence, base_revision=base, decision=decision, expected=preview,
-                                  max_automatic_admissions=self.approval_policy.max_automatic_admissions)
+                                  max_automatic_admissions=policy.max_automatic_admissions)
         except AutomaticAdmissionDeferred:
             return preview  # one automatic admission per repository/issue ID; later tasks wait for a human
         if approved is None:
