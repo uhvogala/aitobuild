@@ -1672,3 +1672,63 @@ def test_planned_child_pins_and_sources_fail_closed(tmp_path, approved_delivery,
                     service._check_planned_child(child)
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("effect", ["landed", "absent", "lookup_down", "drifted"])
+def test_transient_create_error_adopts_the_landed_issue_without_repeating_the_write(tmp_path, approved_delivery, monkeypatch, effect):
+    """#41: a 5xx on issue creation may arrive after GitHub created it. The create is never repeated; the run adopts
+    the single issue carrying the effect's marker and exact content and continues with the rest of the plan."""
+    from aitobuild.tools.github import GitHubTransientError
+    bodies = []
+    document = proposal()
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply(bodies, document))) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service, planning, _, preview, previews, github, restart, _ = planning_fixture(tmp_path, profile, approved_delivery[1])
+                approve_preview(previews, preview.preview_id)
+                waiting = await service.consume(preview.preview_id)
+                assert waiting.state == "waiting", waiting.error
+                original_create, original_find = github.create_issue, github.find_issue_publication
+                writes: list[str] = []
+
+                def create(**kwargs):
+                    writes.append(kwargs["title"])
+                    if len(writes) == 1:
+                        if effect != "absent":
+                            issue = original_create(**kwargs)
+                            if effect == "drifted":
+                                github.issues["example/target"][issue.number] = replace(issue, title="Changed remote")
+                        raise GitHubTransientError("gh api failed for POST repos/example/target/issues: (HTTP 502)")
+                    return original_create(**kwargs)
+
+                lookups = []
+
+                def find(**kwargs):
+                    lookups.append(kwargs["marker"])
+                    if effect == "lookup_down" and len(writes) == 1 and len(lookups) == 2:
+                        raise GitHubTransientError("gh api failed for GET issues: (HTTP 503)")
+                    return original_find(**kwargs)
+
+                monkeypatch.setattr(github, "create_issue", create)
+                monkeypatch.setattr(github, "find_issue_publication", find)
+                done = await service.decide(waiting.assignment_id, request_id=waiting.pending[0].request_id, approved=True)
+                if effect == "landed":
+                    if done.state == "waiting":
+                        assert done.pending[0].data["stage"] == "link"
+                        done = await service.decide(done.assignment_id, request_id=done.pending[0].request_id, approved=True)
+                    assert done.state == "completed", done.error
+                    assert len(writes) == len(document["issues"]) == len(set(writes))
+                    assert len(github.issues["example/target"]) == len(document["issues"])
+                    saved = planning._load_publication(waiting.assignment_id, planning.plans.get(waiting.assignment_id))
+                    assert saved.state == "published" and all(item.state == "linked" for item in saved.effects)
+                else:
+                    assert done.state == "failed", done.error
+                    assert len(writes) == 1
+                    assert len(github.issues.get("example/target", {})) == (0 if effect == "absent" else 1)
+                    with pytest.raises(PermissionError):
+                        restart()[1].reconcile(waiting.assignment_id)
+                    assert len(writes) == 1
+
+    asyncio.run(exercise())
