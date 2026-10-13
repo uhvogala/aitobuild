@@ -97,6 +97,9 @@ def _matches_apart_from_approval(stored: DeveloperPreview, expected: DeveloperPr
     approval writes: approved/approved_at/approval_policy/consent_approval, dispatched_at, and the base revision
     approval pins into an unpinned issue bundle. Everything else, including source_payload, must be identical."""
     if expected is None:
+        # Only reached for the replay when approval_policy is set, and admit_task requires `expected` on every
+        # path that carries a decision (OperatorPolicy, PlannedChild, InheritedReview, Consent); the Human path has
+        # no decision and never reaches this replay. So a None `expected` never widens a replay.
         return True
     bundle = deepcopy(expected.bundle_payload)
     context, saved = bundle.get("issue_context"), stored.bundle_payload.get("issue_context")

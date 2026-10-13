@@ -837,12 +837,38 @@ def test_replay_still_compares_the_expected_preview(task_admission_fixture):
 
 
 def test_replay_refuses_a_different_decision(task_admission_fixture):
+    """Same consent, different decision, on an already-approved record: only the replay's decision-equality check
+    stops this from being returned as a replay (the consent matches, so the consent check cannot refuse it)."""
     store, registry, bridge, projection, inputs = task_admission_fixture
     before = registry.get(projection.preview_id)
-    bridge.approve(projection)
+    admitted = bridge.approve(projection)
     automatic = _automatic(registry, inputs["profile"].policy, before)
+    assert automatic != admitted.approval_policy
     with pytest.raises(PermissionError):
-        approve_preview(registry, before.preview_id, base_revision="c" * 40, approval_policy=automatic, expected=before)
+        approve_preview(registry, before.preview_id, base_revision="c" * 40, approval_policy=automatic,
+                        consent_approval=admitted.consent_approval, expected=before)
+    assert registry.get(projection.preview_id) == admitted
+
+
+@pytest.mark.parametrize("change", ["pinned_base", "bundle"])
+def test_replay_refuses_a_different_expected_bundle(task_admission_fixture, change):
+    """Same consent and decision on an approved record, but `expected` has a different pinned base or bundle."""
+    from dataclasses import replace
+
+    from aitobuild.organization_service import admit_task
+
+    store, registry, bridge, projection, _ = task_admission_fixture
+    before = registry.get(projection.preview_id)
+    admitted = bridge.approve(projection)
+    bundle = deepcopy(before.bundle_payload)
+    if change == "pinned_base":
+        bundle["issue_context"]["base_revision"] = "d" * 40
+    else:
+        bundle["task_id"] = bundle["task_id"] + "-other"
+    with pytest.raises(PermissionError, match="differs from its stored record"):
+        admit_task(registry, projection.preview_id, _consent_args(store, projection), base_revision="c" * 40,
+                   decision=projection.decision, expected=replace(before, bundle_payload=bundle))
+    assert registry.get(projection.preview_id) == admitted
 
 
 @pytest.mark.parametrize("case", ["planning", "non_repo", "edited", "human_mode", "pinned_base", "decision_source"])
