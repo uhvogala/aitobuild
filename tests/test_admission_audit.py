@@ -114,7 +114,7 @@ POLICY = {"source": "operator_policy", "policy_revision": REV}
 
 @pytest.mark.parametrize("task_id,kind", [
     ("pm-planning-x", "human"), ("published-review-x", "inherited_review"), ("planned-issue-x", "planned_child"),
-    ("dependent-issue-x", "planned_child"), ("ISSUE-1", "operator_policy")])
+    ("dependent-issue-x", "planned_child"), ("ISSUE-1", "operator_policy"), ("published-correction-x", "human")])
 def test_expected_evidence_kind(task_id, kind) -> None:
     assert expected_evidence_kind(task_id) == kind
 
@@ -138,3 +138,17 @@ def test_children_and_reviews_need_automatic_admission_with_their_kind(task_id, 
 
 def test_human_task_admission_mode_has_no_admission_verdict() -> None:
     assert admission_problem("p", "planned-issue-x", None, "human", {"task_admission": "human"}, REV) is None
+
+
+def test_correction_by_source_payload_expects_human() -> None:
+    assert expected_evidence_kind("ISSUE-1", {"correction_from_review": {}}) == "human"
+    assert expected_evidence_kind("ISSUE-1", {"other": 1}) == "operator_policy"
+
+
+@pytest.mark.parametrize("task_id,source", [("published-correction-x", None), ("ISSUE-9", {"correction_from_review": {}})])
+def test_corrections_must_be_human_admitted(task_id, source) -> None:
+    assert admission_problem("c", task_id, None, "human", AUTO, REV, source) is None
+    assert admission_problem("c", task_id, POLICY, "operator_policy", AUTO, REV, source)
+    assert admission_problem("c", task_id, POLICY, "human", AUTO, REV, source)
+    assert admission_problem("c", task_id, None, None, AUTO, REV, source)
+

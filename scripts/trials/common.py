@@ -299,9 +299,12 @@ def finish(report: dict[str, Any], recorder: Recorder) -> int:
     return 0 if report["result"] == "pass" else 1
 
 
-def expected_evidence_kind(task_id: str) -> str:
-    """The admit_task evidence kind a task of this ID gets under automatic task admission (planning is #31)."""
-    if task_id.startswith("pm-planning-"):
+def expected_evidence_kind(task_id: str, source_payload: dict[str, Any] | None = None) -> str:
+    """The admit_task evidence kind a task gets under automatic task admission: planning (#31) and corrections
+    (correction: human) stay human-admitted."""
+    if task_id.startswith(("pm-planning-", "published-correction-")) or "correction_from_review" in (
+        source_payload or {}
+    ):
         return "human"
     if task_id.startswith("published-review-"):
         return "inherited_review"
@@ -317,16 +320,17 @@ def admission_problem(
     evidence_kind: str | None,
     modes: dict[str, Any],
     revision: str,
+    source_payload: dict[str, Any] | None = None,
 ) -> str | None:
     """Verdict on one phase's task admission. With automatic task admission, planning tasks must be human-admitted
-    (#31: no policy decision, evidence kind human) and every other task must be an automatic policy decision at the
+    (#31) and corrections must be human-admitted (no policy decision, evidence kind human) and every other task must be an automatic policy decision at the
     pinned revision through its expected evidence kind (planned child, inherited review, operator policy)."""
     if modes.get("task_admission") != "automatic":
         return None
-    want = expected_evidence_kind(task_id)
+    want = expected_evidence_kind(task_id, source_payload)
     if want == "human":
         if admission is not None or evidence_kind != "human":
-            return f"{phase}: planning task not human-admitted (evidence={evidence_kind})"
+            return f"{phase}: planning/correction task not human-admitted (evidence={evidence_kind})"
         return None
     if (
         not admission
@@ -384,6 +388,7 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
             preview.evidence_kind if preview else None,
             modes,
             policy.revision,
+            preview.source_payload if preview else None,
         )
         if problem:
             problems.append(problem)
