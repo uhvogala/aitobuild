@@ -83,11 +83,6 @@ def admit_task(previews: DeveloperPreviewRegistry, preview_id: str, evidence: Ad
     ManagedOrganizationService._admit first; `expected` is the exact preview those checks evaluated and must equal
     the stored one, since the decision digest omits source_payload. The limit and dedupe follow the resolved
     decision source."""
-    stored = previews.get(preview_id)
-    if (stored is not None and str(stored.bundle_payload.get("task_id", "")).startswith("pm-planning-")
-            and not isinstance(evidence, Human)):
-        # #31, enforced on the one route: a planning task is only ever admitted by a human, whatever the caller.
-        raise PermissionError("Planning tasks always require a human admission")
     match evidence:
         case Human():
             if decision is not None or base_revision is not None:
@@ -362,7 +357,9 @@ class ManagedOrganizationService:
             case Consent():
                 return self._admit_consent(preview, evidence)
             case OperatorPolicy() | PlannedChild() | InheritedReview():
-                pass
+                if str(preview.bundle_payload.get("task_id", "")).startswith("pm-planning-"):
+                    # #31: no automatic source ever admits a planning task, whichever caller reached _admit.
+                    raise PermissionError("Planning tasks always require a human admission")
             case _:
                 assert_never(evidence)
         if self._evidence_for(preview) != evidence:
