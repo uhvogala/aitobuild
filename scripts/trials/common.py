@@ -299,6 +299,50 @@ def finish(report: dict[str, Any], recorder: Recorder) -> int:
     return 0 if report["result"] == "pass" else 1
 
 
+def expected_evidence_kind(task_id: str, source_payload: dict[str, Any] | None = None) -> str:
+    """The admit_task evidence kind a task gets under automatic task admission: planning (#31) and corrections
+    (correction: human) stay human-admitted."""
+    if task_id.startswith(("pm-planning-", "published-correction-")) or "correction_from_review" in (
+        source_payload or {}
+    ):
+        return "human"
+    if task_id.startswith("published-review-"):
+        return "inherited_review"
+    if task_id.startswith(("planned-issue-", "dependent-issue-")):
+        return "planned_child"
+    return "operator_policy"
+
+
+def admission_problem(
+    phase: str,
+    task_id: str,
+    admission: dict[str, Any] | None,
+    evidence_kind: str | None,
+    modes: dict[str, Any],
+    revision: str,
+    source_payload: dict[str, Any] | None = None,
+) -> str | None:
+    """Verdict on one phase's task admission. With automatic task admission, planning tasks must be human-admitted
+    (#31) and corrections must be human-admitted (no policy decision, evidence kind human) and every other task must be an automatic policy decision at the
+    pinned revision through its expected evidence kind (planned child, inherited review, operator policy)."""
+    if modes.get("task_admission") != "automatic":
+        return None
+    want = expected_evidence_kind(task_id, source_payload)
+    if want == "human":
+        if admission is not None or evidence_kind != "human":
+            return f"{phase}: planning/correction task not human-admitted (evidence={evidence_kind})"
+        return None
+    if (
+        not admission
+        or admission.get("source") != "operator_policy"
+        or admission.get("policy_revision") != revision
+    ):
+        return f"{phase}: admission not an automatic policy decision at the pinned revision"
+    if evidence_kind != want:
+        return f"{phase}: admitted as {evidence_kind}, expected {want}"
+    return None
+
+
 def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any) -> dict[str, Any]:
     """Read saved preview/run state and classify every recorded decision as automatic or human."""
     service, previews = holder["service"], holder["previews"]
@@ -331,20 +375,23 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
                 "phase": phase["phase"],
                 "preview_id": phase["preview_id"],
                 "admission": admission,
+                "evidence_kind": preview.evidence_kind if preview else None,
                 "run_policy_revision": run.approval_policy_revision if run else None,
                 "automatic_decisions": count,
                 "decisions": decisions,
             }
         )
-        if modes.get("task_admission") == "automatic":
-            if (
-                not admission
-                or admission["source"] != "operator_policy"
-                or admission["policy_revision"] != policy.revision
-            ):
-                problems.append(
-                    f"{phase['phase']}: admission not an automatic policy decision at the pinned revision"
-                )
+        problem = admission_problem(
+            phase["phase"],
+            str((preview.bundle_payload if preview else {}).get("task_id", "")),
+            admission,
+            preview.evidence_kind if preview else None,
+            modes,
+            policy.revision,
+            preview.source_payload if preview else None,
+        )
+        if problem:
+            problems.append(problem)
         for item in decisions:
             stage, source = (
                 (item["policy"] or {}).get("stage"),

@@ -103,7 +103,8 @@ def admit_task(previews: DeveloperPreviewRegistry, preview_id: str, evidence: Ad
     # per-issue dedupe for consent as the one deliberate exception (PLAN 2.4).
     limit = max_automatic_admissions if decision is not None and decision.source == "operator_policy" else None
     return previews._approve_admission(preview_id, base_revision=base_revision, approval_policy=decision,
-                                       expected=expected, max_automatic_admissions=limit, consent_approval=consent)
+                                       expected=expected, max_automatic_admissions=limit, consent_approval=consent,
+                                       evidence_kind=evidence.kind)
 
 
 class ManagedRoute(DefinitionModel):
@@ -356,7 +357,9 @@ class ManagedOrganizationService:
             case Consent():
                 return self._admit_consent(preview, evidence)
             case OperatorPolicy() | PlannedChild() | InheritedReview():
-                pass
+                if str(preview.bundle_payload.get("task_id", "")).startswith("pm-planning-"):
+                    # #31: no automatic source ever admits a planning task, whichever caller reached _admit.
+                    raise PermissionError("Planning tasks always require a human admission")
             case _:
                 assert_never(evidence)
         if self._evidence_for(preview) != evidence:

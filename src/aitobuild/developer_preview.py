@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 import re
 from threading import RLock
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal, get_args
 from uuid import uuid4
 
 from filelock import FileLock
@@ -34,6 +34,9 @@ class DeveloperPreview:
     dispatched_at: datetime | None = None
     approval_policy: ApprovalDecision | None = None
     consent_approval: ConsentAdmissionEvidence | None = None
+    # Audit only (not policy): which admit_task evidence admitted this preview. None on unapproved previews and on
+    # records saved before it was recorded.
+    evidence_kind: AdmissionEvidenceKind | None = None
 
     @property
     def state(self) -> str:
@@ -42,6 +45,9 @@ class DeveloperPreview:
         return "approved" if self.approved else "awaiting_approval"
 
 
+
+AdmissionEvidenceKind = Literal["human", "operator_policy", "planned_child", "inherited_review", "consent"]
+ADMISSION_EVIDENCE_KINDS: frozenset[str] = frozenset(get_args(AdmissionEvidenceKind))
 
 PER_ISSUE_TASK_PREFIXES = ("ISSUE-", "planned-issue-", "dependent-issue-")
 PLANNED_CHILD_TASK_PREFIXES = ("planned-issue-", "dependent-issue-")
@@ -107,7 +113,7 @@ def _matches_apart_from_approval(stored: DeveloperPreview, expected: DeveloperPr
         context["base_revision"] = saved.get("base_revision")
     return replace(expected, bundle_payload=bundle, approved=stored.approved, approved_at=stored.approved_at,
                    approval_policy=stored.approval_policy, consent_approval=stored.consent_approval,
-                   dispatched_at=stored.dispatched_at) == stored
+                   evidence_kind=stored.evidence_kind, dispatched_at=stored.dispatched_at) == stored
 
 
 class AutomaticAdmissionDeferred(PermissionError):
@@ -156,6 +162,9 @@ class DeveloperPreviewRegistry:
                 raise ValueError("Invalid persisted preview lifecycle")
             if item["approved"] and bundle.issue_context is not None and bundle.issue_context.base_revision is None:
                 raise ValueError("Approved issue task is missing its pinned base revision")
+            kind = item.get("evidence_kind")
+            if kind is not None and (kind not in ADMISSION_EVIDENCE_KINDS or not item["approved"]):
+                raise ValueError("Invalid persisted admission evidence kind")
             if item.get("approval_policy") is not None:
                 decision = ApprovalDecision.model_validate(item["approval_policy"])
                 if (not item["approved"] or decision.stage != ApprovalStage.TASK_ADMISSION
@@ -176,6 +185,7 @@ class DeveloperPreviewRegistry:
                 approval_policy=ApprovalDecision.model_validate(item["approval_policy"]) if item.get("approval_policy") is not None else None,
                 consent_approval=ConsentAdmissionEvidence.model_validate(item["consent_approval"])
                 if item.get("consent_approval") is not None else None,
+                evidence_kind=item.get("evidence_kind"),
             )
             for item in data["previews"]
         }
@@ -200,6 +210,7 @@ class DeveloperPreviewRegistry:
                     **({"approval_policy": preview.approval_policy.model_dump(mode="json")} if preview.approval_policy is not None else {}),
                           **({"consent_approval": preview.consent_approval.model_dump(mode="json")}
                               if preview.consent_approval is not None else {}),
+                    **({"evidence_kind": preview.evidence_kind} if preview.evidence_kind is not None else {}),
                 }
                 for preview in self._by_id.values()
             ],
@@ -246,7 +257,8 @@ class DeveloperPreviewRegistry:
                 approval_policy: ApprovalDecision | None = None,
                 max_automatic_admissions: int | None = None,
                 expected: DeveloperPreview | None = None,
-                consent_approval: ConsentAdmissionEvidence | None = None) -> DeveloperPreview | None:
+                consent_approval: ConsentAdmissionEvidence | None = None,
+                evidence_kind: AdmissionEvidenceKind | None = None) -> DeveloperPreview | None:
         """Private: call only through organization_service.admit_task (PLAN 2.4; enforced by tests)."""
         with self._transaction(write=True):
             preview = self._by_id.get(preview_id)
@@ -320,7 +332,7 @@ class DeveloperPreviewRegistry:
                                           "a later task for it needs a direct human approval")
             approved_preview = replace(
                 preview, bundle_payload=bundle, approved=True, approved_at=datetime.now(tz=UTC),
-                approval_policy=approval_policy, consent_approval=consent_approval,
+                approval_policy=approval_policy, consent_approval=consent_approval, evidence_kind=evidence_kind,
             )
             self._by_id[preview_id] = approved_preview
             return deepcopy(approved_preview)
