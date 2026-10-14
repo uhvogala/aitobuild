@@ -18,6 +18,7 @@ import pytest
 
 import aitobuild.app as app_module
 from aitobuild.app import create_app
+from aitobuild.approval_policy import ApprovalMode, ApprovalPolicy, ApprovalStage
 from aitobuild.config import RepositorySourceConfig, load_config
 from aitobuild.developer_isolation import IsolationTool, build_developer_task_bundle, default_developer_isolation_policy
 from aitobuild.runtime import FrameworkAvailability, FrameworkBindings, RuntimeBootstrap
@@ -32,6 +33,60 @@ def _signature(secret: str, payload: bytes) -> str:
 def _internal_headers(test_config) -> dict[str, str]:
     token = test_config.security.internal_api_token or ""
     return {"X-Internal-Token": token}
+
+
+@pytest.mark.parametrize("stage", tuple(ApprovalStage))
+def test_automatic_policy_warning_covers_each_surface(stage):
+    policy = ApprovalPolicy.model_validate({stage.value: "automatic"})
+    assert policy.automatic_stages == (stage.value,)
+    assert len(policy.safety_warnings) == 1
+    assert stage.value in policy.safety_warnings[0]
+    assert policy.revision in policy.safety_warnings[0]
+
+
+def test_automatic_policy_warning_discovers_future_surfaces():
+    class FuturePolicy(ApprovalPolicy):
+        future_surface: ApprovalMode = "human"
+
+    policy = FuturePolicy(future_surface="automatic")
+    assert policy.automatic_stages == ("future_surface",)
+    assert "future_surface" in policy.safety_warnings[0]
+    assert policy.revision in policy.safety_warnings[0]
+
+
+@pytest.mark.parametrize("detached", [False, True])
+def test_automatic_policy_warning_is_shared_with_startup_and_diagnostics(test_config, tmp_path, caplog, detached):
+    from aitobuild.organization_runner import ManagedOperation
+
+    policy = ApprovalPolicy(developer_tools="automatic", review_publication="automatic")
+    operation = ManagedOperation(
+        handler=lambda task, message: None, on_response=lambda task, original, approved: False,
+        approval_stages=(ApprovalStage.DEVELOPER_TOOLS, ApprovalStage.REVIEW_PUBLICATION),
+    )
+    app = _managed_app(replace(test_config, approvals=policy), tmp_path, [], operation=operation, detached=detached)
+    with TestClient(app) as client:
+        assert client.get("/internal/diagnostics").status_code == 401
+        response = client.get("/internal/diagnostics", headers=_internal_headers(test_config))
+        if detached:
+            worker = client.get("/internal/organization/worker", headers=_internal_headers(test_config))
+            assert worker.json()["warnings"] == list(policy.safety_warnings)
+            assert worker.json()["automatic_approval_stages"] == list(policy.automatic_stages)
+            assert worker.json()["approval_policy_revision"] == policy.revision
+    assert response.status_code == 200
+    assert response.json() == {"approval_policy_revision": policy.revision,
+                               "automatic_approval_stages": list(policy.automatic_stages),
+                               "warnings": list(policy.safety_warnings)}
+    assert [(record.levelname, record.getMessage()) for record in caplog.records
+            if record.name == "aitobuild.app"] == [("WARNING", policy.safety_warnings[0])]
+
+
+def test_human_policy_has_no_safety_warning(test_config, caplog):
+    assert test_config.approvals.automatic_stages == ()
+    assert test_config.approvals.safety_warnings == ()
+    with TestClient(create_app(test_config)) as client:
+        response = client.get("/internal/diagnostics", headers=_internal_headers(test_config))
+    assert response.json()["warnings"] == []
+    assert not [record for record in caplog.records if record.name == "aitobuild.app"]
 
 
 def _managed_app(config, tmp_path, calls, operation=None, strategy="rules", version=None, detached=False):

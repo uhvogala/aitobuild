@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from importlib import import_module
 from dataclasses import replace
@@ -57,6 +58,8 @@ from aitobuild.triggers import InMemoryDedupeStore, TriggerEngine
 from aitobuild.tools.mcp_adapters import build_browser_tool
 from aitobuild.tools.bash import _normalize_session_id
 from aitobuild.tool_outputs import MAX_PROMPT_BYTES, build_output_guard
+
+logger = logging.getLogger(__name__)
 
 
 def _is_valid_signature(*, secret: str, payload: bytes, provided: str | None) -> bool:
@@ -416,6 +419,9 @@ def create_app(
     ) else None
     if managed_worker_factory is not None and managed_worker is None:
         raise ValueError("Managed worker factory must return an explicitly bound worker")
+    for warning in app_config.approvals.safety_warnings:
+        logger.warning("%s", warning)
+
     if managed_worker is not None:
         if managed_worker.service is not managed_service:
             raise ValueError("Managed worker must use the app's managed service")
@@ -784,6 +790,15 @@ def create_app(
         if run is not None:
             response.update(run)
         return response
+
+    @app.get("/internal/diagnostics")
+    def internal_diagnostics(
+        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    ) -> dict[str, object]:
+        _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+        return {"approval_policy_revision": app_config.approvals.revision,
+                "automatic_approval_stages": app_config.approvals.automatic_stages,
+                "warnings": app_config.approvals.safety_warnings}
 
     if managed_worker is not None:
         @app.get("/internal/organization/worker")
