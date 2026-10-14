@@ -11,6 +11,13 @@ and supervised recovery. Earlier counts, pending work and commit status describe
 their checkpoint, not the current system. Current setup and usage belong in
 [README.md](README.md); contributor rules belong in [agents.md](agents.md).
 
+Automatic policy visibility (#55): startup and authenticated service/worker
+diagnostics share one policy-model-derived warning listing every automatic field
+and the pinned revision. Default and all-human policies remain silent. Tests cover
+every registered surface, future model fields, multiple automatic stages, internal
+authentication and both worker configurations. This adds visibility only; exact
+approval gates, trusted operation bindings and original budgets are unchanged.
+
 Independent PM implementation handoff (2026-10-11): extended the opt-in detached
 follow-up queue with an explicit service-owned `planning_publication` binding.
 Read-only lookup joins the exact completed planning output to the immutable plan,
