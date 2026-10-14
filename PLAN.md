@@ -11,6 +11,14 @@ and supervised recovery. Earlier counts, pending work and commit status describe
 their checkpoint, not the current system. Current setup and usage belong in
 [README.md](README.md); contributor rules belong in [agents.md](agents.md).
 
+Worker abort lock errors (#22): removed the broad `TimeoutError` suppression that
+also swallowed `filelock.Timeout`. Abort reopens only the original ledger with
+`create=False, allow_aborted=True`; repeat aborts preserve deadlines and reservations
+without recreating budgets. Regression tests cover lock failure during both reopen
+and abort, repeat abort, and the exact `BudgetDeadlineExpired` exception from an
+expired `reserve_paths` call. Lock failures are no longer reported as successful
+abort; existing worker error/deferral handling remains responsible for them.
+
 Automatic policy visibility (#55): startup and authenticated service/worker
 diagnostics share one policy-model-derived warning listing every automatic field
 and the pinned revision. Default and all-human policies remain silent. Tests cover
