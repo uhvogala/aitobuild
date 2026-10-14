@@ -478,10 +478,10 @@ class ManagedOrganizationWorker:
             await self.service.cancel(assignment.assignment_id)
         path = self.service.budget_path(job.preview_id)
         if path.exists():
-            try:
-                DeveloperTaskBudget(path=path, bundle=developer_task_bundle_from_payload(json.loads(job.bundle_content)), create=False).abort()
-            except TimeoutError:
-                pass
+            DeveloperTaskBudget(
+                path=path, bundle=developer_task_bundle_from_payload(json.loads(job.bundle_content)),
+                create=False, allow_aborted=True,
+            ).abort()
 
     async def _execute(self, job: WorkerJob) -> None:
         try:
