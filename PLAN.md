@@ -19,6 +19,13 @@ and abort, repeat abort, and the exact `BudgetDeadlineExpired` exception from an
 expired `reserve_paths` call. Lock failures are no longer reported as successful
 abort; existing worker error/deferral handling remains responsible for them.
 
+Automatic policy visibility (#55): startup and authenticated service/worker
+diagnostics share one policy-model-derived warning listing every automatic field
+and the pinned revision. Default and all-human policies remain silent. Tests cover
+every registered surface, future model fields, multiple automatic stages, internal
+authentication and both worker configurations. This adds visibility only; exact
+approval gates, trusted operation bindings and original budgets are unchanged.
+
 Independent PM implementation handoff (2026-10-11): extended the opt-in detached
 follow-up queue with an explicit service-owned `planning_publication` binding.
 Read-only lookup joins the exact completed planning output to the immutable plan,

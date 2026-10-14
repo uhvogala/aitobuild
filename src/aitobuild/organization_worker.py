@@ -230,7 +230,10 @@ class ManagedOrganizationWorker:
 
     def diagnostics(self) -> dict[str, object]:
         return {"workers": sum(not task.done() for task in self._tasks),
-                "active_previews": tuple(self._active), "errors": tuple(self._errors)}
+                "active_previews": tuple(self._active), "errors": tuple(self._errors),
+                "approval_policy_revision": self.service.approval_policy.revision,
+                "automatic_approval_stages": self.service.approval_policy.automatic_stages,
+                "warnings": self.service.approval_policy.safety_warnings}
 
     def _finished(self, task: asyncio.Task[None]) -> None:
         if not task.cancelled():
