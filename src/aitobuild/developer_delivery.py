@@ -1260,8 +1260,8 @@ class DeveloperDeliveryWorker:
             raise PermissionError("Delivery record failed validation; retire is refused") from error
         if record is None:
             raise PermissionError("Retiring requires a saved delivery record")
-        # Route by the full correction rule (task ID or correction_from_review source). The record carries no
-        # source, so it is resolved from the record's own approved preview; without it nothing is routed.
+        # Route by the full correction rule (task ID or correction_from_review source), evaluated on the record's
+        # own approved preview (its load already checked the stored verdict agrees); without it nothing is routed.
         preview = self._previews.get(preview_id)
         if preview is None or preview.bundle_payload != record.bundle_payload:
             raise PermissionError("Retiring requires the record's own approved preview; it is missing or differs")
@@ -1828,7 +1828,7 @@ class DeveloperDeliveryWorker:
             raise ValueError("Invalid persisted delivery preparation state")
         if bundle.task_id != record.task_id or directory != self._task_dir(record.preview_id):
             raise ValueError("Persisted delivery preparation differs from the approved identity")
-        correction = self.is_correction_record(record)  # full rule, via the record's own approved preview
+        correction = self.is_correction_record(record)  # full rule: approved preview, else the stored verdict
         # A retired non-correction (#61) keeps validating as the `publishing` record it was, plus its receipt.
         evidence_state = record.state
         if record.state == "retired" and not correction:
