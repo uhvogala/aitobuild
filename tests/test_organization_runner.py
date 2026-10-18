@@ -1202,3 +1202,58 @@ def test_actual_configured_native_agent_approval_restart_uses_existing_scoped_to
                     assert (Path(record.checkout_path) / "README.md").read_text() == "Fixture baseline\n"
 
     asyncio.run(exercise())
+
+def _model_call_operation(transport_error: Exception) -> ManagedOperation:
+    """A developer operation whose real OpenAI chat client fails in the HTTP transport."""
+
+    async def call_model(context, message):
+        def fail(request: httpx.Request) -> httpx.Response:
+            raise transport_error
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as http:
+            async with AsyncOpenAI(api_key="k", http_client=http, max_retries=0) as openai:
+                client = OpenAIChatCompletionClient(model="m", async_client=openai)
+                await client.get_response("hello")
+        return message
+
+    return ManagedOperation(call_model)
+
+
+@pytest.mark.parametrize(("transport_error", "expected"), [
+    (httpx.ConnectTimeout("handshake"), "openai.APITimeoutError <- httpx.ConnectTimeout"),
+    (httpx.ReadTimeout("stalled"), "openai.APITimeoutError <- httpx.ReadTimeout"),
+    (httpx.ConnectError("refused"), "openai.APIConnectionError <- httpx.ConnectError"),
+])
+def test_model_call_failure_record_names_transport_exception(tmp_path, transport_error, expected):
+    runner, assignment, *_ = runner_fixture(tmp_path, {"definition_probe": _model_call_operation(transport_error)})
+    failed = asyncio.run(runner.start(assignment.assignment_id, input="hello"))
+    assert failed.state == "failed"
+    assert failed.error is not None
+    assert failed.error.endswith("]")
+    assert "[exception chain: agent_framework.ChatClientException <- " + expected in failed.error
+    saved = FileRunStore(tmp_path / "runs").get(assignment.assignment_id)
+    assert saved is not None and saved.error == failed.error
+
+
+def test_failure_label_names_connect_timeout_inside_api_timeout():
+    from openai import APITimeoutError
+
+    from aitobuild.organization_runner import _failure_label
+
+    request = httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+    try:
+        try:
+            raise httpx.ConnectTimeout("handshake", request=request)
+        except httpx.ConnectTimeout as transport:
+            raise APITimeoutError(request=request) from transport
+    except APITimeoutError as error:
+        label = _failure_label(error)
+    assert label == "Request timed out. [exception chain: openai.APITimeoutError <- httpx.ConnectTimeout]"
+    assert _failure_label(ValueError("plain failure")) == "plain failure"
+    try:
+        try:
+            raise OSError("inner")
+        except OSError as inner:
+            raise ValueError("outer") from inner
+    except ValueError as chained:
+        assert _failure_label(chained) == "outer"
