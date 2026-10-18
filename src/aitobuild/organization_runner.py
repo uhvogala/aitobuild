@@ -594,11 +594,10 @@ class ManagedWorkflowRunner:
             found = await self._interrupted_request(run, expired_context)
         except Exception:
             return await self._terminate(run, context, "failed", label)
-        if found is None or found[2].adopt_after_budget_expiry is None:
+        hook = None if found is None else found[2].adopt_after_budget_expiry
+        if found is None or hook is None:
             return await self._terminate(run, context, "failed", label)
-        decision, request, operation = found
-        hook = operation.adopt_after_budget_expiry
-        assert hook is not None
+        decision, request, _ = found
         try:
             result = await _resolve(hook(expired_context, request.data))
             TypeAdapter(JsonValue).validate_python(result)
