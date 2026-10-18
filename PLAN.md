@@ -19,11 +19,18 @@ ended every loop task, and nothing logged it. The human-admitted correction then
 `queued` for 22 minutes. `_admit` stays the only gate. Its policy refusals (task
 admission disabled, planning or non-repository tasks, and corrections without
 `correction: automatic`) now raise `AdmissionRefused`, a `PermissionError` subclass.
+A used-up `max_automatic_admissions` is a policy refusal too (#70 follow-up): the
+registry raises `AutomaticAdmissionLimitReached` and `_admit` re-raises it as
+`AdmissionRefused`, so a capped follow-up lands in `refused_follow_ups` for a human
+instead of being retried every pass as a `job_errors` entry. A human admission over the
+limit still admits, and the webhook path still answers 409.
 Integrity failures stay plain `PermissionError`. The loop catches exactly
 `AdmissionRefused` when it queues a follow-up: the child stays unadmitted for a human
 (`refused_follow_ups`), with no correction-specific check in the loop. Any other per-job
 error is logged once with its traceback and kept in `job_errors`. That job's receipt is
-left as it was, so the next pass retries it, and the loop keeps serving the other jobs;
+left as it was, so the next pass retries it, and the loop keeps serving the other jobs.
+The retry is paced: a pass reaches the service at most once for a failing follow-up, and
+passes are `poll_seconds` apart (tested), so a persistent error is not a tight loop;
 an unreadable journal pass is treated the same way. Two errors stay fail-stop, because
 the job can be neither recorded nor replayed safely: a lost worker receipt
 (`_ReceiptError`) and an error `_execute` re-raises while its run is finalizing (both

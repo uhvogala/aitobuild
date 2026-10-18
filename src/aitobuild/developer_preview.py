@@ -158,6 +158,11 @@ def _matches_apart_from_approval(stored: DeveloperPreview, expected: DeveloperPr
 class AutomaticAdmissionDeferred(PermissionError):
     """Automatic admission does not apply; the preview stays unapproved and waits for a human approval."""
 
+
+class AutomaticAdmissionLimitReached(PermissionError):
+    """The automatic admission limit (``max_automatic_admissions``) is used up: a policy refusal, not an integrity
+    failure. The preview stays unapproved for a human; the configured gate re-raises it as ``AdmissionRefused``."""
+
 class DeveloperPreviewRegistry:
     def __init__(self, path: Path | None = None) -> None:
         self._path = path
@@ -359,7 +364,8 @@ class DeveloperPreviewRegistry:
                         raise AutomaticAdmissionDeferred("This published head already had an automatic review; "
                                                          "another review of it needs a human approval")
                     if admitted >= max_automatic_admissions:
-                        raise PermissionError("Automatic task admission limit reached; a human approval is required")
+                        raise AutomaticAdmissionLimitReached("Automatic task admission limit reached; "
+                                                             "a human approval is required")
             if consent_approval is not None:
                 # Deliberate exception (PLAN 2.4): consent is human-sourced, so it never counts toward
                 # max_automatic_admissions, but it arrives through automated comment reading, so it keeps the
