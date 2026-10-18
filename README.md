@@ -1225,6 +1225,8 @@ export AITOBUILD_FOUNDRY_ENDPOINT="https://example.foundry.azure.com"
 # Keep AITOBUILD_FOUNDRY_API_KEY unset and authenticate via Azure credentials.
 export AITOBUILD_FOUNDRY_MODEL="gpt-4.1"
 export AITOBUILD_ALLOW_MOCK_MODEL="true"
+# Seconds allowed to connect (TCP + TLS) to the model endpoint; reads keep the 600 s limit.
+export AITOBUILD_MODEL_CONNECT_TIMEOUT_SECONDS="30"
 export AITOBUILD_SCHEDULER_ENABLED="true"
 export AITOBUILD_SCHEDULER_KILL_SWITCH="false"
 export AITOBUILD_ARCHITECT_SCAN_CRON="0 8 * * *"

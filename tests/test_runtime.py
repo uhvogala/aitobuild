@@ -380,3 +380,53 @@ def test_native_history_has_no_duplicates_and_tool_errors_reach_model(tmp_path: 
         artifacts = list((tmp_path / "outputs").glob("*.txt"))
         assert len(artifacts) == 1
         assert json.loads(artifacts[0].read_text())["error"].endswith(error_suffix)
+
+
+def test_openai_client_connect_timeout_is_widened_and_read_limit_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, object] = {}
+
+    class FakeChatClient:
+        def __init__(self, **kwargs: object) -> None:
+            observed.update(kwargs)
+
+    monkeypatch.setattr(runtime_module, "detect_framework_bindings", lambda: FrameworkBindings(
+        openai_chat_completion_client_class=FakeChatClient,
+    ))
+    config = RuntimeConfig(
+        foundry_endpoint="https://example.services.ai.azure.com/openai/v1/",
+        foundry_api_key="test-key", foundry_model="grok-4.6", allow_mock_model=False,
+    )
+    assert config.model_connect_timeout_seconds == 30
+    bootstrap_runtime(config)
+    client = observed["async_client"]
+    assert isinstance(client, AsyncOpenAI)
+    timeout = client.timeout
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.connect is not None and timeout.connect >= 30
+    assert (timeout.read, timeout.write, timeout.pool) == (600, 600, 600)
+    assert client.max_retries == 1
+
+    observed.clear()
+    bootstrap_runtime(RuntimeConfig(
+        foundry_endpoint="https://example.services.ai.azure.com/openai/v1/",
+        foundry_api_key="test-key", foundry_model="grok-4.6", allow_mock_model=False,
+        model_connect_timeout_seconds=45,
+    ))
+    configured = observed["async_client"]
+    assert isinstance(configured, AsyncOpenAI) and isinstance(configured.timeout, httpx.Timeout)
+    assert configured.timeout.connect == 45 and configured.timeout.read == 600
+
+
+def test_model_connect_timeout_loads_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    from aitobuild.config import load_config
+
+    monkeypatch.setenv("AITOBUILD_WEBHOOK_SECRET", "test-secret")
+    monkeypatch.setenv("AITOBUILD_REQUIRE_INTERNAL_AUTH", "false")
+    monkeypatch.delenv("AITOBUILD_CONFIG_FILE", raising=False)
+    monkeypatch.delenv("AITOBUILD_MODEL_CONNECT_TIMEOUT_SECONDS", raising=False)
+    assert load_config().runtime.model_connect_timeout_seconds == 30
+    monkeypatch.setenv("AITOBUILD_MODEL_CONNECT_TIMEOUT_SECONDS", "60")
+    assert load_config().runtime.model_connect_timeout_seconds == 60
+    monkeypatch.setenv("AITOBUILD_MODEL_CONNECT_TIMEOUT_SECONDS", "0")
+    with pytest.raises(ValueError, match="MODEL_CONNECT_TIMEOUT_SECONDS"):
+        load_config()

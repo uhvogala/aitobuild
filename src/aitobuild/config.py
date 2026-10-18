@@ -19,6 +19,8 @@ class RuntimeConfig:
     foundry_api_key: str | None
     foundry_model: str
     allow_mock_model: bool
+    # Seconds to establish the model connection (TCP + TLS); the 600 s read/total limit is unchanged.
+    model_connect_timeout_seconds: int = 30
 
 
 @dataclass(slots=True, frozen=True)
@@ -119,7 +121,8 @@ _CONFIG_CLASSES = {"runtime": RuntimeConfig, "scheduler": SchedulerConfig, "poli
 # (for example AITOBUILD_MANAGED_WORKER_QUEUE_FOLLOW_UPS).
 _CONFIG_ENV = {
     "runtime": {"foundry_endpoint": "FOUNDRY_ENDPOINT", "foundry_api_key": "FOUNDRY_API_KEY",
-                "foundry_model": "FOUNDRY_MODEL", "allow_mock_model": "ALLOW_MOCK_MODEL"},
+                "foundry_model": "FOUNDRY_MODEL", "allow_mock_model": "ALLOW_MOCK_MODEL",
+                "model_connect_timeout_seconds": "MODEL_CONNECT_TIMEOUT_SECONDS"},
     "scheduler": {"enabled": "SCHEDULER_ENABLED", "kill_switch": "SCHEDULER_KILL_SWITCH",
                   "architect_scan_cron": "ARCHITECT_SCAN_CRON", "meeting_tick_cron": "MEETING_TICK_CRON",
                   "max_concurrent_proactive_jobs": "MAX_PROACTIVE_JOBS", "quiet_window_start_hour": "SCHEDULER_QUIET_START_HOUR",
@@ -352,7 +355,10 @@ def load_config() -> AppConfig:
         foundry_api_key=getenv("AITOBUILD_FOUNDRY_API_KEY"),
         foundry_model=getenv("AITOBUILD_FOUNDRY_MODEL", "gpt-4.1"),
         allow_mock_model=_as_bool(getenv("AITOBUILD_ALLOW_MOCK_MODEL"), default=True),
+        model_connect_timeout_seconds=int(getenv("AITOBUILD_MODEL_CONNECT_TIMEOUT_SECONDS", "30")),
     )
+    if not 1 <= runtime.model_connect_timeout_seconds <= 600:
+        raise ValueError("AITOBUILD_MODEL_CONNECT_TIMEOUT_SECONDS must be within 1..600")
 
     scheduler = SchedulerConfig(
         enabled=_as_bool(getenv("AITOBUILD_SCHEDULER_ENABLED"), default=True),

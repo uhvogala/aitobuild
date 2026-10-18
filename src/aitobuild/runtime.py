@@ -16,7 +16,7 @@ from agent_framework import (
 )
 from aitobuild.foundry_compat import FoundryCompatibleFileMemoryProvider
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, Timeout
 
 from aitobuild.agents import AgentSpec, default_agent_specs
 from aitobuild.config import RuntimeConfig
@@ -173,6 +173,15 @@ def bootstrap_runtime(
     )
 
 
+# openai's own default is Timeout(600, connect=5); keep the 600 s read/write/pool limits and only widen connect.
+MODEL_READ_TIMEOUT_SECONDS = 600.0
+
+
+def model_http_timeout(config: RuntimeConfig) -> Timeout:
+    """HTTP timeout for model calls: a TLS handshake slower than openai's 5 s connect default must not fail the call."""
+    return Timeout(MODEL_READ_TIMEOUT_SECONDS, connect=float(config.model_connect_timeout_seconds))
+
+
 def _construct_openai_client(*, bindings: FrameworkBindings, config: RuntimeConfig) -> Any:
     client_class = bindings.openai_chat_completion_client_class
     if client_class is None:
@@ -190,6 +199,7 @@ def _construct_openai_client(*, bindings: FrameworkBindings, config: RuntimeConf
         function_invocation_configuration={"include_detailed_errors": True},
         async_client=AsyncOpenAI(
             base_url=config.foundry_endpoint, api_key=api_key, max_retries=1,
+            timeout=model_http_timeout(config),
         ),
     )
 
