@@ -30,7 +30,20 @@ TRANSIENT_HTTP_STATUSES = frozenset({502, 503, 504})
 _HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
 
 
-class GitHubTransientError(RuntimeError):
+class GitHubAPIError(RuntimeError):
+    """A failed `gh api` call. `status` is the HTTP status gh reported for it, or None when it reported none."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def http_status(detail: str) -> int | None:
+    match = _HTTP_STATUS.search(detail)
+    return int(match.group(1)) if match is not None else None
+
+
+class GitHubTransientError(GitHubAPIError):
     """A GitHub 502/503/504. For a read it is raised only after bounded retries; a write is never retried, so the
     caller must treat the write as uncertain (it may have landed) and reconcile by reading, never by repeating it."""
 
@@ -218,6 +231,9 @@ class GitHubAdapter(Protocol):
 
     def branch_head(self, *, repository: str, branch: str) -> str | None: ...
 
+    def task_pull_requests(self, *, repository: str, head_branch: str,
+                           base_ref: str | None = None) -> tuple[GitHubPullRequest, ...]: ...
+
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue: ...
 
     def list_issues(
@@ -390,6 +406,14 @@ class MockGitHubAdapter:
     def branch_head(self, *, repository: str, branch: str) -> str | None:
         """The live head of a remote branch, or None when it does not exist (read-only)."""
         return self._branch_heads.get(self._resolve_repository(repository), {}).get(branch.strip())
+
+    def task_pull_requests(self, *, repository: str, head_branch: str,
+                           base_ref: str | None = None) -> tuple[GitHubPullRequest, ...]:
+        """Every pull request (any state) whose head is this repository's task branch, optionally into one base
+        (read-only). The one task-branch PR lookup: #56 adoption and the #61 retire guard both use it."""
+        repo = self._resolve_repository(repository)
+        return tuple(pull for pull in self.pull_requests.get(repo, {}).values()
+                     if pull.head_ref == head_branch and (base_ref is None or pull.base_ref == base_ref))
 
     def inspect_dependency_merge(self, *, repository: str, repository_id: int, pull_number: int,
                                  head_sha: str, head_branch: str, base_branch: str, base_revision: str) -> dict[str, Any]:
@@ -874,8 +898,7 @@ class MockGitHubAdapter:
         _check_write_budget(before_write)
         repo_prs = self.pull_requests.setdefault(repo, {})
         if existing_pull_number is None:
-            matches = [pull for pull in repo_prs.values()
-                       if pull.head_ref == cleaned_head and pull.base_ref == cleaned_base]
+            matches = list(self.task_pull_requests(repository=repo, head_branch=cleaned_head, base_ref=cleaned_base))
             open_matches = [pull for pull in matches if pull.state == "open"]
             if matches and len(open_matches) != 1:
                 raise ValueError("Existing task pull request must be one open draft")
@@ -1044,9 +1067,10 @@ class GhCliGitHubAdapter:
         except CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             message = f"gh api failed for {method} {endpoint}: {detail}"
+            status = http_status(detail)
             if transient_http_status(detail) is not None:
-                raise GitHubTransientError(message) from exc
-            raise RuntimeError(message) from exc
+                raise GitHubTransientError(message, status=status) from exc
+            raise GitHubAPIError(message, status=status) from exc
         return completed.stdout.strip()
 
     def _matching_publish_head(
@@ -1180,8 +1204,33 @@ class GhCliGitHubAdapter:
         return head
 
     def branch_head(self, *, repository: str, branch: str) -> str | None:
-        """The live head of a remote task branch (read-only); an unreadable reference raises."""
-        return self._read_branch_head(repository=self._resolve_repository(repository), branch=branch)
+        """The live head of a remote task branch (read-only), or None when GitHub answers 404 for the reference
+        (the branch does not exist). Any other unreadable reference raises."""
+        try:
+            return self._read_branch_head(repository=self._resolve_repository(repository), branch=branch)
+        except GitHubAPIError as error:
+            if error.status == 404:
+                return None
+            raise
+
+    def task_pull_requests(self, *, repository: str, head_branch: str,
+                           base_ref: str | None = None) -> tuple[GitHubPullRequest, ...]:
+        """Every pull request (any state) whose head is this repository's task branch, optionally into one base
+        (read-only). The one task-branch PR lookup: #56 adoption and the #61 retire guard both use it. Any API
+        failure raises; it never reads as "no pull request"."""
+        repo = self._resolve_repository(repository)
+        params = {"state": "all", "head": f"{repo.split('/')[0]}:{head_branch}", "per_page": 100}
+        if base_ref is not None:
+            params["base"] = base_ref
+        raw_matches = self._api(f"repos/{repo}/pulls?{urlencode(params)}")
+        if not isinstance(raw_matches, list):
+            raise RuntimeError("Unexpected GitHub pull request list response")
+        return tuple(
+            replace(_pull_request_from_api(raw, repository=repo), draft=raw.get("draft") is True)
+            for raw in raw_matches if isinstance(raw, dict)
+            and raw.get("head", {}).get("ref") == head_branch
+            and raw.get("head", {}).get("repo", {}).get("full_name", "").lower() == repo
+            and (base_ref is None or raw.get("base", {}).get("ref") == base_ref))
 
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue:
         repo = self._resolve_repository(repository)
@@ -1794,25 +1843,16 @@ class GhCliGitHubAdapter:
         ):
             raise ValueError("existing_pull_number must be a positive integer when provided")
         if existing_pull_number is None:
-            query = urlencode({"state": "all", "head": f"{repo.split('/')[0]}:{cleaned_head}",
-                               "base": cleaned_base, "per_page": 100})
-            raw_matches = self._api(f"repos/{repo}/pulls?{query}")
-            if not isinstance(raw_matches, list):
-                raise RuntimeError("Unexpected GitHub pull request list response")
-            matches = [raw for raw in raw_matches if isinstance(raw, dict)
-                       and raw.get("head", {}).get("ref") == cleaned_head
-                       and raw.get("head", {}).get("repo", {}).get("full_name", "").lower() == repo
-                       and raw.get("base", {}).get("ref") == cleaned_base]
-            open_matches = [raw for raw in matches if raw.get("state") == "open"]
+            matches = self.task_pull_requests(repository=repo, head_branch=cleaned_head, base_ref=cleaned_base)
+            open_matches = [pull for pull in matches if pull.state == "open"]
             if matches and len(open_matches) != 1:
                 raise ValueError("Existing task pull request must be one open draft")
             if open_matches:
                 found = open_matches[0]
-                require_adoptable_pull(title=found.get("title"), body=found.get("body"), draft=found.get("draft"),
-                                       author=(found.get("user") or {}).get("login"),
+                require_adoptable_pull(title=found.title, body=found.body, draft=found.draft, author=found.author,
                                        expected_title=cleaned_title, expected_body=cleaned_body,
                                        writer=self.writer_login())
-                existing_pull_number = int(found["number"])
+                existing_pull_number = found.number
         if existing_pull_number is not None:
             current = self.get_pull_request(repository=repo, pull_number=existing_pull_number)
             if current.head_ref != cleaned_head:

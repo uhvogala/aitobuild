@@ -908,6 +908,28 @@ def create_app(
                 raise HTTPException(status_code=409, detail=str(error)) from error
             return {"retired": record.state == "retired", "delivery": record.to_payload()}
 
+        @app.post("/internal/organization/deliveries/retire")
+        async def retire_delivery(
+            payload: dict[str, Any],
+            x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        ) -> dict[str, Any]:
+            """Generalized retire (#61): `{preview_id, reason}` retires a stuck non-correction `publishing` record;
+            `{preview_id}` for a correction behaves exactly like the `corrections/retire` alias above."""
+            _assert_internal_auth(config=app_config, provided_token=x_internal_token)
+            if (not {"preview_id"} <= set(payload) <= {"preview_id", "reason"}
+                    or not all(isinstance(payload[key], str) and payload[key].strip() for key in payload)):
+                raise HTTPException(status_code=400, detail="Delivery retire accepts only preview_id and an optional reason")
+            if isinstance(github_adapter, MockGitHubAdapter):
+                raise HTTPException(status_code=409, detail="Retiring requires a live GitHub adapter (gh_cli); mock reads are refused")
+            if managed_service is None:
+                raise RuntimeError("Internal invariant violated: managed_service is not None")
+            try:
+                record = await managed_service.retire_delivery(payload["preview_id"].strip(), github=github_adapter,
+                                                               reason=payload.get("reason"))
+            except (ValueError, OSError, PermissionError, RuntimeError, FileLockTimeout) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return {"retired": record.state == "retired", "delivery": record.to_payload()}
+
         @app.post("/internal/organization/dependencies/offer")
         async def offer_dependency_handoff(
             payload: dict[str, Any],
@@ -1193,7 +1215,7 @@ def create_app(
                     status_code=409,
                     detail="Publication requires a live GitHub adapter (gh_cli); mock publication is refused",
                 )
-            if current_delivery.task_id.startswith("published-correction-"):
+            if delivery_worker.is_correction_record(current_delivery):
                 raise HTTPException(status_code=409, detail="Corrections require exact one-use operator publication approval")
             record = await _delivery_call(lambda: delivery_worker.publish(
                 preview_id,

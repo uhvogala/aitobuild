@@ -39,6 +39,44 @@ that needs the model, a push or a new PR stays fail-closed on an expired budget.
 This changes the delivery state model (`publishing` -> `published` without a live
 budget) and needs Vertti's explicit okay before merge.
 
+Stuck publishing retire (2026-10-18, #61): a non-correction delivery left at `publishing`
+after a kill, with no PR recorded and its task branch deleted (pilot trial 4 record
+`dp-9f525f91…`, head `ee43e54`, example PR #74 closed), had no supported exit; resume reuses the
+same record and hits it again. The existing operator retire is generalized instead of adding a
+second command: `retire_delivery` / `POST /internal/organization/deliveries/retire
+{preview_id, reason}` resolves the record's approved preview and routes every correction by the
+full rule (`is_correction_task(preview)`: task ID or `correction_from_review` source) to the
+unchanged `retire_correction` at both the service and the worker (and `corrections/retire` stays
+as its alias); a missing or differing preview is refused, never routed as a non-correction. The
+rule is split: `is_correction_task_id(task_id)` is the prefix check only, used inside the full
+rule and nowhere a preview or record is reachable. A delivery record now stores the full rule's
+verdict (`correction`) when it is created from its approved preview, so `_load` and every worker
+check (including the correction-records scan) classify it the same way after a restart; a present
+preview must carry the record's exact bundle (a differing one is refused) and agree, only a missing
+preview falls back to the stored verdict, a pre-#61 record with no verdict then fails closed, and a
+stored `false` never undercuts a correction task ID. It
+retires any other record only when it is `publishing`, carries no PR number/URL/PR head, the base branch is
+readable, no open PR is on the task branch, and the read-only live `branch_head` is gone (404) or
+not the saved head (an existing branch with no saved head is refused). The open-PR check (ReviewBot's
+condition for #62) reuses the #56 adoption lookup, now the read-only adapter method
+`task_pull_requests` that adoption itself calls; it lists every PR on the task branch into any base,
+and any open one refuses the retire whether or not it carries our delivery marker, even when the
+branch has moved or is gone. A failed or unreadable lookup refuses too. Only the worker checks it:
+the service guard checks locks and routing, not branch state. The delivery implementation lock and the managed run's
+invocation lock must be free. It ends in the same terminal `retired` state with the correction
+audit fields plus `reason` and `live_branch` (`gone`/`moved`); saved head, snapshot and evidence are
+kept, nothing is written to GitHub, and budget and approvals are left alone. Load validation
+checks a retired non-correction as the `publishing` record it was plus its exact receipt; resume,
+adoption, publish and `prepare` refuse it or return it unchanged. The live `branch_head` now returns
+`None` only when the `gh api` error's structured status is 404 (`GitHubAPIError.status`, taken once
+where gh reports it; other errors still raise), matching the protocol and the mock. After a retire
+the managed run of that task stays `running` until the next restart refuses it ("automatic replay
+is blocked") and ends it `failed`; this is expected, since retire never rewrites run receipts.
+Current behaviour with an expired Developer runtime budget is fail-closed: a resumed publication is refused
+before adoption and the record stays at `publishing`, and retire also refuses such a record while its branch
+is still live at the saved head. Whether that record should get another exit is the open question in #66.
+This changes the delivery state model and needs Vertti's okay before merge.
+
 Interrupted draft publication resume (2026-10-13): pilot trial 4 killed the service
 right after the developer branch push; GitHub had opened the draft PR but no record
 held its number, and restart failed closed on the run-level replay block. A run left

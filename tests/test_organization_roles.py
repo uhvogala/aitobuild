@@ -944,6 +944,15 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         assert refused_publish.status_code == 409 and "mock publication is refused" in refused_publish.json()["detail"]
                         refused_retire = client.post(operator_calls[2][0], headers=headers, json=operator_calls[2][1])
                         assert refused_retire.status_code == 409 and "mock reads are refused" in refused_retire.json()["detail"]
+                        # #61: the generalized retire keeps the same auth, payload strictness and live-adapter rule.
+                        general = "/internal/organization/deliveries/retire"
+                        assert client.post(general, json={"preview_id": correction.preview_id}).status_code == 401
+                        for body in ({"preview_id": correction.preview_id, "actor_id": "model"}, {"preview_id": " "},
+                                     {"reason": "why"}, {"preview_id": correction.preview_id, "reason": 7}):
+                            assert client.post(general, headers=headers, json=body).status_code == 400
+                        refused_general = client.post(general, headers=headers,
+                                                      json={"preview_id": correction.preview_id, "reason": "why"})
+                        assert refused_general.status_code == 409 and "mock reads are refused" in refused_general.json()["detail"]
                         assert worker._approvals.get(correction.preview_id) is None
                     approve_preview(previews, correction.preview_id)
                     if native_correcting:
@@ -2086,7 +2095,8 @@ def test_native_pm_proposal_text_reminder_deadline_and_size(tmp_path, monkeypatc
 @pytest.mark.parametrize("case", ["allowlisted", "not_allowlisted", "direct_callback", "parent_unapproved", "parent_is_review",
                                   "missing_record", "unpublished_record", "head_mismatch", "record_bundle_differs", "issue_differs",
                                   "staged_target_mismatch", "planned_parent", "limit", "no_review_binding", "correction_stays_human",
-                                  "parent_without_approval_time", "record_for_other_preview", "malformed_target"])
+                                  "parent_without_approval_time", "record_for_other_preview", "malformed_target",
+                                  "parent_preview_differs"])
 def test_review_inherits_automatic_admission_only_from_its_admitted_parent(tmp_path, published_delivery, case, monkeypatch):
     """A staged Architect review is admitted automatically only as the admitted task whose exact published head it
     reviews, through the same trusted base callback (allowlist / planned child); every mismatch fails closed."""
@@ -2159,6 +2169,7 @@ def test_review_inherits_automatic_admission_only_from_its_admitted_parent(tmp_p
         "not_allowlisted": "allowlisted issue author",
         "parent_unapproved": "admitted parent task",
         "parent_is_review": "Only an admitted delivery task",
+        "parent_preview_differs": "Published review target failed validation",
         "missing_record": "published delivery record",
         "unpublished_record": "published delivery record",
         "head_mismatch": "exact published head",
@@ -2176,7 +2187,12 @@ def test_review_inherits_automatic_admission_only_from_its_admitted_parent(tmp_p
     if case == "parent_unapproved":
         patch_get(service._previews, "get", published_id, replace(parent, approved=False))
     elif case == "parent_is_review":
-        patch_get(service._previews, "get", published_id, replace(parent, bundle_payload=parent.bundle_payload | {"task_id": "published-review-y"}))
+        # Only the service's view changes: the worker still loads the record against its real approved preview
+        # (#61 refuses a present-but-differing one), so the parent-kind check itself is reached.
+        reviewed = replace(parent, bundle_payload=parent.bundle_payload | {"task_id": "published-review-y"})
+        monkeypatch.setattr(service, "_previews", SimpleRegistry(previews, {published_id: reviewed}))
+    elif case == "parent_preview_differs":  # #61: the worker refuses a present-but-differing preview at load
+        patch_get(service._previews, "get", published_id, replace(parent, bundle_payload=parent.bundle_payload | {"objective": "x"}))
     elif case == "missing_record":
         monkeypatch.setattr(service, "_worker", SimpleWorker(worker, {published_id: None}))
     elif case == "unpublished_record":
@@ -2215,6 +2231,17 @@ def test_review_inherits_automatic_admission_only_from_its_admitted_parent(tmp_p
     with pytest.raises(PermissionError, match=expected):
         service._automatic_task_approval(candidate)
     assert not previews.get(staged.preview_id).approved
+
+
+class SimpleRegistry:
+    def __init__(self, registry, overrides):
+        self._inner, self._overrides = registry, overrides
+
+    def get(self, preview_id):
+        return self._overrides[preview_id] if preview_id in self._overrides else self._inner.get(preview_id)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 class SimpleWorker:
@@ -2262,3 +2289,28 @@ def test_configured_admission_refuses_a_forged_source_payload(tmp_path, publishe
         service._automatic_task_approval(forged)
     assert not previews.get(staged.preview_id).approved
     assert service._automatic_task_approval(staged).approved  # the stored preview itself is still admitted
+
+
+def test_publish_endpoint_maps_a_correction_classification_failure_to_409(published_delivery, test_config, monkeypatch):
+    """#61: `is_correction_record` fails closed with ValueError; the publish endpoint reports it as a 409 refusal
+    like its neighbours, never a 500, and publishes nothing."""
+    from fastapi.testclient import TestClient
+    from aitobuild.app import create_app
+
+    worker, published_id, _, github, _ = published_delivery
+
+    class LiveGitHub:  # not a MockGitHubAdapter, so the endpoint reaches the correction check
+        def __getattr__(self, name):
+            return getattr(github, name)
+
+    message = "Delivery record's approved preview differs from the record; correction classification fails closed"
+    record = worker.get(published_id)
+    monkeypatch.setattr(worker, "get", lambda preview_id: record)  # only the endpoint's own check classifies
+    monkeypatch.setattr(worker, "is_correction_record", lambda record: (_ for _ in ()).throw(ValueError(message)))
+    monkeypatch.setattr(worker, "publish", lambda *args, **kwargs: pytest.fail("must not publish"))
+    monkeypatch.setattr("aitobuild.app.DeveloperDeliveryWorker", lambda **kwargs: worker)
+    monkeypatch.setattr("aitobuild.app.build_github_adapter", lambda **kwargs: LiveGitHub())
+    with TestClient(create_app(test_config), raise_server_exceptions=False) as client:
+        headers = {"X-Internal-Token": test_config.security.internal_api_token}
+        response = client.post("/internal/developer/delivery/publish", headers=headers, json={"preview_id": published_id})
+    assert response.status_code == 409 and response.json()["detail"] == message
