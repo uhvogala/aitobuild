@@ -48,9 +48,6 @@ ARCHITECT_REVIEW_BODY_PREFIX = "aitobuild Architect review\n\n"
 _ARCHITECT_REVIEW_EVENTS = frozenset({"COMMENT"})
 
 
-CORRECTION_TASK_PREFIX = "published-correction-"
-
-
 _UNBOUND_REVIEW_PREFIX = "Architect COMMENT already posted for head "
 _RETIRABLE_STATES = frozenset({"failed", "prepared", "awaiting_tool_approval", "implemented", "verified"})
 # #61: receipt keys of an operator retire of a non-correction record stuck at `publishing`. The four correction
@@ -62,13 +59,13 @@ RETIRE_REASON_MAX = 2000
 
 
 def _is_correction_record(record: Any) -> bool:
-    return isinstance(getattr(record, "task_id", None), str) and record.task_id.startswith(CORRECTION_TASK_PREFIX)
+    return isinstance(getattr(record, "task_id", None), str) and is_correction_task(record.task_id)
 
 
 def _refuse_correction_publication(item: Any) -> None:
     """Scoped corrections must update their pinned PR, never open a new one."""
     payload = getattr(item, "bundle_payload", None)
-    if isinstance(payload, dict) and str(payload.get("task_id", "")).startswith(CORRECTION_TASK_PREFIX):
+    if isinstance(payload, dict) and is_correction_task(str(payload.get("task_id", ""))):
         raise PermissionError(
             "Scoped correction tasks cannot publish a new pull request; "
             "same-PR correction publication through the operator stage/publish endpoints is required"
@@ -776,7 +773,7 @@ class DeveloperDeliveryWorker:
                     raise ValueError("Invalid persisted delivery preparation")
             except (ValueError, KeyError, TypeError, OSError) as error:
                 raise PermissionError("An unreadable delivery record blocks correction checks; they fail closed") from error
-            if not str(raw.get("task_id", "")).startswith(CORRECTION_TASK_PREFIX) or not relevant(raw):
+            if not is_correction_task(str(raw.get("task_id", ""))) or not relevant(raw):
                 continue
             try:
                 record = self._load(state.parent)

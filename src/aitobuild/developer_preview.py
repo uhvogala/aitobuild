@@ -56,10 +56,20 @@ PER_ISSUE_TASK_PREFIXES = ("ISSUE-", "planned-issue-", "dependent-issue-")
 PLANNED_CHILD_TASK_PREFIXES = ("planned-issue-", "dependent-issue-")
 
 
-def is_correction_task(preview: Any) -> bool:
-    """A same-PR correction task: the correction task ID or a correction_from_review source."""
-    return (str(preview.bundle_payload.get("task_id", "")).startswith(CORRECTION_TASK_PREFIX)
-            or "correction_from_review" in preview.source_payload)
+def is_correction_task(subject: Any) -> bool:
+    """The one correction rule; nothing else in src may test the correction prefix (tests/test_correction_rule.py).
+
+    A preview is a correction by its task ID or a correction_from_review source. A bare task ID string (from a
+    record, assignment or raw payload that carries no source) is checked by its prefix alone."""
+    if isinstance(subject, str):
+        return subject.startswith(CORRECTION_TASK_PREFIX)
+    return (str(subject.bundle_payload.get("task_id", "")).startswith(CORRECTION_TASK_PREFIX)
+            or "correction_from_review" in subject.source_payload)
+
+
+def correction_task_id(identity_digest: str) -> str:
+    """Build a correction task ID from its identity digest (the only place the prefix is applied)."""
+    return CORRECTION_TASK_PREFIX + identity_digest
 
 
 def _evidence_kind_consistent(kind: str, policy: Any, consent: Any) -> bool:

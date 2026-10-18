@@ -27,7 +27,8 @@ from aitobuild.config import AppConfig, RepositorySourceConfig, load_config, val
 from aitobuild.developer_delivery import DeveloperDeliveryWorker, LocalRepositorySource
 from aitobuild.developer_execution import DeveloperExecutionEngine, PlannedFileWrite
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
-from aitobuild.developer_preview import DeveloperPreviewRegistry, is_planned_child, published_review_target
+from aitobuild.developer_preview import (DeveloperPreviewRegistry, is_correction_task, is_planned_child,
+                                         published_review_target)
 from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import make_internal_event, normalize_github_webhook, parse_trigger_request
 from aitobuild.organization_assignments import AssignmentProposal
@@ -1215,7 +1216,7 @@ def create_app(
                     status_code=409,
                     detail="Publication requires a live GitHub adapter (gh_cli); mock publication is refused",
                 )
-            if current_delivery.task_id.startswith("published-correction-"):
+            if is_correction_task(current_delivery.task_id):
                 raise HTTPException(status_code=409, detail="Corrections require exact one-use operator publication approval")
             record = await _delivery_call(lambda: delivery_worker.publish(
                 preview_id,
