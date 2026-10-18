@@ -137,7 +137,7 @@ def _tamper_record(tmp_path: Path, change) -> None:
                                   "missing_record", "unknown_preview", "base_unreadable", "mock_without_opt_in",
                                   "no_actor", "no_reason", "foreign_preview_scope", "malformed_live_head",
                                   "malformed_saved_head", "foreign_repository", "oversized_reason",
-                                  "no_publication", "missing_preview"])
+                                  "no_publication", "missing_preview", "classification_mismatch"])
 def test_retire_refusals_leave_the_record_and_github_untouched(
     tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, case,
 ):
@@ -162,8 +162,17 @@ def test_retire_refusals_leave_the_record_and_github_untouched(
         fake = replace(preview, source_payload={**preview.source_payload, "correction_from_review": "dp-review"})
         get = worker._previews.get
         monkeypatch.setattr(worker._previews, "get", lambda pid: fake if pid == preview_id else get(pid))
+        _tamper_record(tmp_path, lambda raw: raw.update(correction=True))  # as if created from that preview
         kwargs["reason"] = None  # corrections take no reason
-        match = "saved correction delivery"  # routed to the unchanged retire_correction, which refuses it
+        # Classified as a correction at load by the full rule, its non-correction publication fails the correction
+        # validation, so retire is refused before either path runs.
+        match = "failed validation"
+    elif case == "classification_mismatch":  # the preview says correction, the stored verdict does not
+        preview = worker.preview(preview_id)
+        fake = replace(preview, source_payload={**preview.source_payload, "correction_from_review": "dp-review"})
+        get = worker._previews.get
+        monkeypatch.setattr(worker._previews, "get", lambda pid: fake if pid == preview_id else get(pid))
+        match = "failed validation"
     elif case == "missing_preview":
         get = worker._previews.get
         monkeypatch.setattr(worker._previews, "get", lambda pid: None if pid == preview_id else get(pid))
@@ -465,6 +474,11 @@ def test_worker_routes_a_source_only_correction_to_retire_correction(
     fake = _issue_correction_preview(worker, preview_id)
     get = worker._previews.get
     monkeypatch.setattr(worker._previews, "get", lambda pid: fake if pid == preview_id else get(pid))
+    # Routing only: a real source-only correction would carry correction publication evidence, which this stuck
+    # non-correction fixture lacks (the load-level refusal is the `correction_source` refusal case).
+    monkeypatch.setattr(worker, "_load_preview_record", lambda pid: replace(before, correction=True))
+    state = next((tmp_path / "state" / "deliveries").glob("*/state.json"))
+    saved = state.read_bytes()
     routed: list[tuple] = []
     monkeypatch.setattr(worker, "retire_correction", lambda pid, **kwargs: routed.append((pid, kwargs)) or "correction")
     monkeypatch.setattr(worker, "_retire_stuck_publication",
@@ -477,7 +491,7 @@ def test_worker_routes_a_source_only_correction_to_retire_correction(
     with pytest.raises(PermissionError, match="records no reason"):
         worker.retire_delivery(preview_id, actor_id="operator", github=github, reason=REASON,
                                allow_mock_publication=True)
-    assert len(routed) == 1 and worker.get(preview_id) == before
+    assert len(routed) == 1 and state.read_bytes() == saved
 
 
 def test_service_routes_a_source_only_correction_to_retire_correction(
@@ -505,3 +519,52 @@ def test_service_routes_a_source_only_correction_to_retire_correction(
     with pytest.raises(PermissionError, match="records no reason"):
         asyncio.run(ManagedOrganizationService.retire_delivery(service, preview_id, github=github, reason=REASON))
     assert routed == [(preview_id, True)] and worker.get(preview_id) == before
+
+
+def test_retired_stuck_publication_reloads_as_a_non_correction_after_restart(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch,
+):
+    from aitobuild.developer_delivery import DeveloperDeliveryWorker
+    from aitobuild.developer_preview import DeveloperPreviewRegistry
+
+    github, worker, preview_id, before = _stuck(
+        tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch)
+    assert before.correction is False and not worker.is_correction_record(before)
+    retired = worker.retire_delivery(preview_id, actor_id="operator", github=github, reason=REASON,
+                                     allow_mock_publication=True)
+    for registry in (DeveloperPreviewRegistry(worker._previews._path), DeveloperPreviewRegistry()):
+        fresh = DeveloperDeliveryWorker(preview_registry=registry, state_dir=worker._state_dir,
+                                        service_root=worker._service_root, repository_sources=worker._sources)
+        loaded = fresh.get(preview_id)
+        assert loaded == retired and not fresh.is_correction_record(loaded)
+        assert loaded.retirement["previous_state"] == "publishing" and loaded.retirement["live_branch"] == "gone"
+        assert loaded.retirement["reason"] == REASON
+        with pytest.raises(PermissionError, match="saved correction"):
+            fresh.retire_correction(preview_id, actor_id="operator", github=github, allow_mock_publication=True)
+    # A stored verdict flipped to correction disagrees with the approved preview and fails closed.
+    _tamper_record(tmp_path, lambda raw: raw.update(correction=True))
+    with pytest.raises(ValueError, match="differs from its approved preview"):
+        worker.get(preview_id)
+
+
+def test_record_classification_uses_the_preview_then_the_stored_verdict_and_fails_closed(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch,
+):
+    from aitobuild.developer_delivery import DeveloperDeliveryWorker
+    from aitobuild.developer_preview import DeveloperPreviewRegistry
+
+    _, worker, _, before = _stuck(tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch)
+    blind = DeveloperDeliveryWorker(preview_registry=DeveloperPreviewRegistry(), state_dir=worker._state_dir,
+                                    service_root=worker._service_root, repository_sources=worker._sources)
+    legacy = replace(before, correction=None)
+    assert worker.is_correction_record(legacy) is False  # pre-#61 record: classified by its approved preview
+    with pytest.raises(ValueError, match="no stored correction classification"):
+        blind.is_correction_record(legacy)
+    with pytest.raises(ValueError, match="no stored correction classification"):  # a differing preview is no preview
+        worker.is_correction_record(replace(legacy, bundle_payload={**legacy.bundle_payload, "objective": "x"}))
+    assert blind.is_correction_record(before) is False
+    assert blind.is_correction_record(replace(before, correction=True)) is True
+    with pytest.raises(ValueError, match="contradicts its correction task ID"):
+        blind.is_correction_record(replace(before, task_id="published-correction-x"))
+    with pytest.raises(ValueError, match="differs from its approved preview"):
+        worker.is_correction_record(replace(before, correction=True))

@@ -231,7 +231,7 @@ class ManagedOrganizationService:
 
     def _route(self, preview: DeveloperPreview) -> ManagedRoute | None:
         task_id = str(preview.bundle_payload.get("task_id", ""))
-        if is_correction_task(task_id) and self.approval_policy.correction == "disabled":
+        if is_correction_task(preview) and self.approval_policy.correction == "disabled":
             raise PermissionError("Correction is disabled")
         if self._dependencies is None and task_id.startswith("dependent-issue-"):
             raise PermissionError("Dependent handoffs require their trusted admission binding")
@@ -257,7 +257,7 @@ class ManagedOrganizationService:
             planning_route = self._planning.route_for(preview.preview_id)
             return ManagedRoute.model_validate(planning_route.model_dump()) if planning_route else None
         if self._reviews is None and (str(preview.bundle_payload.get("task_id", "")).startswith(REVIEW_TASK_PREFIX)
-                                      or is_correction_task(str(preview.bundle_payload.get("task_id", "")))):
+                                      or is_correction_task(preview)):
             raise PermissionError("Staged review tasks require their trusted admission binding")
         if self._reviews is not None:
             correction = self._reviews.correction_route_for(preview.preview_id)
@@ -704,7 +704,8 @@ class ManagedOrganizationService:
         reviews = self._reviews
         if self.approval_policy.correction == "automatic" and run.state == "completed" and run.cleanup_succeeded is True:
             assignment = self._assignments.get(run.assignment_id)
-            if assignment is not None and is_correction_task(assignment.task_id):
+            preview = self._previews.get(preview_id)
+            if assignment is not None and preview is not None and is_correction_task(preview):
                 record = await _delivery_call(lambda: self._worker.get(preview_id))
                 if record is not None and record.state in {"verified", "publishing", "published"}:
                     await self.publish_correction_by_policy(preview_id)

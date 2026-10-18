@@ -46,10 +46,10 @@ def correction_chain(implemented_delivery, verification_adapter, monkeypatch):
     _git(Path(published.source_path), "fetch", "--no-tags", "--no-write-fetch-head", str(checkout), head)
     _git(Path(published.source_path), "update-ref", "refs/heads/" + published.branch, head)
 
-    def make(review_id="review-one", content="def probe():\n    return 2\n", target_id=published_id):
+    def make(review_id="review-one", content="def probe():\n    return 2\n", target_id=published_id, task_id=None):
         target = worker.get(target_id)
         bundle = json.loads(json.dumps(target.bundle_payload))
-        task_id = "published-correction-" + sha256(f"{review_id}:{content}".encode()).hexdigest()
+        task_id = task_id or "published-correction-" + sha256(f"{review_id}:{content}".encode()).hexdigest()
         bundle["task_id"] = task_id
         bundle["objective"] = "Fix the inspected edge case"
         bundle["issue_context"]["base_revision"] = target.publication["head_sha"]
@@ -840,3 +840,53 @@ def test_budget_gone_after_the_branch_landed_reports_the_orphan_branch(
     assert record.publication["head_sha"] == github.branch_commits[-1]["head_sha"]
     assert "has no saved pull request" in record.error
     assert worker.get(preview_id) == record
+
+
+def _restarted(worker, registry):
+    from aitobuild.developer_delivery import DeveloperDeliveryWorker
+
+    return DeveloperDeliveryWorker(preview_registry=registry, state_dir=worker._state_dir,
+                                   service_root=worker._service_root, repository_sources=worker._sources)
+
+
+def test_issue_correction_retires_and_reloads_as_a_correction_after_restart(correction_chain, monkeypatch):
+    """#61 end to end: an ISSUE-* correction (a correction by its correction_from_review source only) goes through
+    the general retire, then a worker restart reloads it through `_load`, still classified as a correction."""
+    from aitobuild.developer_preview import DeveloperPreviewRegistry, is_correction_task, is_correction_task_id
+
+    worker, published_id, github, head, make = correction_chain
+    correction = make(task_id="ISSUE-9061")
+    record = worker.get(correction)
+    preview = worker.preview(correction)
+    assert record.task_id == "ISSUE-9061" and not is_correction_task_id(record.task_id)  # the prefix misses it
+    assert preview.source_payload["correction_from_review"] == "review-one" and is_correction_task(preview)
+    assert record.correction is True and worker.is_correction_record(record)
+    with pytest.raises(PermissionError, match="records no reason"):
+        worker.retire_delivery(correction, actor_id="operator", github=github, reason="no", allow_mock_publication=True)
+    monkeypatch.setattr(worker, "_retire_stuck_publication",
+                        lambda *args, **kwargs: pytest.fail("a correction must not take the non-correction path"))
+    retired = worker.retire_delivery(correction, actor_id="operator", github=github, allow_mock_publication=True)
+    assert retired.state == "retired" and retired.retirement["previous_state"] == "verified"
+    assert set(retired.retirement) == {"actor_id", "retired_at", "previous_state", "live_head_sha"}
+    assert retired.retirement["live_head_sha"] == head and retired.retirement["actor_id"] == "operator"
+    assert worker.correction_releases_parent(correction)
+    # Worker restart, with the persisted registry and with none at all: same record, same classification.
+    path = worker._previews._path
+    for registry in (DeveloperPreviewRegistry(path), DeveloperPreviewRegistry()):
+        fresh = _restarted(worker, registry)
+        monkeypatch.setattr(fresh, "_retire_stuck_publication",
+                            lambda *args, **kwargs: pytest.fail("a correction must not take the non-correction path"))
+        loaded = fresh.get(correction)
+        assert loaded == retired and fresh.is_correction_record(loaded)
+        assert fresh.correction_releases_parent(correction)
+        assert fresh.retire_correction(correction, actor_id="other", github=github,
+                                       allow_mock_publication=True) == retired
+    fresh = _restarted(worker, DeveloperPreviewRegistry(path))
+    assert fresh.retire_delivery(correction, actor_id="other", github=github, allow_mock_publication=True) == retired
+    # A stored verdict that disagrees with the approved preview fails closed at load.
+    state = worker._task_dir(correction) / "state.json"
+    raw = json.loads(state.read_text())
+    raw["record"]["correction"] = False
+    state.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="differs from its approved preview"):
+        _restarted(worker, DeveloperPreviewRegistry(path)).get(correction)

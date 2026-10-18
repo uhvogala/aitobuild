@@ -242,7 +242,12 @@ class PublishedReviewAdmission:
             target = PublishedReviewTarget(preview_id=published_preview_id, head_sha=publication["head_sha"])
             journal = self._load()
             root_preview_id, correction_round, max_rounds = published_preview_id, 0, self._max_rounds
-            if is_correction_task(str(payload["task_id"])):
+            published = self._worker.get(published_preview_id)
+            try:
+                correction_target = published is not None and self._worker.is_correction_record(published)
+            except ValueError as error:
+                raise PermissionError("Published review target lacks its approved preview") from error
+            if correction_target:
                 correction = journal.corrections.get(str(payload["task_id"]))
                 parents = [receipt for receipt in journal.receipts.values() if correction is not None and
                            receipt.review_preview_id == correction.review_preview_id]
@@ -544,7 +549,7 @@ class PublishedReviewAdmission:
         with FileLock(str(self._path) + ".lock", timeout=10):
             receipt = self._load().corrections.get(str(preview.bundle_payload["task_id"]))
         if receipt is None:
-            if is_correction_task(str(preview.bundle_payload["task_id"])):
+            if is_correction_task(preview):
                 raise PermissionError("Correction task lacks its trusted staging receipt")
             return None
         if (receipt.state != "staged" or receipt.correction_preview_id != preview_id or

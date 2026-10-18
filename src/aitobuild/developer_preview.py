@@ -56,15 +56,27 @@ PER_ISSUE_TASK_PREFIXES = ("ISSUE-", "planned-issue-", "dependent-issue-")
 PLANNED_CHILD_TASK_PREFIXES = ("planned-issue-", "dependent-issue-")
 
 
-def is_correction_task(subject: Any) -> bool:
+def is_correction_task_id(task_id: str) -> bool:
+    """Prefix-only check, for a caller that genuinely has nothing but a task ID (no preview, no source).
+
+    Prefer `is_correction_task(preview)`: an ISSUE-* task with a correction_from_review source is a correction too,
+    and only the full rule sees it. tests/test_correction_rule.py allowlists every caller of this function."""
+    if not isinstance(task_id, str):
+        raise TypeError("is_correction_task_id takes a task ID string")
+    return task_id.startswith(CORRECTION_TASK_PREFIX)
+
+
+def is_correction_task(preview: Any) -> bool:
     """The one correction rule; nothing else in src may test the correction prefix (tests/test_correction_rule.py).
 
-    A preview is a correction by its task ID or a correction_from_review source. A bare task ID string (from a
-    record, assignment or raw payload that carries no source) is checked by its prefix alone."""
-    if isinstance(subject, str):
-        return subject.startswith(CORRECTION_TASK_PREFIX)
-    return (str(subject.bundle_payload.get("task_id", "")).startswith(CORRECTION_TASK_PREFIX)
-            or "correction_from_review" in subject.source_payload)
+    A same-PR correction task: its task ID carries the correction prefix, or its approved source is a
+    correction_from_review. Takes a preview (or another object carrying `bundle_payload` and `source_payload`),
+    never a bare task ID string."""
+    if isinstance(preview, str) or not isinstance(getattr(preview, "bundle_payload", None), dict) \
+            or not isinstance(getattr(preview, "source_payload", None), dict):
+        raise TypeError("is_correction_task takes a preview carrying bundle_payload and source_payload")
+    return (is_correction_task_id(str(preview.bundle_payload.get("task_id", "")))
+            or "correction_from_review" in preview.source_payload)
 
 
 def correction_task_id(identity_digest: str) -> str:

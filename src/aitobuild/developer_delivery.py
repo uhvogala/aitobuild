@@ -27,7 +27,7 @@ from aitobuild.approval_policy import ApprovalDecision
 from aitobuild.developer_isolation import (
     DeveloperTaskBudget, DeveloperTaskBundle, developer_task_bundle_from_payload, is_command_allowed, is_path_allowed,
 )
-from aitobuild.developer_preview import DeveloperPreviewRegistry, is_correction_task
+from aitobuild.developer_preview import DeveloperPreviewRegistry, is_correction_task, is_correction_task_id
 from aitobuild.publish_approvals import PublishApproval, PublishApprovalStore, snapshot_digest
 from aitobuild.policy import AgentRole
 from aitobuild.tools.github import (
@@ -58,18 +58,14 @@ _PULL_RECEIPT_KEYS = ("pull_number", "html_url", "pull_head_sha")
 RETIRE_REASON_MAX = 2000
 
 
-def _is_correction_record(record: Any) -> bool:
-    return isinstance(getattr(record, "task_id", None), str) and is_correction_task(record.task_id)
+_CORRECTION_PUBLICATION_REFUSAL = ("Scoped correction tasks cannot publish a new pull request; "
+                                   "same-PR correction publication through the operator stage/publish endpoints is required")
 
 
-def _refuse_correction_publication(item: Any) -> None:
-    """Scoped corrections must update their pinned PR, never open a new one."""
-    payload = getattr(item, "bundle_payload", None)
-    if isinstance(payload, dict) and is_correction_task(str(payload.get("task_id", ""))):
-        raise PermissionError(
-            "Scoped correction tasks cannot publish a new pull request; "
-            "same-PR correction publication through the operator stage/publish endpoints is required"
-        )
+def _refuse_correction_publication(preview: Any) -> None:
+    """Scoped corrections (full rule) must update their pinned PR, never open a new one."""
+    if preview is not None and is_correction_task(preview):
+        raise PermissionError(_CORRECTION_PUBLICATION_REFUSAL)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +96,9 @@ class DeliveryPreparation:
     publication: dict[str, Any] | None = None
     architect_review: dict[str, Any] | None = None
     retirement: dict[str, Any] | None = None
+    # Full correction rule (task-ID prefix OR correction_from_review source) captured from the approved preview at
+    # creation (#61). None only on records written before it existed; those classify via the registry or fail closed.
+    correction: bool | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -137,6 +136,31 @@ class DeveloperDeliveryWorker:
         self._sources = repository_sources
         self._command_timeout = command_timeout_seconds
         self._git_executable = shutil.which("git")
+
+    def is_correction_record(self, record: DeliveryPreparation) -> bool:
+        """The full correction rule (`is_correction_task`) for a delivery record.
+
+        The rule's verdict is stored on the record when it is created from its approved preview (`correction`),
+        so a restarted worker classifies it the same way without the registry. When the record's own approved
+        preview (same id, same bundle) is present it is re-evaluated and must agree with the stored verdict. A
+        record without a stored verdict (pre-#61) needs that preview; with neither, classification fails closed.
+        A stored False can never undercut a correction task ID."""
+        preview = self._previews.get(record.preview_id)
+        if preview is not None and preview.bundle_payload == record.bundle_payload:
+            full = is_correction_task(preview)
+            if record.correction is not None and record.correction != full:
+                raise ValueError("Delivery record's stored correction classification differs from its approved preview")
+            return full
+        if record.correction is None:
+            raise ValueError("Delivery record has no stored correction classification and its approved preview is "
+                             "missing or differs; correction classification fails closed")
+        if not record.correction and is_correction_task_id(record.task_id):
+            raise ValueError("Delivery record's stored correction classification contradicts its correction task ID")
+        return record.correction
+
+    def _refuse_correction_record(self, record: DeliveryPreparation) -> None:
+        if self.is_correction_record(record):
+            raise PermissionError(_CORRECTION_PUBLICATION_REFUSAL)
 
     def budget_path(self, preview_id: str) -> Path:
         return self._state_dir / "budgets" / (sha256(preview_id.encode()).hexdigest() + ".json")
@@ -258,6 +282,7 @@ class DeveloperDeliveryWorker:
                     bundle_payload=json.loads(json.dumps(preview.bundle_payload)),
                     approved_at=preview.approved_at.isoformat(), updated_at=datetime.now(tz=UTC).isoformat(),
                     verification_commands=list(matches[0].verification_commands),
+                    correction=is_correction_task(preview),
                 )
                 self._save(directory, record)
             budget = None
@@ -431,7 +456,7 @@ class DeveloperDeliveryWorker:
             record = self._load_preview_record(preview_id)
             if record is None or record.state != "verified":
                 raise PermissionError("Draft publication approval requires an independently verified delivery")
-            _refuse_correction_publication(record)
+            self._refuse_correction_record(record)
             preview = self._previews.get(preview_id)
             if preview is None or not preview.approved or preview.bundle_payload != record.bundle_payload:
                 raise PermissionError("Draft publication approval requires the immutable approved task")
@@ -481,7 +506,7 @@ class DeveloperDeliveryWorker:
                 record = self._load(directory)
             if record is None:
                 raise ValueError("Delivery not found")
-            _refuse_correction_publication(record)
+            self._refuse_correction_record(record)
             if record.state == "failed":
                 return record
             if record.state == "published":
@@ -713,7 +738,7 @@ class DeveloperDeliveryWorker:
             record = self._load_preview_record(preview_id)
         except ValueError as error:
             raise PermissionError("Correction delivery failed validation") from error
-        if record is None or not _is_correction_record(record):
+        if record is None or not self.is_correction_record(record):
             raise PermissionError("Same-PR publication requires a scoped correction delivery")
         issue = developer_task_bundle_from_payload(record.bundle_payload).issue_context
         if issue is None:
@@ -746,7 +771,7 @@ class DeveloperDeliveryWorker:
                 raise PermissionError("Correction chain link repository/PR/branch/head mismatch")
             pull_number, base_ref = publication["pull_number"], publication["base_ref"]
             chain.append(current_id)
-            if not _is_correction_record(link):
+            if not self.is_correction_record(link):
                 break
             if publication.get("mode") != "advance" or publication.get("parent_head_sha") != link.base_revision:
                 raise PermissionError("Correction chain link lacks its pinned parent head")
@@ -773,13 +798,20 @@ class DeveloperDeliveryWorker:
                     raise ValueError("Invalid persisted delivery preparation")
             except (ValueError, KeyError, TypeError, OSError) as error:
                 raise PermissionError("An unreadable delivery record blocks correction checks; they fail closed") from error
-            if not is_correction_task(str(raw.get("task_id", ""))) or not relevant(raw):
+            if not relevant(raw):
+                continue
+            preview_id = raw.get("preview_id")
+            preview = self._previews.get(preview_id) if isinstance(preview_id, str) and preview_id else None
+            if preview is None or preview.bundle_payload != raw.get("bundle_payload"):
+                raise PermissionError("A related delivery record without its approved preview cannot be classified; "
+                                      "correction checks fail closed")
+            if not is_correction_task(preview):
                 continue
             try:
                 record = self._load(state.parent)
             except ValueError as error:
                 raise PermissionError("A related correction record failed validation; correction checks fail closed") from error
-            if record is not None and _is_correction_record(record):
+            if record is not None and self.is_correction_record(record):
                 records.append(record)
         return records
 
@@ -808,7 +840,7 @@ class DeveloperDeliveryWorker:
             record = self._load_preview_record(preview_id)
         except ValueError as error:
             raise PermissionError("Sibling correction delivery failed validation; offering fails closed") from error
-        return record is not None and _is_correction_record(record) and not self.correction_holds_parent(record)
+        return record is not None and self.is_correction_record(record) and not self.correction_holds_parent(record)
 
     def competing_corrections(self, preview_id: str, *, repository: str, parent_head_sha: str) -> list[str]:
         """Other corrections on the same parent head that already staged an approval or pushed (first stage wins)."""
@@ -902,7 +934,7 @@ class DeveloperDeliveryWorker:
         record = self._load_preview_record(preview_id)
         if record is None:
             raise ValueError("Delivery not found")
-        if not _is_correction_record(record):
+        if not self.is_correction_record(record):
             raise PermissionError("Same-PR publication requires a scoped correction delivery")
         if record.state not in ({"verified", "publishing"} if resuming else {"verified"}):
             raise ValueError("Correction publication requires a verified correction delivery")
@@ -1188,7 +1220,7 @@ class DeveloperDeliveryWorker:
                 record = self._load_preview_record(preview_id)
             except ValueError as error:
                 raise PermissionError("Correction delivery failed validation") from error
-            if record is None or not _is_correction_record(record):
+            if record is None or not self.is_correction_record(record):
                 raise PermissionError("Retiring requires a saved correction delivery")
             if record.state == "retired":
                 return record
@@ -1794,14 +1826,17 @@ class DeveloperDeliveryWorker:
         bundle = developer_task_bundle_from_payload(record.bundle_payload)
         if record.state not in {"preparing", "prepared", "failed", "implementing", "awaiting_tool_approval", "implemented", "verifying", "verified", "publishing", "published", "retired"} or bundle.issue_context is None:
             raise ValueError("Invalid persisted delivery preparation state")
+        if bundle.task_id != record.task_id or directory != self._task_dir(record.preview_id):
+            raise ValueError("Persisted delivery preparation differs from the approved identity")
+        correction = self.is_correction_record(record)  # full rule, via the record's own approved preview
         # A retired non-correction (#61) keeps validating as the `publishing` record it was, plus its receipt.
         evidence_state = record.state
-        if record.state == "retired" and not _is_correction_record(record):
+        if record.state == "retired" and not correction:
             evidence_state = "publishing"
             self._validate_publishing_retirement(record)
         elif record.state == "retired":
             retirement = record.retirement
-            if (not _is_correction_record(record) or not isinstance(retirement, dict)
+            if (not correction or not isinstance(retirement, dict)
                     or set(retirement) != {"actor_id", "retired_at", "previous_state", "live_head_sha"}
                     or not isinstance(retirement["actor_id"], str) or not retirement["actor_id"]
                     or retirement["previous_state"] not in _RETIRABLE_STATES
@@ -1855,10 +1890,10 @@ class DeveloperDeliveryWorker:
             ):
                 if not isinstance(publication.get(key), str) or not publication[key]:
                     raise ValueError("Invalid persisted publication field")
-            if publication.get("mode") == "advance" or _is_correction_record(record):
+            if publication.get("mode") == "advance" or correction:
                 parent = publication.get("parent_head_sha")
                 digest = publication.get("approval_digest")
-                if (publication.get("mode") != "advance" or not _is_correction_record(record)
+                if (publication.get("mode") != "advance" or not correction
                         or publication["branch"] != bundle.issue_context.base_branch
                         or publication["base_sha"] != record.base_revision or parent != record.base_revision
                         or type(publication.get("pull_number")) is not int or publication["pull_number"] <= 0

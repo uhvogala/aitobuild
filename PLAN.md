@@ -19,7 +19,13 @@ second command: `retire_delivery` / `POST /internal/organization/deliveries/reti
 {preview_id, reason}` resolves the record's approved preview and routes every correction by the
 full rule (`is_correction_task(preview)`: task ID or `correction_from_review` source) to the
 unchanged `retire_correction` at both the service and the worker (and `corrections/retire` stays
-as its alias); a missing or differing preview is refused, never routed as a non-correction. It
+as its alias); a missing or differing preview is refused, never routed as a non-correction. The
+rule is split: `is_correction_task_id(task_id)` is the prefix check only, used inside the full
+rule and nowhere a preview or record is reachable. A delivery record now stores the full rule's
+verdict (`correction`) when it is created from its approved preview, so `_load` and every worker
+check classify it the same way after a restart; if the preview is present it must agree, a pre-#61
+record with no verdict needs its preview (otherwise it fails closed), and a stored `false` never
+undercuts a correction task ID. It
 retires any other record only when it is `publishing`, carries no PR number/URL/PR head, the base branch is
 readable, and the read-only live `branch_head` is gone (404) or not the saved head (an existing
 branch with no saved head is refused). The delivery implementation lock and the managed run's
