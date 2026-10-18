@@ -18,6 +18,7 @@ from agent_framework import (
     WorkflowRunState, handler, response_handler,
 )
 from filelock import FileLock
+from openai import APIError
 from pydantic import AwareDatetime, JsonValue, StrictBool, StrictStr, TypeAdapter, model_validator
 
 from aitobuild.durable_files import atomic_write_text, sync_directory
@@ -201,10 +202,33 @@ def _failure_label(error: BaseException) -> str:
 
     Only an actual deadline expiry is relabelled; aborted ledgers, lock timeouts and every other error keep
     their own message. The native invocation's asyncio timeout carries no message, so it is "TimeoutError" too.
+    A model API failure (openai.APIError anywhere in the chain) also names its exception chain.
     """
     if type(error) is BudgetDeadlineExpired:
         return "TimeoutError"
-    return str(error) or type(error).__name__
+    label = str(error) or type(error).__name__
+    chain = _exception_chain(error)
+    if any(isinstance(item, APIError) for item in chain):
+        # A model call failure: keep the transport cause (httpx.ConnectTimeout vs httpx.ReadTimeout, ...)
+        # so a connect stall can be told apart from a read stall in the failure record.
+        label += " [exception chain: " + " <- ".join(_exception_name(item) for item in chain) + "]"
+    return label
+
+
+def _exception_chain(error: BaseException, limit: int = 8) -> list[BaseException]:
+    """The error and its causes, outermost first, following ``raise ... from`` and implicit context."""
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    while current is not None and len(chain) < limit and all(current is not seen for seen in chain):
+        chain.append(current)
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+    return chain
+
+
+def _exception_name(error: BaseException) -> str:
+    kind = type(error)
+    package = kind.__module__.split(".")[0]
+    return kind.__qualname__ if package == "builtins" else f"{package}.{kind.__qualname__}"
 
 
 @dataclass(frozen=True, slots=True)
