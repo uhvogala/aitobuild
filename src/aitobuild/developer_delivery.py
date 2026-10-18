@@ -701,7 +701,7 @@ class DeveloperDeliveryWorker:
                 record = self._load(directory)
             if record is None:
                 raise ValueError("Delivery not found")
-            _refuse_correction_publication(record)
+            self._refuse_correction_record(record)
             publication = record.publication
             if record.state != "publishing" or not isinstance(publication, dict):
                 raise PermissionError("Budget-expired adoption requires an interrupted publishing delivery")

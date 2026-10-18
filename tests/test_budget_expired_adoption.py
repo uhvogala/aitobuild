@@ -409,7 +409,8 @@ def test_ghcli_adoptable_pr_lookup_is_read_only(monkeypatch, case) -> None:
     elif case == "none":
         assert find() is None
     else:
-        with pytest.raises(PermissionError, match="not adopted"):
+        with pytest.raises((PermissionError, ValueError), match="not adopted" if case in {
+                "author", "body", "draft"} else "must be one open draft"):
             find()
     assert set(calls) <= {"GET"}
 

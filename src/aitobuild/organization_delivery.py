@@ -381,8 +381,6 @@ class ManagedDeliveryBindings:
         github = self._github
         if github is None or not self.interrupted_publication(context, original):
             raise PermissionError("Budget-expired adoption requires this task's own interrupted publication")
-        if context.assignment.task_id.startswith("published-correction-"):
-            raise PermissionError("Corrections require exact one-use operator publication approval")
         record = await _delivery_call(lambda: self._worker.adopt_after_budget_expiry(
             context.assignment.preview_id, github=github, expected_publication=original,
             before_write=context.revalidate, allow_mock_publication=self._allow_mock,
