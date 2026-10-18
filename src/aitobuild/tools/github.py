@@ -1156,8 +1156,16 @@ class GhCliGitHubAdapter:
         return head
 
     def branch_head(self, *, repository: str, branch: str) -> str | None:
-        """The live head of a remote task branch (read-only); an unreadable reference raises."""
-        return self._read_branch_head(repository=self._resolve_repository(repository), branch=branch)
+        """The live head of a remote task branch (read-only), or None when GitHub answers 404 for the reference
+        (the branch does not exist). Any other unreadable reference raises."""
+        try:
+            return self._read_branch_head(repository=self._resolve_repository(repository), branch=branch)
+        except GitHubTransientError:
+            raise
+        except RuntimeError as error:
+            if "HTTP 404" in str(error):
+                return None
+            raise
 
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue:
         repo = self._resolve_repository(repository)

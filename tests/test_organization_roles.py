@@ -944,6 +944,15 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         assert refused_publish.status_code == 409 and "mock publication is refused" in refused_publish.json()["detail"]
                         refused_retire = client.post(operator_calls[2][0], headers=headers, json=operator_calls[2][1])
                         assert refused_retire.status_code == 409 and "mock reads are refused" in refused_retire.json()["detail"]
+                        # #61: the generalized retire keeps the same auth, payload strictness and live-adapter rule.
+                        general = "/internal/organization/deliveries/retire"
+                        assert client.post(general, json={"preview_id": correction.preview_id}).status_code == 401
+                        for body in ({"preview_id": correction.preview_id, "actor_id": "model"}, {"preview_id": " "},
+                                     {"reason": "why"}, {"preview_id": correction.preview_id, "reason": 7}):
+                            assert client.post(general, headers=headers, json=body).status_code == 400
+                        refused_general = client.post(general, headers=headers,
+                                                      json={"preview_id": correction.preview_id, "reason": "why"})
+                        assert refused_general.status_code == 409 and "mock reads are refused" in refused_general.json()["detail"]
                         assert worker._approvals.get(correction.preview_id) is None
                     approve_preview(previews, correction.preview_id)
                     if native_correcting:

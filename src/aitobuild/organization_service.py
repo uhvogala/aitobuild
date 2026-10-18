@@ -11,6 +11,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal, Mapping, assert_never
 
+from filelock import Timeout as FileLockTimeout
 from pydantic import Field, JsonValue, StrictInt, StrictStr
 
 from aitobuild.agent_tools import DeveloperToolContext
@@ -628,6 +629,37 @@ class ManagedOrganizationService:
         return await _delivery_call(lambda: self._worker.retire_correction(
             correction_preview_id, actor_id=self.operator_id, github=github,
             allow_mock_publication=allow_mock_publication))
+    async def retire_delivery(
+        self, preview_id: str, *, github: GitHubAdapter, reason: str | None = None,
+        allow_mock_publication: bool = False,
+    ) -> DeliveryPreparation:
+        """The generalized operator retire (#61). Corrections go through `retire_correction` unchanged; any other
+        delivery may only retire a stuck `publishing` record, while its managed run is not executing."""
+        preview = self._previews.get(preview_id)
+        if preview is None:
+            raise PermissionError("Retiring requires an existing approved preview")
+        task_id = str(preview.bundle_payload.get("task_id", ""))
+        if task_id.startswith(CORRECTION_TASK_PREFIX):
+            if reason is not None:
+                raise PermissionError("Correction retire records no reason; omit it")
+            return await self.retire_correction(preview_id, github=github,
+                                                allow_mock_publication=allow_mock_publication)
+        assignment = self.recorded_assignment(task_id)
+        # The runner holds this lock for every invoke/approve/resume; a run left `running` by a kill does not.
+        lock = self._runs.invocation_lock(assignment.assignment_id) if assignment is not None else None
+        if lock is not None:
+            try:
+                lock.acquire()
+            except FileLockTimeout as error:
+                raise PermissionError("The managed run for this delivery is executing; retire is refused") from error
+        try:
+            return await _delivery_call(lambda: self._worker.retire_delivery(
+                preview_id, actor_id=self.operator_id, github=github, reason=reason,
+                allow_mock_publication=allow_mock_publication))
+        finally:
+            if lock is not None:
+                lock.release()
+
     def follow_up_status(self, run_id: str) -> dict[str, JsonValue] | None:
         return self._reviews.follow_up_status(run_id) if self._reviews is not None else None
 

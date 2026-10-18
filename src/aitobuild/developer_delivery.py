@@ -20,14 +20,14 @@ from time import monotonic
 from typing import Any, Literal
 from uuid import uuid4
 
-from filelock import FileLock
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from aitobuild.durable_files import atomic_write_text
 from aitobuild.approval_policy import ApprovalDecision
 from aitobuild.developer_isolation import (
     DeveloperTaskBudget, DeveloperTaskBundle, developer_task_bundle_from_payload, is_command_allowed, is_path_allowed,
 )
-from aitobuild.developer_preview import DeveloperPreviewRegistry
+from aitobuild.developer_preview import DeveloperPreviewRegistry, is_correction_task
 from aitobuild.publish_approvals import PublishApproval, PublishApprovalStore, snapshot_digest
 from aitobuild.policy import AgentRole
 from aitobuild.tools.github import (
@@ -53,6 +53,12 @@ CORRECTION_TASK_PREFIX = "published-correction-"
 
 _UNBOUND_REVIEW_PREFIX = "Architect COMMENT already posted for head "
 _RETIRABLE_STATES = frozenset({"failed", "prepared", "awaiting_tool_approval", "implemented", "verified"})
+# #61: receipt keys of an operator retire of a non-correction record stuck at `publishing`. The four correction
+# receipt keys plus why it was retired and what the read-only live branch check saw (`gone` or `moved`).
+_PUBLISHING_RETIREMENT_KEYS = frozenset({"actor_id", "retired_at", "previous_state", "live_head_sha", "reason",
+                                         "live_branch"})
+_PULL_RECEIPT_KEYS = ("pull_number", "html_url", "pull_head_sha")
+RETIRE_REASON_MAX = 2000
 
 
 def _is_correction_record(record: Any) -> bool:
@@ -1210,6 +1216,109 @@ class DeveloperDeliveryWorker:
             self._save(directory, record)
             return record
 
+    def retire_delivery(
+        self, preview_id: str, *, actor_id: str, github: GitHubAdapter, reason: str | None = None,
+        allow_mock_publication: bool = False,
+    ) -> DeliveryPreparation:
+        """The one operator retire (#61): corrections keep `retire_correction` unchanged; any other delivery may
+        only be retired from a `publishing` record that is stuck (see `_retire_stuck_publication`)."""
+        directory = self._task_dir(preview_id)
+        if not directory.exists():
+            raise PermissionError("Retiring requires a saved delivery record")
+        try:
+            record = self._load_preview_record(preview_id)
+        except ValueError as error:
+            raise PermissionError("Delivery record failed validation; retire is refused") from error
+        if record is None:
+            raise PermissionError("Retiring requires a saved delivery record")
+        if _is_correction_record(record):
+            if reason is not None:
+                raise PermissionError("Correction retire records no reason; omit it")
+            return self.retire_correction(preview_id, actor_id=actor_id, github=github,
+                                          allow_mock_publication=allow_mock_publication)
+        return self._retire_stuck_publication(preview_id, actor_id=actor_id, reason=reason, github=github,
+                                              allow_mock_publication=allow_mock_publication)
+
+    def _retire_stuck_publication(
+        self, preview_id: str, *, actor_id: str, reason: str | None, github: GitHubAdapter,
+        allow_mock_publication: bool,
+    ) -> DeliveryPreparation:
+        """Operator retire of a non-correction delivery left at `publishing` that can never finish (#61).
+
+        Allowed only when the record is `publishing`, it is not a correction (`is_correction_task`), no PR is
+        recorded, the repository is readable, and the live task branch (read-only `branch_head`) is gone or not at
+        the saved head; with no saved head an existing branch is refused, since it may carry an unrecorded push.
+        The implementation lock must be free (no publish, verify or implementation in flight). Nothing is written
+        to GitHub, the budget and approvals are left as they are, and the saved head, snapshot and evidence stay
+        on the record next to the retirement receipt. `retired` is terminal: publish, resume, adoption and
+        `prepare` all refuse or return it unchanged.
+        """
+        if isinstance(github, MockGitHubAdapter) and not allow_mock_publication:
+            raise ValueError("Retiring a delivery requires a live GitHub adapter; mock reads are refused")
+        if not isinstance(actor_id, str) or not actor_id.strip():
+            raise PermissionError("Retiring a delivery requires an operator identity")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > RETIRE_REASON_MAX or "\x00" in reason:
+            raise PermissionError("Retiring a stuck publication requires a bounded operator reason")
+        directory = self._task_dir(preview_id)
+        lock = self.implementation_lock(preview_id)
+        try:
+            lock.acquire()
+        except FileLockTimeout as error:
+            raise PermissionError("Delivery is in flight (its implementation lock is held); retire is refused") from error
+        try:
+            try:
+                record = self._load_preview_record(preview_id)
+            except ValueError as error:
+                raise PermissionError("Delivery record failed validation; retire is refused") from error
+            if record is None:
+                raise PermissionError("Retiring requires a saved delivery record")
+            preview = self._previews.get(preview_id)
+            if (_is_correction_record(record) or preview is None or preview.bundle_payload != record.bundle_payload
+                    or is_correction_task(preview)):
+                raise PermissionError("Corrections retire through the correction rule; this record is refused")
+            if record.state == "retired":
+                return record
+            if record.state != "publishing":
+                raise PermissionError(f"A {record.state} delivery cannot be retired; only a stuck publishing record can")
+            publication = record.publication
+            if not isinstance(publication, dict):
+                raise PermissionError("A publishing record without a saved publication cannot be retired")
+            if any(publication.get(key) is not None for key in _PULL_RECEIPT_KEYS):
+                raise PermissionError("A pull request is recorded for this delivery; reconcile or resume it instead")
+            issue = developer_task_bundle_from_payload(record.bundle_payload).issue_context
+            repository, base_ref = publication.get("repository"), publication.get("base_ref")
+            if (issue is None or repository != issue.repository or publication.get("branch") != record.branch
+                    or not isinstance(base_ref, str) or not base_ref):
+                raise PermissionError("Publication target differs from the approved delivery; retire is refused")
+            saved_head = publication.get("head_sha")
+            if saved_head is not None and (not isinstance(saved_head, str)
+                                           or re.fullmatch(r"[0-9a-f]{40}", saved_head) is None):
+                raise PermissionError("Saved head SHA is malformed; retire is refused")
+            # A 404 only proves "branch gone" when the repository itself is readable with this adapter.
+            base_head = github.branch_head(repository=repository, branch=base_ref)
+            if not isinstance(base_head, str) or re.fullmatch(r"[0-9a-f]{40}", base_head.lower()) is None:
+                raise PermissionError("Base branch is unreadable, so a missing task branch proves nothing; retire is refused")
+            live = github.branch_head(repository=repository, branch=record.branch)
+            if live is not None and (not isinstance(live, str) or re.fullmatch(r"[0-9a-f]{40}", live.lower()) is None):
+                raise PermissionError("Live task branch head is malformed; retire is refused")
+            live_head = live.lower() if isinstance(live, str) else None
+            if live_head is not None and saved_head is None:
+                raise PermissionError(f"Task branch {record.branch} exists at {live_head} but no head was saved; it may "
+                                      "carry an unrecorded push, so retire is refused")
+            if live_head is not None and live_head == saved_head:
+                raise PermissionError(f"Task branch {record.branch} is still at the saved head {saved_head}; "
+                                      "resume the publication instead")
+            now = datetime.now(tz=UTC).isoformat()
+            record = replace(record, state="retired", error=record.error or "Retired by operator",
+                             retirement={"actor_id": actor_id.strip(), "retired_at": now, "previous_state": "publishing",
+                                         "live_head_sha": live_head, "reason": reason.strip(),
+                                         "live_branch": "gone" if live_head is None else "moved"},
+                             updated_at=now)
+            self._save(directory, record)
+            return record
+        finally:
+            lock.release()
+
     def get_published_pull_request(
         self, preview_id: str, *, github: GitHubAdapter,
     ) -> dict[str, Any]:
@@ -1686,7 +1795,12 @@ class DeveloperDeliveryWorker:
         bundle = developer_task_bundle_from_payload(record.bundle_payload)
         if record.state not in {"preparing", "prepared", "failed", "implementing", "awaiting_tool_approval", "implemented", "verifying", "verified", "publishing", "published", "retired"} or bundle.issue_context is None:
             raise ValueError("Invalid persisted delivery preparation state")
-        if record.state == "retired":
+        # A retired non-correction (#61) keeps validating as the `publishing` record it was, plus its receipt.
+        evidence_state = record.state
+        if record.state == "retired" and not _is_correction_record(record):
+            evidence_state = "publishing"
+            self._validate_publishing_retirement(record)
+        elif record.state == "retired":
             retirement = record.retirement
             if (not _is_correction_record(record) or not isinstance(retirement, dict)
                     or set(retirement) != {"actor_id", "retired_at", "previous_state", "live_head_sha"}
@@ -1697,15 +1811,15 @@ class DeveloperDeliveryWorker:
                 raise ValueError("Invalid persisted correction retirement")
             datetime.fromisoformat(retirement["retired_at"])
         elif record.retirement is not None:
-            raise ValueError("Only retired corrections may carry a retirement receipt")
+            raise ValueError("Only retired deliveries may carry a retirement receipt")
         self._validate_verification_commands(record.verification_commands, bundle)
         if record.session_id is not None:
             if not isinstance(record.session_id, str):
                 raise ValueError("Invalid persisted native delivery session")
             _normalize_session_id(record.session_id)
-        if record.state in {"implementing", "awaiting_tool_approval", "implemented", "verifying", "verified", "publishing", "published"} and record.session_id is None:
+        if evidence_state in {"implementing", "awaiting_tool_approval", "implemented", "verifying", "verified", "publishing", "published"} and record.session_id is None:
             raise ValueError("Missing persisted native delivery session")
-        if record.state in {"verifying", "verified", "publishing", "published"}:
+        if evidence_state in {"verifying", "verified", "publishing", "published"}:
             evidence = record.verification
             if not isinstance(evidence, dict) or not isinstance(evidence.get("session_id"), str):
                 raise ValueError("Invalid persisted verification evidence")
@@ -1714,13 +1828,13 @@ class DeveloperDeliveryWorker:
                     or not isinstance(evidence.get("checkout_digest"), str)
                     or re.fullmatch(r"[0-9a-f]{64}", evidence["checkout_digest"]) is None):
                 raise ValueError("Invalid persisted verification identity")
-            timestamps = ("started_at", "completed_at") if record.state in {"verified", "publishing", "published"} else ("started_at",)
+            timestamps = ("started_at", "completed_at") if evidence_state in {"verified", "publishing", "published"} else ("started_at",)
             for name in timestamps:
                 timestamp = evidence.get(name)
                 if not isinstance(timestamp, str) or not timestamp:
                     raise ValueError("Invalid persisted verification timestamp")
                 datetime.fromisoformat(timestamp)
-            if record.state in {"verified", "publishing", "published"} and (
+            if evidence_state in {"verified", "publishing", "published"} and (
                 not record.verification_commands or evidence.get("cleanup_succeeded") is not True
                 or len(evidence["commands"]) != len(record.verification_commands)
                 or any(not isinstance(result, dict) or result.get("command") != command
@@ -1728,7 +1842,7 @@ class DeveloperDeliveryWorker:
                        for command, result in zip(record.verification_commands, evidence["commands"], strict=True))
             ):
                 raise ValueError("Persisted verification lacks successful command/cleanup evidence")
-        if record.state in {"publishing", "published"} or (
+        if evidence_state in {"publishing", "published"} or (
             record.state in {"failed", "retired"}
             and isinstance(record.publication, dict)
             and isinstance(record.publication.get("pull_number"), int)
@@ -1784,7 +1898,7 @@ class DeveloperDeliveryWorker:
             raise ValueError("Persisted delivery checkout identity is invalid")
         if (record.state in {"prepared", "implementing", "awaiting_tool_approval", "implemented", "verifying", "verified"}
             and record.head_revision != record.base_revision
-                or record.state == "publishing"
+                or evidence_state == "publishing"
                 and record.head_revision not in {record.base_revision, None}
                 and (
                     not isinstance(record.publication, dict)
@@ -1823,6 +1937,31 @@ class DeveloperDeliveryWorker:
         datetime.fromisoformat(record.approved_at)
         datetime.fromisoformat(record.updated_at)
         return record
+
+    @staticmethod
+    def _validate_publishing_retirement(record: DeliveryPreparation) -> None:
+        """Load/replay check of a #61 receipt: exactly what `_retire_stuck_publication` could have written."""
+        retirement, publication = record.retirement, record.publication
+        if (not isinstance(retirement, dict) or set(retirement) != _PUBLISHING_RETIREMENT_KEYS
+                or not isinstance(publication, dict)
+                or not isinstance(retirement["actor_id"], str) or not retirement["actor_id"].strip()
+                or not isinstance(retirement["reason"], str) or not retirement["reason"].strip()
+                or len(retirement["reason"]) > RETIRE_REASON_MAX
+                or retirement["previous_state"] != "publishing"
+                or not isinstance(retirement["retired_at"], str)
+                or any(publication.get(key) is not None for key in _PULL_RECEIPT_KEYS)):
+            raise ValueError("Invalid persisted publishing retirement")
+        live, saved = retirement["live_head_sha"], publication.get("head_sha")
+        if retirement["live_branch"] == "gone":
+            valid = live is None
+        elif retirement["live_branch"] == "moved":
+            valid = (isinstance(live, str) and re.fullmatch(r"[0-9a-f]{40}", live) is not None
+                     and isinstance(saved, str) and live != saved)
+        else:
+            valid = False
+        if not valid:
+            raise ValueError("Invalid persisted publishing retirement branch observation")
+        datetime.fromisoformat(retirement["retired_at"])
 
     def _save(self, directory: Path, record: DeliveryPreparation) -> None:
         directory.mkdir(parents=True, exist_ok=True)
