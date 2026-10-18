@@ -6,6 +6,7 @@ import asyncio
 from datetime import UTC, datetime
 from hashlib import sha256
 import json
+import logging
 import math
 from pathlib import Path
 from typing import Annotated, Literal, Protocol, Self
@@ -18,7 +19,9 @@ from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bu
 from aitobuild.organization import DefinitionModel
 from aitobuild.organization_assignments import AssignmentCapacityError, AssignmentProposal, Digest
 from aitobuild.organization_runner import TERMINAL, ApprovalPolicyChanged
-from aitobuild.organization_service import ManagedOrganizationService, ManagedRoute
+from aitobuild.organization_service import AdmissionRefused, ManagedOrganizationService, ManagedRoute
+
+logger = logging.getLogger(__name__)
 
 
 class WorkerCommand(DefinitionModel):
@@ -101,6 +104,13 @@ class WorkerStore(Protocol):
 
 class _ReceiptError(RuntimeError):
     pass
+
+
+class _ExecutionStop(RuntimeError):
+    """An error ``_execute`` deliberately did not absorb (a lost worker receipt or an interrupted finalization).
+
+    These stay fail-stop: the job cannot be recorded or replayed safely, so the loop task ends and the dead loop is
+    reported by ``diagnostics()``/``health()`` (#69). Every other per-job error is contained by the loop."""
 
 
 class FileWorkerStore:
@@ -228,14 +238,28 @@ class ManagedOrganizationWorker:
         self._tasks: list[asyncio.Task[None]] = []
         self._active: dict[str, asyncio.Task[None]] = {}
         self._errors: list[str] = []
+        # #69: per-job errors the loop contained (logged once with traceback) and follow-ups whose automatic
+        # admission was refused (left for a human); both bounded, keyed so a persistent error is reported once.
+        self._job_errors: dict[tuple[str, str], str] = {}
+        self._refused: dict[str, str] = {}
 
     @property
     def queue_follow_ups(self) -> bool:
         return self._queue_follow_ups
 
+    def health(self) -> dict[str, object]:
+        """Loop liveness (#69): ``stopped`` when started and no loop is alive, ``degraded`` when some died."""
+        alive = sum(not task.done() for task in self._tasks)
+        expected = len(self._tasks)
+        status = "not_started" if not expected else "ok" if alive == expected else "stopped" if alive == 0 else "degraded"
+        return {"status": status, "workers_alive": alive, "workers_expected": expected}
+
     def diagnostics(self) -> dict[str, object]:
         return {"workers": sum(not task.done() for task in self._tasks),
+                "health": self.health(),
                 "active_previews": tuple(self._active), "errors": tuple(self._errors),
+                "job_errors": tuple(f"{preview_id}: {error}" for (preview_id, _), error in self._job_errors.items()),
+                "refused_follow_ups": tuple(self._refused),
                 "approval_policy_revision": self.service.approval_policy.revision,
                 "automatic_approval_stages": self.service.approval_policy.automatic_stages,
                 "warnings": self.service.approval_policy.safety_warnings}
@@ -244,6 +268,7 @@ class ManagedOrganizationWorker:
         if not task.cancelled():
             error = task.exception()
             if error is not None:
+                logger.error("Managed worker loop stopped", exc_info=error)
                 self._errors.append(str(error)[:4000])
                 self._changed.set()
 
@@ -420,55 +445,102 @@ class ManagedOrganizationWorker:
             except TimeoutError:
                 pass
 
+    def _contain(self, preview_id: str, error: Exception) -> None:
+        """Log an unexpected per-job error once (with traceback) and keep the loop running (#69).
+
+        The job's receipt is left as it is, so the next pass retries it (a requeue); nothing is marked failed here
+        because the loop cannot know how far that job got."""
+        key = (preview_id, f"{type(error).__name__}: {error}"[:4000])
+        if key not in self._job_errors:
+            if len(self._job_errors) >= 128:
+                self._job_errors.pop(next(iter(self._job_errors)))
+            self._job_errors[key] = key[1]
+            logger.error("Managed worker contained an error for %s; the loop keeps running", preview_id,
+                         exc_info=error)
+            self._changed.set()
+
+    def _queue_follow_ups_of(self, job: WorkerJob) -> None:
+        child_id = self.service.follow_up_preview_id(job.preview_id)
+        children = self.service.planning_follow_up_preview_ids(job.preview_id)
+        if child_id is not None:
+            children = (*children, child_id)
+        for next_id in children:
+            if self.store.get(next_id) is not None:
+                continue
+            try:
+                self.enqueue(next_id)
+            except AdmissionRefused as refusal:
+                # The one admission gate (_admit) refused the automatic admission: the follow-up stays unadmitted
+                # and waits for a human (who admits it through admit_task(Human) and enqueues it).
+                if self._refused.get(next_id) != str(refusal):
+                    if len(self._refused) >= 128:
+                        self._refused.pop(next(iter(self._refused)))
+                    self._refused[next_id] = str(refusal)
+                    logger.info("Follow-up %s of %s waits for a human admission: %s", next_id, job.preview_id, refusal)
+                    self._changed.set()
+
+    async def _run_owned(self, current: WorkerJob) -> None:
+        parent = asyncio.current_task()
+        if parent is None:
+            raise RuntimeError("Internal invariant violated: parent is not None")
+        task = asyncio.create_task(self._execute(current))
+        self._active[current.preview_id] = task
+        try:
+            while not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=self._poll)
+                except TimeoutError:
+                    latest = self.store.get(current.preview_id)
+                    if latest is not None and latest.cancel_requested:
+                        task.cancel()
+            await task
+        except asyncio.CancelledError:
+            if parent.cancelling():
+                task.cancel()
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        pass
+                raise
+        except Exception as error:
+            # Only what _execute chose not to absorb reaches here; keep it fail-stop (see _ExecutionStop).
+            raise _ExecutionStop(str(error)) from error
+        finally:
+            self._active.pop(current.preview_id, None)
+
+    async def _dispatch(self, job: WorkerJob) -> None:
+        if self._queue_follow_ups and job.state == "completed":
+            try:
+                self._queue_follow_ups_of(job)
+            except LockTimeout:
+                return
+        if job.state not in {"queued", "running"} and not (job.state == "waiting" and job.cancel_requested):
+            return
+        try:
+            with self.store.invocation_lock(job.preview_id):
+                current = self.store.get(job.preview_id)
+                if current is not None and (current.state in {"queued", "running"} or
+                                            current.state == "waiting" and current.cancel_requested):
+                    await self._run_owned(current)
+        except LockTimeout:
+            return
+
     async def _loop(self) -> None:
         while True:
             self._wake.clear()
-            for job in self.store.list():
-                if self._queue_follow_ups and job.state == "completed":
-                    try:
-                        child_id = self.service.follow_up_preview_id(job.preview_id)
-                        children = self.service.planning_follow_up_preview_ids(job.preview_id)
-                        if child_id is not None:
-                            children = (*children, child_id)
-                        for next_id in children:
-                            if self.store.get(next_id) is None:
-                                self.enqueue(next_id)
-                    except LockTimeout:
-                        continue
-                if job.state not in {"queued", "running"} and not (job.state == "waiting" and job.cancel_requested):
-                    continue
+            try:
+                jobs = self.store.list()
+            except Exception as error:  # an unreadable journal must not end the loop silently either
+                self._contain("<worker journal>", error)
+                jobs = ()
+            for job in jobs:
                 try:
-                    with self.store.invocation_lock(job.preview_id):
-                        current = self.store.get(job.preview_id)
-                        if current is not None and (current.state in {"queued", "running"} or
-                                                    current.state == "waiting" and current.cancel_requested):
-                            parent = asyncio.current_task()
-                            if parent is None:
-                                raise RuntimeError("Internal invariant violated: parent is not None")
-                            task = asyncio.create_task(self._execute(current))
-                            self._active[current.preview_id] = task
-                            try:
-                                while not task.done():
-                                    try:
-                                        await asyncio.wait_for(asyncio.shield(task), timeout=self._poll)
-                                    except TimeoutError:
-                                        latest = self.store.get(current.preview_id)
-                                        if latest is not None and latest.cancel_requested:
-                                            task.cancel()
-                                await task
-                            except asyncio.CancelledError:
-                                if parent.cancelling():
-                                    task.cancel()
-                                    while not task.done():
-                                        try:
-                                            await asyncio.shield(task)
-                                        except asyncio.CancelledError:
-                                            pass
-                                    raise
-                            finally:
-                                self._active.pop(current.preview_id, None)
-                except LockTimeout:
-                    continue
+                    await self._dispatch(job)
+                except (_ExecutionStop, _ReceiptError):
+                    raise
+                except Exception as error:
+                    self._contain(job.preview_id, error)
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=self._poll)
             except TimeoutError:

@@ -485,7 +485,8 @@ def test_publication_stages_unapproved_head_pinned_review_once(tmp_path, publish
                                      "correction_native", "correction_native_automatic", "correction_native_queued", "correction_native_recovered", "correction_native_rejected",
                                      "correction_native_outside", "correction_native_verification_failure", "correction_native_head_drift",
                                      "correction_native_followup_retry", "correction_native_two_rounds", "correction_native_publish_bypass", "correction_limit_zero",
-                                     "correction_missing_delivery", "correction_native_unpinned", "correction_native_unpinned_override"])
+                                     "correction_missing_delivery", "correction_native_unpinned", "correction_native_unpinned_override",
+                                     "correction_native_queued_human"])
 def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, published_delivery, detached, outcome, monkeypatch, test_config, verification_adapter):
     from aitobuild.organization_reviews import PublishedReviewAdmission, PublishedReviewRoute
     from aitobuild.organization_service import ManagedOrganizationService
@@ -497,9 +498,13 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
     native_correcting = outcome.startswith("correction_native")
     from aitobuild.approval_policy import ApprovalPolicy
 
-    queued_followups = outcome == "correction_native_queued"
+    queued_followups = outcome in {"correction_native_queued", "correction_native_queued_human"}
+    # #69: task_admission automatic but correction human, so the worker's automatic follow-up admission is refused.
+    human_queued = outcome == "correction_native_queued_human"
     automatic_correction = outcome in {"correction_native_automatic", "correction_native_queued"}
-    policy = (ApprovalPolicy(task_admission="automatic", developer_tools="automatic", review_publication="automatic",
+    policy = (ApprovalPolicy(task_admission="automatic", developer_tools="automatic", review_publication="automatic")
+              if human_queued else
+              ApprovalPolicy(task_admission="automatic", developer_tools="automatic", review_publication="automatic",
                              correction="automatic") if queued_followups else
               ApprovalPolicy(correction="automatic") if automatic_correction else
               ApprovalPolicy(review_publication="automatic") if outcome == "automatic_review" else
@@ -681,12 +686,33 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                                 current = service()
                                 background = background_for(current)
                                 await background.start()
+                            if human_queued:
+                                # #69: _admit refuses the automatic admission; the loop records it and keeps running.
+                                while correction_id not in background.diagnostics()["refused_follow_ups"]:
+                                    await asyncio.sleep(0.01)
+                                diagnostics = background.diagnostics()
+                                assert diagnostics["health"]["status"] == "ok" and diagnostics["workers"] == 1
+                                assert not diagnostics["errors"] and not diagnostics["job_errors"]
+                                assert background.store.get(correction_id) is None
+                                assert not previews.get(correction_id).approved
+                                assert previews.get(correction_id).evidence_kind is None
+                                assert "correction_from_review" in previews.get(correction_id).source_payload
+                                from aitobuild.organization_service import Human, admit_task
+                                admitted = admit_task(previews, correction_id, Human())
+                                assert admitted.approved and admitted.evidence_kind == "human"
+                                background.enqueue(correction_id)  # what the HTTP approve endpoint does next
                             await enqueued.setdefault(correction_id, asyncio.Event()).wait()
                             correction_job = await background.wait_idle(correction_id)
                             assert correction_job.state == "completed", correction_job.error
                             correction_run = current.recorded_run(correction_job.task_id)
                             assert correction_run.state == "completed" and correction_run.cleanup_succeeded is True, correction_run.error
                             correction = worker.get(correction_id)
+                            if human_queued:
+                                # Ran to completion through the worker; publication stays a human correction step.
+                                assert correction.state != "published"
+                                assert previews.get(correction_id).evidence_kind == "human"
+                                assert background.diagnostics()["health"]["status"] == "ok"
+                                return
                             assert correction.state == "published"
                             rereview_id = current.follow_up_status(correction_run.run_id)["next_preview_id"]
                             await enqueued.setdefault(rereview_id, asyncio.Event()).wait()

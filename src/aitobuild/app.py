@@ -20,7 +20,7 @@ from uuid import uuid4
 from filelock import Timeout as FileLockTimeout
 
 from agent_framework import AgentSession, Content, FileSessionStore, FunctionInvocationContext, function_middleware
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 
 from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
 from aitobuild.config import AppConfig, RepositorySourceConfig, load_config, validate_automatic_admission_sources
@@ -572,8 +572,15 @@ def create_app(
         return metadata
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health(response: Response) -> dict[str, object]:
+        if managed_worker is None:
+            return {"status": "ok"}
+        # #69: a managed worker loop that died must not vanish silently. Unauthenticated, so counts only.
+        loops = managed_worker.health()
+        if loops["status"] in {"ok", "not_started"}:
+            return {"status": "ok", "managed_worker": loops}
+        response.status_code = 503
+        return {"status": "degraded", "managed_worker": loops}
 
     @app.post("/webhook")
     async def webhook(

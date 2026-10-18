@@ -567,6 +567,15 @@ receipt-backed child admission. The default is `false`. The app requires an
 explicit worker factory and verifies that it binds `context.queue_follow_ups`
 exactly. Standalone operator-created workers accept `queue_follow_ups=True`.
 
+Worker loops survive a refused or failing job (#69). When the configured gate refuses a
+follow-up's automatic admission (`AdmissionRefused`, for example a correction while
+`correction` is not `automatic`), the child stays unqueued until a person admits it, and
+it is listed under `refused_follow_ups`. Any other per-job error is logged once with its
+traceback and listed under `job_errors`, and the job is retried on the next pass. A lost
+worker receipt still stops that loop on purpose. `GET /internal/organization/worker`
+reports `health` (`status`, `workers_alive`, `workers_expected`), and `GET /health`
+answers 503 with `{"status": "degraded", ...}` when any loop has stopped.
+
 Only completed, successfully cleaned-up parents with an unchanged approved scope
 and an exact saved child receipt qualify. Enable
 `automatic_review_followups=True` on the service to stage these receipts, or stage
@@ -1207,6 +1216,8 @@ curl --fail -H 'X-Internal-Token: local-internal-token' \
 ```
 
 Expect health status `ok`, runtime mode `mock`, and `ready_for_run=false`.
+With a detached managed worker, `/health` also returns `managed_worker` loop counts and
+answers 503 `degraded` when a worker loop has stopped (#69).
 The readiness endpoint checks native handle availability, not provider
 connectivity or successful tool execution. Interactive API schemas are at
 `http://127.0.0.1:8000/docs`.

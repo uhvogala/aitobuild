@@ -99,6 +99,22 @@ def prepare_docker_wrapper(directory: Path) -> str:
     return str(wrapper)
 
 
+def queued_without_worker(diagnostics: dict[str, Any]) -> str | None:
+    """The reason a queued job cannot run, from ``/internal/organization/worker`` (#69), or ``None``.
+
+    Fails closed: a worker status without the health signal is treated as no live loop."""
+    health = diagnostics.get("health")
+    if not isinstance(health, dict) or not isinstance(health.get("workers_alive"), int):
+        return "the worker status has no loop health signal"
+    if health["workers_alive"] > 0:
+        return None
+    errors = "; ".join(str(error)[:300] for error in (diagnostics.get("errors") or [])[:3])
+    return (
+        f"no managed worker loop is alive (status {health.get('status')}, "
+        f"0/{health.get('workers_expected')} loops)" + (f": {errors}" if errors else "")
+    )
+
+
 class Operator:
     def __init__(
         self,
@@ -187,6 +203,32 @@ class Operator:
         self.recorder.save()
         return result
 
+    def require_live_worker(self, preview_id: str, label: str) -> None:
+        """#69: a queued job with no live managed worker loop can never run; fail the run now with the reason
+        instead of waiting out the stage timeout (pilot trial4-20261018-234433 sat 22 minutes on one)."""
+        response = self.client.get("/internal/organization/worker", headers=self.headers)
+        if response.status_code == 404:
+            return  # no detached worker in this app: nothing to check
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"worker status -> {response.status_code}: {response.text[:2000]}"
+            )
+        diagnostics = response.json()
+        problem = queued_without_worker(diagnostics)
+        if problem is None:
+            return
+        self.recorder.report.setdefault("stalls", []).append(
+            {
+                "at": now(),
+                "label": label,
+                "preview_id": preview_id,
+                "detail": problem,
+                "worker_errors": list(diagnostics.get("errors") or [])[:8],
+            }
+        )
+        self.recorder.save()
+        raise RuntimeError(f"{label}: job {preview_id} is queued but {problem}")
+
     def drive(self, preview_id: str, label: str) -> dict[str, Any]:
         """Approve each exact pending service request (human stage) until the run is terminal."""
         deadline = time.monotonic() + self.timeout
@@ -195,6 +237,8 @@ class Operator:
             status = self.task(preview_id)
             job = status.get("managed_admission") or {}
             run = status.get("managed_run") or {}
+            if job.get("state") == "queued":
+                self.require_live_worker(preview_id, label)
             state = (job.get("state"), run.get("state"))
             if state != last:
                 self.recorder.event(
