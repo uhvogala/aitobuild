@@ -18,7 +18,7 @@ from agent_framework import (
 
 from aitobuild.agent_tools import DeveloperToolContext, build_developer_tools
 from aitobuild.approval_policy import ApprovalStage
-from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
+from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker, publication_binding_mismatch
 from aitobuild.developer_isolation import DeveloperTaskBudget
 from aitobuild.developer_preview import is_correction_task
 from aitobuild.organization import DefinitionSnapshot
@@ -257,6 +257,7 @@ class ManagedDeliveryBindings:
                 self.publish, action=ActionClass.REPO_WRITE, on_response=self.continue_publication,
                 approval_stage=ApprovalStage.DRAFT_PUBLICATION,
                 resume_interrupted=self.interrupted_publication,
+                adopt_after_budget_expiry=self.adopt_after_budget_expiry,
             )
         return operations
 
@@ -353,22 +354,33 @@ class ManagedDeliveryBindings:
         bundle = json.loads(assignment.bundle_content)
         issue = bundle.get("issue_context") if isinstance(bundle, dict) else None
         publication = record.publication
-        if (record.preview_id != assignment.preview_id or original.get("preview_id") != assignment.preview_id
+        if (record.preview_id != assignment.preview_id
                 or record.approved_at != assignment.approved_at.isoformat()
-                or original.get("approved_at") != record.approved_at
                 or record.bundle_payload != bundle
                 or not isinstance(issue, dict) or issue.get("base_revision") != record.base_revision
-                or original.get("base_sha") != record.base_revision or publication.get("base_sha") != record.base_revision
-                or record.session_id != context.run.session_id):
+                or record.session_id != context.run.session_id
+                or publication_binding_mismatch(record, original) is not None):
             return False
-        for key in ("title", "body", "commit_message", "checkout_digest", "tree_fingerprint", "changed_paths",
-                    "blob_shas", "file_modes", "base_ref", "branch", "repository", "issue_number"):
-            if publication.get(key) != original.get(key):
-                return False
         head = publication.get("head_sha")
         if head is not None and (not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None):
             return False
         return True
+
+    async def adopt_after_budget_expiry(self, context: ManagedTaskContext, original: Any) -> dict[str, Any]:
+        """#66: finish this task's interrupted publication on an expired budget by adopting its open draft PR only.
+
+        ``context`` revalidates every pin except a live deadline (runner-provided, expired ledger only). The worker
+        makes no model call, push or PR write; any mismatch or a missing PR raises, leaving ``publishing``.
+        """
+        self._check(context)
+        github = self._github
+        if github is None or not self.interrupted_publication(context, original):
+            raise PermissionError("Budget-expired adoption requires this task's own interrupted publication")
+        record = await _delivery_call(lambda: self._worker.adopt_after_budget_expiry(
+            context.assignment.preview_id, github=github, expected_publication=original,
+            before_write=context.revalidate, allow_mock_publication=self._allow_mock,
+        ))
+        return self._record(context, record, "published")
 
     async def continue_publication(self, context: ManagedTaskContext, original: Any, approved: Any) -> dict[str, Any]:
         self._check(context)

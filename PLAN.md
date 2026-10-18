@@ -11,6 +11,38 @@ and supervised recovery. Earlier counts, pending work and commit status describe
 their checkpoint, not the current system. Current setup and usage belong in
 [README.md](README.md); contributor rules belong in [agents.md](agents.md).
 
+Budget-expired PR adoption (#66, 2026-10-18): pilot trial 4 kill point 2 opened
+example PR #86 and was killed before the record saved it; the child's 30-minute
+budget expired before the restart, and `BudgetDeadlineExpired` (raised by the
+assignment revalidation in the runner's restart path) refused the run before
+`publish()` reached adoption, leaving the record at `publishing`. By Vertti's
+decision this is now the single runtime-budget exemption on ordinary deliveries,
+and it covers only adopting that already-open PR. On a `running` receipt whose
+revalidation fails with exactly `BudgetDeadlineExpired`, the runner proves the
+interrupted continuation as before (checkpoint, last decision, data digest,
+`interrupted_publication`) under a context that checks every pin except a live
+deadline (same unaborted ledger, expired at exactly that deadline), then calls the
+operation's `adopt_after_budget_expiry` hook; only `delivery_publish` declares one.
+`DeveloperDeliveryWorker.adopt_after_budget_expiry` refuses corrections by the full
+rule (preview and `_refuse_correction_record`) and re-checks the approved task, the
+exact approval snapshot field by field (`publication_binding_mismatch`, the one
+check shared with the #56 `interrupted_publication` resume), the recomputed
+title/body/commit message, this task's marker, the saved verified head, the live
+branch head, and the read-only `find_adoptable_draft_pull_request`; the PR head must
+also equal the saved head. That lookup is the one adoption rule (exactly one open PR
+on the task branch and base, #51 marker, exact title/body, draft, our author), built
+on #61's `task_pull_requests` in both adapters, and `create_or_update_draft_pull_request`
+calls it too, so ordinary #56 adoption and this path cannot drift apart. It never calls a model, runs the Developer, pushes, or creates or
+updates a PR. Success records `publication.adopted_after_budget_expiry {deadline,
+adopted_at}` (validated on load; absent on older records), the run receipt
+`adopted_after_budget_expiry {request_id, deadline, adopted_at}` (immutable), and
+the assignment completes only against that exact expired deadline. Without a
+matching PR, or on any mismatch, the run fails as `TimeoutError` (with the refusal
+reason appended once the hook ran) and the record stays `publishing`; every path
+that needs the model, a push or a new PR stays fail-closed on an expired budget.
+This changes the delivery state model (`publishing` -> `published` without a live
+budget) and needs Vertti's explicit okay before merge.
+
 Stuck publishing retire (2026-10-18, #61): a non-correction delivery left at `publishing`
 after a kill, with no PR recorded and its task branch deleted (pilot trial 4 record
 `dp-9f525f91…`, head `ee43e54`, example PR #74 closed), had no supported exit; resume reuses the
@@ -44,9 +76,12 @@ adoption, publish and `prepare` refuse it or return it unchanged. The live `bran
 where gh reports it; other errors still raise), matching the protocol and the mock. After a retire
 the managed run of that task stays `running` until the next restart refuses it ("automatic replay
 is blocked") and ends it `failed`; this is expected, since retire never rewrites run receipts.
-Current behaviour with an expired Developer runtime budget is fail-closed: a resumed publication is refused
-before adoption and the record stays at `publishing`, and retire also refuses such a record while its branch
-is still live at the saved head. Whether that record should get another exit is the open question in #66.
+With an expired Developer runtime budget (#66, see the note above), a restart adopts the already-open draft
+PR only while the managed run is still `running` (killed mid-publication) and every adoption check passes;
+nothing that needs the model, a push or a new PR runs. A run that has already failed, including one whose
+restart was refused before #66 and so aborted its ledger, is not resumed: its record stays at `publishing`,
+retire still refuses it while the branch is live at the saved head, and the exit is the retire path once the
+branch is gone or moved, or a fresh approved run.
 This changes the delivery state model and needs Vertti's okay before merge.
 
 Interrupted draft publication resume (2026-10-13): pilot trial 4 killed the service

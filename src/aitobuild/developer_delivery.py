@@ -116,6 +116,36 @@ def _failed_publication(record: DeliveryPreparation, error: str) -> DeliveryPrep
                    updated_at=datetime.now(tz=UTC).isoformat())
 
 
+PUBLICATION_BINDING_FIELDS = (
+    "title", "body", "commit_message", "checkout_digest", "tree_fingerprint", "changed_paths", "blob_shas",
+    "file_modes", "base_ref", "branch", "repository", "issue_number",
+)
+
+
+def publication_binding_mismatch(record: DeliveryPreparation, approved: Any) -> str | None:
+    """The first field where a saved publication differs from its exact approved snapshot, or None (#56/#66).
+
+    The one field-by-field binding check, shared by the interrupted-publication resume check and budget-expired
+    adoption: preview id, approval time, pinned base (in the approval and the saved publication) and every
+    approved publication field, which the saved publication must carry.
+    """
+    publication = record.publication
+    if not isinstance(publication, dict) or not isinstance(approved, dict):
+        return "publication"
+    for name, saved, expected in (
+        ("preview_id", record.preview_id, approved.get("preview_id")),
+        ("approved_at", record.approved_at, approved.get("approved_at")),
+        ("base_sha", record.base_revision, approved.get("base_sha")),
+        ("publication.base_sha", record.base_revision, publication.get("base_sha")),
+    ):
+        if saved != expected:
+            return name
+    for key in PUBLICATION_BINDING_FIELDS:
+        if key not in publication or publication[key] != approved.get(key):
+            return key
+    return None
+
+
 def delivery_marker(preview_id: str, bundle_payload: dict[str, Any]) -> str:
     """The PR-body marker binding a draft to its exact admitted task (preview id + bundle digest).
     Adoption of an existing PR on the task branch requires it plus the exact receipt and our author."""
@@ -671,6 +701,101 @@ class DeveloperDeliveryWorker:
             if error is not None:
                 budget.abort()
                 record = _failed_publication(record, error)
+            self._save(directory, record)
+            return record
+
+    def adopt_after_budget_expiry(
+        self,
+        preview_id: str,
+        *,
+        github: GitHubAdapter,
+        expected_publication: dict[str, Any],
+        before_write: Callable[[], Any] | None = None,
+        allow_mock_publication: bool = False,
+    ) -> DeliveryPreparation:
+        """#66, the one runtime-budget exemption: adopt the already-open draft PR of an interrupted publication.
+
+        Runs only when the original ledger has expired (a live budget refuses: use ``publish``). Read-only towards
+        GitHub: no model call, Developer run, push, PR create or PR update. It requires, in full, the exact binding
+        of the ``publishing`` record to its approval snapshot and approved task (#56), this task's delivery marker
+        in the approved body, a single open draft PR with that exact title/body by our own writer (#51), and the
+        live branch head and the PR head equal to the saved verified head. Any refusal raises and leaves the record
+        untouched at ``publishing``; success records ``adopted_after_budget_expiry`` with the deadline.
+        """
+        if isinstance(github, MockGitHubAdapter) and not allow_mock_publication:
+            raise ValueError("Publication requires a live GitHub adapter; mock publication is refused")
+        _refuse_correction_publication(self._previews.get(preview_id))
+        directory = self._task_dir(preview_id)
+        with self.implementation_lock(preview_id):
+            with FileLock(str(directory) + ".lock", timeout=10):
+                record = self._load(directory)
+            if record is None:
+                raise ValueError("Delivery not found")
+            self._refuse_correction_record(record)
+            publication = record.publication
+            if record.state != "publishing" or not isinstance(publication, dict):
+                raise PermissionError("Budget-expired adoption requires an interrupted publishing delivery")
+            preview = self._previews.get(preview_id)
+            if (preview is None or not preview.approved or preview.approved_at is None
+                    or preview.approved_at.isoformat() != record.approved_at
+                    or preview.bundle_payload != record.bundle_payload):
+                raise PermissionError("Budget-expired adoption requires the immutable approved task")
+            bundle = developer_task_bundle_from_payload(record.bundle_payload)
+            issue = bundle.issue_context
+            if issue is None or issue.base_revision != record.base_revision:
+                raise PermissionError("Budget-expired adoption requires the approved repository issue identity")
+            if not any(
+                source.repository == issue.repository and source.repository_id == issue.repository_id
+                and str(source.path.resolve()) == record.source_path for source in self._sources
+            ):
+                raise PermissionError("Budget-expired adoption requires its operator-configured target source")
+            if record.verification is None or record.verification.get("cleanup_succeeded") is not True:
+                raise PermissionError("Budget-expired adoption requires successful verification evidence")
+            budget = DeveloperTaskBudget(path=self.budget_path(preview_id), bundle=bundle, create=False)
+            deadline = budget.expired_deadline()
+            # Exact binding (#56): the saved publication is the approved snapshot, field for field.
+            mismatch = publication_binding_mismatch(record, expected_publication)
+            if mismatch is None and expected_publication.get("repository_id") != issue.repository_id:
+                mismatch = "repository_id"
+            if mismatch is not None:
+                raise PermissionError(f"Budget-expired adoption differs from its exact saved approval ({mismatch})")
+            title, body, commit_message = self._publication_metadata(bundle, record)
+            if ((publication["title"], publication["body"], publication["commit_message"]) != (title, body, commit_message)
+                    or publication["branch"] != record.branch or publication["base_ref"] != issue.base_branch
+                    or publication["repository"] != issue.repository
+                    or publication["issue_number"] != issue.issue_number):
+                raise PermissionError("Budget-expired adoption differs from the approved task's publication")
+            if delivery_marker(preview_id, record.bundle_payload) not in body:
+                raise PermissionError("Budget-expired adoption requires this task's delivery marker")
+            head_sha = publication.get("head_sha")
+            if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+                raise PermissionError("Budget-expired adoption requires a saved verified head; a push is not allowed")
+            live_head = github.branch_head(repository=issue.repository, branch=record.branch)
+            if live_head != head_sha:
+                raise PermissionError(
+                    f"Task branch {record.branch} is at {live_head or 'no head'}, not the verified head {head_sha}; "
+                    "budget-expired adoption is refused")
+            pull = github.find_adoptable_draft_pull_request(
+                repository=issue.repository, title=title, body=body, head_branch=record.branch,
+                base_ref=issue.base_branch)
+            if pull is None:
+                raise PermissionError("No open draft PR to adopt; an expired budget does not allow creating one")
+            saved_number = publication.get("pull_number")
+            if ((type(saved_number) is int and saved_number != pull.number)
+                    or pull.state != "open" or pull.draft is not True or pull.head_sha != head_sha
+                    or pull.head_ref != record.branch or pull.base_ref != issue.base_branch
+                    or pull.repository != issue.repository):
+                raise PermissionError("Budget-expired adoption requires the open draft PR at the verified head and target")
+            if before_write is not None:
+                before_write()
+            now = datetime.now(tz=UTC)
+            adopted = {**publication, "pull_number": pull.number, "html_url": pull.html_url, "draft": pull.draft,
+                       "pull_head_sha": pull.head_sha, "published_at": now.isoformat(),
+                       "adopted_after_budget_expiry": {
+                           "deadline": datetime.fromtimestamp(deadline, tz=UTC).isoformat(),
+                           "adopted_at": now.isoformat()}}
+            record = replace(record, state="published", head_revision=head_sha, publication=adopted, error=None,
+                             updated_at=now.isoformat())
             self._save(directory, record)
             return record
 
@@ -1937,6 +2062,15 @@ class DeveloperDeliveryWorker:
                 datetime.fromisoformat(published_at)
                 if publication.get("draft") is not True:
                     raise ValueError("Published delivery must record a draft pull request")
+            if "adopted_after_budget_expiry" in publication:
+                # #66 receipt; older records simply do not carry it.
+                adoption = publication["adopted_after_budget_expiry"]
+                if (record.state != "published" or not isinstance(adoption, dict)
+                        or set(adoption) != {"deadline", "adopted_at"}
+                        or not all(isinstance(adoption[key], str) for key in adoption)):
+                    raise ValueError("Invalid persisted budget-expired adoption receipt")
+                if datetime.fromisoformat(adoption["deadline"]) > datetime.fromisoformat(adoption["adopted_at"]):
+                    raise ValueError("Budget-expired adoption cannot precede its deadline")
         if bundle.task_id != record.task_id or bundle.issue_context.base_revision != record.base_revision:
             raise ValueError("Persisted delivery preparation differs from the approved identity")
         expected_branch = f"aitobuild/issue-{bundle.issue_context.issue_number}-{sha256(bundle.task_id.encode()).hexdigest()[:16]}"

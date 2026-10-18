@@ -263,6 +263,20 @@ class AssignmentService:
         return self._assignments.claim(candidate)
 
     def revalidate(self, assignment_id: str) -> TaskAssignment:
+        record, budget = self._revalidate_scope(assignment_id)
+        budget.remaining_seconds()
+        return record
+
+    def revalidate_expired(self, assignment_id: str) -> tuple[TaskAssignment, float]:
+        """Every ``revalidate`` check except a live deadline, for #66 budget-expired adoption only.
+
+        The original ledger must still exist, match the approved snapshot, be unaborted and have actually
+        expired (a live budget raises, so the normal path cannot be bypassed). Returns its deadline.
+        """
+        record, budget = self._revalidate_scope(assignment_id)
+        return record, budget.expired_deadline()
+
+    def _revalidate_scope(self, assignment_id: str) -> tuple[TaskAssignment, DeveloperTaskBudget]:
         record = self._assignments.get(assignment_id)
         if record is None or record.state != "claimed":
             raise PermissionError("Managed execution requires a claimed assignment")
@@ -292,10 +306,16 @@ class AssignmentService:
         path = self._budget_path_for(record.preview_id).resolve()
         if str(path) != record.budget_path:
             raise ValueError("Assignment must use its original budget ledger")
-        DeveloperTaskBudget(path=path, bundle=record.bundle, create=False).remaining_seconds()
-        return record
+        return record, DeveloperTaskBudget(path=path, bundle=record.bundle, create=False)
 
-    def finish(self, assignment_id: str, *, state: TerminalState, outcome: str) -> TaskAssignment:
+    def finish(self, assignment_id: str, *, state: TerminalState, outcome: str,
+               adopted_after_budget_expiry: float | None = None) -> TaskAssignment:
+        """Close an assignment. ``completed`` requires a live budget, except a run whose interrupted
+        publication adopted its already-open PR after expiry (#66): then the ledger must be the same expired,
+        unaborted one, at exactly the recorded deadline."""
+        if adopted_after_budget_expiry is not None and state != "completed":
+            adopted_after_budget_expiry = None
+
         def check_budget(record: TaskAssignment) -> None:
             path = self._budget_path_for(record.preview_id).resolve()
             if str(path) != record.budget_path:
@@ -306,7 +326,10 @@ class AssignmentService:
                 if state == "completed":
                     raise
             else:
-                if state == "completed":
+                if state == "completed" and adopted_after_budget_expiry is not None:
+                    if budget.expired_deadline() != adopted_after_budget_expiry:
+                        raise PermissionError("Budget-expired adoption deadline differs from the original ledger")
+                elif state == "completed":
                     budget.remaining_seconds()
                 else:
                     budget.abort()

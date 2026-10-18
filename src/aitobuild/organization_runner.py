@@ -11,7 +11,7 @@ from inspect import isawaitable, iscoroutinefunction
 import json
 import os
 from pathlib import Path
-from typing import Any, Literal, Protocol, Self
+from typing import Annotated, Any, Literal, Protocol, Self
 
 from agent_framework import (
     Executor, FileCheckpointStorage, WorkflowCheckpoint, WorkflowContext,
@@ -19,7 +19,7 @@ from agent_framework import (
 )
 from filelock import FileLock
 from openai import APIError
-from pydantic import AwareDatetime, JsonValue, StrictBool, StrictStr, TypeAdapter, model_validator
+from pydantic import AwareDatetime, Field, JsonValue, StrictBool, StrictStr, TypeAdapter, model_validator
 
 from aitobuild.durable_files import atomic_write_text, sync_directory
 from aitobuild.approval_policy import ApprovalDecision, ApprovalPolicy, ApprovalStage
@@ -68,6 +68,14 @@ class WorkflowDecision(DefinitionModel):
     approval_policy: ApprovalDecision | None = None
 
 
+class ExpiredBudgetAdoption(DefinitionModel):
+    """#66 run receipt: the interrupted continuation finished by adopting its already-open PR after the budget
+    deadline. Only the delivery layer's adopt-only hook can produce it; nothing else runs on an expired budget."""
+    request_id: StrictStr
+    deadline: Annotated[float, Field(strict=True, allow_inf_nan=False)]
+    adopted_at: AwareDatetime
+
+
 def workflow_input_digest(data: Any) -> str:
     return sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
@@ -96,6 +104,9 @@ class ManagedRun(DefinitionModel):
     cleanup_succeeded: StrictBool | None = None
     terminal_state: Literal["completed", "failed", "cancelled"] | None = None
     approval_policy_revision: Digest | None = None
+    # #66: set only when an interrupted publication was finished by budget-expired PR adoption. Older run
+    # receipts have no such field and load as None.
+    adopted_after_budget_expiry: ExpiredBudgetAdoption | None = None
 
     @model_validator(mode="after")
     def validate_state(self) -> Self:
@@ -117,6 +128,10 @@ class ManagedRun(DefinitionModel):
             raise ValueError("Finalization requires exactly one recorded terminal intent")
         if self.state == "completed" and (self.error is not None or self.cleanup_succeeded is not True):
             raise ValueError("Completed runs require successful cleanup")
+        adoption = self.adopted_after_budget_expiry
+        if adoption is not None and (self.state in {"ready", "waiting"} or not self.decisions
+                                     or self.decisions[-1].request_id != adoption.request_id):
+            raise ValueError("Budget-expired adoption must finish the run's own last recorded decision")
         return self
 
 
@@ -174,9 +189,13 @@ class FileRunStore:
             if path.exists():
                 original = ManagedRun.model_validate_json(path.read_text(encoding="utf-8"))
                 mutable = {"updated_at", "state", "checkpoint_id", "checkpoint_digest", "pending",
-                           "decisions", "outputs", "error", "cleanup_succeeded", "terminal_state"}
+                           "decisions", "outputs", "error", "cleanup_succeeded", "terminal_state",
+                           "adopted_after_budget_expiry"}
                 if original.model_dump(exclude=mutable) != run.model_dump(exclude=mutable):
                     raise ValueError("Managed run identity and pins are immutable")
+                if (original.adopted_after_budget_expiry is not None
+                        and original.adopted_after_budget_expiry != run.adopted_after_budget_expiry):
+                    raise ValueError("Budget-expired adoption receipts are immutable")
                 if original.state in TERMINAL and original != run:
                     raise ValueError("Terminal managed receipts are immutable")
                 transitions = {
@@ -266,6 +285,11 @@ class ManagedOperation:
     # continuation for this exact approved request was interrupted mid-effect and can be finished idempotently
     # by its existing resume path. Never re-admits or re-approves; any doubt must return False.
     resume_interrupted: Callable[[ManagedTaskContext, Any], bool] | None = None
+    # Optional (#66), requires ``resume_interrupted``: finish that same interrupted continuation after the budget
+    # deadline by adopting an already-existing effect only (for ``delivery_publish``: the open draft PR). It gets
+    # a context whose revalidation checks everything except a live deadline. It must never call a model, run the
+    # Developer, push or create anything; any doubt must raise. Nothing else in the runner runs on an expired budget.
+    adopt_after_budget_expiry: Callable[[ManagedTaskContext, Any], Any] | None = None
 
     def __post_init__(self) -> None:
         assert_role_action_allowed(self.role, self.action)
@@ -281,6 +305,9 @@ class ManagedOperation:
             raise ValueError("Additional approval stages require unique registered stages and a continuation")
         if self.resume_interrupted is not None and (self.approval_stage is None or not callable(self.resume_interrupted)):
             raise ValueError("Interrupted-continuation resume requires a stage-bound continuation")
+        if self.adopt_after_budget_expiry is not None and (
+                self.resume_interrupted is None or not callable(self.adopt_after_budget_expiry)):
+            raise ValueError("Budget-expired adoption requires an interrupted-continuation check")
 
 
 async def _resolve(value: Any) -> Any:
@@ -421,7 +448,10 @@ class ManagedWorkflowRunner:
         if actor.kind == "agent" and (assignment.strategy != "coordinator" or actor.actor_id != assignment.actor_id):
             raise PermissionError("Managed execution requires its trusted coordinator or an operator")
 
-    def _context(self, run: ManagedRun, assignment: TaskAssignment) -> ManagedTaskContext:
+    def _context(self, run: ManagedRun, assignment: TaskAssignment, *,
+                 expired_deadline: float | None = None) -> ManagedTaskContext:
+        """The run's task context. ``expired_deadline`` (#66 adoption only) swaps the live-deadline check for
+        "the same unaborted ledger, expired at exactly this deadline"; every other pin is still revalidated."""
         if run.assignment_digest != _assignment_digest(assignment):
             raise PermissionError("Managed run assignment pins changed")
         if (run.organization_id, run.revision, run.workflow_id, run.scope_digest) != (
@@ -436,7 +466,12 @@ class ManagedWorkflowRunner:
             expected = run.approval_policy_revision or ApprovalPolicy().revision
             if expected != self.approval_policy.revision:
                 raise PermissionError("Approval policy revision changed during active work")
-            current = self._service.revalidate(assignment.assignment_id)
+            if expired_deadline is None:
+                current = self._service.revalidate(assignment.assignment_id)
+            else:
+                current, deadline = self._service.revalidate_expired(assignment.assignment_id)
+                if deadline != expired_deadline:
+                    raise PermissionError("Budget-expired adoption ledger deadline changed")
             if _assignment_digest(current) != run.assignment_digest:
                 raise PermissionError("Managed run assignment pins changed")
             return current
@@ -488,6 +523,10 @@ class ManagedWorkflowRunner:
                 raise PermissionError("Managed operator binding revision has changed")
             context.revalidate()
         except Exception as error:
+            if type(error) is BudgetDeadlineExpired and run.state == "running":
+                # #66: the only budget exemption. An interrupted approved continuation may still be finished by
+                # its operation's adopt-only hook; everything else (and any refusal) fails closed as before.
+                return await self._adopt_after_budget_expiry(run, assignment, context, error)
             return await self._terminate(run, context, "failed", _failure_label(error))
         if run.state == "running":
             try:
@@ -504,6 +543,12 @@ class ManagedWorkflowRunner:
 
     async def _interrupted_continuation(self, run: ManagedRun, context: ManagedTaskContext) -> WorkflowDecision | None:
         """The single approved continuation a killed invocation was executing, if its operation proves it resumable."""
+        found = await self._interrupted_request(run, context)
+        return None if found is None else found[0]
+
+    async def _interrupted_request(
+        self, run: ManagedRun, context: ManagedTaskContext,
+    ) -> tuple[WorkflowDecision, PendingWorkflowInput, ManagedOperation] | None:
         if not run.decisions or run.checkpoint_id is None or run.checkpoint_digest is None:
             return None
         decision = run.decisions[-1]
@@ -529,7 +574,44 @@ class ManagedWorkflowRunner:
         operation = self._input_operation(context, request)
         if operation.resume_interrupted is None or self._input_stage(operation, request) is None:
             return None
-        return decision if operation.resume_interrupted(context, request.data) is True else None
+        return (decision, request, operation) if operation.resume_interrupted(context, request.data) is True else None
+
+    async def _adopt_after_budget_expiry(
+        self, run: ManagedRun, assignment: TaskAssignment, context: ManagedTaskContext, expired: BaseException,
+    ) -> ManagedRun:
+        """#66: finish an interrupted approved continuation on an expired budget by adoption only.
+
+        Applies only when the run was killed mid-continuation (state ``running``), the pinned checkpoint and last
+        recorded decision prove that exact approved continuation, and its operation declares an adopt-only hook.
+        No workflow, handler, model or Developer runs; no decision, admission or approval is recorded. Without a
+        hook or interrupted continuation the refusal is exactly today's; a hook refusal fails closed the same way.
+        """
+        label = _failure_label(expired)
+        try:
+            _, deadline = self._service.revalidate_expired(assignment.assignment_id)
+            expired_context = self._context(run, assignment, expired_deadline=deadline)
+            expired_context.revalidate()
+            found = await self._interrupted_request(run, expired_context)
+        except Exception:
+            return await self._terminate(run, context, "failed", label)
+        hook = None if found is None else found[2].adopt_after_budget_expiry
+        if found is None or hook is None:
+            return await self._terminate(run, context, "failed", label)
+        decision, request, _ = found
+        try:
+            result = await _resolve(hook(expired_context, request.data))
+            TypeAdapter(JsonValue).validate_python(result)
+            expired_context.revalidate()
+        except Exception as refusal:
+            return await self._terminate(
+                run, context, "failed", f"{label} (budget-expired adoption refused: {_failure_label(refusal)})")
+        adopted = ManagedRun.model_validate(run.model_dump() | {
+            "outputs": (*run.outputs, result), "updated_at": datetime.now(tz=UTC),
+            "adopted_after_budget_expiry": ExpiredBudgetAdoption(
+                request_id=decision.request_id, deadline=deadline, adopted_at=datetime.now(tz=UTC)),
+        })
+        self._runs.save(adopted)
+        return await self._terminate(adopted, expired_context, "completed", None)
 
     def _input_operation(self, context: ManagedTaskContext, request: PendingWorkflowInput) -> ManagedOperation:
         workflow = next(item for item in context.snapshot.definition.workflows if item.id == context.run.workflow_id)
@@ -791,7 +873,9 @@ class ManagedWorkflowRunner:
         try:
             assignment = self._assignments.get(intent.assignment_id)
             if assignment is not None and assignment.state == "claimed" and intent.terminal_state == "completed":
-                self._context(intent, assignment).revalidate()
+                adoption = intent.adopted_after_budget_expiry
+                self._context(intent, assignment,
+                              expired_deadline=None if adoption is None else adoption.deadline).revalidate()
             self._finish_assignment(intent)
         except (TimeoutError, PermissionError, ValueError) as error:
             if intent.terminal_state != "completed":
@@ -814,7 +898,10 @@ class ManagedWorkflowRunner:
         assignment = self._assignments.get(run.assignment_id)
         if assignment is None or run.assignment_digest != _assignment_digest(assignment):
             raise PermissionError("Managed terminal assignment pins changed")
+        adoption = run.adopted_after_budget_expiry
         self._service.finish(
             run.assignment_id, state=state,  # type: ignore[arg-type]
-            outcome=f"Managed workflow {state}: {run.run_id} (metadata only)",
+            outcome=f"Managed workflow {state}: {run.run_id} (metadata only)"
+            + (" after budget-expired PR adoption" if adoption is not None and state == "completed" else ""),
+            adopted_after_budget_expiry=None if adoption is None else adoption.deadline,
         )

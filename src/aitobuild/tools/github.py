@@ -327,6 +327,10 @@ class GitHubAdapter(Protocol):
         before_write: Callable[[], object] | None = None,
     ) -> str: ...
 
+    def find_adoptable_draft_pull_request(
+        self, *, repository: str, title: str, body: str, head_branch: str, base_ref: str,
+    ) -> GitHubPullRequest | None: ...
+
     def create_or_update_draft_pull_request(
         self,
         *,
@@ -837,6 +841,17 @@ class MockGitHubAdapter:
                 expected[path] = (change.mode, change.blob_sha)
         return tree(commit_sha) == expected
 
+    def find_adoptable_draft_pull_request(
+        self, *, repository: str, title: str, body: str, head_branch: str, base_ref: str,
+    ) -> GitHubPullRequest | None:
+        """Read-only: the existing task-branch PR we may adopt, or None when there is none.
+
+        The one adoption rule (#51/#56/#66), shared by ``create_or_update_draft_pull_request`` and budget-expired
+        adoption, built on the one ``task_pull_requests`` lookup (#61)."""
+        return _select_adoptable_pull(
+            self.task_pull_requests(repository=repository, head_branch=head_branch, base_ref=base_ref),
+            title=title, body=body, writer=self.writer_login)
+
     def create_or_update_draft_pull_request(
         self,
         *,
@@ -874,15 +889,9 @@ class MockGitHubAdapter:
         _check_write_budget(before_write)
         repo_prs = self.pull_requests.setdefault(repo, {})
         if existing_pull_number is None:
-            matches = list(self.task_pull_requests(repository=repo, head_branch=cleaned_head, base_ref=cleaned_base))
-            open_matches = [pull for pull in matches if pull.state == "open"]
-            if matches and len(open_matches) != 1:
-                raise ValueError("Existing task pull request must be one open draft")
-            if open_matches:
-                found = open_matches[0]
-                require_adoptable_pull(title=found.title, body=found.body, draft=found.draft, author=found.author,
-                                       expected_title=cleaned_title, expected_body=cleaned_body,
-                                       writer=self.writer_login())
+            found = self.find_adoptable_draft_pull_request(repository=repo, title=cleaned_title, body=cleaned_body,
+                                                           head_branch=cleaned_head, base_ref=cleaned_base)
+            if found is not None:
                 existing_pull_number = found.number
         if existing_pull_number is not None:
             current = repo_prs.get(existing_pull_number)
@@ -1752,6 +1761,17 @@ class GhCliGitHubAdapter:
         _validate_advance_target(pull, pull_number=pull_number, head_branch=head_branch, base_ref=base_ref)
         return pull
 
+    def find_adoptable_draft_pull_request(
+        self, *, repository: str, title: str, body: str, head_branch: str, base_ref: str,
+    ) -> GitHubPullRequest | None:
+        """Read-only: the existing task-branch PR we may adopt, or None when there is none.
+
+        The one adoption rule (#51/#56/#66), shared by ``create_or_update_draft_pull_request`` and budget-expired
+        adoption, built on the one ``task_pull_requests`` lookup (#61)."""
+        return _select_adoptable_pull(
+            self.task_pull_requests(repository=repository, head_branch=head_branch, base_ref=base_ref),
+            title=title, body=body, writer=self.writer_login)
+
     def create_or_update_draft_pull_request(
         self,
         *,
@@ -1787,15 +1807,9 @@ class GhCliGitHubAdapter:
         ):
             raise ValueError("existing_pull_number must be a positive integer when provided")
         if existing_pull_number is None:
-            matches = self.task_pull_requests(repository=repo, head_branch=cleaned_head, base_ref=cleaned_base)
-            open_matches = [pull for pull in matches if pull.state == "open"]
-            if matches and len(open_matches) != 1:
-                raise ValueError("Existing task pull request must be one open draft")
-            if open_matches:
-                found = open_matches[0]
-                require_adoptable_pull(title=found.title, body=found.body, draft=found.draft, author=found.author,
-                                       expected_title=cleaned_title, expected_body=cleaned_body,
-                                       writer=self.writer_login())
+            found = self.find_adoptable_draft_pull_request(repository=repo, title=cleaned_title, body=cleaned_body,
+                                                           head_branch=cleaned_head, base_ref=cleaned_base)
+            if found is not None:
                 existing_pull_number = found.number
         if existing_pull_number is not None:
             current = self.get_pull_request(repository=repo, pull_number=existing_pull_number)
@@ -2200,6 +2214,23 @@ def is_own_author(author: str | None, writer: str) -> bool:
     """#51: a marker match is ours only when the account that wrote it is the adapter's own writer."""
     return (isinstance(author, str) and bool(author.strip()) and isinstance(writer, str) and bool(writer.strip())
             and author.strip().casefold() == writer.strip().casefold())
+
+
+def _select_adoptable_pull(
+    matches: tuple[GitHubPullRequest, ...], *, title: str, body: str, writer: Callable[[], str],
+) -> GitHubPullRequest | None:
+    """The single adoption rule over one task branch's PRs into one base: none -> None; anything but exactly
+    one open PR -> refused; that one PR only if #51 accepts it (marker, exact title/body receipt, draft, our
+    author)."""
+    open_matches = [pull for pull in matches if pull.state == "open"]
+    if matches and len(open_matches) != 1:
+        raise ValueError("Existing task pull request must be one open draft")
+    if not open_matches:
+        return None
+    found = open_matches[0]
+    require_adoptable_pull(title=found.title, body=found.body, draft=found.draft, author=found.author,
+                           expected_title=title.strip(), expected_body=body.strip(), writer=writer())
+    return found
 
 
 def require_adoptable_pull(*, title: str | None, body: str | None, draft: object, author: str | None,
