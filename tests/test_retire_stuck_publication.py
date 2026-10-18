@@ -68,8 +68,12 @@ def test_retire_allowed_when_the_live_branch_is_gone_or_moved(
     pulls_before = dict(github.pull_requests.get(REPO, {}))
     budgets_before = _budget_and_approvals(tmp_path)
     writes = _no_github_writes(github, monkeypatch)
+    locks = []
+    implementation_lock = worker.implementation_lock
+    monkeypatch.setattr(worker, "implementation_lock", lambda pid: locks.append(implementation_lock(pid)) or locks[-1])
     retired = worker.retire_delivery(preview_id, actor_id=" operator ", github=github, reason=f"  {REASON} ",
                                      allow_mock_publication=True)
+    assert len(locks) == 1 and not locks[0].is_locked  # held during the retire, released after it
     assert retired.state == "retired" and retired.error == "Retired by operator"
     assert set(retired.retirement) == {"actor_id", "retired_at", "previous_state", "live_head_sha", "reason",
                                        "live_branch"}
@@ -121,7 +125,8 @@ def _tamper_record(tmp_path: Path, change) -> None:
                                   "correction_task_with_reason", "verified", "failed", "implementation_locked",
                                   "missing_record", "unknown_preview", "base_unreadable", "mock_without_opt_in",
                                   "no_actor", "no_reason", "foreign_preview_scope", "malformed_live_head",
-                                  "malformed_saved_head", "foreign_repository", "oversized_reason"])
+                                  "malformed_saved_head", "foreign_repository", "oversized_reason",
+                                  "no_publication"])
 def test_retire_refusals_leave_the_record_and_github_untouched(
     tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, case,
 ):
@@ -193,6 +198,10 @@ def test_retire_refusals_leave_the_record_and_github_untouched(
     elif case == "foreign_repository":
         _tamper_record(tmp_path, lambda record: record["publication"].update(repository="someone/else"))
         match = "Publication target differs"
+    elif case == "no_publication":
+        # Unreachable through a validated load (publishing requires a publication); the guard still fails closed.
+        monkeypatch.setattr(worker, "_load_preview_record", lambda pid: replace(before, publication=None))
+        match = "without a saved publication"
     elif case == "oversized_reason":
         kwargs["reason"] = "x" * 2001
         match = "operator reason"
@@ -207,6 +216,8 @@ def test_retire_refusals_leave_the_record_and_github_untouched(
         worker.retire_delivery(target, **kwargs)
     if case == "implementation_locked":
         held.release()
+    if case == "unknown_preview":  # refusing an unknown preview leaves no lock or state files behind
+        assert not worker._task_dir(target).exists() and not Path(str(worker._task_dir(target)) + ".lock").exists()
     assert {path: path.read_bytes() for path in saved} == saved
     assert writes == [] and github._branch_heads[REPO] == heads and github.pull_requests.get(REPO, {}) == pulls
 
@@ -343,10 +354,19 @@ def test_service_retire_refuses_while_the_managed_run_is_executing(
         assert worker.get(preview_id).state == "publishing"
     finally:
         executing.release()
+    seen = []
+
+    class Runs:
+        def invocation_lock(self, assignment):
+            seen.append(runs.invocation_lock(assignment))
+            return seen[-1]
+
+    service._runs = Runs()
     retired = asyncio.run(ManagedOrganizationService.retire_delivery(
         service, preview_id, github=github, reason=REASON, allow_mock_publication=True))
     assert retired.state == "retired" and retired.retirement["actor_id"] == "operator"
-    # The run lock is released again afterwards.
+    # The run lock was taken for this assignment and is released again afterwards.
+    assert len(seen) == 1 and not seen[0].is_locked
     with runs.invocation_lock(assignment_id):
         pass
 
@@ -385,7 +405,8 @@ def test_live_branch_head_is_none_only_on_404(monkeypatch):
     assert adapter.branch_head(repository="fixture/widgets", branch="aitobuild/x") == "c" * 40
     answers.append(RuntimeError("gh api failed for GET repos/fixture/widgets/git/ref/heads/aitobuild/x: HTTP 404"))
     assert adapter.branch_head(repository="fixture/widgets", branch="aitobuild/x") is None
-    for failure in (RuntimeError("gh api failed: HTTP 403"), GitHubTransientError("gh api failed: HTTP 502")):
+    for failure in (RuntimeError("gh api failed: HTTP 403"), GitHubTransientError("gh api failed: HTTP 502"),
+                    GitHubTransientError("gh api failed: HTTP 502 (upstream said HTTP 404)")):
         answers.append(failure)
         with pytest.raises(RuntimeError):
             adapter.branch_head(repository="fixture/widgets", branch="aitobuild/x")

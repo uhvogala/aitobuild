@@ -1273,8 +1273,7 @@ class DeveloperDeliveryWorker:
             if record is None:
                 raise PermissionError("Retiring requires a saved delivery record")
             preview = self._previews.get(preview_id)
-            if (_is_correction_record(record) or preview is None or preview.bundle_payload != record.bundle_payload
-                    or is_correction_task(preview)):
+            if (preview is None or preview.bundle_payload != record.bundle_payload or is_correction_task(preview)):
                 raise PermissionError("Corrections retire through the correction rule; this record is refused")
             if record.state == "retired":
                 return record

@@ -11,6 +11,24 @@ and supervised recovery. Earlier counts, pending work and commit status describe
 their checkpoint, not the current system. Current setup and usage belong in
 [README.md](README.md); contributor rules belong in [agents.md](agents.md).
 
+Stuck publishing retire (2026-10-18, #61): a non-correction delivery left at `publishing`
+after a kill, with no PR recorded and its task branch deleted (pilot trial 4 record
+`dp-9f525f91…`, head `ee43e54`, example PR #74 closed), had no supported exit; resume reuses the
+same record and hits it again. The existing operator retire is generalized instead of adding a
+second command: `retire_delivery` / `POST /internal/organization/deliveries/retire
+{preview_id, reason}` routes corrections to the unchanged `retire_correction` (and
+`corrections/retire` stays as its alias), and retires any other record only when it is
+`publishing`, not `is_correction_task`, carries no PR number/URL/PR head, the base branch is
+readable, and the read-only live `branch_head` is gone (404) or not the saved head (an existing
+branch with no saved head is refused). The delivery implementation lock and the managed run's
+invocation lock must be free. It ends in the same terminal `retired` state with the correction
+audit fields plus `reason` and `live_branch` (`gone`/`moved`); saved head, snapshot and evidence are
+kept, nothing is written to GitHub, and budget and approvals are left alone. Load validation
+checks a retired non-correction as the `publishing` record it was plus its exact receipt; resume,
+adoption, publish and `prepare` refuse it or return it unchanged. The live `branch_head` now returns
+`None` on 404 (other errors still raise), matching the protocol and the mock. This changes the
+delivery state model and needs Vertti's okay before merge.
+
 Interrupted draft publication resume (2026-10-13): pilot trial 4 killed the service
 right after the developer branch push; GitHub had opened the draft PR but no record
 held its number, and restart failed closed on the run-level replay block. A run left
