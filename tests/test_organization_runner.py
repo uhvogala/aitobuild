@@ -19,7 +19,7 @@ from aitobuild.organization import FileDefinitionStore, parse_organization_defin
 from aitobuild.organization_assignments import AssignmentService, FileAssignmentStore
 from aitobuild.organization_delivery import DeliveryInvocation, ManagedDeliveryBindings, NativeDeliveryImplementation
 from aitobuild.organization_runner import (
-    FileRunStore, ManagedOperation, ManagedRun, ManagedWorkflowRunner, RuntimeActor, WorkflowInput,
+    ApprovalPolicyChanged, FileRunStore, ManagedOperation, ManagedRun, ManagedWorkflowRunner, RuntimeActor, WorkflowInput,
 )
 from aitobuild.policy import ActionClass, AgentRole
 from aitobuild.organization_runtime import ModelProfile, bootstrap_organization
@@ -138,10 +138,14 @@ def test_active_policy_drift_fails_without_approving_or_replaying(tmp_path):
     waiting = asyncio.run(runner.start(assignment.assignment_id))
     restarted, *_ = runner_fixture(tmp_path, {"definition_probe": operation},
                                    approval_policy=ApprovalPolicy(developer_tools="automatic"))
-    failed = asyncio.run(restarted.start(assignment.assignment_id))
-    assert failed.state == "failed" and "policy revision changed" in failed.error
-    assert failed.approval_policy_revision == waiting.approval_policy_revision
-    assert calls == ["initial"] and not failed.decisions
+    # #65: refused before any work, naming both digests; the run is left waiting for a human override.
+    with pytest.raises(ApprovalPolicyChanged) as refused:
+        asyncio.run(restarted.start(assignment.assignment_id))
+    assert waiting.approval_policy_revision in str(refused.value)
+    assert restarted.approval_policy.revision in str(refused.value)
+    kept = FileRunStore(tmp_path / "runs").get(assignment.assignment_id)
+    assert kept == waiting and kept.state == "waiting"
+    assert calls == ["initial"] and not kept.decisions
 
 
 def test_automatic_policy_bounds_repeated_native_decisions(tmp_path):
@@ -332,7 +336,7 @@ def test_configured_delivery_stages_reuse_guarded_services_and_original_budget(
     assert (source / "README.md").read_text() == "Fixture baseline\n"
 
 
-def _service_fixture(tmp_path, approved_delivery, operation=None, coordinator=None):
+def _service_fixture(tmp_path, approved_delivery, operation=None, coordinator=None, approval_policy=None):
     from aitobuild.organization_service import ManagedOrganizationService, ManagedRoute
 
     previews, worker, preview_id, _, _ = approved_delivery
@@ -359,7 +363,7 @@ def _service_fixture(tmp_path, approved_delivery, operation=None, coordinator=No
                              event="github.issue.ready"),),
         coordinators={"planner": coordinator or propose},
         operations={"definition_probe": operation or ManagedOperation(lambda context, message: calls.append("run") or "done")},
-        cleanup=cleanup, binding_revision="service-v1",
+        cleanup=cleanup, binding_revision="service-v1", approval_policy=approval_policy or ApprovalPolicy(),
     )
     return service, assignments, calls
 

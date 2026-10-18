@@ -32,8 +32,8 @@ from aitobuild.dispatcher import DispatcherAgent
 from aitobuild.events import make_internal_event, normalize_github_webhook, parse_trigger_request
 from aitobuild.organization_assignments import AssignmentProposal
 from aitobuild.organization_delivery import _delivery_call
-from aitobuild.organization_runner import ManagedRun
-from aitobuild.organization_service import ManagedOrganizationService, ManagedServiceContext
+from aitobuild.organization_runner import ManagedRun, PolicyAlreadyPinned
+from aitobuild.organization_service import Human, ManagedOrganizationService, ManagedServiceContext
 from aitobuild.organization_worker import ManagedOrganizationWorker, WorkerJob
 from aitobuild.proactive import ArchitectScanRunner
 from aitobuild.runtime import bootstrap_runtime, kickoff_meeting_bootstrap
@@ -993,6 +993,7 @@ def create_app(
             fields = {
                 "run": {"preview_id", "proposal"}, "approve": {"assignment_id", "request_id", "approved"},
                 "resume": {"assignment_id", "request_id", "response"},
+                "override_policy": {"assignment_id", "reason"},
                 "cancel": {"assignment_id", "preview_id"} if managed_worker is not None else {"assignment_id"},
             }.get(operation)
             if fields is None:
@@ -1012,6 +1013,22 @@ def create_app(
             if operation == "approve" and type(payload["approved"]) is not bool:
                 raise HTTPException(status_code=400, detail="approved must be a Boolean")
             try:
+                if operation == "override_policy":
+                    # #65: the authenticated operator endpoint is the human evidence, as for task approval. It only
+                    # records the override; the run is resumed afterwards through the usual run/approve/resume.
+                    assignment_id = payload["assignment_id"].strip()
+                    try:
+                        await managed_service.override_approval_policy(
+                            assignment_id, evidence=Human(), reason=payload["reason"])
+                    except PolicyAlreadyPinned:
+                        # A retry after the requeue below met a busy worker lock: the override is already
+                        # recorded, so only the requeue is repeated. Without a worker there is nothing to repeat.
+                        if managed_worker is None:
+                            raise
+                    preview_id = managed_service.assignment_preview(assignment_id)
+                    if managed_worker is not None:
+                        managed_worker.requeue_after_policy_override(preview_id)
+                    return _run_metadata(managed_service.status(preview_id))
                 if managed_worker is not None:
                     if operation == "run":
                         proposal = AssignmentProposal.model_validate(payload["proposal"]) if "proposal" in payload else None

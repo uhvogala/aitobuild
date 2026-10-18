@@ -106,7 +106,8 @@ human stages are given by the script and recorded).
 uv run python scripts/trials/pilot.py start --sudo-docker --allowed-issue-author <login>
 # 2. after the PR in report.merge_points is merged by a person
 uv run python scripts/trials/pilot.py resume --sudo-docker --allowed-issue-author <login> --run-dir /workspace/trials/runs/trial4-<stamp> \
-    [--brief-edit-what "..." --brief-edit-why "..."]
+    [--brief-edit-what "..." --brief-edit-why "..."] \
+    [--policy-override-actor <person> --policy-override-reason "..."]
 ```
 
 `resume` restarts the service on the saved state, refreshes every merge point from GitHub, provisions the merged
@@ -117,6 +118,14 @@ planning but answer 409 until that handoff exists; `start` skips them. If a pers
 resuming, pass `--brief-edit-what/--brief-edit-why`; it lands in `report.operator_actions` as `brief_edit`.
 Repeat `resume` until the plan is done. Runs and artifacts live under `--work-root` (outside the checkout,
 git-ignored); delete `runs/trial4-*` once the pilot is finished.
+
+Approval policy pinning (#65, related to #41): the first session pins its approval policy in the report, and every
+phase records the policy revision it ran under. A `resume` whose `--automatic-stage` flags give a different policy is
+refused (both revisions are named) unless `--policy-override-actor <person> --policy-override-reason "..."` records a
+human override in `report.policy_overrides`; the harness then records the service's own override
+(`POST /internal/organization/tasks/override_policy`) on each still-open run before anything resumes it.
+`report.evidence` judges each phase, and each run decision, by the policy recorded for it, never by the latest
+session's policy (pilot trial 4 reported 29 start-phase decisions against the resume policy).
 
 `resume` refuses a seed with uncommitted changes, a seed without the base branch checked out and a seed whose base
 branch diverged from origin (git's error is included). Any failure, including one before the service starts, is

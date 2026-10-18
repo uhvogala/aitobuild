@@ -17,6 +17,7 @@ from aitobuild.durable_files import atomic_write_text
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.organization import DefinitionModel
 from aitobuild.organization_assignments import AssignmentCapacityError, AssignmentProposal, Digest
+from aitobuild.organization_runner import TERMINAL, ApprovalPolicyChanged
 from aitobuild.organization_service import ManagedOrganizationService, ManagedRoute
 
 
@@ -58,6 +59,8 @@ class WorkerJob(DefinitionModel):
     state: Literal["queued", "running", "waiting", "completed", "failed", "cancelled"] = "queued"
     error: StrictStr | None = None
     cancel_requested: StrictBool = False
+    # #65: structured reason a job waits outside the normal flow; only the runner's approval-policy refusal sets it.
+    refusal: Literal["approval_policy_changed"] | None = None
 
     @model_validator(mode="after")
     def validate_job(self) -> Self:
@@ -77,6 +80,8 @@ class WorkerJob(DefinitionModel):
             raise ValueError("Worker command timestamps must lie within the receipt history")
         if self.state == "failed" and not self.error:
             raise ValueError("Failed worker receipts require a diagnostic")
+        if self.refusal is not None and self.state != "waiting":
+            raise ValueError("A worker refusal is recorded only on a waiting job")
         return self
 
 
@@ -157,7 +162,7 @@ class FileWorkerStore:
             original = next((item for item in journal.jobs if item.preview_id == job.preview_id), None)
             if original is None:
                 raise ValueError("Worker admission not found")
-            mutable = {"state", "updated_at", "error", "commands", "cancel_requested"}
+            mutable = {"state", "updated_at", "error", "commands", "cancel_requested", "refusal"}
             if original.model_dump(exclude=mutable) != job.model_dump(exclude=mutable):
                 raise ValueError("Worker admission pins are immutable")
             if original.state in {"completed", "failed", "cancelled"} and original != job:
@@ -264,7 +269,7 @@ class ManagedOrganizationWorker:
                 with self.store.invocation_lock(preview_id):
                     self._validate(original)
                     self.store.save(original.model_copy(update={
-                        "commands": (*original.commands, command), "state": "queued", "error": None,
+                        "commands": (*original.commands, command), "state": "queued", "error": None, "refusal": None,
                         "updated_at": datetime.now(tz=UTC),
                     }))
                 self._wake.set()
@@ -301,7 +306,25 @@ class ManagedOrganizationWorker:
                 raise PermissionError("Worker request kind/identity is not pending")
             command = WorkerCommand(kind=kind, request_id=request_id, value=value,
                                     actor_id=self.service.operator_id, created_at=datetime.now(tz=UTC))
-            updated = job.model_copy(update={"commands": (*job.commands, command), "state": "queued", "error": None,
+            updated = job.model_copy(update={"commands": (*job.commands, command), "state": "queued", "error": None, "refusal": None,
+                                             "updated_at": datetime.now(tz=UTC)})
+            self.store.save(updated)
+        self._wake.set()
+        return WorkerJob.model_validate(updated.model_dump())
+
+    def requeue_after_policy_override(self, preview_id: str) -> WorkerJob | None:
+        """#65: put a job the runner refused for a changed approval policy back in the queue, once a human override
+        has pinned its run to the live policy. Its last saved command runs again; nothing else is replayed."""
+        with self.store.invocation_lock(preview_id):
+            job = self.store.get(preview_id)
+            if job is None or job.state != "waiting" or job.refusal != "approval_policy_changed":
+                return None
+            run = self.service.recorded_run(job.task_id)
+            if (run is None or run.state in TERMINAL | {"finalizing"}
+                    or run.pinned_policy_revision != self.service.approval_policy.revision):
+                raise PermissionError("Policy-refused worker job has no overridden continuation to resume")
+            self._validate(job)
+            updated = job.model_copy(update={"state": "queued", "error": None, "refusal": None,
                                              "updated_at": datetime.now(tz=UTC)})
             self.store.save(updated)
         self._wake.set()
@@ -451,12 +474,14 @@ class ManagedOrganizationWorker:
             except TimeoutError:
                 pass
 
-    def _update(self, job: WorkerJob, *, state: str, error: str | None = None) -> None:
+    def _update(self, job: WorkerJob, *, state: str, error: str | None = None,
+                refusal: Literal["approval_policy_changed"] | None = None) -> None:
         current = self.store.get(job.preview_id)
         if current is None:
             raise ValueError("Worker admission disappeared")
         try:
-            self.store.save(current.model_copy(update={"state": state, "error": error, "updated_at": datetime.now(tz=UTC)}))
+            self.store.save(current.model_copy(update={"state": state, "error": error, "refusal": refusal,
+                                                       "updated_at": datetime.now(tz=UTC)}))
         except Exception as failure:
             raise _ReceiptError(str(failure)) from failure
         self._changed.set()
@@ -535,6 +560,10 @@ class ManagedOrganizationWorker:
             raise
         except (AssignmentCapacityError, LockTimeout) as error:
             self._update(job, state="queued", error=str(error))
+        except ApprovalPolicyChanged as error:
+            # #65: the runner refused before any work and left the run as it was; keep it (no abort) so a human
+            # policy override can resume it through requeue_after_policy_override.
+            self._update(job, state="waiting", error=str(error), refusal="approval_policy_changed")
         except _ReceiptError:
             raise
         except Exception as error:

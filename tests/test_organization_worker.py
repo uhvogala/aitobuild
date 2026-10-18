@@ -21,8 +21,9 @@ from test_organization_runner import _service_fixture
 from conftest import approve_preview
 
 
-def make_worker(tmp_path, approved_delivery, operation=None, **options):
-    service, assignments, calls = _service_fixture(tmp_path, approved_delivery, operation=operation)
+def make_worker(tmp_path, approved_delivery, operation=None, approval_policy=None, **options):
+    service, assignments, calls = _service_fixture(tmp_path, approved_delivery, operation=operation,
+                                                   approval_policy=approval_policy)
     worker = ManagedOrganizationWorker(service=service, store=FileWorkerStore(tmp_path / "worker.json"),
                                        poll_seconds=0.01, **options)
     return worker, service, assignments, calls

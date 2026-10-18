@@ -202,7 +202,25 @@ Every nondefault mode needs its registered trusted adapter. Missing factories,
 empty factory results, ignored policies and unregistered stages refuse activation.
 Native workflows pin policy revisions, save decisions before effects and enforce
 `max_automatic_decisions` (1-128, default 32) across human waits and restarts. Active
-policy drift fails closed; terminal recovery is metadata-only. Automatic input
+policy drift fails closed; terminal recovery is metadata-only.
+
+A managed run keeps the approval policy it started with (#65, related to #41). The
+run records the policy revision at start (the same `ApprovalPolicy.revision` that
+admission decisions snapshot). A restart, approval or response under a different
+live policy is refused before any model call, push or adoption, naming both
+revisions, and the run is left as it was. Only a human can let it continue:
+`POST /internal/organization/tasks/override_policy` with `{assignment_id, reason}`
+on the authenticated operator endpoint (the same human evidence as task approval;
+operator-policy, planned-child, inherited-review and consent evidence are refused)
+appends an immutable `policy_overrides` entry with the actor, old and new revisions,
+reason, time and the decision index it applies from. Decisions after it are made
+under the new policy; `ManagedRun.policy_phases()` shows which policy governed
+which decisions. A run saved before pinning has no revision and fails closed until
+a human override pins it. Correction publication checks the correction run's pinned
+policy by the same rule (and refuses a correction without a managed run); a finished
+run accepts an override for that purpose and is still never resumed. With the
+detached worker, a refused job waits with `refusal: approval_policy_changed` (it is
+not aborted) and the override endpoint requeues it. Automatic input
 other than Boolean approval requires an explicit trusted exact response callback.
 
 App startup emits one safety warning listing every automatic approval surface and
