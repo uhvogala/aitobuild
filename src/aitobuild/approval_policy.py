@@ -60,6 +60,18 @@ class ApprovalPolicy(DefinitionModel):
         content = {"schema_version": 1, "stages": self.model_dump(mode="json")}
         return sha256(json.dumps(content, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
+    @property
+    def automatic_stages(self) -> tuple[str, ...]:
+        return tuple(name for name, mode in self.model_dump(mode="json").items() if mode == "automatic")
+
+    @property
+    def safety_warnings(self) -> tuple[str, ...]:
+        stages = self.automatic_stages
+        if not stages:
+            return ()
+        return (f"Automatic approval changes the safety model: {', '.join(stages)}. "
+                f"Policy revision: {self.revision}. Configured gates and budgets still apply.",)
+
     def mode(self, stage: ApprovalStage) -> ApprovalMode:
         if not isinstance(stage, ApprovalStage):
             raise TypeError("Approval stage must be a registered stage")

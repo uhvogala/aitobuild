@@ -205,6 +205,13 @@ Native workflows pin policy revisions, save decisions before effects and enforce
 policy drift fails closed; terminal recovery is metadata-only. Automatic input
 other than Boolean approval requires an explicit trusted exact response callback.
 
+App startup emits one safety warning listing every automatic approval surface and
+the configured policy revision. Authenticated `GET /internal/diagnostics` reports
+the same `warnings`, `automatic_approval_stages` and `approval_policy_revision`,
+including when no detached worker is configured. Worker diagnostics include the
+same policy information. Default and all-human policies produce no automatic
+approval warning; the warning does not change any gate or budget.
+
 This changes approval decisions, not activation, graph structure or scheduling.
 Organization definitions and model/tool profile references still resolve through
 operator-owned registries and factories. Opt-in detached workers can queue exact

@@ -8,7 +8,9 @@ import json
 from threading import Event
 
 import pytest
+from filelock import Timeout as LockTimeout
 
+import aitobuild.organization_worker as worker_module
 from aitobuild.organization_delivery import _delivery_call
 from aitobuild.organization import parse_organization_definition
 from aitobuild.organization_assignments import AssignmentProposal
@@ -37,6 +39,45 @@ def other_preview(approved_delivery, *, approve=True):
     payload["task_id"] = "other-worker-task"
     preview = previews.create_or_get(dedupe_key="other-worker-task", bundle_payload=payload, source_payload={})
     return approve_preview(previews, preview.preview_id, base_revision=revision) if approve else preview
+
+
+@pytest.mark.parametrize("phase", ["open", "abort"])
+def test_worker_abort_does_not_hide_budget_lock_timeout(tmp_path, approved_delivery, monkeypatch, phase):
+    _, delivery, preview_id, _, _ = approved_delivery
+    delivery.prepare(preview_id)
+    worker, _, _, _ = make_worker(tmp_path, approved_delivery)
+    job = worker.enqueue(preview_id)
+    path = delivery.budget_path(preview_id)
+    before = path.read_bytes()
+    original = worker_module.DeveloperTaskBudget
+
+    def locked_budget(**options):
+        if phase == "open":
+            raise LockTimeout(str(path) + ".lock")
+        budget = original(**options)
+
+        def locked_abort():
+            raise LockTimeout(str(path) + ".lock")
+
+        monkeypatch.setattr(budget, "abort", locked_abort)
+        return budget
+
+    monkeypatch.setattr(worker_module, "DeveloperTaskBudget", locked_budget)
+    with pytest.raises(LockTimeout):
+        asyncio.run(worker._abort(job))
+    assert path.read_bytes() == before
+
+
+def test_worker_abort_reopens_already_aborted_budget_without_reset(tmp_path, approved_delivery):
+    _, delivery, preview_id, _, _ = approved_delivery
+    delivery.prepare(preview_id)
+    worker, _, _, _ = make_worker(tmp_path, approved_delivery)
+    job = worker.enqueue(preview_id)
+    path = delivery.budget_path(preview_id)
+    before = json.loads(path.read_text())
+    asyncio.run(worker._abort(job))
+    asyncio.run(worker._abort(job))
+    assert json.loads(path.read_text()) == before | {"aborted": True}
 
 
 @pytest.mark.parametrize("kind,value", [("service_approval", True), ("human_input", "answer")])

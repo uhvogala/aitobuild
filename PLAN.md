@@ -23,7 +23,11 @@ native session and the approved publication snapshot (head SHA well-formed once
 recorded). The runner then replays only that recorded response into the worker's
 existing `publish` resume path: no new decision, admission or approval is recorded,
 and every other interrupted state keeps "automatic replay is blocked". Corrections are
-excluded. This is same-run recovery only and does not touch #41 cross-run resume.
+excluded (`is_correction_task`, #54). Before any PR create or update on that resume, the
+live task branch must still equal the saved verified head, under the original approval
+and budget checks; a moved branch refuses with no PR write, keeps the saved evidence and
+leaves the branch untouched. This is same-run recovery only and does not touch #41
+cross-run resume.
 
 Draft PR bodies now carry `<!-- aitobuild-delivery:<sha256(preview id, bundle digest)> -->`.
 An existing PR on the task branch is adopted only when the expected body carries that
@@ -33,6 +37,21 @@ duplicated. The same author check (#51) now guards marker adoption of planned is
 after an uncertain create and in `reconcile`, which also records `adopted` for effects
 it found by marker without a saved receipt. PRs opened before this change carry no
 marker and are not adopted automatically.
+
+Worker abort lock errors (#22): removed the broad `TimeoutError` suppression that
+also swallowed `filelock.Timeout`. Abort reopens only the original ledger with
+`create=False, allow_aborted=True`; repeat aborts preserve deadlines and reservations
+without recreating budgets. Regression tests cover lock failure during both reopen
+and abort, repeat abort, and the exact `BudgetDeadlineExpired` exception from an
+expired `reserve_paths` call. Lock failures are no longer reported as successful
+abort; existing worker error/deferral handling remains responsible for them.
+
+Automatic policy visibility (#55): startup and authenticated service/worker
+diagnostics share one policy-model-derived warning listing every automatic field
+and the pinned revision. Default and all-human policies remain silent. Tests cover
+every registered surface, future model fields, multiple automatic stages, internal
+authentication and both worker configurations. This adds visibility only; exact
+approval gates, trusted operation bindings and original budgets are unchanged.
 
 Independent PM implementation handoff (2026-10-11): extended the opt-in detached
 follow-up queue with an explicit service-owned `planning_publication` binding.

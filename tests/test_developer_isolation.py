@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from aitobuild.developer_isolation import (
+    BudgetDeadlineExpired,
     DeveloperTaskBudget,
     developer_task_bundle_from_payload,
     IsolationTool,
@@ -39,7 +40,7 @@ def test_task_budget_persists_unique_files_and_deadline(tmp_path: Path, monkeypa
     clock[0] += 61
     with pytest.raises(TimeoutError, match="expired"):
         DeveloperTaskBudget(path=path, bundle=bundle).remaining_seconds()
-    with pytest.raises(TimeoutError):
+    with pytest.raises(BudgetDeadlineExpired, match="expired"):
         restored.reserve_paths(("src/one.py",))
     path.unlink()
     with pytest.raises(ValueError, match="missing"):
