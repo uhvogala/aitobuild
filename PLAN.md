@@ -11,6 +11,33 @@ and supervised recovery. Earlier counts, pending work and commit status describe
 their checkpoint, not the current system. Current setup and usage belong in
 [README.md](README.md); contributor rules belong in [agents.md](agents.md).
 
+Interrupted draft publication resume (2026-10-13): pilot trial 4 killed the service
+right after the developer branch push; GitHub had opened the draft PR but no record
+held its number, and restart failed closed on the run-level replay block. A run left
+`running` now resumes only when its last decision is the recorded affirmative service
+approval for an operation that declares an interrupted-continuation check, the pinned
+checkpoint still holds exactly that request with the same data digest, and the check
+proves the effect is in flight. For `delivery_publish` that means the delivery record
+is `publishing` and matches the run on preview id, approval time, pinned base, bundle,
+native session and the approved publication snapshot (head SHA well-formed once
+recorded). The runner then replays only that recorded response into the worker's
+existing `publish` resume path: no new decision, admission or approval is recorded,
+and every other interrupted state keeps "automatic replay is blocked". Corrections are
+excluded (`is_correction_task`, #54). Before any PR create or update on that resume, the
+live task branch must still equal the saved verified head, under the original approval
+and budget checks; a moved branch refuses with no PR write, keeps the saved evidence and
+leaves the branch untouched. This is same-run recovery only and does not touch #41
+cross-run resume.
+
+Draft PR bodies now carry `<!-- aitobuild-delivery:<sha256(preview id, bundle digest)> -->`.
+An existing PR on the task branch is adopted only when the expected body carries that
+marker, title and body match the exact approved receipt, it is an open draft, and its
+author is the adapter's own writer login; anything else is refused, never adopted or
+duplicated. The same author check (#51) now guards marker adoption of planned issues
+after an uncertain create and in `reconcile`, which also records `adopted` for effects
+it found by marker without a saved receipt. PRs opened before this change carry no
+marker and are not adopted automatically.
+
 Worker abort lock errors (#22): removed the broad `TimeoutError` suppression that
 also swallowed `filelock.Timeout`. Abort reopens only the original ledger with
 `create=False, allow_aborted=True`; repeat aborts preserve deadlines and reservations

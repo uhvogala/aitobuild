@@ -114,6 +114,13 @@ def _failed_publication(record: DeliveryPreparation, error: str) -> DeliveryPrep
                    updated_at=datetime.now(tz=UTC).isoformat())
 
 
+def delivery_marker(preview_id: str, bundle_payload: dict[str, Any]) -> str:
+    """The PR-body marker binding a draft to its exact admitted task (preview id + bundle digest).
+    Adoption of an existing PR on the task branch requires it plus the exact receipt and our author."""
+    bundle_digest = snapshot_digest(bundle_payload)
+    return f"<!-- aitobuild-delivery:{sha256(f'{preview_id}:{bundle_digest}'.encode()).hexdigest()} -->"
+
+
 class DeveloperDeliveryWorker:
     def __init__(
         self, *, preview_registry: DeveloperPreviewRegistry, state_dir: Path,
@@ -575,6 +582,16 @@ class DeveloperDeliveryWorker:
                 existing = publication.get("pull_number")
                 if type(existing) is not int:
                     existing = None
+                if reuse_head:
+                    # Resume (#56): the saved head was verified before the interruption, but the remote task branch
+                    # may have moved since. Re-check it live under the original approval and budget, so no PR is
+                    # created or updated at a foreign head; the moved branch and saved evidence are left untouched.
+                    publication_check()
+                    live_head = github.branch_head(repository=issue.repository, branch=publication_branch)
+                    if live_head != head_sha:
+                        raise PermissionError(
+                            f"Task branch {publication_branch} is at {live_head or 'no head'}, not the verified head "
+                            f"{head_sha}; resumed publication is refused")
                 budget.remaining_seconds()
                 pull = github.create_or_update_draft_pull_request(
                     role=AgentRole.DEVELOPER,
@@ -677,6 +694,10 @@ class DeveloperDeliveryWorker:
                 or not isinstance(review_id, str) or not review_id):
             raise PermissionError("Correction chain link is missing or invalid; publication is refused")
         return target["preview_id"], review_id
+
+    def preview(self, preview_id: str) -> Any:
+        """The immutable approved preview behind a delivery (read-only)."""
+        return self._previews.get(preview_id)
 
     def _load_preview_record(self, preview_id: str) -> DeliveryPreparation | None:
         directory = self._task_dir(preview_id)
@@ -1510,6 +1531,7 @@ class DeveloperDeliveryWorker:
             f"- base revision: `{record.base_revision}`\n"
             f"{verification_block}\n\n"
             f"Closes #{issue.issue_number}\n"
+            f"{delivery_marker(record.preview_id, record.bundle_payload)}\n"
         )
         commit_message = f"aitobuild: implement #{issue.issue_number} {issue.title}".strip()
         return title[:200], body, commit_message[:200]

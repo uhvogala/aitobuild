@@ -238,6 +238,10 @@ class ManagedOperation:
     approval_stage: ApprovalStage | None = None
     automatic_response: Callable[[ManagedTaskContext, PendingWorkflowInput], JsonValue] | None = None
     approval_stages: tuple[ApprovalStage, ...] = ()
+    # Optional, approval-stage-bound: True only when the operation's own durable effect record proves that the
+    # continuation for this exact approved request was interrupted mid-effect and can be finished idempotently
+    # by its existing resume path. Never re-admits or re-approves; any doubt must return False.
+    resume_interrupted: Callable[[ManagedTaskContext, Any], bool] | None = None
 
     def __post_init__(self) -> None:
         assert_role_action_allowed(self.role, self.action)
@@ -251,6 +255,8 @@ class ManagedOperation:
                 any(not isinstance(stage, ApprovalStage) for stage in self.approval_stages) or
                 len(set(self.approval_stages)) != len(self.approval_stages)):
             raise ValueError("Additional approval stages require unique registered stages and a continuation")
+        if self.resume_interrupted is not None and (self.approval_stage is None or not callable(self.resume_interrupted)):
+            raise ValueError("Interrupted-continuation resume requires a stage-bound continuation")
 
 
 async def _resolve(value: Any) -> Any:
@@ -460,10 +466,46 @@ class ManagedWorkflowRunner:
         except Exception as error:
             return await self._terminate(run, context, "failed", _failure_label(error))
         if run.state == "running":
-            return await self._terminate(run, context, "failed", "Interrupted native invocation; automatic replay is blocked")
+            try:
+                interrupted = await self._interrupted_continuation(run, context)
+            except Exception as error:
+                return await self._terminate(run, context, "failed", _failure_label(error))
+            if interrupted is None:
+                return await self._terminate(run, context, "failed", "Interrupted native invocation; automatic replay is blocked")
+            # Finish the same admitted task's own approved continuation; no new decision, admission or approval.
+            return await self._advance_automatic(await self._invoke(run, assignment, interrupted=interrupted), assignment)
         if run.state == "waiting":
             return await self._advance_automatic(run, assignment)
         return await self._advance_automatic(await self._invoke(run, assignment), assignment)
+
+    async def _interrupted_continuation(self, run: ManagedRun, context: ManagedTaskContext) -> WorkflowDecision | None:
+        """The single approved continuation a killed invocation was executing, if its operation proves it resumable."""
+        if not run.decisions or run.checkpoint_id is None or run.checkpoint_digest is None:
+            return None
+        decision = run.decisions[-1]
+        if decision.kind != "service_approval" or decision.value is not True or decision.data_digest is None:
+            return None
+        storage = _RunCheckpoints(self._runs.checkpoint_path(run.assignment_id), context)
+        if storage.digest(run.checkpoint_id) != run.checkpoint_digest:
+            return None
+        checkpoint = await storage.load(run.checkpoint_id)
+        if (checkpoint.workflow_name != run.workflow_name or checkpoint.metadata.get("aitobuild") != {
+                "run_id": run.run_id, "assignment_id": context.assignment.assignment_id,
+                "revision": context.assignment.revision, "scope_digest": context.assignment.scope_digest}
+                or set(checkpoint.pending_request_info_events) != {decision.request_id}):
+            return None
+        event = checkpoint.pending_request_info_events[decision.request_id]
+        data = event.data
+        if (not isinstance(data, dict) or data.get("kind") != decision.kind
+                or workflow_input_digest(data.get("data")) != decision.data_digest):
+            return None
+        request = PendingWorkflowInput(request_id=decision.request_id, node_id=event.source_executor_id,
+                                       kind=data["kind"], prompt=data["prompt"], data=data["data"],
+                                       approval_stage=data.get("approval_stage"))
+        operation = self._input_operation(context, request)
+        if operation.resume_interrupted is None or self._input_stage(operation, request) is None:
+            return None
+        return decision if operation.resume_interrupted(context, request.data) is True else None
 
     def _input_operation(self, context: ManagedTaskContext, request: PendingWorkflowInput) -> ManagedOperation:
         workflow = next(item for item in context.snapshot.definition.workflows if item.id == context.run.workflow_id)
@@ -622,9 +664,16 @@ class ManagedWorkflowRunner:
     async def _invoke(
         self, run: ManagedRun, assignment: TaskAssignment, *, responses: dict[str, Any] | None = None,
         policy_decisions: Mapping[str, ApprovalDecision] | None = None,
+        interrupted: WorkflowDecision | None = None,
     ) -> ManagedRun:
         context = self._context(run, assignment)
         current = run
+        if interrupted is not None:
+            if responses is not None or policy_decisions is not None or run.state != "running":
+                raise ValueError("Interrupted continuation resumes only its own recorded decision")
+            responses = {interrupted.request_id: {"kind": interrupted.kind, "value": interrupted.value}}
+        expected_pending = ({interrupted.request_id} if interrupted is not None
+                            else {item.request_id for item in run.pending})
         try:
             if run.binding_revision != self._binding_revision:
                 raise PermissionError("Managed operator binding revision has changed")
@@ -640,9 +689,8 @@ class ManagedWorkflowRunner:
                     "revision": assignment.revision, "scope_digest": assignment.scope_digest,
                 }:
                     raise ValueError("Checkpoint managed assignment references differ")
-                if checkpoint.workflow_name != run.workflow_name or set(checkpoint.pending_request_info_events) != {
-                    item.request_id for item in run.pending
-                }:
+                if checkpoint.workflow_name != run.workflow_name or set(
+                        checkpoint.pending_request_info_events) != expected_pending:
                     raise ValueError("Checkpoint differs from the pinned run/pending requests")
             running = ManagedRun.model_validate(run.model_dump() | {
                 "state": "running", "pending": (), "updated_at": datetime.now(tz=UTC),
@@ -651,7 +699,7 @@ class ManagedWorkflowRunner:
                     value=response["value"],
                     data_digest=workflow_input_digest(next(item.data for item in run.pending if item.request_id == request_id)),
                     approval_policy=(policy_decisions or {}).get(request_id),
-                ) for request_id, response in (responses or {}).items())),
+                ) for request_id, response in (responses or {}).items() if interrupted is None)),
             })
             self._runs.save(running)
             current = running

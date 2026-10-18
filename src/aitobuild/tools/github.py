@@ -86,6 +86,8 @@ class GitHubIssue:
     html_url: str | None = None
     repository: str | None = None
     issue_id: int | None = None
+    # Login of the account that opened the issue (#51); None when the response did not carry one.
+    author: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -112,6 +114,8 @@ class GitHubPullRequest:
     repository: str | None = None
     changed_files: tuple[str, ...] = ()
     head_sha: str | None = None
+    # Login of the account that opened the pull request (#51); None when the response did not carry one.
+    author: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -209,6 +213,10 @@ class GitHubAdapter(Protocol):
                                  head_sha: str, head_branch: str, base_branch: str, base_revision: str) -> dict[str, Any]: ...
 
     def find_issue_publication(self, *, repository: str, marker: str, max_pages: int = 10) -> tuple[GitHubIssue, ...]: ...
+
+    def writer_login(self) -> str: ...
+
+    def branch_head(self, *, repository: str, branch: str) -> str | None: ...
 
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue: ...
 
@@ -370,6 +378,14 @@ class MockGitHubAdapter:
     commit_files: dict[tuple[str, str], dict[str, GitHubBlobChange]] = field(default_factory=dict)
     repository_ids: dict[str, int] = field(default_factory=dict)
     dependency_merges: dict[tuple[str, int, str], dict[str, Any]] = field(default_factory=dict)
+    login: str = "aitobuild-bot"
+
+    def writer_login(self) -> str:
+        return self.login
+
+    def branch_head(self, *, repository: str, branch: str) -> str | None:
+        """The live head of a remote branch, or None when it does not exist (read-only)."""
+        return self._branch_heads.get(self._resolve_repository(repository), {}).get(branch.strip())
 
     def inspect_dependency_merge(self, *, repository: str, repository_id: int, pull_number: int,
                                  head_sha: str, head_branch: str, base_branch: str, base_revision: str) -> dict[str, Any]:
@@ -476,6 +492,7 @@ class MockGitHubAdapter:
             html_url=f"https://github.com/{repository}/issues/{number}",
             repository=repository,
             issue_id=number,
+            author=self.login,
         )
         self.issues.setdefault(repository, {})[number] = issue
         return issue
@@ -512,6 +529,7 @@ class MockGitHubAdapter:
             html_url=current.html_url,
             repository=current.repository or repository,
             issue_id=current.issue_id,
+            author=current.author,
         )
         self.issues[repository][issue_number] = updated
         return updated
@@ -838,7 +856,11 @@ class MockGitHubAdapter:
             if matches and len(open_matches) != 1:
                 raise ValueError("Existing task pull request must be one open draft")
             if open_matches:
-                existing_pull_number = open_matches[0].number
+                found = open_matches[0]
+                require_adoptable_pull(title=found.title, body=found.body, draft=found.draft, author=found.author,
+                                       expected_title=cleaned_title, expected_body=cleaned_body,
+                                       writer=self.writer_login())
+                existing_pull_number = found.number
         if existing_pull_number is not None:
             current = repo_prs.get(existing_pull_number)
             if current is None:
@@ -863,6 +885,7 @@ class MockGitHubAdapter:
                 repository=repo,
                 changed_files=current.changed_files,
                 head_sha=self._branch_heads.get(repo, {}).get(cleaned_head) or current.head_sha,
+                author=current.author,
             )
             repo_prs[existing_pull_number] = updated
             return updated
@@ -880,6 +903,7 @@ class MockGitHubAdapter:
             repository=repo,
             changed_files=(),
             head_sha=self._branch_heads.get(repo, {}).get(cleaned_head),
+            author=self.login,
         )
         repo_prs[number] = created
         return created
@@ -928,6 +952,7 @@ class GhCliGitHubAdapter:
         if self.default_repository is not None:
             allowed = allowed | {self.default_repository}
         self.allowed_repositories = allowed
+        self._writer_login: str | None = None
         self.enforce_allowlist = enforce_allowlist
         if self.enforce_allowlist and not self.allowed_repositories:
             raise ValueError(
@@ -1130,6 +1155,10 @@ class GhCliGitHubAdapter:
             raise RuntimeError("Unexpected GitHub task reference response")
         return head
 
+    def branch_head(self, *, repository: str, branch: str) -> str | None:
+        """The live head of a remote task branch (read-only); an unreadable reference raises."""
+        return self._read_branch_head(repository=self._resolve_repository(repository), branch=branch)
+
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue:
         repo = self._resolve_repository(repository)
         raw = self._api(f"repos/{repo}/issues/{issue_number}")
@@ -1146,6 +1175,16 @@ class GhCliGitHubAdapter:
                 not isinstance(commit, dict) or commit.get("sha") != base_revision):
             raise PermissionError("Planning repository identity or pinned base differs")
         return {"repository": repo, "repository_id": repository_id, "base_revision": base_revision}
+
+    def writer_login(self) -> str:
+        """The login this adapter writes as (#51), read once from the authenticated identity."""
+        if self._writer_login is None:
+            raw = self._api("user")
+            login = raw.get("login") if isinstance(raw, dict) else None
+            if not isinstance(login, str) or not login.strip():
+                raise PermissionError("GitHub writer identity is unreadable; marker adoption is refused")
+            self._writer_login = login.strip()
+        return self._writer_login
 
     def find_issue_publication(self, *, repository: str, marker: str, max_pages: int = 10) -> tuple[GitHubIssue, ...]:
         repo = self._resolve_repository(repository)
@@ -1712,7 +1751,12 @@ class GhCliGitHubAdapter:
             if matches and len(open_matches) != 1:
                 raise ValueError("Existing task pull request must be one open draft")
             if open_matches:
-                existing_pull_number = int(open_matches[0]["number"])
+                found = open_matches[0]
+                require_adoptable_pull(title=found.get("title"), body=found.get("body"), draft=found.get("draft"),
+                                       author=(found.get("user") or {}).get("login"),
+                                       expected_title=cleaned_title, expected_body=cleaned_body,
+                                       writer=self.writer_login())
+                existing_pull_number = int(found["number"])
         if existing_pull_number is not None:
             current = self.get_pull_request(repository=repo, pull_number=existing_pull_number)
             if current.head_ref != cleaned_head:
@@ -1750,13 +1794,16 @@ class GhCliGitHubAdapter:
         except Exception:
             # GitHub may have accepted the create before `gh` timed out; adopt that exact PR (read-only)
             # so its number is saved instead of leaving an open PR with no receipt.
-            adopted = self._created_pull_after_failure(repo, head=cleaned_head, base=cleaned_base, title=cleaned_title)
+            adopted = self._created_pull_after_failure(repo, head=cleaned_head, base=cleaned_base, title=cleaned_title,
+                                                       body=cleaned_body)
             if adopted is None:
                 raise
             return adopted
         return _pull_request_from_api(raw, repository=repo, changed_files=())
 
-    def _created_pull_after_failure(self, repo: str, *, head: str, base: str, title: str) -> GitHubPullRequest | None:
+    def _created_pull_after_failure(
+        self, repo: str, *, head: str, base: str, title: str, body: str,
+    ) -> GitHubPullRequest | None:
         try:
             query = urlencode({"state": "open", "head": f"{repo.split('/')[0]}:{head}", "base": base, "per_page": 100})
             raw_matches = self._api(f"repos/{repo}/pulls?{query}")
@@ -1770,6 +1817,13 @@ class GhCliGitHubAdapter:
                    and raw.get("head", {}).get("repo", {}).get("full_name", "").lower() == repo
                    and raw.get("base", {}).get("ref") == base]
         if len(matches) != 1:
+            return None
+        try:
+            require_adoptable_pull(title=matches[0].get("title"), body=matches[0].get("body"),
+                                   draft=matches[0].get("draft"), author=(matches[0].get("user") or {}).get("login"),
+                                   expected_title=title, expected_body=body, writer=self.writer_login())
+        except PermissionError:
+            # Not our exact PR: report "not adopted". A transient writer-identity failure propagates instead.
             return None
         return _pull_request_from_api(matches[0], repository=repo, changed_files=())
 
@@ -2065,6 +2119,7 @@ def _issue_from_api(raw: Any, *, repository: str) -> GitHubIssue:
         html_url=str(raw["html_url"]) if raw.get("html_url") else None,
         repository=repository,
         issue_id=raw.get("id") if type(raw.get("id")) is int else None,
+        author=_login(raw),
     )
 
 
@@ -2094,4 +2149,32 @@ def _pull_request_from_api(
         repository=repository,
         changed_files=changed_files,
         head_sha=head_sha,
+        author=_login(raw),
     )
+
+
+DELIVERY_MARKER = re.compile(r"<!-- aitobuild-delivery:[0-9a-f]{64} -->")
+
+
+def is_own_author(author: str | None, writer: str) -> bool:
+    """#51: a marker match is ours only when the account that wrote it is the adapter's own writer."""
+    return (isinstance(author, str) and bool(author.strip()) and isinstance(writer, str) and bool(writer.strip())
+            and author.strip().casefold() == writer.strip().casefold())
+
+
+def require_adoptable_pull(*, title: str | None, body: str | None, draft: object, author: str | None,
+                           expected_title: str, expected_body: str, writer: str) -> None:
+    """Adopt an existing task-branch PR only by its delivery marker, the exact approved title/body receipt
+    and our own writer as author. Anything else on the task branch is refused, never adopted or duplicated."""
+    # The exact body receipt implies the found PR carries the same marker as the expected body.
+    if (DELIVERY_MARKER.search(expected_body) is None or (body or "").strip() != expected_body
+            or (title or "") != expected_title or draft is not True
+            or not is_own_author(author, writer)):
+        raise PermissionError("Existing task pull request lacks this publication's marker, exact receipt or "
+                              "author; it is not adopted")
+
+
+def _login(raw: dict[str, Any]) -> str | None:
+    user = raw.get("user")
+    login = user.get("login") if isinstance(user, dict) else None
+    return login if isinstance(login, str) and login.strip() else None
