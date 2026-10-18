@@ -114,6 +114,17 @@ def test_retire_allowed_with_no_saved_head_only_when_the_branch_is_gone(
     assert retired.publication == before.publication
 
 
+def _as_prefix_correction(worker, preview_id, record, monkeypatch):
+    """Present a consistent correction-prefixed record and preview (same bundle, correction task ID)."""
+    task_id = "published-correction-x"
+    bundle = {**record.bundle_payload, "task_id": task_id}
+    preview = replace(worker.preview(preview_id), bundle_payload=bundle)
+    get = worker._previews.get
+    monkeypatch.setattr(worker._previews, "get", lambda pid: preview if pid == preview_id else get(pid))
+    monkeypatch.setattr(worker, "_load_preview_record",
+                        lambda pid: replace(record, task_id=task_id, bundle_payload=bundle))
+
+
 def _tamper_record(tmp_path: Path, change) -> None:
     path = next((tmp_path / "state" / "deliveries").glob("*/state.json"))
     raw = json.loads(path.read_text())
@@ -158,7 +169,7 @@ def test_retire_refusals_leave_the_record_and_github_untouched(
         monkeypatch.setattr(worker._previews, "get", lambda pid: None if pid == preview_id else get(pid))
         match = "own approved preview"
     elif case == "correction_task_with_reason":
-        monkeypatch.setattr(worker, "_load_preview_record", lambda pid: replace(before, task_id="published-correction-x"))
+        _as_prefix_correction(worker, preview_id, before, monkeypatch)
         monkeypatch.setattr(worker, "retire_correction", lambda *args, **kwargs: pytest.fail("must not route"))
         match = "records no reason"
     elif case in {"verified", "failed"}:
@@ -233,8 +244,7 @@ def test_correction_records_still_route_to_the_unchanged_correction_retire(
     github, worker, preview_id, _ = _stuck(
         tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch)
     seen: list[dict] = []
-    record = worker.get(preview_id)
-    monkeypatch.setattr(worker, "_load_preview_record", lambda pid: replace(record, task_id="published-correction-x"))
+    _as_prefix_correction(worker, preview_id, worker.get(preview_id), monkeypatch)
     monkeypatch.setattr(worker, "retire_correction", lambda pid, **kwargs: seen.append({"pid": pid, **kwargs}) or "c")
     assert worker.retire_delivery(preview_id, actor_id="operator", github=github, allow_mock_publication=True) == "c"
     assert seen == [{"pid": preview_id, "actor_id": "operator", "github": github, "allow_mock_publication": True}]

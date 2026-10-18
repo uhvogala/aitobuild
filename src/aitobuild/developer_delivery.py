@@ -1233,7 +1233,7 @@ class DeveloperDeliveryWorker:
         preview = self._previews.get(preview_id)
         if preview is None or preview.bundle_payload != record.bundle_payload:
             raise PermissionError("Retiring requires the record's own approved preview; it is missing or differs")
-        if is_correction_task(preview) or _is_correction_record(record):
+        if is_correction_task(preview):
             if reason is not None:
                 raise PermissionError("Correction retire records no reason; omit it")
             return self.retire_correction(preview_id, actor_id=actor_id, github=github,
