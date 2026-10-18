@@ -11,6 +11,30 @@ and supervised recovery. Earlier counts, pending work and commit status describe
 their checkpoint, not the current system. Current setup and usage belong in
 [README.md](README.md); contributor rules belong in [agents.md](agents.md).
 
+Managed worker loop containment (#69, 2026-10-19): in pilot `trial4-20261018-234433`,
+`task_admission` was automatic and `correction` was human. The completed review's
+staged correction was correctly refused by `_admit`, but `ManagedOrganizationWorker._loop`
+caught only `LockTimeout` while queueing follow-ups. The `PermissionError` therefore
+ended every loop task, and nothing logged it. The human-admitted correction then sat
+`queued` for 22 minutes. `_admit` stays the only gate. Its policy refusals (task
+admission disabled, planning or non-repository tasks, and corrections without
+`correction: automatic`) now raise `AdmissionRefused`, a `PermissionError` subclass.
+Integrity failures stay plain `PermissionError`. The loop catches exactly
+`AdmissionRefused` when it queues a follow-up: the child stays unadmitted for a human
+(`refused_follow_ups`), with no correction-specific check in the loop. Any other per-job
+error is logged once with its traceback and kept in `job_errors`. That job's receipt is
+left as it was, so the next pass retries it, and the loop keeps serving the other jobs;
+an unreadable journal pass is treated the same way. Two errors stay fail-stop, because
+the job can be neither recorded nor replayed safely: a lost worker receipt
+(`_ReceiptError`) and an error `_execute` re-raises while its run is finalizing (both
+reach the loop as `_ExecutionStop`). A loop that dies that way, or any other way, is
+logged with its traceback, appears in `errors`, and is reported by
+`ManagedOrganizationWorker.health()`: `ok`, `degraded`, `stopped` or `not_started`, with
+`workers_alive` and `workers_expected`. The worker status endpoint includes this health,
+and `GET /health` answers 503 `degraded` with counts only. The trial harness's
+`Operator.drive` fails the run immediately when a job is `queued` and no loop is alive,
+and records the stall.
+
 Run approval-policy pinning (#65, related to #41, 2026-10-18): pilot trial 4 started
 with `--automatic-stage task_admission` (policy `127e5bd9…`) and resumed without it
 (`1443ea4b…`); nothing refused the change, and the harness judged all 29 start-phase

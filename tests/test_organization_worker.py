@@ -374,8 +374,14 @@ def test_followup_queueing_preserves_approval_and_terminal_parent(tmp_path, appr
                 worker.store.save(child_job.model_copy(update={"state": "failed", "error": "Saved terminal failure"}))
             await asyncio.wait_for(discovered.wait(), timeout=5)
             if case == "invalid_child":
-                failures = await asyncio.wait_for(asyncio.gather(*worker._tasks, return_exceptions=True), timeout=5)
-                assert isinstance(failures[0], ValueError) and worker.diagnostics()["workers"] == 0
+                # #69: the follow-up error is contained and reported once; the loop keeps running.
+                async with asyncio.timeout(5):
+                    while not worker.diagnostics()["job_errors"]:
+                        await asyncio.sleep(0.01)
+                diagnostics = worker.diagnostics()
+                assert diagnostics["job_errors"] == (f"{preview_id}: ValueError: Preview not found",)
+                assert diagnostics["workers"] == 1 and diagnostics["health"]["status"] == "ok"
+                assert not diagnostics["errors"] and worker.store.get("unknown-child") is None
             elif case == "human":
                 assert worker.store.get(child.preview_id) is None and not child.approved
             else:
@@ -798,3 +804,104 @@ def test_local_cancel_lock_wait_is_bounded_and_explicit(tmp_path, approved_deliv
     with pytest.raises(Timeout):
         _cancel_under_contention(tmp_path, approved_delivery, monkeypatch, held_seconds=60)
     assert time.monotonic() - began < 10
+
+
+def test_unexpected_dispatch_error_is_contained_and_the_job_is_retried(tmp_path, approved_delivery, monkeypatch, caplog):
+    """#69: an unexpected per-job error is logged once with its traceback, the loop keeps serving other jobs, and
+    the failing job's receipt is left as it was so the next pass retries it."""
+    _, _, preview_id, _, _ = approved_delivery
+    other = other_preview(approved_delivery)
+    worker, service, _, calls = make_worker(tmp_path, approved_delivery)
+    worker.enqueue(preview_id)
+    worker.enqueue(other.preview_id)
+    original_lock = worker.store.invocation_lock
+    failures = {"left": 3}
+
+    def flaky_lock(identity):
+        if identity == preview_id and failures["left"]:
+            failures["left"] -= 1
+            raise OSError("transient lock directory failure")
+        return original_lock(identity)
+
+    monkeypatch.setattr(worker.store, "invocation_lock", flaky_lock)
+
+    async def exercise():
+        await worker.start()
+        try:
+            assert (await finish(worker, other.preview_id)).state == "completed"
+            assert (await finish(worker, preview_id)).state == "completed"
+            diagnostics = worker.diagnostics()
+            assert diagnostics["health"] == {"status": "ok", "workers_alive": 1, "workers_expected": 1}
+            assert diagnostics["job_errors"] == (f"{preview_id}: OSError: transient lock directory failure",)
+            assert not diagnostics["errors"]
+        finally:
+            await worker.close()
+
+    with caplog.at_level("ERROR", logger="aitobuild.organization_worker"):
+        asyncio.run(exercise())
+    contained = [record for record in caplog.records if "contained an error" in record.getMessage()]
+    assert len(contained) == 1 and contained[0].exc_info is not None  # logged once, with traceback
+    assert failures["left"] == 0 and calls.count("run") == 2
+
+
+def test_unreadable_journal_pass_does_not_end_the_loop(tmp_path, approved_delivery, monkeypatch):
+    _, _, preview_id, _, _ = approved_delivery
+    worker, _, _, _ = make_worker(tmp_path, approved_delivery)
+    worker.enqueue(preview_id)
+    original_list = worker.store.list
+    broken = {"left": 2}
+
+    def flaky_list():
+        if broken["left"]:
+            broken["left"] -= 1
+            raise ValueError("journal briefly unreadable")
+        return original_list()
+
+    async def exercise():
+        await worker.start()  # start reads the journal itself; the loop's own passes then hit the failure
+        monkeypatch.setattr(worker.store, "list", flaky_list)
+        try:
+            assert (await finish(worker, preview_id)).state == "completed"
+            assert broken["left"] == 0
+            assert worker.diagnostics()["job_errors"] == ("<worker journal>: ValueError: journal briefly unreadable",)
+            assert worker.health()["status"] == "ok"
+        finally:
+            await worker.close()
+
+    asyncio.run(exercise())
+
+
+def test_a_dead_loop_shows_up_in_health(tmp_path, approved_delivery, monkeypatch, caplog):
+    """#69: a lost worker receipt stays fail-stop (no safe record or replay), and the dead loop is reported."""
+    _, _, preview_id, _, _ = approved_delivery
+    worker, _, _, _ = make_worker(tmp_path, approved_delivery, max_workers=2)
+    worker.enqueue(preview_id)
+    original_save = worker.store.save
+
+    def lost_receipt(job):
+        if job.state == "completed":
+            raise OSError("Interrupted worker receipt")
+        original_save(job)
+
+    monkeypatch.setattr(worker.store, "save", lost_receipt)
+
+    async def exercise():
+        assert worker.health() == {"status": "not_started", "workers_alive": 0, "workers_expected": 0}
+        await worker.start()
+        try:
+            assert worker.health()["status"] == "ok"
+            async with asyncio.timeout(5):
+                while worker.health()["workers_alive"] == 2:
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0)
+            health = worker.health()
+            assert health["workers_expected"] == 2 and health["workers_alive"] in {0, 1}
+            assert health["status"] == ("stopped" if health["workers_alive"] == 0 else "degraded")
+            assert worker.diagnostics()["health"] == health
+            assert "Interrupted worker receipt" in worker.diagnostics()["errors"][0]
+        finally:
+            await worker.close()
+
+    with caplog.at_level("ERROR", logger="aitobuild.organization_worker"):
+        asyncio.run(exercise())
+    assert any(record.getMessage() == "Managed worker loop stopped" and record.exc_info for record in caplog.records)

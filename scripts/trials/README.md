@@ -127,6 +127,10 @@ human override in `report.policy_overrides`; the harness then records the servic
 `report.evidence` judges each phase, and each run decision, by the policy recorded for it, never by the latest
 session's policy (pilot trial 4 reported 29 start-phase decisions against the resume policy).
 
+Worker liveness (#69): while it drives a phase, the harness checks `GET /internal/organization/worker` whenever the
+job is `queued`. If no managed worker loop is alive (or the status has no health signal), the run fails at once with
+the reason and the loop errors recorded in `report.stalls`, instead of waiting out `--stage-timeout`.
+
 `resume` refuses a seed with uncommitted changes, a seed without the base branch checked out and a seed whose base
 branch diverged from origin (git's error is included). Any failure, including one before the service starts, is
 recorded in `report.json` as `result: fail` with the error and an end time.

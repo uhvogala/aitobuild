@@ -7,6 +7,7 @@ from pathlib import Path
 import asyncio
 import hmac
 import json
+import time
 import re
 from hashlib import sha256
 from typing import Any
@@ -2495,3 +2496,42 @@ def test_edited_event_alone_never_auto_admits(
     _, context = app.state.test_services[0]
     assert all(not preview.approved for preview in context.previews.list_previews(pending_only=False, limit=10))
     assert calls == []
+
+
+def test_health_reports_a_dead_managed_worker_loop(test_config, tmp_path, repository_issue_body, local_issue_repository) -> None:
+    """#69: a managed worker loop that dies is visible on /health (503, counts only) and in the worker status."""
+    source, revision = local_issue_repository
+    config = replace(test_config, developer=replace(test_config.developer, repository_sources=(
+        RepositorySourceConfig("fixture/widgets", 101, str(source)),
+    )))
+    app = _managed_app(config, tmp_path, [], detached=True)
+    headers = _internal_headers(config)
+    with TestClient(app) as client:
+        healthy = client.get("/health")
+        assert healthy.status_code == 200
+        assert healthy.json() == {"status": "ok", "managed_worker": {"status": "ok", "workers_alive": 1, "workers_expected": 1}}
+        worker = app.state.test_workers[0]
+        original_save = worker.store.save
+
+        def lost_receipt(job):
+            if job.state == "completed":
+                raise OSError("Interrupted worker receipt")
+            original_save(job)
+
+        worker.store.save = lost_receipt
+        preview = client.post("/internal/developer/preview", headers=headers, json={
+            "github_event": "issues", "action": "opened", "body": repository_issue_body,
+        }).json()
+        approved = client.post("/internal/developer/preview/approve", headers=headers, json={
+            "preview_id": preview["preview_id"], "base_revision": revision,
+        })
+        assert approved.status_code == 200, approved.text
+        deadline = time.monotonic() + 5
+        while client.get("/health").status_code == 200 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        dead = client.get("/health")
+        assert dead.status_code == 503
+        assert dead.json() == {"status": "degraded",
+                               "managed_worker": {"status": "stopped", "workers_alive": 0, "workers_expected": 1}}
+        status = client.get("/internal/organization/worker", headers=headers).json()
+        assert status["health"]["status"] == "stopped" and "Interrupted worker receipt" in status["errors"][0]

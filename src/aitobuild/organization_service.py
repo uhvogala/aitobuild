@@ -44,6 +44,15 @@ def _approved_scope_matches(preview: DeveloperPreview, run: ManagedRun) -> bool:
 
 
 
+class AdmissionRefused(PermissionError):
+    """A configured (non-human) admission was refused by policy: the task stays unadmitted and waits for a human.
+
+    Raised only by the configured-admission gate (``_admission_gate``/``_admit``) for the policy refusals, never for
+    integrity failures (those stay plain ``PermissionError``). The managed worker catches exactly this type when it
+    queues follow-ups (#69), so a refused automatic admission leaves the follow-up for a human instead of ending the
+    worker loop."""
+
+
 class Human(DefinitionModel):
     """A person approved the exact task (the HTTP approve endpoint)."""
     kind: Literal["human"] = "human"
@@ -298,14 +307,14 @@ class ManagedOrganizationService:
     def _admission_gate(self, preview: DeveloperPreview) -> bool:
         """True when a configured (non-human) admission may be evaluated at all; False leaves the task waiting."""
         if self.approval_policy.task_admission == "disabled":
-            raise PermissionError("Task admission is disabled")
+            raise AdmissionRefused("Task admission is disabled")
         if preview.approved or self.approval_policy.task_admission == "human":
             return False
         if preview.source_payload.get("action") == "edited":
             return False  # an edit never auto-admits; it waits for a human approval
         bundle = developer_task_bundle_from_payload(preview.bundle_payload)
         if bundle.task_id.startswith("pm-planning-") or bundle.issue_context is None:
-            raise PermissionError("Planning and non-repository tasks always require a human admission")
+            raise AdmissionRefused("Planning and non-repository tasks always require a human admission")
         return True
 
     @staticmethod
@@ -363,11 +372,11 @@ class ManagedOrganizationService:
         # endpoint), so these refusals cover OperatorPolicy, PlannedChild, InheritedReview and Consent alike.
         if str(preview.bundle_payload.get("task_id", "")).startswith(PLANNING_TASK_PREFIX):
             # #31: only a direct human admission admits a planning task, whichever caller reached _admit.
-            raise PermissionError("Planning tasks always require a human admission")
+            raise AdmissionRefused("Planning tasks always require a human admission")
         if is_correction_task(preview) and (isinstance(evidence, Consent) or policy.correction != "automatic"):
             # A correction is admitted automatically only under correction: automatic in this snapshot (the queued
             # native correction cycle); Consent never admits a correction in any mode (PLAN 2.4).
-            raise PermissionError("Correction tasks require a human admission unless correction is automatic")
+            raise AdmissionRefused("Correction tasks require a human admission unless correction is automatic")
         match evidence:
             case Consent():
                 return self._admit_consent(preview, evidence)
