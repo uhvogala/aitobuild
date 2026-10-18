@@ -257,6 +257,7 @@ class ManagedDeliveryBindings:
                 self.publish, action=ActionClass.REPO_WRITE, on_response=self.continue_publication,
                 approval_stage=ApprovalStage.DRAFT_PUBLICATION,
                 resume_interrupted=self.interrupted_publication,
+                adopt_after_budget_expiry=self.adopt_after_budget_expiry,
             )
         return operations
 
@@ -369,6 +370,24 @@ class ManagedDeliveryBindings:
         if head is not None and (not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None):
             return False
         return True
+
+    async def adopt_after_budget_expiry(self, context: ManagedTaskContext, original: Any) -> dict[str, Any]:
+        """#66: finish this task's interrupted publication on an expired budget by adopting its open draft PR only.
+
+        ``context`` revalidates every pin except a live deadline (runner-provided, expired ledger only). The worker
+        makes no model call, push or PR write; any mismatch or a missing PR raises, leaving ``publishing``.
+        """
+        self._check(context)
+        github = self._github
+        if github is None or not self.interrupted_publication(context, original):
+            raise PermissionError("Budget-expired adoption requires this task's own interrupted publication")
+        if context.assignment.task_id.startswith("published-correction-"):
+            raise PermissionError("Corrections require exact one-use operator publication approval")
+        record = await _delivery_call(lambda: self._worker.adopt_after_budget_expiry(
+            context.assignment.preview_id, github=github, expected_publication=original,
+            before_write=context.revalidate, allow_mock_publication=self._allow_mock,
+        ))
+        return self._record(context, record, "published")
 
     async def continue_publication(self, context: ManagedTaskContext, original: Any, approved: Any) -> dict[str, Any]:
         self._check(context)

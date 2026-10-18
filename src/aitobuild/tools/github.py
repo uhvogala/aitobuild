@@ -311,6 +311,10 @@ class GitHubAdapter(Protocol):
         before_write: Callable[[], object] | None = None,
     ) -> str: ...
 
+    def find_adoptable_draft_pull_request(
+        self, *, repository: str, title: str, body: str, head_branch: str, base_ref: str,
+    ) -> GitHubPullRequest | None: ...
+
     def create_or_update_draft_pull_request(
         self,
         *,
@@ -812,6 +816,26 @@ class MockGitHubAdapter:
             else:
                 expected[path] = (change.mode, change.blob_sha)
         return tree(commit_sha) == expected
+
+    def find_adoptable_draft_pull_request(
+        self, *, repository: str, title: str, body: str, head_branch: str, base_ref: str,
+    ) -> GitHubPullRequest | None:
+        """Read-only (#66): the one open task-branch PR, only if #51 adoption accepts it; None if none exists."""
+        repo = self._resolve_repository(repository)
+        cleaned_head = _validate_aitobuild_branch_name(head_branch, field_name="head_branch")
+        cleaned_base = base_ref.strip()
+        _validate_base_ref_name(cleaned_base, head_branch=cleaned_head)
+        matches = [pull for pull in self.pull_requests.get(repo, {}).values()
+                   if pull.head_ref == cleaned_head and pull.base_ref == cleaned_base]
+        open_matches = [pull for pull in matches if pull.state == "open"]
+        if matches and len(open_matches) != 1:
+            raise PermissionError("Existing task pull request must be one open draft; it is not adopted")
+        if not open_matches:
+            return None
+        found = open_matches[0]
+        require_adoptable_pull(title=found.title, body=found.body, draft=found.draft, author=found.author,
+                               expected_title=title.strip(), expected_body=body.strip(), writer=self.writer_login())
+        return found
 
     def create_or_update_draft_pull_request(
         self,
@@ -1702,6 +1726,38 @@ class GhCliGitHubAdapter:
             raise ValueError("Correction target pull request head must live in the base repository")
         _validate_advance_target(pull, pull_number=pull_number, head_branch=head_branch, base_ref=base_ref)
         return pull
+
+    def find_adoptable_draft_pull_request(
+        self, *, repository: str, title: str, body: str, head_branch: str, base_ref: str,
+    ) -> GitHubPullRequest | None:
+        """Read-only (#66): the one open task-branch PR, only if #51 adoption accepts it; None if none exists.
+
+        Same selection as the #51 adoption in ``create_or_update_draft_pull_request``: exactly one open PR on
+        the task branch and base, else refused.
+        """
+        repo = self._resolve_repository(repository)
+        cleaned_head = _validate_aitobuild_branch_name(head_branch, field_name="head_branch")
+        cleaned_base = base_ref.strip()
+        _validate_base_ref_name(cleaned_base, head_branch=cleaned_head)
+        query = urlencode({"state": "all", "head": f"{repo.split('/')[0]}:{cleaned_head}",
+                           "base": cleaned_base, "per_page": 100})
+        raw_matches = self._api(f"repos/{repo}/pulls?{query}")
+        if not isinstance(raw_matches, list):
+            raise RuntimeError("Unexpected GitHub pull request list response")
+        matches = [raw for raw in raw_matches if isinstance(raw, dict)
+                   and raw.get("head", {}).get("ref") == cleaned_head
+                   and raw.get("head", {}).get("repo", {}).get("full_name", "").lower() == repo
+                   and raw.get("base", {}).get("ref") == cleaned_base]
+        open_matches = [raw for raw in matches if raw.get("state") == "open"]
+        if matches and len(open_matches) != 1:
+            raise PermissionError("Existing task pull request must be one open draft; it is not adopted")
+        if not open_matches:
+            return None
+        found = open_matches[0]
+        require_adoptable_pull(title=found.get("title"), body=found.get("body"), draft=found.get("draft"),
+                               author=(found.get("user") or {}).get("login"),
+                               expected_title=title.strip(), expected_body=body.strip(), writer=self.writer_login())
+        return _pull_request_from_api(found, repository=repo, changed_files=())
 
     def create_or_update_draft_pull_request(
         self,

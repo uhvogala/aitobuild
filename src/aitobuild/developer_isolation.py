@@ -113,6 +113,19 @@ class DeveloperTaskBudget:
             raise BudgetDeadlineExpired("Approved task runtime budget has expired; a new approved task is required")
         return remaining
 
+    def expired_deadline(self) -> float:
+        """The absolute deadline of an expired, unaborted, matching ledger (#66).
+
+        Used only by the budget-expired adoption of an interrupted publication's already-open PR. It never
+        extends or resets the ledger, and raises ``ValueError`` while the budget is still live, so the normal
+        budgeted path cannot be skipped with it.
+        """
+        with self._lock:
+            deadline = float(self._load()["deadline"])
+        if deadline > time():
+            raise ValueError("Task budget has not expired; the live budgeted path applies")
+        return deadline
+
     def abort(self) -> None:
         with self._lock:
             state = self._load(allow_aborted=True)
