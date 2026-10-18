@@ -216,8 +216,11 @@ appends an immutable `policy_overrides` entry with the actor, old and new revisi
 reason, time and the decision index it applies from. Decisions after it are made
 under the new policy; `ManagedRun.policy_phases()` shows which policy governed
 which decisions. A run saved before pinning has no revision and fails closed until
-a human override pins it. With the detached worker, a refused job waits (it is not
-aborted) and the override endpoint requeues it. Automatic input
+a human override pins it. Correction publication checks the correction run's pinned
+policy by the same rule (and refuses a correction without a managed run); a finished
+run accepts an override for that purpose and is still never resumed. With the
+detached worker, a refused job waits with `refusal: approval_policy_changed` (it is
+not aborted) and the override endpoint requeues it. Automatic input
 other than Boolean approval requires an explicit trusted exact response callback.
 
 App startup emits one safety warning listing every automatic approval surface and

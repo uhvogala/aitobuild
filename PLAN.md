@@ -27,9 +27,18 @@ refused) and the runner appends an immutable `ApprovalPolicyOverride`
 decisions resolve under it, and `policy_phases()`/`policy_revision_for_decision()`
 give the history. Records without a pinned revision fail closed (the old
 `or ApprovalPolicy().revision` fallback is gone, per ReviewBot's review criteria)
-and need an override, which records `previous_revision: null`. The detached worker
-keeps a policy-refused job `waiting` without aborting its budget, and the override
-endpoint requeues it. The pilot harness pins the session policy, refuses a resume
+and need an override, which records `previous_revision: null`. Correction
+publication applies the same rule (`ManagedWorkflowRunner.require_pinned_policy`) to
+the correction's managed run, so an unpinned or re-policied run is refused there too
+until a human override is recorded; a terminal run takes an appended override (its
+only permitted change) for exactly this, and is still never resumed. A correction
+with no managed run is refused rather than allowed: corrections are admitted only
+through the managed correction route (`_route` refuses them without the review
+binding) and verified only by that run's `delivery_verify`, so a missing run is not
+a legitimate publication and allowing it would skip the policy check. The detached
+worker keeps a policy-refused job `waiting` without aborting its budget, marked by
+the structured `refusal: approval_policy_changed` (not by its error text), and the
+override endpoint requeues only such a job. The pilot harness pins the session policy, refuses a resume
 whose flags change it unless `--policy-override-actor/--policy-override-reason`
 record a human override, and judges each phase and run decision by the policy
 recorded for it. This changes the approval model and needs Vertti's okay before merge.

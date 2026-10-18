@@ -485,7 +485,7 @@ def test_publication_stages_unapproved_head_pinned_review_once(tmp_path, publish
                                      "correction_native", "correction_native_automatic", "correction_native_queued", "correction_native_recovered", "correction_native_rejected",
                                      "correction_native_outside", "correction_native_verification_failure", "correction_native_head_drift",
                                      "correction_native_followup_retry", "correction_native_two_rounds", "correction_native_publish_bypass", "correction_limit_zero",
-                                     "correction_missing_delivery"])
+                                     "correction_missing_delivery", "correction_native_unpinned", "correction_native_unpinned_override"])
 def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, published_delivery, detached, outcome, monkeypatch, test_config, verification_adapter):
     from aitobuild.organization_reviews import PublishedReviewAdmission, PublishedReviewRoute
     from aitobuild.organization_service import ManagedOrganizationService
@@ -1053,6 +1053,30 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                             await service().publish_correction(correction.preview_id, approval_digest="0" * 64,
                                                                github=github, allow_mock_publication=True)
                         assert worker._approvals.get(correction.preview_id).state == "pending"
+                        if outcome.startswith("correction_native_unpinned"):
+                            # #65: a correction run saved before pinning has no policy revision; publishing it fails
+                            # closed through the runner's one rule until a human override is recorded on the run.
+                            from hashlib import sha256
+
+                            from aitobuild.organization_runner import ApprovalPolicyChanged
+                            from aitobuild.organization_service import Human
+
+                            run_path = tmp_path / "review-runs" / sha256(completed.assignment_id.encode()).hexdigest() / "run.json"
+                            document = json.loads(run_path.read_text())
+                            document.pop("approval_policy_revision")
+                            run_path.write_text(json.dumps(document))
+                            commits = len(github.branch_commits)
+                            with pytest.raises(ApprovalPolicyChanged, match="none recorded"):
+                                await service().publish_correction(correction.preview_id, approval_digest=staged["digest"],
+                                                                   github=github, allow_mock_publication=True)
+                            assert len(github.branch_commits) == commits and worker.get(correction.preview_id).state == "verified"
+                            assert worker._approvals.get(correction.preview_id).state == "pending"
+                            if outcome == "correction_native_unpinned":
+                                return
+                            completed = await service().override_approval_policy(
+                                completed.assignment_id, evidence=Human(), reason="correction run predates policy pinning")
+                            assert completed.state == "completed" and completed.policy_overrides[0].previous_revision is None
+                            assert completed.policy_overrides[0].revision == policy.revision
                         if outcome == "correction_native_head_drift":
                             with pytest.raises(ValueError, match="head moved"):
                                 await service().publish_correction(correction.preview_id, approval_digest=staged["digest"],

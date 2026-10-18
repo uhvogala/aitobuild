@@ -585,9 +585,14 @@ class ManagedOrganizationService:
         if saved is None:
             raise PermissionError("Correction requires an exact staged publication approval")
         run = self.status(correction_preview_id)
+        if run is None:
+            # #65: a correction is admitted and verified only through its managed run (PLAN), so a missing run is
+            # never a legitimate publication; refusing keeps the pinned-policy rule from being skipped.
+            raise PermissionError("Correction publication requires its managed correction run")
+        pinned = self._runner.require_pinned_policy(run)  # the one #65 rule; refuses an unpinned run
         decision = self.approval_policy.resolve(ApprovalStage.CORRECTION, actor_id=self.operator_id,
             operation=publish_policy_operation(approval_digest, saved.snapshot),
-            expected_revision=run.pinned_policy_revision if run is not None else None,
+            expected_revision=pinned,
             automatic_supported=self._correction_github is not None, source=_policy_source)
         if saved.approval_policy is not None and saved.state in {"consuming", "consumed"}:
             if saved.approval_policy.policy_revision != decision.policy_revision:

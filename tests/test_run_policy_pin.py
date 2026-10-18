@@ -179,9 +179,40 @@ def test_override_needs_a_reason_a_change_and_an_open_run(tmp_path):
     changed = restarted(tmp_path, calls, CHANGED)
     with pytest.raises(ValueError, match="reason"):
         asyncio.run(changed.override_policy(assignment.assignment_id, evidence_kind="human", reason="  "))
-    asyncio.run(same.cancel(assignment.assignment_id))
-    with pytest.raises(ValueError, match="finished"):
+    cancelled = asyncio.run(same.cancel(assignment.assignment_id))
+    # A terminal run is never resumed, but an override may be appended for decisions made on it afterwards
+    # (correction publication); nothing else on the receipt changes.
+    overridden = asyncio.run(changed.override_policy(assignment.assignment_id, evidence_kind="human", reason="r"))
+    assert overridden.state == "cancelled" and len(overridden.policy_overrides) == 1
+    assert overridden.model_dump(exclude={"policy_overrides", "updated_at"}) == cancelled.model_dump(
+        exclude={"policy_overrides", "updated_at"})
+    with pytest.raises(ValueError, match="Terminal managed receipts are immutable"):
+        FileRunStore(tmp_path / "runs").save(overridden.model_copy(update={"error": "rewritten"}))
+
+
+def test_finalizing_run_takes_no_override(tmp_path):
+    calls = []
+    assignment, waiting = waiting_run(tmp_path, calls)
+    finalizing = ManagedRun.model_validate(waiting.model_dump() | {
+        "state": "finalizing", "terminal_state": "cancelled", "pending": (), "cleanup_succeeded": True})
+    FileRunStore(tmp_path / "runs").save(finalizing)
+    changed = restarted(tmp_path, calls, CHANGED)
+    with pytest.raises(ValueError, match="finalizing"):
         asyncio.run(changed.override_policy(assignment.assignment_id, evidence_kind="human", reason="r"))
+
+
+def test_correction_publication_without_a_managed_run_is_refused(monkeypatch):
+    from types import SimpleNamespace
+
+    service = object.__new__(ManagedOrganizationService)
+    service._reviews = SimpleNamespace(correction_publication_binding=lambda preview_id: "b" * 64)
+    service._worker = SimpleNamespace(publication_approval=lambda preview_id: SimpleNamespace(state="approved"))
+    pushed = []
+    service._worker.approve_and_publish_correction = lambda *args, **kwargs: pushed.append(kwargs)
+    monkeypatch.setattr(service, "status", lambda preview_id: None, raising=False)
+    with pytest.raises(PermissionError, match="managed correction run"):
+        asyncio.run(service.publish_correction("correction-x", approval_digest="a" * 64, github=None))
+    assert pushed == []
 
 
 def test_overrides_are_append_only_and_must_chain(tmp_path):
@@ -293,13 +324,15 @@ def test_worker_keeps_a_policy_refused_run_and_requeues_it_after_a_human_overrid
             refused = await finish(second, preview_id)
             await asyncio.sleep(0.2)  # let the worker loop leave the job's invocation lock
             assert refused.state == "waiting" and START.revision in refused.error and CHANGED.revision in refused.error
+            assert refused.refusal == "approval_policy_changed"  # structured, not read back from the error text
             kept = changed.recorded_run(refused.task_id)
             assert kept == run and calls == ["initial"]
             assert delivery.budget_path(preview_id).read_bytes() == budget  # not aborted
             with pytest.raises(PermissionError, match="overridden"):
                 second.requeue_after_policy_override(preview_id)
             await changed.override_approval_policy(run.assignment_id, evidence=Human(), reason="tools now automatic")
-            assert second.requeue_after_policy_override(preview_id).state == "queued"
+            requeued = second.requeue_after_policy_override(preview_id)
+            assert requeued.state == "queued" and requeued.refusal is None and requeued.error is None
             done = await finish(second, preview_id)
             assert done.state == "completed", done.error
         finally:
@@ -361,3 +394,28 @@ def test_http_override_records_human_evidence_then_resume_continues(
     done = client.post("/internal/organization/tasks/approve", headers=headers, json=decision)
     assert done.status_code == 200 and done.json()["managed_run"]["state"] == "completed", done.text
     assert calls == ["initial", ("effect", True), "cleanup"]
+
+
+def test_requeue_reads_the_structured_refusal_not_the_error_text(tmp_path, approved_delivery):
+    from test_organization_worker import finish, make_worker
+
+    _, _, preview_id, _, _ = approved_delivery
+    calls: list = []
+
+    async def exercise():
+        first, service, _, _ = make_worker(tmp_path, approved_delivery, gated(calls))
+        first.enqueue(preview_id)
+        await first.start()
+        try:
+            waiting = await finish(first, preview_id)
+        finally:
+            await first.close()
+        assert waiting.state == "waiting" and waiting.refusal is None
+        # A waiting job whose error merely reads like a policy refusal is not requeued.
+        mimic = waiting.model_copy(update={"error": "Approval policy changed for run-x: pinned a, current b."})
+        first.store.save(mimic)
+        assert first.requeue_after_policy_override(preview_id) is None
+        with pytest.raises(ValueError, match="only on a waiting job"):
+            mimic.model_validate(mimic.model_dump() | {"state": "queued", "refusal": "approval_policy_changed"})
+
+    asyncio.run(exercise())

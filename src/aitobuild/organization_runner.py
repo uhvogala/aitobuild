@@ -103,16 +103,13 @@ class ApprovalPolicyOverride(DefinitionModel):
         return self
 
 
-POLICY_REFUSAL_PREFIX = "Approval policy changed for "
-
-
 class ApprovalPolicyChanged(PermissionError):
     """#65: the run's pinned approval policy differs from the live one and no human override covers the change."""
 
     def __init__(self, run_id: str, pinned: str | None, current: str) -> None:
         self.pinned, self.current = pinned, current
         recorded = pinned if pinned is not None else "none recorded (run predates policy pinning)"
-        super().__init__(f"{POLICY_REFUSAL_PREFIX}{run_id}: pinned {recorded}, current {current}. "
+        super().__init__(f"Approval policy changed for {run_id}: pinned {recorded}, current {current}. "
                          "Resuming is refused unless a human records an approval policy override.")
 
 
@@ -270,7 +267,9 @@ class FileRunStore:
                 if (original.adopted_after_budget_expiry is not None
                         and original.adopted_after_budget_expiry != run.adopted_after_budget_expiry):
                     raise ValueError("Budget-expired adoption receipts are immutable")
-                if original.state in TERMINAL and original != run:
+                if original.state in TERMINAL and original.model_dump(exclude={"policy_overrides", "updated_at"}) != \
+                        run.model_dump(exclude={"policy_overrides", "updated_at"}):
+                    # #65: the only change a terminal receipt takes is an appended human policy override.
                     raise ValueError("Terminal managed receipts are immutable")
                 transitions = {
                     "ready": {"ready", "running", "finalizing"},
@@ -539,7 +538,7 @@ class ManagedWorkflowRunner:
             raise ValueError("Pinned organization revision not found")
 
         def revalidate() -> TaskAssignment:
-            self._require_pinned_policy(run)
+            self.require_pinned_policy(run)
             if expired_deadline is None:
                 current = self._service.revalidate(assignment.assignment_id)
             else:
@@ -593,7 +592,7 @@ class ManagedWorkflowRunner:
             return self._finalize(run)
         # #65: refuse before any work (model call, push, adoption) and leave the run as it is, so a human override
         # can still resume it; the old behaviour failed the run on this mismatch inside revalidate.
-        self._require_pinned_policy(run)
+        self.require_pinned_policy(run)
         context = self._context(run, assignment)
         try:
             if run.binding_revision != self._binding_revision:
@@ -715,7 +714,7 @@ class ManagedWorkflowRunner:
         return self.approval_policy.resolve(
             stage, actor_id=self._actor().actor_id,
             operation={"request": request.model_dump(mode="json"), "response": value},
-            expected_revision=self._require_pinned_policy(context.run),
+            expected_revision=self.require_pinned_policy(context.run),
             automatic_supported=True, source=source,
         )
 
@@ -791,7 +790,7 @@ class ManagedWorkflowRunner:
                 raise ValueError("Managed run not found")
             self._authorize(assignment)
             if run.state not in TERMINAL | {"finalizing"}:
-                self._require_pinned_policy(run)  # #65: before any decision is recorded or work starts
+                self.require_pinned_policy(run)  # #65: before any decision is recorded or work starts
             if run.state == "running":
                 return await self._existing(run, assignment)
             if run.state != "waiting":
@@ -808,9 +807,10 @@ class ManagedWorkflowRunner:
                                      policy_decisions={request_id: decision} if decision is not None else None)
             return await self._advance_automatic(run, assignment)
 
-    def _require_pinned_policy(self, run: ManagedRun) -> str:
-        """#65: the live approval policy must be the run's pinned one (start revision or latest human override).
-        A run without a pinned revision (saved before pinning) fails closed: only a human override resumes it."""
+    def require_pinned_policy(self, run: ManagedRun) -> str:
+        """#65, the one rule: the live approval policy must be the run's pinned one (start revision or latest human
+        override), for resuming the run and for anything decided on it afterwards (correction publication). A run
+        without a pinned revision (saved before pinning) fails closed: only a human override lets it on."""
         pinned, current = run.pinned_policy_revision, self.approval_policy.revision
         if pinned is None or pinned != current:
             raise ApprovalPolicyChanged(run.run_id, pinned, current)
@@ -831,8 +831,10 @@ class ManagedWorkflowRunner:
             if assignment is None or run is None:
                 raise ValueError("Managed run not found")
             self._authorize(assignment)
-            if run.state in TERMINAL | {"finalizing"}:
-                raise ValueError("A finished managed run cannot be resumed; no override applies")
+            if run.state == "finalizing":
+                raise ValueError("A finalizing managed run takes no approval policy override")
+            # A terminal run is never resumed, but decisions on it still follow its pinned policy (correction
+            # publication after a completed correction run), so an override may be appended to its receipt.
             current = self.approval_policy.revision
             if run.pinned_policy_revision == current:
                 raise PolicyAlreadyPinned("Managed run already runs under the current approval policy; nothing to override")
