@@ -1054,7 +1054,8 @@ compatible alias for corrections, which take no reason and keep the rule above u
 preview and the full rule (`is_correction_task(preview)`, so an `ISSUE-*` task with a
 `correction_from_review` source is a correction); a missing preview is refused. Each delivery record stores
 that verdict as `correction` when it is created, so a restarted worker loads and classifies it the same way;
-it must match the approved preview whenever that is present, and an older record without it needs its preview. For a
+a present approved preview must have the record's exact bundle (a differing one is refused) and agree with it; only a
+missing preview falls back to the stored verdict, and an older record without it needs its preview. For a
 non-correction it retires only a record stuck at `publishing` (#61): no PR number, URL or PR head recorded, the base branch readable and the live task branch
 (read-only `branch_head`) gone (gh status 404) or not at the saved head; with no saved head an existing branch
 is refused because it may hold an unrecorded push. The delivery implementation lock and the managed

@@ -23,9 +23,10 @@ as its alias); a missing or differing preview is refused, never routed as a non-
 rule is split: `is_correction_task_id(task_id)` is the prefix check only, used inside the full
 rule and nowhere a preview or record is reachable. A delivery record now stores the full rule's
 verdict (`correction`) when it is created from its approved preview, so `_load` and every worker
-check classify it the same way after a restart; if the preview is present it must agree, a pre-#61
-record with no verdict needs its preview (otherwise it fails closed), and a stored `false` never
-undercuts a correction task ID. It
+check (including the correction-records scan) classify it the same way after a restart; a present
+preview must carry the record's exact bundle (a differing one is refused) and agree, only a missing
+preview falls back to the stored verdict, a pre-#61 record with no verdict then fails closed, and a
+stored `false` never undercuts a correction task ID. It
 retires any other record only when it is `publishing`, carries no PR number/URL/PR head, the base branch is
 readable, and the read-only live `branch_head` is gone (404) or not the saved head (an existing
 branch with no saved head is refused). The delivery implementation lock and the managed run's

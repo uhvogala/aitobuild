@@ -142,18 +142,22 @@ class DeveloperDeliveryWorker:
 
         The rule's verdict is stored on the record when it is created from its approved preview (`correction`),
         so a restarted worker classifies it the same way without the registry. When the record's own approved
-        preview (same id, same bundle) is present it is re-evaluated and must agree with the stored verdict. A
-        record without a stored verdict (pre-#61) needs that preview; with neither, classification fails closed.
-        A stored False can never undercut a correction task ID."""
+        preview is present it must carry the record's exact bundle (a differing preview is refused, never a reason
+        to fall back) and is re-evaluated; it must agree with the stored verdict. Only a missing preview falls
+        back to the stored verdict; a record without one (pre-#61) then fails closed. A stored False can never
+        undercut a correction task ID."""
         preview = self._previews.get(record.preview_id)
-        if preview is not None and preview.bundle_payload == record.bundle_payload:
+        if preview is not None:
+            if preview.bundle_payload != record.bundle_payload:
+                raise ValueError("Delivery record's approved preview differs from the record; correction "
+                                 "classification fails closed")
             full = is_correction_task(preview)
             if record.correction is not None and record.correction != full:
                 raise ValueError("Delivery record's stored correction classification differs from its approved preview")
             return full
         if record.correction is None:
             raise ValueError("Delivery record has no stored correction classification and its approved preview is "
-                             "missing or differs; correction classification fails closed")
+                             "missing; correction classification fails closed")
         if not record.correction and is_correction_task_id(record.task_id):
             raise ValueError("Delivery record's stored correction classification contradicts its correction task ID")
         return record.correction
@@ -800,17 +804,13 @@ class DeveloperDeliveryWorker:
                 raise PermissionError("An unreadable delivery record blocks correction checks; they fail closed") from error
             if not relevant(raw):
                 continue
-            preview_id = raw.get("preview_id")
-            preview = self._previews.get(preview_id) if isinstance(preview_id, str) and preview_id else None
-            if preview is None or preview.bundle_payload != raw.get("bundle_payload"):
-                raise PermissionError("A related delivery record without its approved preview cannot be classified; "
-                                      "correction checks fail closed")
-            if not is_correction_task(preview):
-                continue
+            # Classified exactly as `_load` does (`is_correction_record`): the approved preview when present (a
+            # differing one is refused), else the stored verdict, so it holds after a restart with an empty registry.
             try:
                 record = self._load(state.parent)
             except ValueError as error:
-                raise PermissionError("A related correction record failed validation; correction checks fail closed") from error
+                raise PermissionError("A related delivery record failed validation or classification; correction "
+                                      "checks fail closed") from error
             if record is not None and self.is_correction_record(record):
                 records.append(record)
         return records

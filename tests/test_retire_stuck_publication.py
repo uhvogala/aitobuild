@@ -212,7 +212,7 @@ def test_retire_refusals_leave_the_record_and_github_untouched(
         fake = replace(preview, bundle_payload={**preview.bundle_payload, "objective": "edited"})
         get = worker._previews.get
         monkeypatch.setattr(worker._previews, "get", lambda pid: fake if pid == preview_id else get(pid))
-        match = "own approved preview"
+        match = "failed validation"  # a present-but-differing preview is refused at load, never a fallback
     elif case == "malformed_live_head":
         github._branch_heads[REPO][before.branch] = "not-a-sha"
         match = "Live task branch head is malformed"
@@ -560,8 +560,11 @@ def test_record_classification_uses_the_preview_then_the_stored_verdict_and_fail
     assert worker.is_correction_record(legacy) is False  # pre-#61 record: classified by its approved preview
     with pytest.raises(ValueError, match="no stored correction classification"):
         blind.is_correction_record(legacy)
-    with pytest.raises(ValueError, match="no stored correction classification"):  # a differing preview is no preview
-        worker.is_correction_record(replace(legacy, bundle_payload={**legacy.bundle_payload, "objective": "x"}))
+    # A present preview whose bundle differs is refused for every stored verdict; it never falls back.
+    for verdict in (None, False, True):
+        with pytest.raises(ValueError, match="approved preview differs from the record"):
+            worker.is_correction_record(replace(before, correction=verdict,
+                                                bundle_payload={**before.bundle_payload, "objective": "x"}))
     assert blind.is_correction_record(before) is False
     assert blind.is_correction_record(replace(before, correction=True)) is True
     with pytest.raises(ValueError, match="contradicts its correction task ID"):

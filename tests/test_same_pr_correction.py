@@ -890,3 +890,60 @@ def test_issue_correction_retires_and_reloads_as_a_correction_after_restart(corr
     state.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="differs from its approved preview"):
         _restarted(worker, DeveloperPreviewRegistry(path)).get(correction)
+
+
+@pytest.mark.parametrize("side", ["record_bundle", "preview_bundle"])
+def test_issue_correction_with_a_false_verdict_and_a_differing_preview_fails_at_load(correction_chain, monkeypatch, side):
+    """A present preview whose bundle differs from the record is refused; only a missing preview may fall back to
+    the stored verdict (here a forged `false` on an ISSUE-* correction, which the prefix backstop cannot see)."""
+    from aitobuild.developer_preview import DeveloperPreviewRegistry
+
+    worker, _, _, _, make = correction_chain
+    correction = make(task_id="ISSUE-9062")
+    path = worker._previews._path
+    state = worker._task_dir(correction) / "state.json"
+    raw = json.loads(state.read_text())
+    raw["record"]["correction"] = False
+    if side == "record_bundle":
+        raw["record"]["bundle_payload"]["objective"] += " (edited)"
+    state.write_text(json.dumps(raw))
+    fresh = _restarted(worker, DeveloperPreviewRegistry(path))
+    if side == "preview_bundle":
+        preview = fresh.preview(correction)
+        fake = replace(preview, bundle_payload={**preview.bundle_payload, "objective": "edited"})
+        get = fresh._previews.get
+        monkeypatch.setattr(fresh._previews, "get", lambda pid: fake if pid == correction else get(pid))
+    with pytest.raises(ValueError, match="approved preview differs from the record"):
+        fresh.get(correction)
+    with pytest.raises(PermissionError, match="failed validation"):
+        fresh.retire_delivery(correction, actor_id="operator", github=None, allow_mock_publication=True)
+
+
+def test_correction_scan_classifies_like_load_after_a_restart_with_an_empty_registry(correction_chain, monkeypatch):
+    """`_correction_records` loads each related record and uses `is_correction_record`, so the sibling and
+    supersession checks still see an ISSUE-* correction when the registry is empty (stored verdict), and refuse a
+    present-but-differing preview."""
+    from aitobuild.developer_preview import DeveloperPreviewRegistry
+
+    worker, published_id, github, head, make = correction_chain
+    first = make(task_id="ISSUE-9063")
+    worker.stage_correction_publication(first, review_receipt_digest=RECEIPT)
+    second = make("review-two", "def probe():\n    return 3\n")
+    assert worker.competing_corrections(second, repository="fixture/widgets", parent_head_sha=head) == [first]
+    blind = _restarted(worker, DeveloperPreviewRegistry())
+    assert blind.competing_corrections(second, repository="fixture/widgets", parent_head_sha=head) == [first]
+    staged = worker.stage_correction_publication(first, review_receipt_digest=RECEIPT)
+    assert _publish(worker, github, first, staged["digest"]).state == "published"
+    blind = _restarted(worker, DeveloperPreviewRegistry())
+    assert blind.superseded_by(published_id) == first
+    assert blind.competing_corrections(second, repository="fixture/widgets", parent_head_sha=head) == [first]
+    # A present preview with a different bundle blocks the scan instead of falling back to the stored verdict.
+    fresh = _restarted(worker, DeveloperPreviewRegistry(worker._previews._path))
+    preview = fresh.preview(first)
+    fake = replace(preview, bundle_payload={**preview.bundle_payload, "objective": "edited"})
+    get = fresh._previews.get
+    monkeypatch.setattr(fresh._previews, "get", lambda pid: fake if pid == first else get(pid))
+    with pytest.raises(PermissionError, match="failed validation or classification"):
+        fresh.superseded_by(published_id)
+    with pytest.raises(PermissionError, match="failed validation or classification"):
+        fresh.competing_corrections(second, repository="fixture/widgets", parent_head_sha=head)

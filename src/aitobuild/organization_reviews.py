@@ -219,7 +219,10 @@ class PublishedReviewAdmission:
         atomic_write_text(self._path, journal.model_dump_json())
 
     def _publication(self, preview_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        record = self._worker.get(preview_id)
+        try:
+            record = self._worker.get(preview_id)
+        except ValueError as error:  # load validation or correction classification failed; fail closed
+            raise PermissionError("Published review target failed validation") from error
         if record is None or record.state != "published" or record.publication is None:
             raise PermissionError("Review staging requires a saved published delivery")
         pull = self._worker.get_published_pull_request(preview_id, github=self._github)
