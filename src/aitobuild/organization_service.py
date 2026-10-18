@@ -587,7 +587,7 @@ class ManagedOrganizationService:
         run = self.status(correction_preview_id)
         decision = self.approval_policy.resolve(ApprovalStage.CORRECTION, actor_id=self.operator_id,
             operation=publish_policy_operation(approval_digest, saved.snapshot),
-            expected_revision=run.approval_policy_revision if run is not None else None,
+            expected_revision=run.pinned_policy_revision if run is not None else None,
             automatic_supported=self._correction_github is not None, source=_policy_source)
         if saved.approval_policy is not None and saved.state in {"consuming", "consumed"}:
             if saved.approval_policy.policy_revision != decision.policy_revision:
@@ -869,6 +869,26 @@ class ManagedOrganizationService:
         try:
             run = await self._runner.resume(assignment_id, request_id=request_id, response=response)
             return await self._follow_up(assignment.preview_id, run)
+        finally:
+            self._actor.reset(token)
+
+    async def override_approval_policy(self, assignment_id: str, *, evidence: AdmissionEvidence, reason: str) -> ManagedRun:
+        """#65: a human lets this run continue under the live approval policy instead of its pinned one.
+
+        The evidence is the same admission evidence the one admission route takes; only `Human` (the authenticated
+        operator endpoint, as for task approval) can override. The runner records the entry and starts no work."""
+        match evidence:
+            case Human():
+                if evidence.base_revision is not None:
+                    raise ValueError("A policy override carries no task base revision")
+            case OperatorPolicy() | PlannedChild() | InheritedReview() | Consent():
+                raise PermissionError(f"Approval policy override requires human evidence, not {evidence.kind}")
+            case _:
+                assert_never(evidence)
+        self._assignment(assignment_id)
+        token = self._actor.set(self._operator)
+        try:
+            return await self._runner.override_policy(assignment_id, evidence_kind=evidence.kind, reason=reason)
         finally:
             self._actor.reset(token)
 

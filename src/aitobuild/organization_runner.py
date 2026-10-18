@@ -19,11 +19,12 @@ from agent_framework import (
 )
 from filelock import FileLock
 from openai import APIError
-from pydantic import AwareDatetime, Field, JsonValue, StrictBool, StrictStr, TypeAdapter, model_validator
+from pydantic import AwareDatetime, Field, JsonValue, StrictBool, StrictInt, StrictStr, TypeAdapter, model_validator
 
 from aitobuild.durable_files import atomic_write_text, sync_directory
 from aitobuild.approval_policy import ApprovalDecision, ApprovalPolicy, ApprovalStage
 from aitobuild.developer_isolation import BudgetDeadlineExpired, DeveloperTaskBudget
+from aitobuild.developer_preview import AdmissionEvidenceKind
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, Identifier
 from aitobuild.organization_assignments import (
     AssignmentProposal, AssignmentService, AssignmentStore, Digest, TaskAssignment,
@@ -76,6 +77,49 @@ class ExpiredBudgetAdoption(DefinitionModel):
     adopted_at: AwareDatetime
 
 
+class ApprovalPolicyOverride(DefinitionModel):
+    """#65: one human decision to continue a run under a different approval policy than the one it was pinned to.
+
+    It reuses the admission evidence record (`evidence_kind`, the same field `admit_task` stores on a preview), and
+    only the human kind is valid: an override from operator policy, a planned child, an inherited review or consent
+    cannot be stored. Entries are append-only; the run's pinned policy is the latest entry's `revision`, and every
+    decision from `after_decisions` onwards was made under it."""
+    evidence_kind: AdmissionEvidenceKind
+    actor_id: StrictStr = Field(min_length=1)
+    previous_revision: Digest | None
+    revision: Digest
+    reason: StrictStr = Field(min_length=1, max_length=2000)
+    after_decisions: StrictInt = Field(ge=0)
+    at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_override(self) -> Self:
+        if self.evidence_kind != "human":
+            raise ValueError("An approval policy override requires human evidence")
+        if not self.actor_id.strip() or not self.reason.strip():
+            raise ValueError("An approval policy override requires its human actor and a reason")
+        if self.previous_revision == self.revision:
+            raise ValueError("An approval policy override must change the pinned policy")
+        return self
+
+
+POLICY_REFUSAL_PREFIX = "Approval policy changed for "
+
+
+class ApprovalPolicyChanged(PermissionError):
+    """#65: the run's pinned approval policy differs from the live one and no human override covers the change."""
+
+    def __init__(self, run_id: str, pinned: str | None, current: str) -> None:
+        self.pinned, self.current = pinned, current
+        recorded = pinned if pinned is not None else "none recorded (run predates policy pinning)"
+        super().__init__(f"{POLICY_REFUSAL_PREFIX}{run_id}: pinned {recorded}, current {current}. "
+                         "Resuming is refused unless a human records an approval policy override.")
+
+
+class PolicyAlreadyPinned(ValueError):
+    """#65: the run already runs under the live approval policy, so there is nothing to override."""
+
+
 def workflow_input_digest(data: Any) -> str:
     return sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
@@ -107,9 +151,39 @@ class ManagedRun(DefinitionModel):
     # #66: set only when an interrupted publication was finished by budget-expired PR adoption. Older run
     # receipts have no such field and load as None.
     adopted_after_budget_expiry: ExpiredBudgetAdoption | None = None
+    # #65: human overrides of the pinned approval policy, oldest first (append-only).
+    policy_overrides: tuple[ApprovalPolicyOverride, ...] = ()
+
+    @property
+    def pinned_policy_revision(self) -> str | None:
+        """The approval policy revision this run currently runs under: its start revision, or the latest human
+        override. None only for a run saved before runs pinned their policy."""
+        return self.policy_overrides[-1].revision if self.policy_overrides else self.approval_policy_revision
+
+    def policy_phases(self) -> tuple[dict[str, Any], ...]:
+        """Which approval policy applied to which decisions: the start phase, then one phase per override."""
+        phases: list[dict[str, Any]] = [{"revision": self.approval_policy_revision, "from_decision": 0,
+                                         "override": None}]
+        for item in self.policy_overrides:
+            phases.append({"revision": item.revision, "from_decision": item.after_decisions,
+                           "override": item.model_dump(mode="json")})
+        return tuple(phases)
+
+    def policy_revision_for_decision(self, index: int) -> str | None:
+        """The pinned approval policy revision the decision at `index` was made under."""
+        revision = self.approval_policy_revision
+        for item in self.policy_overrides:
+            if index >= item.after_decisions:
+                revision = item.revision
+        return revision
 
     @model_validator(mode="after")
     def validate_state(self) -> Self:
+        previous, decided = self.approval_policy_revision, 0
+        for item in self.policy_overrides:
+            if item.previous_revision != previous or item.after_decisions < decided or item.after_decisions > len(self.decisions):
+                raise ValueError("Approval policy overrides must chain from the pinned policy in decision order")
+            previous, decided = item.revision, item.after_decisions
         if (self.checkpoint_id is None) != (self.checkpoint_digest is None):
             raise ValueError("Run checkpoint identity requires an integrity pin")
         if self.state == "waiting" and (not self.pending or self.checkpoint_id is None):
@@ -190,7 +264,7 @@ class FileRunStore:
                 original = ManagedRun.model_validate_json(path.read_text(encoding="utf-8"))
                 mutable = {"updated_at", "state", "checkpoint_id", "checkpoint_digest", "pending",
                            "decisions", "outputs", "error", "cleanup_succeeded", "terminal_state",
-                           "adopted_after_budget_expiry"}
+                           "adopted_after_budget_expiry", "policy_overrides"}
                 if original.model_dump(exclude=mutable) != run.model_dump(exclude=mutable):
                     raise ValueError("Managed run identity and pins are immutable")
                 if (original.adopted_after_budget_expiry is not None
@@ -208,6 +282,8 @@ class FileRunStore:
                     raise ValueError("Managed run state cannot rewind or skip finalization")
                 if run.decisions[:len(original.decisions)] != original.decisions:
                     raise ValueError("Consumed workflow decisions are immutable")
+                if run.policy_overrides[:len(original.policy_overrides)] != original.policy_overrides:
+                    raise ValueError("Approval policy overrides are immutable")
             atomic_write_text(path, run.model_dump_json())
             sync_directory(self._directory)
 
@@ -463,9 +539,7 @@ class ManagedWorkflowRunner:
             raise ValueError("Pinned organization revision not found")
 
         def revalidate() -> TaskAssignment:
-            expected = run.approval_policy_revision or ApprovalPolicy().revision
-            if expected != self.approval_policy.revision:
-                raise PermissionError("Approval policy revision changed during active work")
+            self._require_pinned_policy(run)
             if expired_deadline is None:
                 current = self._service.revalidate(assignment.assignment_id)
             else:
@@ -517,6 +591,9 @@ class ManagedWorkflowRunner:
             return run
         if run.state == "finalizing":
             return self._finalize(run)
+        # #65: refuse before any work (model call, push, adoption) and leave the run as it is, so a human override
+        # can still resume it; the old behaviour failed the run on this mismatch inside revalidate.
+        self._require_pinned_policy(run)
         context = self._context(run, assignment)
         try:
             if run.binding_revision != self._binding_revision:
@@ -638,7 +715,7 @@ class ManagedWorkflowRunner:
         return self.approval_policy.resolve(
             stage, actor_id=self._actor().actor_id,
             operation={"request": request.model_dump(mode="json"), "response": value},
-            expected_revision=context.run.approval_policy_revision or ApprovalPolicy().revision,
+            expected_revision=self._require_pinned_policy(context.run),
             automatic_supported=True, source=source,
         )
 
@@ -713,6 +790,8 @@ class ManagedWorkflowRunner:
             if assignment is None or run is None:
                 raise ValueError("Managed run not found")
             self._authorize(assignment)
+            if run.state not in TERMINAL | {"finalizing"}:
+                self._require_pinned_policy(run)  # #65: before any decision is recorded or work starts
             if run.state == "running":
                 return await self._existing(run, assignment)
             if run.state != "waiting":
@@ -728,6 +807,42 @@ class ManagedWorkflowRunner:
             run = await self._invoke(run, assignment, responses={request_id: {"kind": kind, "value": value}},
                                      policy_decisions={request_id: decision} if decision is not None else None)
             return await self._advance_automatic(run, assignment)
+
+    def _require_pinned_policy(self, run: ManagedRun) -> str:
+        """#65: the live approval policy must be the run's pinned one (start revision or latest human override).
+        A run without a pinned revision (saved before pinning) fails closed: only a human override resumes it."""
+        pinned, current = run.pinned_policy_revision, self.approval_policy.revision
+        if pinned is None or pinned != current:
+            raise ApprovalPolicyChanged(run.run_id, pinned, current)
+        return pinned
+
+    async def override_policy(self, assignment_id: str, *, evidence_kind: AdmissionEvidenceKind, reason: str) -> ManagedRun:
+        """#65: record one human decision that this run continues under the live approval policy.
+
+        Only a trusted operator context with human evidence may record it; it changes nothing else on the run and
+        starts no work. Decisions after it are made, and checked, under the new policy."""
+        if self._actor().kind != "operator" or evidence_kind != "human":
+            raise PermissionError("Approval policy override requires a human decision in trusted operator context")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("Approval policy override requires a reason")
+        with self._runs.invocation_lock(assignment_id):
+            assignment = self._assignments.get(assignment_id)
+            run = self._runs.get(assignment_id)
+            if assignment is None or run is None:
+                raise ValueError("Managed run not found")
+            self._authorize(assignment)
+            if run.state in TERMINAL | {"finalizing"}:
+                raise ValueError("A finished managed run cannot be resumed; no override applies")
+            current = self.approval_policy.revision
+            if run.pinned_policy_revision == current:
+                raise PolicyAlreadyPinned("Managed run already runs under the current approval policy; nothing to override")
+            entry = ApprovalPolicyOverride(
+                evidence_kind="human", actor_id=self._actor().actor_id, previous_revision=run.pinned_policy_revision,
+                revision=current, reason=reason.strip(), after_decisions=len(run.decisions), at=datetime.now(tz=UTC))
+            updated = ManagedRun.model_validate(run.model_dump() | {
+                "policy_overrides": (*run.policy_overrides, entry), "updated_at": datetime.now(tz=UTC)})
+            self._runs.save(updated)
+            return updated
 
     async def cancel(self, assignment_id: str) -> ManagedRun:
         if self._actor().kind != "operator":

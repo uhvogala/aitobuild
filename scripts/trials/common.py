@@ -353,14 +353,110 @@ def admission_problem(
     return None
 
 
+def pin_session_policy(
+    report: dict[str, Any], policy: dict[str, Any], override: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """#65: pin this session's approval policy (``check_policy`` output) on the report.
+
+    The first session pins it. A later session with the same policy just records it; a different one is refused
+    unless ``override`` names the human ``actor`` and a ``reason``, which is recorded once with both revisions. Every
+    revision a session ran under is kept in ``approval_policies`` so each phase is judged by its own policy."""
+    prior = report.get("pinned_policy") or report.get("approval_policy")
+    revision = policy["revision"]
+    if prior is not None and prior["revision"] != revision:
+        if override is None:
+            raise SystemExit(
+                f"Refusing to resume under a different approval policy: pinned {prior['revision']}, these flags give "
+                f"{revision}. Pass --policy-override-actor and --policy-override-reason to record a human override."
+            )
+        if not all(isinstance(override.get(key), str) and override[key].strip() for key in ("actor", "reason")):
+            raise SystemExit("A policy override needs a human actor and a reason")
+        report.setdefault("policy_overrides", []).append(
+            {
+                "at": now(),
+                "evidence_kind": "human",
+                "actor": override["actor"].strip(),
+                "reason": override["reason"].strip(),
+                "previous_revision": prior["revision"],
+                "revision": revision,
+            }
+        )
+    elif override is not None:
+        raise SystemExit("--policy-override-* given but the approval policy did not change; nothing to override")
+    policies = report.setdefault("approval_policies", {})
+    if prior is not None:
+        policies.setdefault(prior["revision"], prior["modes"])
+        report.setdefault("start_policy_revision", prior["revision"])
+    policies.setdefault(revision, policy["modes"])
+    report.setdefault("start_policy_revision", revision)
+    report["pinned_policy"] = policy
+    report["approval_policy"] = policy
+    sessions = report.get("sessions") or []
+    if sessions:
+        sessions[-1]["approval_policy_revision"] = revision
+    return policy
+
+
+def phase_policy_revision(report: dict[str, Any], phase: dict[str, Any]) -> str:
+    """The policy a phase ran under: its own stamp, else (phases from before #65) the run's start policy."""
+    return (
+        phase.get("policy_revision")
+        or report.get("start_policy_revision")
+        or report["approval_policy"]["revision"]
+    )
+
+
+def recorded_policy_modes(report: dict[str, Any], revision: str | None) -> dict[str, Any] | None:
+    if revision is None:
+        return None
+    policies = report.get("approval_policies") or {}
+    if revision in policies:
+        return policies[revision]
+    current = report.get("approval_policy") or {}
+    return current.get("modes") if current.get("revision") == revision else None
+
+
+def run_decision_revision(run: Any, index: int, fallback: str) -> str | None:
+    """The run's pinned policy for its decision at ``index`` (start revision or the override in force)."""
+    if run is None:
+        return fallback
+    by_index = getattr(run, "policy_revision_for_decision", None)
+    return by_index(index) if callable(by_index) else run.approval_policy_revision
+
+
+def runs_needing_policy_override(report: dict[str, Any], task_of: Any, revision: str) -> list[str]:
+    """Assignment IDs of the report's non-finished runs still pinned to another policy than ``revision``; with a
+    recorded harness override, each gets the service's own human override before it is resumed."""
+    found = []
+    for phase in report.get("phases", []):
+        run = (task_of(phase["preview_id"]) or {}).get("managed_run") or {}
+        if not run or run.get("state") in {"completed", "failed", "cancelled", "finalizing"}:
+            continue
+        overrides = run.get("policy_overrides") or []
+        pinned = overrides[-1]["revision"] if overrides else run.get("approval_policy_revision")
+        if pinned != revision and run["assignment_id"] not in found:
+            found.append(run["assignment_id"])
+    return found
+
+
 def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any) -> dict[str, Any]:
-    """Read saved preview/run state and classify every recorded decision as automatic or human."""
+    """Read saved preview/run state and classify every recorded decision as automatic or human.
+
+    #65: each phase is judged by the policy recorded for that phase, and each run decision by the policy the run
+    was pinned to when it was made, never by the latest session's policy."""
     service, previews = holder["service"], holder["previews"]
-    modes = report["approval_policy"]["modes"]
+    report.setdefault("approval_policies", {}).setdefault(
+        policy.revision, policy.model_dump(mode="json")
+    )
     phases, problems = [], []
     for phase in report["phases"]:
+        revision = phase_policy_revision(report, phase)
+        modes = recorded_policy_modes(report, revision)
         preview = previews.get(phase["preview_id"])
         run = service.status(phase["preview_id"])
+        if modes is None:
+            problems.append(f"{phase['phase']}: phase policy {revision} was never recorded")
+            continue
         admission = (
             preview.approval_policy.model_dump(mode="json") if preview.approval_policy else None
         )
@@ -369,11 +465,12 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
                 "request_id": item.request_id,
                 "kind": item.kind,
                 "actor_id": item.actor_id,
+                "pinned_policy_revision": run_decision_revision(run, index, revision),
                 "policy": item.approval_policy.model_dump(mode="json")
                 if item.approval_policy
                 else None,
             }
-            for item in (run.decisions if run else ())
+            for index, item in enumerate(run.decisions if run else ())
         ]
         count = sum(
             1
@@ -384,9 +481,13 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
             {
                 "phase": phase["phase"],
                 "preview_id": phase["preview_id"],
+                "policy_revision": revision,
                 "admission": admission,
                 "evidence_kind": preview.evidence_kind if preview else None,
                 "run_policy_revision": run.approval_policy_revision if run else None,
+                "run_policy_overrides": [
+                    item.model_dump(mode="json") for item in getattr(run, "policy_overrides", ())
+                ],
                 "automatic_decisions": count,
                 "decisions": decisions,
             }
@@ -397,29 +498,34 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
             admission,
             preview.evidence_kind if preview else None,
             modes,
-            policy.revision,
+            revision,
             preview.source_payload if preview else None,
         )
         if problem:
             problems.append(problem)
+        if run is not None and run.approval_policy_revision != revision:
+            problems.append(
+                f"{phase['phase']}: run started under {run.approval_policy_revision}, phase policy {revision}"
+            )
         for item in decisions:
             stage, source = (
                 (item["policy"] or {}).get("stage"),
                 (item["policy"] or {}).get("source"),
             )
-            want = "operator_policy" if modes.get(stage) == "automatic" else "human"
+            pinned = item["pinned_policy_revision"]
+            decision_modes = recorded_policy_modes(report, pinned) or {}
+            want = "operator_policy" if decision_modes.get(stage) == "automatic" else "human"
             if (
                 item["policy"] is None
                 or source != want
-                or item["policy"]["policy_revision"] != policy.revision
+                or item["policy"]["policy_revision"] != pinned
             ):
                 problems.append(
-                    f"{phase['phase']}: decision {item['request_id']} {stage} source={source}, expected {want}"
+                    f"{phase['phase']}: decision {item['request_id']} {stage} source={source}, expected {want} under {pinned}"
                 )
-        if count > policy.max_automatic_decisions:
-            problems.append(
-                f"{phase['phase']}: {count} automatic decisions exceed max {policy.max_automatic_decisions}"
-            )
+        limit = modes.get("max_automatic_decisions", policy.max_automatic_decisions)
+        if count > limit:
+            problems.append(f"{phase['phase']}: {count} automatic decisions exceed max {limit}")
     return {
         "ok": not problems,
         "problems": problems,

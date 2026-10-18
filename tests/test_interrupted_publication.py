@@ -44,7 +44,7 @@ class Crash:
         shutil.copytree(self.snapshot, self.root, symlinks=True, dirs_exist_ok=True)
 
 
-def build(tmp_path, approved_delivery, verification_adapter, monkeypatch, github):
+def build(tmp_path, approved_delivery, verification_adapter, monkeypatch, github, approval_policy=None):
     previews, _, preview_id, source, _ = approved_delivery
     sources = (LocalRepositorySource(REPO, 101, source, ("python -m pytest -q",)),)
     worker = DeveloperDeliveryWorker(preview_registry=previews, state_dir=tmp_path / "state",
@@ -97,7 +97,7 @@ def build(tmp_path, approved_delivery, verification_adapter, monkeypatch, github
         definitions=definitions, assignments=assignments, assignment_service=service,
         runs=FileRunStore(tmp_path / "runs"), actor_provider=lambda: RuntimeActor("operator", "operator"),
         operations=bindings.operations, cleanup=bindings.cleanup, binding_revision="delivery-test-v1",
-        approval_policy=ApprovalPolicy(draft_publication="human"),
+        approval_policy=approval_policy or ApprovalPolicy(draft_publication="human"),
     )
     return runner, worker, assignment.assignment_id, preview_id
 
@@ -134,9 +134,9 @@ def kill_during_publication(tmp_path, tmp_path_factory, approved_delivery, verif
     return github, worker, preview_id, waiting
 
 
-def restart(tmp_path, approved_delivery, verification_adapter, monkeypatch, github):
+def restart(tmp_path, approved_delivery, verification_adapter, monkeypatch, github, approval_policy=None):
     runner, worker, assignment_id, preview_id = build(tmp_path, approved_delivery, verification_adapter,
-                                                      monkeypatch, github)
+                                                      monkeypatch, github, approval_policy)
     return asyncio.run(runner.start(assignment_id)), worker, preview_id
 
 

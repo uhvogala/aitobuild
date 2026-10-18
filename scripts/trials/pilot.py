@@ -49,6 +49,8 @@ from common import (  # noqa: E402
     Recorder,
     check_policy,
     collect_evidence,
+    pin_session_policy,
+    runs_needing_policy_override,
     configure_trial_environment,
     gh_json,
     git,
@@ -98,6 +100,13 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--brief-edit-what", help="resume only: what a person changed in the PM-written brief"
     )
     parser.add_argument("--brief-edit-why", help="resume only: why the brief was edited")
+    parser.add_argument(
+        "--policy-override-actor",
+        help="resume only (#65): the person who decides the run continues under a changed approval policy",
+    )
+    parser.add_argument(
+        "--policy-override-reason", help="resume only (#65): why the approval policy changes"
+    )
     arguments = parser.parse_args(argv)
     if arguments.repository != DEFAULT_REPOSITORY and not arguments.allow_other_repository:
         parser.error(
@@ -105,7 +114,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     if (arguments.command == "resume") != (arguments.run_dir is not None):
         parser.error("--run-dir is required for resume and not accepted for start")
-    for name in ("brief_edit_what", "brief_edit_why"):
+    for name in ("brief_edit_what", "brief_edit_why", "policy_override_actor", "policy_override_reason"):
         value = getattr(arguments, name)
         if value is not None and not value.strip():
             parser.error(f"--{name.replace('_', '-')} must not be blank")
@@ -113,6 +122,10 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--brief-edit-what and --brief-edit-why must be given together")
     if arguments.brief_edit_what is not None and arguments.command != "resume":
         parser.error("brief edits are recorded on resume")
+    if (arguments.policy_override_actor is None) != (arguments.policy_override_reason is None):
+        parser.error("--policy-override-actor and --policy-override-reason must be given together")
+    if arguments.policy_override_actor is not None and arguments.command != "resume":
+        parser.error("a policy override applies only to a resume")
     try:
         arguments.automatic_stages = resolve_automatic_stages(arguments.automatic_stage)
     except ValueError as error:
@@ -127,6 +140,13 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "--work-root must live outside the service checkout (keeps runs and secrets out of git)"
         )
     return arguments
+
+
+def policy_override(arguments: argparse.Namespace) -> dict[str, str] | None:
+    actor = getattr(arguments, "policy_override_actor", None)
+    if actor is None:
+        return None
+    return {"actor": actor, "reason": arguments.policy_override_reason}
 
 
 def resolve_automatic_stages(requested: Iterable[str] | None) -> tuple[str, ...]:
@@ -357,7 +377,15 @@ def phase(
     *,
     human_admission: bool = False,
 ) -> dict[str, Any]:
-    report["phases"].append({"phase": label, "started_at": now(), "preview_id": preview_id})
+    report["phases"].append(
+        {
+            "phase": label,
+            "started_at": now(),
+            "preview_id": preview_id,
+            # #65: the policy this phase runs under, so evidence never judges it by a later session's policy.
+            "policy_revision": report["approval_policy"]["revision"],
+        }
+    )
     # Since #31 planning tasks never auto-admit, so the planning phase admits as a human (as in followups, #35).
     hands.child(preview_id, what, human_admission=human_admission)
     status = operator.drive(preview_id, label)
@@ -599,7 +627,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         from aitobuild.organization_planning import PlanningLimits, PlanningScope
 
         config = load_config()
-        report["approval_policy"] = check_policy(config.approvals, stages)
+        pin_session_policy(report, check_policy(config.approvals, stages), policy_override(arguments))
         service_factory, worker_factory, holder = build(
             repo["full_name"],
             repo["id"],
@@ -619,6 +647,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 client, token, recorder, arguments.poll_seconds, arguments.stage_timeout, stages
             )
             hands = followups.HandsOff(operator, report, arguments.pickup_seconds)
+            override = policy_override(arguments)
+            if override is not None:
+                # #65: the harness override is the human decision; record it on each open run through the service's
+                # own override before anything resumes it.
+                for assignment_id in runs_needing_policy_override(
+                    report, operator.task, report["approval_policy"]["revision"]
+                ):
+                    operator.post(
+                        "/internal/organization/tasks/override_policy",
+                        {
+                            "assignment_id": assignment_id,
+                            "reason": f"{override['actor']}: {override['reason']}",
+                        },
+                    )
+                    hands.action(
+                        "approval_policy_override",
+                        f"override for {assignment_id}",
+                        endpoint="POST /internal/organization/tasks/override_policy",
+                    )
             if arguments.command == "start":
                 planning = holder["planning_admission"].offer(
                     request_id=trial_id,
