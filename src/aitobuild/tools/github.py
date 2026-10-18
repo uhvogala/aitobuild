@@ -1160,10 +1160,8 @@ class GhCliGitHubAdapter:
         (the branch does not exist). Any other unreadable reference raises."""
         try:
             return self._read_branch_head(repository=self._resolve_repository(repository), branch=branch)
-        except GitHubTransientError:
-            raise
         except RuntimeError as error:
-            if "HTTP 404" in str(error):
+            if "HTTP 404" in str(error) and not isinstance(error, GitHubTransientError):
                 return None
             raise
 

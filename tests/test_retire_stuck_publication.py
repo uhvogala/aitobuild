@@ -120,7 +120,8 @@ def _tamper_record(tmp_path: Path, change) -> None:
 @pytest.mark.parametrize("case", ["pr_recorded", "pr_url_recorded", "at_saved_head", "correction_source",
                                   "correction_task_with_reason", "verified", "failed", "implementation_locked",
                                   "missing_record", "unknown_preview", "base_unreadable", "mock_without_opt_in",
-                                  "no_actor", "no_reason", "foreign_preview_scope"])
+                                  "no_actor", "no_reason", "foreign_preview_scope", "malformed_live_head",
+                                  "malformed_saved_head", "foreign_repository", "oversized_reason"])
 def test_retire_refusals_leave_the_record_and_github_untouched(
     tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, case,
 ):
@@ -182,6 +183,19 @@ def test_retire_refusals_leave_the_record_and_github_untouched(
         get = worker._previews.get
         monkeypatch.setattr(worker._previews, "get", lambda pid: fake if pid == preview_id else get(pid))
         match = "correction rule"
+    elif case == "malformed_live_head":
+        github._branch_heads[REPO][before.branch] = "not-a-sha"
+        match = "Live task branch head is malformed"
+    elif case == "malformed_saved_head":
+        monkeypatch.setattr(worker, "_load_preview_record", lambda pid: replace(
+            before, publication={**before.publication, "head_sha": "E" * 40}))
+        match = "Saved head SHA is malformed"
+    elif case == "foreign_repository":
+        _tamper_record(tmp_path, lambda record: record["publication"].update(repository="someone/else"))
+        match = "Publication target differs"
+    elif case == "oversized_reason":
+        kwargs["reason"] = "x" * 2001
+        match = "operator reason"
     saved = {path: path.read_bytes() for path in (tmp_path / "state" / "deliveries").glob("*/state.json")}
     heads, pulls = dict(github._branch_heads[REPO]), dict(github.pull_requests.get(REPO, {}))
     writes = _no_github_writes(github, monkeypatch)
