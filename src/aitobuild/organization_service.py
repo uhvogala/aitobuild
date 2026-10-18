@@ -19,7 +19,8 @@ from aitobuild.approval_consent import ConsentAdmissionEvidence
 from aitobuild.approval_policy import ApprovalDecision, ApprovalPolicy, ApprovalStage
 from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
-from aitobuild.developer_preview import (AutomaticAdmissionDeferred, DeveloperPreview, DeveloperPreviewRegistry, is_planned_child,
+from aitobuild.developer_preview import (AutomaticAdmissionDeferred, AutomaticAdmissionLimitReached, DeveloperPreview,
+                                         DeveloperPreviewRegistry, is_planned_child,
                                          preview_approval_operation, published_review_target,
                                          PLANNING_TASK_PREFIX, is_correction_task,
                                          REVIEW_TASK_PREFIX)
@@ -423,6 +424,9 @@ class ManagedOrganizationService:
                                   max_automatic_admissions=policy.max_automatic_admissions)
         except AutomaticAdmissionDeferred:
             return preview  # one automatic admission per repository/issue ID; later tasks wait for a human
+        except AutomaticAdmissionLimitReached as limit:
+            # The automatic limit is a policy refusal like the ones above: the task waits for a human (#69 follow-up).
+            raise AdmissionRefused(str(limit)) from limit
         if approved is None:
             raise ValueError("Preview disappeared before configured admission")
         return approved

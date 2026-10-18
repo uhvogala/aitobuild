@@ -21,11 +21,13 @@ from test_organization_runner import _service_fixture
 from conftest import approve_preview
 
 
-def make_worker(tmp_path, approved_delivery, operation=None, approval_policy=None, **options):
+def make_worker(tmp_path, approved_delivery, operation=None, approval_policy=None, task_base_revision_for=None,
+                **options):
     service, assignments, calls = _service_fixture(tmp_path, approved_delivery, operation=operation,
-                                                   approval_policy=approval_policy)
-    worker = ManagedOrganizationWorker(service=service, store=FileWorkerStore(tmp_path / "worker.json"),
-                                       poll_seconds=0.01, **options)
+                                                   approval_policy=approval_policy,
+                                                   task_base_revision_for=task_base_revision_for)
+    options.setdefault("poll_seconds", 0.01)
+    worker = ManagedOrganizationWorker(service=service, store=FileWorkerStore(tmp_path / "worker.json"), **options)
     return worker, service, assignments, calls
 
 
@@ -394,6 +396,103 @@ def test_followup_queueing_preserves_approval_and_terminal_parent(tmp_path, appr
 
     asyncio.run(exercise())
     assert calls == ["proposal", "run", "cleanup"]
+
+
+def test_capped_followup_is_a_policy_refusal_left_for_a_human(tmp_path, approved_delivery, monkeypatch):
+    """#69/#70 follow-up: a used-up max_automatic_admissions refuses the follow-up as policy (AdmissionRefused), so it
+    lands in refused_follow_ups for a human, not in job_errors to be retried as an error every pass."""
+    from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
+    from aitobuild.developer_preview import preview_approval_operation
+    from aitobuild.organization_service import AdmissionRefused, Human, admit_task
+
+    previews, delivery, preview_id, _, revision = approved_delivery
+    policy = ApprovalPolicy(task_admission="automatic", max_automatic_admissions=1)
+    worker, service, _, calls = make_worker(tmp_path, approved_delivery, approval_policy=policy, queue_follow_ups=True,
+                                            task_base_revision_for=lambda preview: revision)
+    payload = json.loads(json.dumps(previews.get(preview_id).bundle_payload))
+    used = previews.create_or_get(dedupe_key="used-worker-task", bundle_payload=payload | {"task_id": "used-worker-task"},
+                                  source_payload={})
+    decision = policy.resolve(ApprovalStage.TASK_ADMISSION, actor_id="trusted-operator",
+                              operation=preview_approval_operation(used.preview_id, used.bundle_payload),
+                              automatic_supported=True, expected_revision=policy.revision)
+    assert approve_preview(previews, used.preview_id, approval_policy=decision, max_automatic_admissions=1).approved
+    child = other_preview(approved_delivery, approve=False)
+    with pytest.raises(AdmissionRefused, match="admission limit reached"):  # the gate itself, before any worker
+        service.admission(child.preview_id)
+    worker.enqueue(preview_id)
+    monkeypatch.setattr(service, "follow_up_preview_id", lambda source: child.preview_id if source == preview_id else None)
+
+    async def exercise():
+        await worker.start()
+        try:
+            assert (await finish(worker, preview_id)).state == "completed"
+            async with asyncio.timeout(5):
+                while child.preview_id not in worker.diagnostics()["refused_follow_ups"]:
+                    await asyncio.sleep(0.01)
+            diagnostics = worker.diagnostics()
+            assert diagnostics["refused_follow_ups"] == (child.preview_id,)
+            assert not diagnostics["job_errors"] and not diagnostics["errors"]
+            assert diagnostics["health"]["status"] == "ok"
+            assert worker.store.get(child.preview_id) is None and not previews.get(child.preview_id).approved
+            # Over the limit a human admission still admits, and the loop runs it.
+            assert admit_task(previews, child.preview_id, Human(base_revision=revision)).evidence_kind == "human"
+            worker.enqueue(child.preview_id)
+            assert (await finish(worker, child.preview_id)).state == "completed"
+        finally:
+            await worker.close()
+
+    asyncio.run(exercise())
+    assert calls == ["proposal", "run", "cleanup"] * 2
+
+
+def test_persistent_followup_error_is_retried_at_most_once_per_poll(tmp_path, approved_delivery, monkeypatch):
+    """#70 follow-up: a contained follow-up error is retried on the next pass, not in a tight loop. Each loop pass
+    reaches the service at most once for it, and passes are paced by poll_seconds."""
+    _, _, preview_id, _, _ = approved_delivery
+    poll = 0.1
+    worker, service, _, _ = make_worker(tmp_path, approved_delivery, queue_follow_ups=True, poll_seconds=poll)
+    worker.enqueue(preview_id)
+    monkeypatch.setattr(service, "follow_up_preview_id", lambda source: "unknown-child" if source == preview_id else None)
+    attempts: list[float] = []
+    passes: list[float] = []
+    admission = service.admission
+    journal = worker.store.list
+
+    def counted_admission(identity):
+        if identity == "unknown-child":
+            attempts.append(time.monotonic())
+        return admission(identity)
+
+    def counted_list():
+        passes.append(time.monotonic())
+        return journal()
+
+    monkeypatch.setattr(service, "admission", counted_admission)
+
+    async def exercise():
+        await worker.start()
+        monkeypatch.setattr(worker.store, "list", counted_list)  # from here on, one call per loop pass
+        try:
+            assert (await finish(worker, preview_id)).state == "completed"
+            async with asyncio.timeout(5):
+                while not attempts:
+                    await asyncio.sleep(0.01)
+            attempts.clear()
+            passes.clear()
+            began = time.monotonic()
+            await asyncio.sleep(1.0)
+            elapsed = time.monotonic() - began
+            window_attempts, window_passes = len(attempts), len(passes)
+            assert worker.diagnostics()["job_errors"] == (f"{preview_id}: ValueError: Preview not found",)
+            assert worker.health()["status"] == "ok"
+        finally:
+            await worker.close()
+        return window_attempts, window_passes, elapsed
+
+    window_attempts, window_passes, elapsed = asyncio.run(exercise())
+    assert window_attempts >= 2  # still retried, so a transient error clears without a restart
+    assert window_attempts <= window_passes + 1  # at most one service call per pass, no retry within a pass
+    assert window_attempts <= elapsed / poll + 2  # passes are paced by the poll, not a tight loop
 
 
 def test_worker_journal_refuses_corruption_and_symlinks(tmp_path, approved_delivery):

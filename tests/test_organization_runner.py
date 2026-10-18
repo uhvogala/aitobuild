@@ -336,7 +336,8 @@ def test_configured_delivery_stages_reuse_guarded_services_and_original_budget(
     assert (source / "README.md").read_text() == "Fixture baseline\n"
 
 
-def _service_fixture(tmp_path, approved_delivery, operation=None, coordinator=None, approval_policy=None):
+def _service_fixture(tmp_path, approved_delivery, operation=None, coordinator=None, approval_policy=None,
+                     task_base_revision_for=None):
     from aitobuild.organization_service import ManagedOrganizationService, ManagedRoute
 
     previews, worker, preview_id, _, _ = approved_delivery
@@ -364,6 +365,7 @@ def _service_fixture(tmp_path, approved_delivery, operation=None, coordinator=No
         coordinators={"planner": coordinator or propose},
         operations={"definition_probe": operation or ManagedOperation(lambda context, message: calls.append("run") or "done")},
         cleanup=cleanup, binding_revision="service-v1", approval_policy=approval_policy or ApprovalPolicy(),
+        task_base_revision_for=task_base_revision_for,
     )
     return service, assignments, calls
 
