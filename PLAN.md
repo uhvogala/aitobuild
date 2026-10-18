@@ -11,6 +11,34 @@ and supervised recovery. Earlier counts, pending work and commit status describe
 their checkpoint, not the current system. Current setup and usage belong in
 [README.md](README.md); contributor rules belong in [agents.md](agents.md).
 
+Budget-expired PR adoption (#66, 2026-10-18): pilot trial 4 kill point 2 opened
+example PR #86 and was killed before the record saved it; the child's 30-minute
+budget expired before the restart, and `BudgetDeadlineExpired` (raised by the
+assignment revalidation in the runner's restart path) refused the run before
+`publish()` reached adoption, leaving the record at `publishing`. By Vertti's
+decision this is now the single runtime-budget exemption on ordinary deliveries,
+and it covers only adopting that already-open PR. On a `running` receipt whose
+revalidation fails with exactly `BudgetDeadlineExpired`, the runner proves the
+interrupted continuation as before (checkpoint, last decision, data digest,
+`interrupted_publication`) under a context that checks every pin except a live
+deadline (same unaborted ledger, expired at exactly that deadline), then calls the
+operation's `adopt_after_budget_expiry` hook; only `delivery_publish` declares one.
+`DeveloperDeliveryWorker.adopt_after_budget_expiry` re-checks the approved task,
+the exact approval snapshot field by field, the recomputed title/body/commit
+message, this task's marker, the saved verified head, the live branch head, and a
+read-only `find_adoptable_draft_pull_request` lookup that applies the #51 rule
+(one open PR, exact title/body, draft, our author); the PR head must also equal the
+saved head. It never calls a model, runs the Developer, pushes, or creates or
+updates a PR. Success records `publication.adopted_after_budget_expiry {deadline,
+adopted_at}` (validated on load; absent on older records), the run receipt
+`adopted_after_budget_expiry {request_id, deadline, adopted_at}` (immutable), and
+the assignment completes only against that exact expired deadline. Without a
+matching PR, or on any mismatch, the run fails as `TimeoutError` (with the refusal
+reason appended once the hook ran) and the record stays `publishing`; every path
+that needs the model, a push or a new PR stays fail-closed on an expired budget.
+This changes the delivery state model (`publishing` -> `published` without a live
+budget) and needs Vertti's explicit okay before merge.
+
 Interrupted draft publication resume (2026-10-13): pilot trial 4 killed the service
 right after the developer branch push; GitHub had opened the draft PR but no record
 held its number, and restart failed closed on the run-level replay block. A run left

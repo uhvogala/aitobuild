@@ -394,6 +394,25 @@ recovers terminal/assignment metadata only. Cancel in-process asyncio tasks and
 await them; `cancel` handles idle/recovered runs. Busy runs reject competing calls.
 Threaded delivery calls drain before ownership is released; worker limits still apply.
 
+Budget-expired PR adoption (#66) is the one exemption from the Developer runtime
+budget on ordinary deliveries. It applies only to a `running` receipt whose
+`delivery_publish` continuation was killed after GitHub opened the draft PR but
+before the record saved it, and only when the restart is refused by an actual
+`BudgetDeadlineExpired`. The runner then calls that operation's adopt-only hook
+instead of failing; it runs no graph, handler, model or Developer and records no
+new decision, admission or approval. The hook still requires, in full: the exact
+#56 binding of the `publishing` record to the run and approval snapshot, this
+task's delivery marker in the approved body, exactly one open draft PR with that
+exact title and body opened by our own writer (#51), and the live branch head and
+the PR head equal to the saved verified head. It reads GitHub only (no push, PR
+create or PR update) and needs the original ledger unaborted and actually expired.
+Success marks the delivery `published` with `publication.adopted_after_budget_expiry
+{deadline, adopted_at}`, the run `adopted_after_budget_expiry`, and completes the
+assignment against that exact expired deadline. Anything else (no PR, any mismatch,
+no saved head, an interrupted implementation, a fresh approval) fails closed as
+before: the run fails as `TimeoutError` and the record stays `publishing`. Older
+records without these fields load unchanged.
+
 [src/aitobuild/organization_delivery.py](src/aitobuild/organization_delivery.py)
 provides `ManagedDeliveryBindings` for configurable `delivery_prepare`,
 `delivery_implement`, `delivery_verify` and optional `delivery_publish` nodes.
