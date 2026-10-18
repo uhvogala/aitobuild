@@ -1228,7 +1228,12 @@ class DeveloperDeliveryWorker:
             raise PermissionError("Delivery record failed validation; retire is refused") from error
         if record is None:
             raise PermissionError("Retiring requires a saved delivery record")
-        if _is_correction_record(record):
+        # Route by the full correction rule (task ID or correction_from_review source). The record carries no
+        # source, so it is resolved from the record's own approved preview; without it nothing is routed.
+        preview = self._previews.get(preview_id)
+        if preview is None or preview.bundle_payload != record.bundle_payload:
+            raise PermissionError("Retiring requires the record's own approved preview; it is missing or differs")
+        if is_correction_task(preview) or _is_correction_record(record):
             if reason is not None:
                 raise PermissionError("Correction retire records no reason; omit it")
             return self.retire_correction(preview_id, actor_id=actor_id, github=github,
@@ -1242,7 +1247,8 @@ class DeveloperDeliveryWorker:
     ) -> DeliveryPreparation:
         """Operator retire of a non-correction delivery left at `publishing` that can never finish (#61).
 
-        Allowed only when the record is `publishing`, it is not a correction (`is_correction_task`), no PR is
+        `retire_delivery` has already routed every correction (`is_correction_task(preview)`) away and refused a
+        missing or differing preview. Allowed only when the record is `publishing`, no PR is
         recorded, the repository is readable, and the live task branch (read-only `branch_head`) is gone or not at
         the saved head; with no saved head an existing branch is refused, since it may carry an unrecorded push.
         The implementation lock must be free (no publish, verify or implementation in flight). Nothing is written
@@ -1269,9 +1275,6 @@ class DeveloperDeliveryWorker:
                 raise PermissionError("Delivery record failed validation; retire is refused") from error
             if record is None:
                 raise PermissionError("Retiring requires a saved delivery record")
-            preview = self._previews.get(preview_id)
-            if (preview is None or preview.bundle_payload != record.bundle_payload or is_correction_task(preview)):
-                raise PermissionError("Corrections retire through the correction rule; this record is refused")
             if record.state == "retired":
                 return record
             if record.state != "publishing":

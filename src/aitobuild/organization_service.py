@@ -640,7 +640,7 @@ class ManagedOrganizationService:
         if preview is None:
             raise PermissionError("Retiring requires an existing approved preview")
         task_id = str(preview.bundle_payload.get("task_id", ""))
-        if is_correction_task(task_id):
+        if is_correction_task(preview):  # the full rule: task ID or correction_from_review source
             if reason is not None:
                 raise PermissionError("Correction retire records no reason; omit it")
             return await self.retire_correction(preview_id, github=github,

@@ -30,7 +30,20 @@ TRANSIENT_HTTP_STATUSES = frozenset({502, 503, 504})
 _HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
 
 
-class GitHubTransientError(RuntimeError):
+class GitHubAPIError(RuntimeError):
+    """A failed `gh api` call. `status` is the HTTP status gh reported for it, or None when it reported none."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def http_status(detail: str) -> int | None:
+    match = _HTTP_STATUS.search(detail)
+    return int(match.group(1)) if match is not None else None
+
+
+class GitHubTransientError(GitHubAPIError):
     """A GitHub 502/503/504. For a read it is raised only after bounded retries; a write is never retried, so the
     caller must treat the write as uncertain (it may have landed) and reconcile by reading, never by repeating it."""
 
@@ -1020,9 +1033,10 @@ class GhCliGitHubAdapter:
         except CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             message = f"gh api failed for {method} {endpoint}: {detail}"
+            status = http_status(detail)
             if transient_http_status(detail) is not None:
-                raise GitHubTransientError(message) from exc
-            raise RuntimeError(message) from exc
+                raise GitHubTransientError(message, status=status) from exc
+            raise GitHubAPIError(message, status=status) from exc
         return completed.stdout.strip()
 
     def _matching_publish_head(
@@ -1160,8 +1174,8 @@ class GhCliGitHubAdapter:
         (the branch does not exist). Any other unreadable reference raises."""
         try:
             return self._read_branch_head(repository=self._resolve_repository(repository), branch=branch)
-        except RuntimeError as error:
-            if "HTTP 404" in str(error) and not isinstance(error, GitHubTransientError):
+        except GitHubAPIError as error:
+            if error.status == 404:
                 return None
             raise
 

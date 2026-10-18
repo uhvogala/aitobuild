@@ -1050,16 +1050,18 @@ failed or abandoned unpublished correction only while the live PR head still equ
 invalidating any pending approval; both sibling checks skip released and retired corrections.
 The generalized `POST /internal/organization/deliveries/retire {preview_id, reason}` (same internal
 token, live adapter only) is the one retire for every delivery; `corrections/retire` stays as its
-compatible alias for corrections, which take no reason and keep the rule above unchanged. For a
-non-correction it retires only a record stuck at `publishing` (#61): not a correction
-(`is_correction_task`), no PR number, URL or PR head recorded, the base branch readable and the live task branch
-(read-only `branch_head`) gone (404) or not at the saved head; with no saved head an existing branch
+compatible alias for corrections, which take no reason and keep the rule above unchanged. Routing uses the record's approved
+preview and the full rule (`is_correction_task(preview)`, so an `ISSUE-*` task with a
+`correction_from_review` source is a correction); a missing preview is refused. For a
+non-correction it retires only a record stuck at `publishing` (#61): no PR number, URL or PR head recorded, the base branch readable and the live task branch
+(read-only `branch_head`) gone (gh status 404) or not at the saved head; with no saved head an existing branch
 is refused because it may hold an unrecorded push. The delivery implementation lock and the managed
 run's invocation lock must both be free, so a run left `running` by a kill can be retired but an
 executing one cannot. The record becomes terminal `retired` with a receipt (`actor_id`, `retired_at`,
 `previous_state: publishing`, `reason`, `live_branch: gone|moved`, `live_head_sha`); the saved head,
 snapshot and verification evidence stay as they were, nothing is written to GitHub and the budget and
-approvals are not touched. A retired record still loads as the publishing record it was, so tampered
+approvals are not touched. The task's managed run stays `running` until the next restart refuses
+and fails it; that is expected. A retired record still loads as the publishing record it was, so tampered
 evidence or receipts fail validation; resume, PR adoption, publish and `prepare` all refuse it or return it
 unchanged. A fresh run needs a new approved preview; it reuses the task branch name only if it has the same task ID.
 Re-offering that completed review after release or retirement creates the next linked attempt

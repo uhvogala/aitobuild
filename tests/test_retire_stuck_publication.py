@@ -126,7 +126,7 @@ def _tamper_record(tmp_path: Path, change) -> None:
                                   "missing_record", "unknown_preview", "base_unreadable", "mock_without_opt_in",
                                   "no_actor", "no_reason", "foreign_preview_scope", "malformed_live_head",
                                   "malformed_saved_head", "foreign_repository", "oversized_reason",
-                                  "no_publication"])
+                                  "no_publication", "missing_preview"])
 def test_retire_refusals_leave_the_record_and_github_untouched(
     tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, case,
 ):
@@ -151,7 +151,12 @@ def test_retire_refusals_leave_the_record_and_github_untouched(
         fake = replace(preview, source_payload={**preview.source_payload, "correction_from_review": "dp-review"})
         get = worker._previews.get
         monkeypatch.setattr(worker._previews, "get", lambda pid: fake if pid == preview_id else get(pid))
-        match = "correction rule"
+        kwargs["reason"] = None  # corrections take no reason
+        match = "saved correction delivery"  # routed to the unchanged retire_correction, which refuses it
+    elif case == "missing_preview":
+        get = worker._previews.get
+        monkeypatch.setattr(worker._previews, "get", lambda pid: None if pid == preview_id else get(pid))
+        match = "own approved preview"
     elif case == "correction_task_with_reason":
         monkeypatch.setattr(worker, "_load_preview_record", lambda pid: replace(before, task_id="published-correction-x"))
         monkeypatch.setattr(worker, "retire_correction", lambda *args, **kwargs: pytest.fail("must not route"))
@@ -187,7 +192,7 @@ def test_retire_refusals_leave_the_record_and_github_untouched(
         fake = replace(preview, bundle_payload={**preview.bundle_payload, "objective": "edited"})
         get = worker._previews.get
         monkeypatch.setattr(worker._previews, "get", lambda pid: fake if pid == preview_id else get(pid))
-        match = "correction rule"
+        match = "own approved preview"
     elif case == "malformed_live_head":
         github._branch_heads[REPO][before.branch] = "not-a-sha"
         match = "Live task branch head is malformed"
@@ -390,7 +395,10 @@ def test_service_retire_routes_corrections_to_the_correction_rule(tmp_path):
         asyncio.run(ManagedOrganizationService.retire_delivery(missing, "dp-x", github=None, reason="why"))
 
 
-def test_live_branch_head_is_none_only_on_404(monkeypatch):
+def test_live_branch_head_is_none_only_on_a_404_status(monkeypatch):
+    """The 404 decision reads the structured `GitHubAPIError.status`, never the error wording."""
+    from subprocess import CalledProcessError
+    from aitobuild.tools.github import GitHubAPIError
     adapter = GhCliGitHubAdapter(allowed_repositories=("fixture/widgets",))
     answers: list = []
 
@@ -401,15 +409,89 @@ def test_live_branch_head_is_none_only_on_404(monkeypatch):
         return answer
 
     monkeypatch.setattr(adapter, "_api", api)
+    read = lambda: adapter.branch_head(repository="fixture/widgets", branch="aitobuild/x")  # noqa: E731
     answers.append({"object": {"sha": "c" * 40}})
-    assert adapter.branch_head(repository="fixture/widgets", branch="aitobuild/x") == "c" * 40
-    answers.append(RuntimeError("gh api failed for GET repos/fixture/widgets/git/ref/heads/aitobuild/x: HTTP 404"))
-    assert adapter.branch_head(repository="fixture/widgets", branch="aitobuild/x") is None
-    for failure in (RuntimeError("gh api failed: HTTP 403"), GitHubTransientError("gh api failed: HTTP 502"),
-                    GitHubTransientError("gh api failed: HTTP 502 (upstream said HTTP 404)")):
+    assert read() == "c" * 40
+    for wording in ("gh: Not Found (HTTP 404)", "branch is gone", ""):
+        answers.append(GitHubAPIError(wording, status=404))
+        assert read() is None, wording
+    for failure in (GitHubAPIError("gh: Not Found (HTTP 404)", status=403),  # wording says 404, status does not
+                    GitHubAPIError("HTTP 404", status=None), RuntimeError("gh api failed: HTTP 404"),
+                    GitHubTransientError("gh api failed: HTTP 502", status=502)):
         answers.append(failure)
         with pytest.raises(RuntimeError):
-            adapter.branch_head(repository="fixture/widgets", branch="aitobuild/x")
+            read()
     answers.append({"object": {"sha": "nope"}})
     with pytest.raises(RuntimeError, match="Unexpected"):
-        adapter.branch_head(repository="fixture/widgets", branch="aitobuild/x")
+        read()
+
+    # The status is taken once, where gh reports it, and carried on the error.
+    def gh_fails(stderr):
+        def run(*args, **kwargs):
+            raise CalledProcessError(1, ["gh"], stderr=stderr)
+        return run
+
+    for stderr, status, kind in (("gh: Not Found (HTTP 404)", 404, GitHubAPIError),
+                                 ("gh: Bad Gateway (HTTP 502)", 502, GitHubTransientError),
+                                 ("gh: could not connect", None, GitHubAPIError)):
+        monkeypatch.setattr("aitobuild.tools.github.run", gh_fails(stderr))
+        with pytest.raises(kind) as raised:
+            GhCliGitHubAdapter(allowed_repositories=("fixture/widgets",))._api_once("x", method="GET", payload=None)
+        assert raised.value.status == status
+
+
+def _issue_correction_preview(worker, preview_id):
+    """An ISSUE-* task whose approved source is a correction_from_review: a correction by the full rule only."""
+    preview = worker.preview(preview_id)
+    assert str(preview.bundle_payload["task_id"]).startswith("ISSUE-")
+    return replace(preview, source_payload={**preview.source_payload, "correction_from_review": "dp-review"})
+
+
+def test_worker_routes_a_source_only_correction_to_retire_correction(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch,
+):
+    github, worker, preview_id, before = _stuck(
+        tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch)
+    fake = _issue_correction_preview(worker, preview_id)
+    get = worker._previews.get
+    monkeypatch.setattr(worker._previews, "get", lambda pid: fake if pid == preview_id else get(pid))
+    routed: list[tuple] = []
+    monkeypatch.setattr(worker, "retire_correction", lambda pid, **kwargs: routed.append((pid, kwargs)) or "correction")
+    monkeypatch.setattr(worker, "_retire_stuck_publication",
+                        lambda *args, **kwargs: pytest.fail("a correction must not take the non-correction path"))
+    monkeypatch.setattr(worker, "implementation_lock",
+                        lambda pid: pytest.fail("routing must not take the non-correction lock"))
+    assert worker.retire_delivery(preview_id, actor_id="operator", github=github,
+                                  allow_mock_publication=True) == "correction"
+    assert routed == [(preview_id, {"actor_id": "operator", "github": github, "allow_mock_publication": True})]
+    with pytest.raises(PermissionError, match="records no reason"):
+        worker.retire_delivery(preview_id, actor_id="operator", github=github, reason=REASON,
+                               allow_mock_publication=True)
+    assert len(routed) == 1 and worker.get(preview_id) == before
+
+
+def test_service_routes_a_source_only_correction_to_retire_correction(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch,
+):
+    github, worker, preview_id, before = _stuck(
+        tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch)
+    fake = _issue_correction_preview(worker, preview_id)
+    routed: list[tuple] = []
+
+    async def retire_correction(pid, *, github, allow_mock_publication=False):
+        routed.append((pid, allow_mock_publication))
+        return "correction"
+
+    def never(*args, **kwargs):
+        pytest.fail("a correction must not take the non-correction run-lock path")
+
+    service = SimpleNamespace(
+        _previews=SimpleNamespace(get=lambda pid: fake), retire_correction=retire_correction,
+        recorded_assignment=never, _runs=SimpleNamespace(invocation_lock=never),
+        _worker=SimpleNamespace(retire_delivery=never), operator_id="operator")
+    assert asyncio.run(ManagedOrganizationService.retire_delivery(
+        service, preview_id, github=github, allow_mock_publication=True)) == "correction"
+    assert routed == [(preview_id, True)]
+    with pytest.raises(PermissionError, match="records no reason"):
+        asyncio.run(ManagedOrganizationService.retire_delivery(service, preview_id, github=github, reason=REASON))
+    assert routed == [(preview_id, True)] and worker.get(preview_id) == before
