@@ -368,3 +368,50 @@ def test_resume_refuses_a_moved_task_branch_without_any_pr_write(
         key: record.publication[key] for key in ("checkout_digest", "tree_fingerprint", "body")}
     # The budget is not reset (deadline unchanged).
     assert json.loads(budget_path.read_text())["deadline"] == deadline_before
+
+
+def test_resume_fails_the_record_when_the_returned_pr_is_at_a_different_head(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch,
+):
+    """#56 review nit: on the resume path, the PR returned by create/update must be at the verified head.
+
+    The live branch is still at the saved head (so the pre-write guard passes); the adapter then hands back a PR
+    at another head. The record fails from the returned PR alone, with no extra read and no further writes."""
+    from dataclasses import replace as dc_replace
+    github, worker, preview_id, _ = kill_during_publication(
+        tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, "after_push_before_pr")
+    record = worker.get(preview_id)
+    saved_head = record.publication["head_sha"]
+    assert github._branch_heads[REPO][record.branch] == saved_head
+    calls: list[str] = []
+    upsert, create = github.upsert_branch_commit, github.create_or_update_draft_pull_request
+
+    def counting_upsert(**kwargs):
+        calls.append("upsert_branch_commit")
+        return upsert(**kwargs)
+
+    def foreign_head_create(**kwargs):
+        calls.append("create_or_update_draft_pull_request")
+        return dc_replace(create(**kwargs), head_sha="e" * 40)
+
+    def no_other_write(name):
+        def refuse(**kwargs):
+            calls.append(name)
+            raise AssertionError(f"unexpected write {name}")
+        return refuse
+
+    monkeypatch.setattr(github, "upsert_branch_commit", counting_upsert)
+    monkeypatch.setattr(github, "create_or_update_draft_pull_request", foreign_head_create)
+    for name in ("advance_draft_pull_request_head", "reconcile_advanced_head", "submit_pr_review", "update_issue",
+                 "create_issue"):
+        monkeypatch.setattr(github, name, no_other_write(name))
+    run, worker, preview_id = restart(tmp_path, approved_delivery, verification_adapter, monkeypatch, github)
+    assert run.state == "failed"
+    failed = worker.get(preview_id)
+    assert failed.state == "failed"
+    assert "open draft PR at the verified head" in failed.error
+    assert failed.head_revision != "e" * 40 and failed.publication["head_sha"] == saved_head
+    # Exactly the one PR write; no branch re-push and no other write afterwards.
+    assert calls == ["create_or_update_draft_pull_request"]
+    assert github._branch_heads[REPO][record.branch] == saved_head
+    assert len(github.pull_requests[REPO]) == 1
