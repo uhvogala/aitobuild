@@ -116,6 +116,36 @@ def _failed_publication(record: DeliveryPreparation, error: str) -> DeliveryPrep
                    updated_at=datetime.now(tz=UTC).isoformat())
 
 
+PUBLICATION_BINDING_FIELDS = (
+    "title", "body", "commit_message", "checkout_digest", "tree_fingerprint", "changed_paths", "blob_shas",
+    "file_modes", "base_ref", "branch", "repository", "issue_number",
+)
+
+
+def publication_binding_mismatch(record: DeliveryPreparation, approved: Any) -> str | None:
+    """The first field where a saved publication differs from its exact approved snapshot, or None (#56/#66).
+
+    The one field-by-field binding check, shared by the interrupted-publication resume check and budget-expired
+    adoption: preview id, approval time, pinned base (in the approval and the saved publication) and every
+    approved publication field, which the saved publication must carry.
+    """
+    publication = record.publication
+    if not isinstance(publication, dict) or not isinstance(approved, dict):
+        return "publication"
+    for name, saved, expected in (
+        ("preview_id", record.preview_id, approved.get("preview_id")),
+        ("approved_at", record.approved_at, approved.get("approved_at")),
+        ("base_sha", record.base_revision, approved.get("base_sha")),
+        ("publication.base_sha", record.base_revision, publication.get("base_sha")),
+    ):
+        if saved != expected:
+            return name
+    for key in PUBLICATION_BINDING_FIELDS:
+        if key not in publication or publication[key] != approved.get(key):
+            return key
+    return None
+
+
 def delivery_marker(preview_id: str, bundle_payload: dict[str, Any]) -> str:
     """The PR-body marker binding a draft to its exact admitted task (preview id + bundle digest).
     Adoption of an existing PR on the task branch requires it plus the exact receipt and our author."""
@@ -724,17 +754,11 @@ class DeveloperDeliveryWorker:
             budget = DeveloperTaskBudget(path=self.budget_path(preview_id), bundle=bundle, create=False)
             deadline = budget.expired_deadline()
             # Exact binding (#56): the saved publication is the approved snapshot, field for field.
-            if (not isinstance(expected_publication, dict)
-                    or expected_publication.get("preview_id") != preview_id
-                    or expected_publication.get("approved_at") != record.approved_at
-                    or expected_publication.get("repository_id") != issue.repository_id
-                    or expected_publication.get("base_sha") != record.base_revision
-                    or publication.get("base_sha") != record.base_revision):
-                raise PermissionError("Budget-expired adoption differs from its exact saved approval")
-            for key in ("title", "body", "commit_message", "checkout_digest", "tree_fingerprint", "changed_paths",
-                        "blob_shas", "file_modes", "base_ref", "branch", "repository", "issue_number"):
-                if key not in publication or publication[key] != expected_publication.get(key):
-                    raise PermissionError(f"Budget-expired adoption differs from its exact saved approval ({key})")
+            mismatch = publication_binding_mismatch(record, expected_publication)
+            if mismatch is None and expected_publication.get("repository_id") != issue.repository_id:
+                mismatch = "repository_id"
+            if mismatch is not None:
+                raise PermissionError(f"Budget-expired adoption differs from its exact saved approval ({mismatch})")
             title, body, commit_message = self._publication_metadata(bundle, record)
             if ((publication["title"], publication["body"], publication["commit_message"]) != (title, body, commit_message)
                     or publication["branch"] != record.branch or publication["base_ref"] != issue.base_branch

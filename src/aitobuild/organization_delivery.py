@@ -18,7 +18,7 @@ from agent_framework import (
 
 from aitobuild.agent_tools import DeveloperToolContext, build_developer_tools
 from aitobuild.approval_policy import ApprovalStage
-from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
+from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker, publication_binding_mismatch
 from aitobuild.developer_isolation import DeveloperTaskBudget
 from aitobuild.developer_preview import is_correction_task
 from aitobuild.organization import DefinitionSnapshot
@@ -354,18 +354,13 @@ class ManagedDeliveryBindings:
         bundle = json.loads(assignment.bundle_content)
         issue = bundle.get("issue_context") if isinstance(bundle, dict) else None
         publication = record.publication
-        if (record.preview_id != assignment.preview_id or original.get("preview_id") != assignment.preview_id
+        if (record.preview_id != assignment.preview_id
                 or record.approved_at != assignment.approved_at.isoformat()
-                or original.get("approved_at") != record.approved_at
                 or record.bundle_payload != bundle
                 or not isinstance(issue, dict) or issue.get("base_revision") != record.base_revision
-                or original.get("base_sha") != record.base_revision or publication.get("base_sha") != record.base_revision
-                or record.session_id != context.run.session_id):
+                or record.session_id != context.run.session_id
+                or publication_binding_mismatch(record, original) is not None):
             return False
-        for key in ("title", "body", "commit_message", "checkout_digest", "tree_fingerprint", "changed_paths",
-                    "blob_shas", "file_modes", "base_ref", "branch", "repository", "issue_number"):
-            if publication.get(key) != original.get(key):
-                return False
         head = publication.get("head_sha")
         if head is not None and (not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None):
             return False

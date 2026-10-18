@@ -532,3 +532,33 @@ def test_running_adoption_receipt_is_immutable(
     with pytest.raises(ValueError, match="immutable"):
         store.save(ManagedRun.model_validate(running.model_dump() | {
             "adopted_after_budget_expiry": receipt.model_copy(update={"deadline": receipt.deadline - 5})}))
+
+
+@pytest.mark.parametrize("field", ["preview_id", "approved_at", "base_sha", "publication.base_sha", "missing_field",
+                                   *__import__("aitobuild.developer_delivery", fromlist=["x"]).PUBLICATION_BINDING_FIELDS])
+def test_shared_publication_binding_check_names_each_field(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, field,
+):
+    """#56/#66 share one field-by-field binding check; each field on its own makes it refuse."""
+    from aitobuild.developer_delivery import publication_binding_mismatch
+    _, worker, preview_id, _, record = interrupted(
+        tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch)
+    approved = _snapshot(record, preview_id)
+    assert publication_binding_mismatch(record, approved) is None
+    assert publication_binding_mismatch(record, None) == "publication"
+    assert publication_binding_mismatch(dc_replace(record, publication=None), approved) == "publication"
+    if field == "publication.base_sha":
+        changed, expected = dc_replace(record, publication={**record.publication, "base_sha": "0" * 40}), field
+        assert publication_binding_mismatch(changed, approved) == expected
+        return
+    if field == "missing_field":
+        # Absent on both sides is still a mismatch: the saved publication must carry every approved field.
+        publication = dict(record.publication)
+        del publication["file_modes"]
+        approved.pop("file_modes")
+        assert publication_binding_mismatch(dc_replace(record, publication=publication), approved) == "file_modes"
+        return
+    value = approved[field]
+    approved[field] = (value + "-x") if isinstance(value, str) else ([*value, "x"] if isinstance(value, list) else (
+        {**value, "x": None} if isinstance(value, dict) else value + 1))
+    assert publication_binding_mismatch(record, approved) == field
