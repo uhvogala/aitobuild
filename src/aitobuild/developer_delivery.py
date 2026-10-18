@@ -1261,10 +1261,12 @@ class DeveloperDeliveryWorker:
         if record is None:
             raise PermissionError("Retiring requires a saved delivery record")
         # Route by the full correction rule (task ID or correction_from_review source), evaluated on the record's
-        # own approved preview (its load already checked the stored verdict agrees); without it nothing is routed.
+        # own approved preview; without it nothing is routed. No bundle comparison here: the load above already
+        # refused a present preview whose bundle differs (`is_correction_record`), and an approved preview's
+        # bundle is immutable, so a second check could never fire.
         preview = self._previews.get(preview_id)
-        if preview is None or preview.bundle_payload != record.bundle_payload:
-            raise PermissionError("Retiring requires the record's own approved preview; it is missing or differs")
+        if preview is None:
+            raise PermissionError("Retiring requires the record's own approved preview; it is missing")
         if is_correction_task(preview):
             if reason is not None:
                 raise PermissionError("Correction retire records no reason; omit it")
