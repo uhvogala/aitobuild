@@ -1331,6 +1331,17 @@ class DeveloperDeliveryWorker:
             base_head = github.branch_head(repository=repository, branch=base_ref)
             if not isinstance(base_head, str) or re.fullmatch(r"[0-9a-f]{40}", base_head.lower()) is None:
                 raise PermissionError("Base branch is unreadable, so a missing task branch proves nothing; retire is refused")
+            # Any open PR on the task branch (into any base, ours or not, marker or not) means the publication may
+            # still be live: refuse, whatever the branch state. Same lookup #56 adoption uses; failure fails closed.
+            try:
+                pulls = github.task_pull_requests(repository=repository, head_branch=record.branch)
+            except Exception as error:
+                raise PermissionError("Open pull requests on the task branch are unreadable; retire is refused") from error
+            open_pulls = sorted(pull.number for pull in pulls if pull.state == "open")
+            if open_pulls:
+                raise PermissionError(f"Task branch {record.branch} has open pull request(s) "
+                                      f"{', '.join(f'#{number}' for number in open_pulls)}; resume or reconcile "
+                                      "instead, retire is refused")
             live = github.branch_head(repository=repository, branch=record.branch)
             if live is not None and (not isinstance(live, str) or re.fullmatch(r"[0-9a-f]{40}", live.lower()) is None):
                 raise PermissionError("Live task branch head is malformed; retire is refused")

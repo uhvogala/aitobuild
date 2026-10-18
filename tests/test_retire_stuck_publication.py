@@ -571,3 +571,101 @@ def test_record_classification_uses_the_preview_then_the_stored_verdict_and_fail
         blind.is_correction_record(replace(before, task_id="published-correction-x"))
     with pytest.raises(ValueError, match="differs from its approved preview"):
         worker.is_correction_record(replace(before, correction=True))
+
+
+@pytest.mark.parametrize("case", ["moved_marker_pr", "moved_foreign_pr", "gone_marker_pr", "other_base_pr",
+                                  "lookup_error", "lookup_transient", "lookup_malformed"])
+def test_retire_refuses_while_any_open_pr_is_on_the_task_branch(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, case,
+):
+    """ReviewBot's #62 condition: any open PR on the task branch (ours with the delivery marker, or anyone's
+    without it, into any base) refuses the retire whatever the branch state; an unreadable lookup fails closed."""
+    from aitobuild.developer_delivery import delivery_marker
+
+    github, worker, preview_id, before = _stuck(
+        tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch,
+        branch="gone" if case == "gone_marker_pr" else "moved")
+    publication = before.publication
+    marker = delivery_marker(preview_id, before.bundle_payload)
+    pulls = github.pull_requests.setdefault(REPO, {})
+    ours = GitHubPullRequest(number=74, title=publication["title"], body=f"{publication['body'].strip()}\n{marker}",
+                             state="open", head_ref=before.branch, base_ref=publication["base_ref"], draft=True,
+                             repository=REPO, head_sha=publication["head_sha"], author=github.login)
+    match = "has open pull request"
+    if case in {"moved_marker_pr", "gone_marker_pr"}:
+        pulls[74] = ours
+        match = "has open pull request\\(s\\) #74;"
+    elif case == "moved_foreign_pr":
+        pulls[75] = replace(ours, number=75, title="Someone else's", body="no marker here", draft=False,
+                            author="intruder", head_sha="f" * 40)
+        pulls[76] = replace(ours, number=76, state="closed")  # closed PRs alone never block; open ones are listed
+        match = "has open pull request\\(s\\) #75;"
+    elif case == "other_base_pr":
+        pulls[77] = replace(ours, number=77, base_ref="release", body="no marker")
+        match = "#77;"
+    else:
+        failure = {"lookup_error": RuntimeError("gh: boom"), "lookup_transient": GitHubTransientError("gh: 502"),
+                   "lookup_malformed": KeyError("number")}[case]
+        monkeypatch.setattr(github, "task_pull_requests", lambda **kwargs: (_ for _ in ()).throw(failure))
+        match = "unreadable; retire is refused"
+    state = next((tmp_path / "state" / "deliveries").glob("*/state.json"))
+    saved, budgets = state.read_bytes(), _budget_and_approvals(tmp_path)
+    pulls_before = dict(pulls)
+    writes = _no_github_writes(github, monkeypatch)
+    with pytest.raises(PermissionError, match=match):
+        worker.retire_delivery(preview_id, actor_id="operator", github=github, reason=REASON,
+                               allow_mock_publication=True)
+    assert state.read_bytes() == saved and _budget_and_approvals(tmp_path) == budgets
+    assert writes == [] and github.pull_requests.get(REPO, {}) == pulls_before
+    assert worker.get(preview_id) == before
+
+
+def test_retire_succeeds_when_the_branch_is_gone_and_no_open_pr_exists(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch,
+):
+    github, worker, preview_id, before = _stuck(
+        tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch)
+    lookups = []
+    lookup = github.task_pull_requests
+    monkeypatch.setattr(github, "task_pull_requests", lambda **kwargs: lookups.append(kwargs) or lookup(**kwargs))
+    github.pull_requests.setdefault(REPO, {})[74] = GitHubPullRequest(  # the pilot's PR #74: closed, not open
+        number=74, title="t", body="b", state="closed", head_ref=before.branch,
+        base_ref=before.publication["base_ref"], repository=REPO)
+    retired = worker.retire_delivery(preview_id, actor_id="operator", github=github, reason=REASON,
+                                     allow_mock_publication=True)
+    assert retired.state == "retired" and retired.retirement["live_branch"] == "gone"
+    assert lookups == [{"repository": before.publication["repository"], "head_branch": before.branch}]  # any base
+
+
+def test_gh_task_pull_requests_is_one_read_that_raises_on_failure(monkeypatch):
+    """The shared lookup: one GET on the task branch head (any state; any base unless one is given), filtered to
+    this repository's branch, so a fork's same-named branch is ignored; a failure or odd answer raises."""
+    adapter = GhCliGitHubAdapter(allowed_repositories=("fixture/widgets",))
+    calls, answers = [], []
+
+    def api(endpoint, *, method="GET", payload=None):
+        calls.append((endpoint, method))
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(adapter, "_api", api)
+
+    def raw(number, *, ref="aitobuild/x", repo="fixture/widgets", base="main", state="open", draft=True):
+        return {"number": number, "title": "t", "body": "b", "state": state, "draft": draft, "user": {"login": "w"},
+                "head": {"ref": ref, "repo": {"full_name": repo}, "sha": "c" * 40}, "base": {"ref": base}}
+
+    answers.append([raw(1), raw(2, repo="fork/widgets"), raw(3, ref="aitobuild/y"), raw(4, base="release", state="closed"),
+                    raw(5, draft="yes")])
+    found = adapter.task_pull_requests(repository="fixture/widgets", head_branch="aitobuild/x")
+    assert [pull.number for pull in found] == [1, 4, 5] and [pull.draft for pull in found] == [True, True, False]
+    assert calls[-1] == ("repos/fixture/widgets/pulls?state=all&head=fixture%3Aaitobuild%2Fx&per_page=100", "GET")
+    answers.append([raw(1), raw(4, base="release")])
+    assert [p.number for p in adapter.task_pull_requests(repository="fixture/widgets", head_branch="aitobuild/x",
+                                                         base_ref="main")] == [1]
+    assert "base=main" in calls[-1][0]
+    for failure in (RuntimeError("gh: boom"), GitHubTransientError("gh: 502"), {"not": "a list"}):
+        answers.append(failure)
+        with pytest.raises(RuntimeError):
+            adapter.task_pull_requests(repository="fixture/widgets", head_branch="aitobuild/x")

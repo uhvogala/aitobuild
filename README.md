@@ -1056,7 +1056,9 @@ preview and the full rule (`is_correction_task(preview)`, so an `ISSUE-*` task w
 that verdict as `correction` when it is created, so a restarted worker loads and classifies it the same way;
 a present approved preview must have the record's exact bundle (a differing one is refused) and agree with it; only a
 missing preview falls back to the stored verdict, and an older record without it needs its preview. For a
-non-correction it retires only a record stuck at `publishing` (#61): no PR number, URL or PR head recorded, the base branch readable and the live task branch
+non-correction it retires only a record stuck at `publishing` (#61): no PR number, URL or PR head recorded, the base branch readable,
+no open pull request on the task branch (into any base, with or without our delivery marker, whatever the branch state; the same read-only
+`task_pull_requests` lookup that #56 adoption uses, and a failed lookup refuses), and the live task branch
 (read-only `branch_head`) gone (gh status 404) or not at the saved head; with no saved head an existing branch
 is refused because it may hold an unrecorded push. The delivery implementation lock and the managed
 run's invocation lock must both be free, so a run left `running` by a kill can be retired but an

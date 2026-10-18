@@ -28,8 +28,13 @@ preview must carry the record's exact bundle (a differing one is refused) and ag
 preview falls back to the stored verdict, a pre-#61 record with no verdict then fails closed, and a
 stored `false` never undercuts a correction task ID. It
 retires any other record only when it is `publishing`, carries no PR number/URL/PR head, the base branch is
-readable, and the read-only live `branch_head` is gone (404) or not the saved head (an existing
-branch with no saved head is refused). The delivery implementation lock and the managed run's
+readable, no open PR is on the task branch, and the read-only live `branch_head` is gone (404) or
+not the saved head (an existing branch with no saved head is refused). The open-PR check (ReviewBot's
+condition for #62) reuses the #56 adoption lookup, now the read-only adapter method
+`task_pull_requests` that adoption itself calls; it lists every PR on the task branch into any base,
+and any open one refuses the retire whether or not it carries our delivery marker, even when the
+branch has moved or is gone. A failed or unreadable lookup refuses too. Only the worker checks it:
+the service guard checks locks and routing, not branch state. The delivery implementation lock and the managed run's
 invocation lock must be free. It ends in the same terminal `retired` state with the correction
 audit fields plus `reason` and `live_branch` (`gone`/`moved`); saved head, snapshot and evidence are
 kept, nothing is written to GitHub, and budget and approvals are left alone. Load validation
@@ -38,8 +43,11 @@ adoption, publish and `prepare` refuse it or return it unchanged. The live `bran
 `None` only when the `gh api` error's structured status is 404 (`GitHubAPIError.status`, taken once
 where gh reports it; other errors still raise), matching the protocol and the mock. After a retire
 the managed run of that task stays `running` until the next restart refuses it ("automatic replay
-is blocked") and ends it `failed`; this is expected, since retire never rewrites run receipts. This changes the
-delivery state model and needs Vertti's okay before merge.
+is blocked") and ends it `failed`; this is expected, since retire never rewrites run receipts.
+Current behaviour with an expired Developer runtime budget is fail-closed: a resumed publication is refused
+before adoption and the record stays at `publishing`, and retire also refuses such a record while its branch
+is still live at the saved head. Whether that record should get another exit is the open question in #66.
+This changes the delivery state model and needs Vertti's okay before merge.
 
 Interrupted draft publication resume (2026-10-13): pilot trial 4 killed the service
 right after the developer branch push; GitHub had opened the draft PR but no record
