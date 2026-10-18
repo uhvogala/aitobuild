@@ -89,6 +89,9 @@ def test_allowlist_covers_only_its_own_definitions(snippet: str) -> None:
     nested = "\n\nclass Rogue:\n    def is_correction_task(self, task_id):\n        " + snippet.replace("\n", "\n        ") + "\n"
     assert _scan(text + nested, ALLOWED_FILE)
     assert _scan(snippet + "\n", "aitobuild/developer_delivery.py")
+    # A namesake of an allowlisted function in another module is not allowlisted.
+    copy = "def is_correction_task(task_id):\n    " + snippet.replace("\n", "\n    ") + "\n"
+    assert _scan(copy, "aitobuild/developer_delivery.py")
 
 
 def test_only_the_correction_rule_names_the_correction_prefix() -> None:
