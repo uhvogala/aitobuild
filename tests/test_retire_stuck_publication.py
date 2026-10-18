@@ -669,3 +669,17 @@ def test_gh_task_pull_requests_is_one_read_that_raises_on_failure(monkeypatch):
         answers.append(failure)
         with pytest.raises(RuntimeError):
             adapter.task_pull_requests(repository="fixture/widgets", head_branch="aitobuild/x")
+
+
+def test_mock_task_pull_requests_filters_like_the_gh_lookup():
+    from aitobuild.tools.github import MockGitHubAdapter
+
+    github = MockGitHubAdapter(allowed_repositories=frozenset({REPO}), enforce_allowlist=True)
+    pull = GitHubPullRequest(number=1, title="t", body="b", state="open", head_ref="aitobuild/x", base_ref="main",
+                             repository=REPO)
+    github.pull_requests[REPO] = {1: pull, 2: replace(pull, number=2, base_ref="release", state="closed"),
+                                  3: replace(pull, number=3, head_ref="aitobuild/y")}
+    assert [p.number for p in github.task_pull_requests(repository=REPO, head_branch="aitobuild/x")] == [1, 2]
+    assert [p.number for p in github.task_pull_requests(repository=REPO, head_branch="aitobuild/x",
+                                                        base_ref="main")] == [1]
+    assert github.task_pull_requests(repository=REPO, head_branch="aitobuild/z") == ()
