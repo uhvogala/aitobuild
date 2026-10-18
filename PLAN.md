@@ -11,6 +11,29 @@ and supervised recovery. Earlier counts, pending work and commit status describe
 their checkpoint, not the current system. Current setup and usage belong in
 [README.md](README.md); contributor rules belong in [agents.md](agents.md).
 
+Run approval-policy pinning (#65, related to #41, 2026-10-18): pilot trial 4 started
+with `--automatic-stage task_admission` (policy `127e5bd9…`) and resumed without it
+(`1443ea4b…`); nothing refused the change, and the harness judged all 29 start-phase
+decisions against the resume policy. A run now pins `ApprovalPolicy.revision` (the
+one digest `_admit`'s snapshot resolves against) at start, and `start`/`approve`/
+`resume` on an existing run refuse a different live policy before any work
+(`ApprovalPolicyChanged`, naming both revisions) instead of failing the run inside
+revalidation, so it stays resumable. The only way on is a human override: the
+operator endpoint's `Human` admission evidence goes through
+`ManagedOrganizationService.override_approval_policy` (every other evidence kind is
+refused) and the runner appends an immutable `ApprovalPolicyOverride`
+(`evidence_kind: human`, actor, previous and new revision, reason, time,
+`after_decisions`). The pinned policy is then the latest override's revision, later
+decisions resolve under it, and `policy_phases()`/`policy_revision_for_decision()`
+give the history. Records without a pinned revision fail closed (the old
+`or ApprovalPolicy().revision` fallback is gone, per ReviewBot's review criteria)
+and need an override, which records `previous_revision: null`. The detached worker
+keeps a policy-refused job `waiting` without aborting its budget, and the override
+endpoint requeues it. The pilot harness pins the session policy, refuses a resume
+whose flags change it unless `--policy-override-actor/--policy-override-reason`
+record a human override, and judges each phase and run decision by the policy
+recorded for it. This changes the approval model and needs Vertti's okay before merge.
+
 Budget-expired PR adoption (#66, 2026-10-18): pilot trial 4 kill point 2 opened
 example PR #86 and was killed before the record saved it; the child's 30-minute
 budget expired before the restart, and `BudgetDeadlineExpired` (raised by the
@@ -202,6 +225,8 @@ or unsupported adapters cannot silently activate legacy behavior.
 Managed runs pin the immutable policy revision and persist exact decisions before
 native continuation. Automatic decision ceilings survive human waits and restart;
 disabled stages, drift, unbound free-text input and uncertain effects fail closed.
+A resume under a different policy is refused unless a human override is recorded on
+the run (#65).
 Native tool evidence includes the SDK request arguments. Automatic admission saves
 the exact task/repository/operator-pinned base and policy decision atomically,
 without replacing an existing base or resetting a ledger. Draft publication now

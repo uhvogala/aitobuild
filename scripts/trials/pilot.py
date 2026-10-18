@@ -383,7 +383,7 @@ def phase(
             "started_at": now(),
             "preview_id": preview_id,
             # #65: the policy this phase runs under, so evidence never judges it by a later session's policy.
-            "policy_revision": report["approval_policy"]["revision"],
+            "policy_revision": (report.get("approval_policy") or {}).get("revision"),
         }
     )
     # Since #31 planning tasks never auto-admit, so the planning phase admits as a human (as in followups, #35).

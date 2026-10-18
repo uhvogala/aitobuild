@@ -173,3 +173,16 @@ def test_open_runs_needing_the_service_override_are_found():
                                        "policy_overrides": [{"revision": RESUME.revision}]}},
     }
     assert common.runs_needing_policy_override(report, runs.get, RESUME.revision) == ["a1"]
+
+
+def test_pilot_phase_is_stamped_with_the_session_policy():
+    report = fresh_report()
+    common.pin_session_policy(report, policy_report(START))
+    hands = SimpleNamespace(child=lambda *args, **kwargs: None)
+    operator = SimpleNamespace(drive=lambda preview_id, label: {"managed_run": {"state": "completed"}})
+    pilot.phase(operator, hands, report, "p1", "delivery:a", "Developer a")
+    assert report["phases"][0]["policy_revision"] == START.revision
+    report["sessions"].append({"command": "resume"})
+    common.pin_session_policy(report, policy_report(RESUME), {"actor": "vertti", "reason": "r"})
+    pilot.phase(operator, hands, report, "p2", "delivery:b", "Developer b")
+    assert [item["policy_revision"] for item in report["phases"]] == [START.revision, RESUME.revision]
