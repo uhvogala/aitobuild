@@ -420,8 +420,8 @@ def _snapshot(record, preview_id):
         "preview_id": preview_id, "approved_at": record.approved_at, "repository_id": 101}
 
 
-@pytest.mark.parametrize("tamper", ["other_task_marker", "approved_at", "preview_id", "found_not_draft",
-                                    "found_closed", "found_other_number"])
+@pytest.mark.parametrize("tamper", ["other_task_marker", "approved_at", "preview_id", "repository_id",
+                                    "found_not_draft", "found_closed", "found_other_number", "correction_record"])
 def test_worker_adoption_rechecks_every_guard_itself(
     tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, tamper,
 ):
@@ -447,9 +447,17 @@ def test_worker_adoption_rechecks_every_guard_itself(
         monkeypatch.setattr(DeveloperDeliveryWorker, "_publication_metadata", staticmethod(
             lambda bundle, rec: tuple(item.replace(ours, theirs) for item in metadata(bundle, rec))))
         match = "delivery marker"
-    elif tamper in {"approved_at", "preview_id"}:
-        snapshot[tamper] = {"approved_at": "2020-01-01T00:00:00+00:00", "preview_id": "dp-other"}[tamper]
+    elif tamper in {"approved_at", "preview_id", "repository_id"}:
+        snapshot[tamper] = {"approved_at": "2020-01-01T00:00:00+00:00", "preview_id": "dp-other",
+                            "repository_id": 999}[tamper]
         match = "exact saved approval"
+    elif tamper == "correction_record":
+        # The preview passes the full rule as a non-correction; the record-side full rule alone refuses.
+        import inspect
+        real = DeveloperDeliveryWorker.is_correction_record
+        monkeypatch.setattr(DeveloperDeliveryWorker, "is_correction_record", lambda self, rec: (
+            inspect.stack()[1].function == "_refuse_correction_record" or real(self, rec)))
+        match = "Scoped correction tasks cannot publish"
     else:
         found = {"found_not_draft": dc_replace(pull, draft=False), "found_closed": dc_replace(pull, state="closed"),
                  "found_other_number": dc_replace(pull, number=99)}[tamper]
