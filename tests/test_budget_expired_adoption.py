@@ -14,7 +14,8 @@ import time
 
 import pytest
 
-from aitobuild.developer_delivery import DeveloperDeliveryWorker
+from aitobuild.developer_delivery import DeveloperDeliveryWorker, delivery_marker
+from aitobuild.organization_runner import ManagedWorkflowRunner
 from aitobuild.organization_delivery import ManagedDeliveryBindings
 from aitobuild.organization_runner import FileRunStore, ManagedRun
 from aitobuild.tools.github import GitHubPullRequest, MockGitHubAdapter
@@ -133,7 +134,7 @@ def test_expired_budget_without_a_pr_is_refused_and_stays_publishing(
     assert github._branch_heads == heads_before
 
 
-@pytest.mark.parametrize("tamper", ["marker", "body", "title", "draft", "author", "live_head", "pr_head",
+@pytest.mark.parametrize("tamper", ["pr_marker", "body", "title", "draft", "author", "live_head", "pr_head",
                                     "second_open", "binding", "approval_snapshot"])
 def test_expired_budget_refuses_each_failing_check_on_its_own(
     tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, tamper,
@@ -144,10 +145,11 @@ def test_expired_budget_refuses_each_failing_check_on_its_own(
     pulls = github.pull_requests[REPO]
     (number,) = pulls
     pull = pulls[number]
-    if tamper == "marker":
-        # Exact title/body/draft/author/head all match; only this task's marker is not the one in the body.
-        monkeypatch.setattr("aitobuild.developer_delivery.delivery_marker",
-                            lambda *args: "<!-- aitobuild-delivery:" + "0" * 64 + " -->")
+    if tamper == "pr_marker":
+        # The open PR's body lost this task's delivery marker (the worker-only marker check is isolated below).
+        marker = delivery_marker(preview_id, record.bundle_payload)
+        assert marker in pull.body
+        pulls[number] = dc_replace(pull, body=pull.body.replace(marker, ""))
     elif tamper == "body":
         pulls[number] = dc_replace(pull, body=pull.body + "\nedited")
     elif tamper == "title":
@@ -363,6 +365,8 @@ def test_finish_binds_the_adoption_to_the_expired_ledger_deadline(
     runner, _, assignment_id, _ = build(tmp_path, approved_delivery, verification_adapter, monkeypatch, github)
     service = runner._service
     with pytest.raises(ValueError, match="has not expired"):
+        service.revalidate_expired(assignment_id)
+    with pytest.raises(ValueError, match="has not expired"):
         service.finish(assignment_id, state="completed", outcome="x", adopted_after_budget_expiry=time.time())
     deadline = expire(tmp_path)
     assert service.revalidate_expired(assignment_id)[1] == deadline
@@ -408,3 +412,122 @@ def test_ghcli_adoptable_pr_lookup_is_read_only(monkeypatch, case) -> None:
         with pytest.raises(PermissionError, match="not adopted"):
             find()
     assert set(calls) <= {"GET"}
+
+
+def _snapshot(record, preview_id):
+    return {key: record.publication[key] for key in SNAPSHOT_KEYS} | {
+        "preview_id": preview_id, "approved_at": record.approved_at, "repository_id": 101}
+
+
+@pytest.mark.parametrize("tamper", ["other_task_marker", "approved_at", "preview_id", "found_not_draft",
+                                    "found_closed", "found_other_number"])
+def test_worker_adoption_rechecks_every_guard_itself(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, tamper,
+):
+    """The worker does not rely on the runner/binding checks or the adapter: each guard refuses on its own."""
+    github, worker, preview_id, _, record = interrupted(
+        tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch)
+    expire(tmp_path)
+    snapshot = _snapshot(record, preview_id)
+    (number,) = github.pull_requests[REPO]
+    pull = github.pull_requests[REPO][number]
+    if tamper == "other_task_marker":
+        # A well-formed marker of another task everywhere (saved body, approval, PR, recomputed metadata): exact
+        # receipt and #51 regex both pass, so only the worker's own marker check refuses.
+        ours = delivery_marker(preview_id, record.bundle_payload)
+        theirs = delivery_marker("dp-other", record.bundle_payload)
+        path = next((tmp_path / "state" / "deliveries").glob("*/state.json"))
+        raw = json.loads(path.read_text())
+        raw["record"]["publication"]["body"] = raw["record"]["publication"]["body"].replace(ours, theirs)
+        path.write_text(json.dumps(raw))
+        snapshot["body"] = snapshot["body"].replace(ours, theirs)
+        github.pull_requests[REPO][number] = dc_replace(pull, body=pull.body.replace(ours, theirs))
+        metadata = DeveloperDeliveryWorker._publication_metadata
+        monkeypatch.setattr(DeveloperDeliveryWorker, "_publication_metadata", staticmethod(
+            lambda bundle, rec: tuple(item.replace(ours, theirs) for item in metadata(bundle, rec))))
+        match = "delivery marker"
+    elif tamper in {"approved_at", "preview_id"}:
+        snapshot[tamper] = {"approved_at": "2020-01-01T00:00:00+00:00", "preview_id": "dp-other"}[tamper]
+        match = "exact saved approval"
+    else:
+        found = {"found_not_draft": dc_replace(pull, draft=False), "found_closed": dc_replace(pull, state="closed"),
+                 "found_other_number": dc_replace(pull, number=99)}[tamper]
+        if tamper == "found_other_number":
+            path = next((tmp_path / "state" / "deliveries").glob("*/state.json"))
+            raw = json.loads(path.read_text())
+            raw["record"]["publication"]["pull_number"] = number
+            path.write_text(json.dumps(raw))
+        monkeypatch.setattr(github, "find_adoptable_draft_pull_request", lambda **kwargs: found)
+        match = "open draft PR at the verified head"
+    before = worker.get(preview_id)
+    with pytest.raises(PermissionError, match=match):
+        worker.adopt_after_budget_expiry(preview_id, github=github, expected_publication=snapshot,
+                                         allow_mock_publication=True)
+    assert worker.get(preview_id) == before
+
+
+def test_binding_hook_rechecks_the_interrupted_publication_itself(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch,
+):
+    github, worker, preview_id, _, record = interrupted(
+        tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch)
+    deadline = expire(tmp_path)
+    runner, _, assignment_id, _ = build(tmp_path, approved_delivery, verification_adapter, monkeypatch, github)
+    run = FileRunStore(tmp_path / "runs").get(assignment_id)
+    context = runner._context(run, runner._assignments.get(assignment_id), expired_deadline=deadline)
+    hook = runner._operations["delivery_publish"].adopt_after_budget_expiry
+    original = _snapshot(record, preview_id)
+    with pytest.raises(PermissionError, match="own interrupted publication"):
+        asyncio.run(hook(context, original | {"body": original["body"] + " changed"}))
+    assert worker.get(preview_id).state == "publishing"
+    # The expired-mode context is pinned to that exact deadline and still revalidates everything else.
+    stale = runner._context(run, runner._assignments.get(assignment_id), expired_deadline=deadline - 1)
+    with pytest.raises(PermissionError, match="deadline changed"):
+        stale.revalidate()
+    assert asyncio.run(hook(context, original)) == {"preview_id": preview_id, "state": "published"}
+
+
+def test_other_resume_failures_never_enter_adoption(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch,
+):
+    """Only an actual deadline expiry on a run killed mid-continuation is routed to the adopt-only hook."""
+    github, worker, preview_id, _, _ = interrupted(
+        tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch)
+    expire(tmp_path)
+    entered: list[str] = []
+    monkeypatch.setattr(ManagedWorkflowRunner, "_adopt_after_budget_expiry",
+                        lambda *args, **kwargs: entered.append("adopt"))
+    runner, _, assignment_id, _ = build(tmp_path, approved_delivery, verification_adapter, monkeypatch, github)
+    runner._binding_revision = "delivery-test-v2"
+    failed = asyncio.run(runner.start(assignment_id))
+    assert failed.state == "failed" and "binding revision" in failed.error and entered == []
+    assert worker.get(preview_id).state == "publishing"
+
+
+def test_waiting_runs_never_enter_adoption(tmp_path, approved_delivery, verification_adapter, monkeypatch):
+    github = MockGitHubAdapter(allowed_repositories=frozenset({REPO}), enforce_allowlist=True)
+    runner, worker, assignment_id, preview_id = build(tmp_path, approved_delivery, verification_adapter,
+                                                      monkeypatch, github)
+    asyncio.run(runner.start(assignment_id))
+    expire(tmp_path)
+    entered: list[str] = []
+    monkeypatch.setattr(ManagedWorkflowRunner, "_adopt_after_budget_expiry",
+                        lambda *args, **kwargs: entered.append("adopt"))
+    failed = asyncio.run(runner.start(assignment_id))
+    assert failed.state == "failed" and failed.error == "TimeoutError" and entered == []
+
+
+def test_running_adoption_receipt_is_immutable(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch,
+):
+    github, *_ = interrupted(tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch)
+    expire(tmp_path)
+    run, *_ = restart(tmp_path, approved_delivery, verification_adapter, monkeypatch, github)
+    running = ManagedRun.model_validate(run.model_dump() | {
+        "state": "running", "error": None, "cleanup_succeeded": None, "terminal_state": None})
+    store = FileRunStore(tmp_path / "other-runs")
+    store.save(running)
+    receipt = running.adopted_after_budget_expiry
+    with pytest.raises(ValueError, match="immutable"):
+        store.save(ManagedRun.model_validate(running.model_dump() | {
+            "adopted_after_budget_expiry": receipt.model_copy(update={"deadline": receipt.deadline - 5})}))
