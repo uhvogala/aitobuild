@@ -23,12 +23,16 @@ interrupted continuation as before (checkpoint, last decision, data digest,
 `interrupted_publication`) under a context that checks every pin except a live
 deadline (same unaborted ledger, expired at exactly that deadline), then calls the
 operation's `adopt_after_budget_expiry` hook; only `delivery_publish` declares one.
-`DeveloperDeliveryWorker.adopt_after_budget_expiry` re-checks the approved task,
-the exact approval snapshot field by field, the recomputed title/body/commit
-message, this task's marker, the saved verified head, the live branch head, and a
-read-only `find_adoptable_draft_pull_request` lookup that applies the #51 rule
-(one open PR, exact title/body, draft, our author); the PR head must also equal the
-saved head. It never calls a model, runs the Developer, pushes, or creates or
+`DeveloperDeliveryWorker.adopt_after_budget_expiry` refuses corrections by the full
+rule (preview and `_refuse_correction_record`) and re-checks the approved task, the
+exact approval snapshot field by field (`publication_binding_mismatch`, the one
+check shared with the #56 `interrupted_publication` resume), the recomputed
+title/body/commit message, this task's marker, the saved verified head, the live
+branch head, and the read-only `find_adoptable_draft_pull_request`; the PR head must
+also equal the saved head. That lookup is the one adoption rule (exactly one open PR
+on the task branch and base, #51 marker, exact title/body, draft, our author), built
+on #61's `task_pull_requests` in both adapters, and `create_or_update_draft_pull_request`
+calls it too, so ordinary #56 adoption and this path cannot drift apart. It never calls a model, runs the Developer, pushes, or creates or
 updates a PR. Success records `publication.adopted_after_budget_expiry {deadline,
 adopted_at}` (validated on load; absent on older records), the run receipt
 `adopted_after_budget_expiry {request_id, deadline, adopted_at}` (immutable), and
@@ -72,9 +76,12 @@ adoption, publish and `prepare` refuse it or return it unchanged. The live `bran
 where gh reports it; other errors still raise), matching the protocol and the mock. After a retire
 the managed run of that task stays `running` until the next restart refuses it ("automatic replay
 is blocked") and ends it `failed`; this is expected, since retire never rewrites run receipts.
-Current behaviour with an expired Developer runtime budget is fail-closed: a resumed publication is refused
-before adoption and the record stays at `publishing`, and retire also refuses such a record while its branch
-is still live at the saved head. Whether that record should get another exit is the open question in #66.
+With an expired Developer runtime budget (#66, see the note above), a restart adopts the already-open draft
+PR only while the managed run is still `running` (killed mid-publication) and every adoption check passes;
+nothing that needs the model, a push or a new PR runs. A run that has already failed, including one whose
+restart was refused before #66 and so aborted its ledger, is not resumed: its record stays at `publishing`,
+retire still refuses it while the branch is live at the saved head, and the exit is the retire path once the
+branch is gone or moved, or a fresh approved run.
 This changes the delivery state model and needs Vertti's okay before merge.
 
 Interrupted draft publication resume (2026-10-13): pilot trial 4 killed the service

@@ -410,8 +410,12 @@ Success marks the delivery `published` with `publication.adopted_after_budget_ex
 {deadline, adopted_at}`, the run `adopted_after_budget_expiry`, and completes the
 assignment against that exact expired deadline. Anything else (no PR, any mismatch,
 no saved head, an interrupted implementation, a fresh approval) fails closed as
-before: the run fails as `TimeoutError` and the record stays `publishing`. Older
-records without these fields load unchanged.
+before: the run fails as `TimeoutError` and the record stays `publishing`. A run
+that has already failed is never resumed by this path; its record goes to the
+delivery retire once the branch is gone or moved, or to a fresh approved run. The
+PR selection is the same `find_adoptable_draft_pull_request` rule that ordinary
+publication uses when it adopts an existing PR. Older records without these
+fields load unchanged.
 
 [src/aitobuild/organization_delivery.py](src/aitobuild/organization_delivery.py)
 provides `ManagedDeliveryBindings` for configurable `delivery_prepare`,
