@@ -582,6 +582,16 @@ class DeveloperDeliveryWorker:
                 existing = publication.get("pull_number")
                 if type(existing) is not int:
                     existing = None
+                if reuse_head:
+                    # Resume (#56): the saved head was verified before the interruption, but the remote task branch
+                    # may have moved since. Re-check it live under the original approval and budget, so no PR is
+                    # created or updated at a foreign head; the moved branch and saved evidence are left untouched.
+                    publication_check()
+                    live_head = github.branch_head(repository=issue.repository, branch=publication_branch)
+                    if live_head != head_sha:
+                        raise PermissionError(
+                            f"Task branch {publication_branch} is at {live_head or 'no head'}, not the verified head "
+                            f"{head_sha}; resumed publication is refused")
                 budget.remaining_seconds()
                 pull = github.create_or_update_draft_pull_request(
                     role=AgentRole.DEVELOPER,

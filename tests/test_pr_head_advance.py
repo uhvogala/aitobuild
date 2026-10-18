@@ -689,3 +689,12 @@ def test_gh_pr_create_timeout_propagates_a_transient_writer_identity_error(monke
             head_branch="aitobuild/issue-8-task", base_ref="main", issue_number=8, approved=True,
             require_human_approval_for_repo_writes=True)
     assert [call for call in fake.calls if call[0] != "GET"] == [("POST", f"repos/{REPO}/pulls")]
+
+
+def test_gh_branch_head_reads_the_live_task_reference_without_writes(monkeypatch) -> None:
+    fake = FakeGitHub(head="c" * 40)
+    adapter = _gh(fake, monkeypatch)
+    assert adapter.branch_head(repository=REPO, branch=BRANCH) == "c" * 40
+    fake.ref = "f" * 40
+    assert adapter.branch_head(repository=REPO, branch=BRANCH) == "f" * 40
+    assert fake.calls == [("GET", f"repos/{REPO}/git/ref/heads/{BRANCH}")] * 2

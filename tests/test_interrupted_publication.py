@@ -326,3 +326,45 @@ def test_delivery_marker_is_stable_and_uses_the_shared_snapshot_digest():
     assert delivery_marker("dp-1", payload) == (
         "<!-- aitobuild-delivery:" + sha256(("dp-1:" + sha256(
             b'{"acceptance_criteria":["a"],"objective":"x","task_id":"ISSUE-7"}').hexdigest()).encode()).hexdigest() + " -->")
+
+
+@pytest.mark.parametrize("point", ["after_push_before_pr", "after_pr_before_record"])
+def test_resume_refuses_a_moved_task_branch_without_any_pr_write(
+    tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, point,
+):
+    """P1 (#56 review): the resumed publish re-checks the live branch before the PR write, not only after it."""
+    github, worker, preview_id, _ = kill_during_publication(
+        tmp_path, tmp_path_factory, approved_delivery, verification_adapter, monkeypatch, point)
+    record = worker.get(preview_id)
+    saved_head = record.publication["head_sha"]
+    foreign = "f" * 40
+    github._branch_heads[REPO][record.branch] = foreign
+    pulls_before = dict(github.pull_requests.get(REPO, {}))
+    budget_path = next((tmp_path / "state" / "budgets").glob("*.json"))
+    deadline_before = json.loads(budget_path.read_text())["deadline"]
+    writes: list[str] = []
+    upsert, create = github.upsert_branch_commit, github.create_or_update_draft_pull_request
+
+    def counting_upsert(**kwargs):
+        writes.append("branch")
+        return upsert(**kwargs)
+
+    def counting_create(**kwargs):
+        writes.append("pull")
+        return create(**kwargs)
+
+    monkeypatch.setattr(github, "upsert_branch_commit", counting_upsert)
+    monkeypatch.setattr(github, "create_or_update_draft_pull_request", counting_create)
+    run, worker, preview_id = restart(tmp_path, approved_delivery, verification_adapter, monkeypatch, github)
+    assert run.state == "failed"
+    assert writes == []  # no PR create/update and no branch overwrite
+    assert github.pull_requests.get(REPO, {}) == pulls_before
+    assert github._branch_heads[REPO][record.branch] == foreign
+    failed = worker.get(preview_id)
+    assert failed.state == "failed" and "not the verified head" in failed.error
+    # Saved evidence is preserved: the verified head and snapshot stay on the record.
+    assert failed.publication["head_sha"] == saved_head
+    assert {key: failed.publication[key] for key in ("checkout_digest", "tree_fingerprint", "body")} == {
+        key: record.publication[key] for key in ("checkout_digest", "tree_fingerprint", "body")}
+    # The budget is not reset (deadline unchanged).
+    assert json.loads(budget_path.read_text())["deadline"] == deadline_before

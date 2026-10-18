@@ -216,6 +216,8 @@ class GitHubAdapter(Protocol):
 
     def writer_login(self) -> str: ...
 
+    def branch_head(self, *, repository: str, branch: str) -> str | None: ...
+
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue: ...
 
     def list_issues(
@@ -380,6 +382,10 @@ class MockGitHubAdapter:
 
     def writer_login(self) -> str:
         return self.login
+
+    def branch_head(self, *, repository: str, branch: str) -> str | None:
+        """The live head of a remote branch, or None when it does not exist (read-only)."""
+        return self._branch_heads.get(self._resolve_repository(repository), {}).get(branch.strip())
 
     def inspect_dependency_merge(self, *, repository: str, repository_id: int, pull_number: int,
                                  head_sha: str, head_branch: str, base_branch: str, base_revision: str) -> dict[str, Any]:
@@ -1148,6 +1154,10 @@ class GhCliGitHubAdapter:
         if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
             raise RuntimeError("Unexpected GitHub task reference response")
         return head
+
+    def branch_head(self, *, repository: str, branch: str) -> str | None:
+        """The live head of a remote task branch (read-only); an unreadable reference raises."""
+        return self._read_branch_head(repository=self._resolve_repository(repository), branch=branch)
 
     def get_issue(self, *, repository: str, issue_number: int) -> GitHubIssue:
         repo = self._resolve_repository(repository)
