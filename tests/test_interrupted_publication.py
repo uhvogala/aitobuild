@@ -211,6 +211,11 @@ def test_interrupted_publication_binding_mismatch_stays_blocked(
             restart(tmp_path, approved_delivery, verification_adapter, monkeypatch, github)
         assert not github.pull_requests.get(REPO)
         return
+    if tamper == "bundle":  # #61: the approved preview no longer matches the record, so it is refused at load
+        with pytest.raises(ValueError, match="approved preview differs from the record"):
+            restart(tmp_path, approved_delivery, verification_adapter, monkeypatch, github)
+        assert not github.pull_requests.get(REPO)
+        return
     run, worker, preview_id = restart(tmp_path, approved_delivery, verification_adapter, monkeypatch, github)
     assert run.state == "failed"
     assert "Interrupted native invocation" in run.error or "replay" in (run.error or "")

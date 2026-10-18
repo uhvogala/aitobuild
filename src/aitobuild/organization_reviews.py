@@ -14,7 +14,7 @@ from pydantic import Field, StrictStr, model_validator
 from aitobuild.durable_files import atomic_write_text
 from aitobuild.developer_delivery import DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
-from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry
+from aitobuild.developer_preview import DeveloperPreview, DeveloperPreviewRegistry, correction_task_id, is_correction_task
 from aitobuild.organization import DefinitionModel, DefinitionStore, EventName, Identifier
 from aitobuild.organization_runner import ManagedRun
 from aitobuild.policy import AgentRole
@@ -219,7 +219,10 @@ class PublishedReviewAdmission:
         atomic_write_text(self._path, journal.model_dump_json())
 
     def _publication(self, preview_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        record = self._worker.get(preview_id)
+        try:
+            record = self._worker.get(preview_id)
+        except ValueError as error:  # load validation or correction classification failed; fail closed
+            raise PermissionError("Published review target failed validation") from error
         if record is None or record.state != "published" or record.publication is None:
             raise PermissionError("Review staging requires a saved published delivery")
         pull = self._worker.get_published_pull_request(preview_id, github=self._github)
@@ -242,7 +245,12 @@ class PublishedReviewAdmission:
             target = PublishedReviewTarget(preview_id=published_preview_id, head_sha=publication["head_sha"])
             journal = self._load()
             root_preview_id, correction_round, max_rounds = published_preview_id, 0, self._max_rounds
-            if str(payload["task_id"]).startswith("published-correction-"):
+            published = self._worker.get(published_preview_id)
+            try:
+                correction_target = published is not None and self._worker.is_correction_record(published)
+            except ValueError as error:
+                raise PermissionError("Published review target lacks its approved preview") from error
+            if correction_target:
                 correction = journal.corrections.get(str(payload["task_id"]))
                 parents = [receipt for receipt in journal.receipts.values() if correction is not None and
                            receipt.review_preview_id == correction.review_preview_id]
@@ -397,7 +405,7 @@ class PublishedReviewAdmission:
             identity: dict[str, Any] = {"review": review_preview_id, "run": run_content, "route": route.model_dump()}
             if attempt > 1:
                 identity |= {"attempt": attempt, "predecessor": predecessor}
-            task_id = "published-correction-" + sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+            task_id = correction_task_id(sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest())
             bundle = json.loads(json.dumps(published.bundle_payload))
             bundle["task_id"] = task_id
             bundle["objective"] = proposal.objective
@@ -544,7 +552,7 @@ class PublishedReviewAdmission:
         with FileLock(str(self._path) + ".lock", timeout=10):
             receipt = self._load().corrections.get(str(preview.bundle_payload["task_id"]))
         if receipt is None:
-            if str(preview.bundle_payload["task_id"]).startswith("published-correction-"):
+            if is_correction_task(preview):
                 raise PermissionError("Correction task lacks its trusted staging receipt")
             return None
         if (receipt.state != "staged" or receipt.correction_preview_id != preview_id or

@@ -11,6 +11,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal, Mapping, assert_never
 
+from filelock import Timeout as FileLockTimeout
 from pydantic import Field, JsonValue, StrictInt, StrictStr
 
 from aitobuild.agent_tools import DeveloperToolContext
@@ -19,7 +20,7 @@ from aitobuild.approval_policy import ApprovalDecision, ApprovalPolicy, Approval
 from aitobuild.developer_delivery import DeliveryPreparation, DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.developer_preview import (AutomaticAdmissionDeferred, DeveloperPreview, DeveloperPreviewRegistry, is_planned_child,
-                                         preview_approval_operation, published_review_target, CORRECTION_TASK_PREFIX,
+                                         preview_approval_operation, published_review_target,
                                          PLANNING_TASK_PREFIX, is_correction_task,
                                          REVIEW_TASK_PREFIX)
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, EventName, Identifier, OrganizationDefinition
@@ -230,7 +231,7 @@ class ManagedOrganizationService:
 
     def _route(self, preview: DeveloperPreview) -> ManagedRoute | None:
         task_id = str(preview.bundle_payload.get("task_id", ""))
-        if task_id.startswith("published-correction-") and self.approval_policy.correction == "disabled":
+        if is_correction_task(preview) and self.approval_policy.correction == "disabled":
             raise PermissionError("Correction is disabled")
         if self._dependencies is None and task_id.startswith("dependent-issue-"):
             raise PermissionError("Dependent handoffs require their trusted admission binding")
@@ -255,7 +256,8 @@ class ManagedOrganizationService:
                 raise PermissionError("Planning tasks require their trusted admission binding")
             planning_route = self._planning.route_for(preview.preview_id)
             return ManagedRoute.model_validate(planning_route.model_dump()) if planning_route else None
-        if self._reviews is None and str(preview.bundle_payload.get("task_id", "")).startswith(("published-review-", "published-correction-")):
+        if self._reviews is None and (str(preview.bundle_payload.get("task_id", "")).startswith(REVIEW_TASK_PREFIX)
+                                      or is_correction_task(preview)):
             raise PermissionError("Staged review tasks require their trusted admission binding")
         if self._reviews is not None:
             correction = self._reviews.correction_route_for(preview.preview_id)
@@ -327,8 +329,8 @@ class ManagedOrganizationService:
         if preview.source_payload.get("action") == "edited":
             raise PermissionError("An edited task needs a fresh consent")
         task_id = str(preview.bundle_payload.get("task_id", ""))
-        if (task_id.startswith((REVIEW_TASK_PREFIX, CORRECTION_TASK_PREFIX)) or published_review_target(preview) is not None
-                or "correction_from_review" in preview.source_payload):
+        if (task_id.startswith(REVIEW_TASK_PREFIX) or is_correction_task(preview)
+                or published_review_target(preview) is not None):
             raise PermissionError("Consent cannot admit review or correction tasks")
         bundle = developer_task_bundle_from_payload(preview.bundle_payload)
         if bundle.task_id.startswith("pm-planning-") or bundle.issue_context is None:
@@ -628,6 +630,37 @@ class ManagedOrganizationService:
         return await _delivery_call(lambda: self._worker.retire_correction(
             correction_preview_id, actor_id=self.operator_id, github=github,
             allow_mock_publication=allow_mock_publication))
+    async def retire_delivery(
+        self, preview_id: str, *, github: GitHubAdapter, reason: str | None = None,
+        allow_mock_publication: bool = False,
+    ) -> DeliveryPreparation:
+        """The generalized operator retire (#61). Corrections go through `retire_correction` unchanged; any other
+        delivery may only retire a stuck `publishing` record, while its managed run is not executing."""
+        preview = self._previews.get(preview_id)
+        if preview is None:
+            raise PermissionError("Retiring requires an existing approved preview")
+        task_id = str(preview.bundle_payload.get("task_id", ""))
+        if is_correction_task(preview):  # the full rule: task ID or correction_from_review source
+            if reason is not None:
+                raise PermissionError("Correction retire records no reason; omit it")
+            return await self.retire_correction(preview_id, github=github,
+                                                allow_mock_publication=allow_mock_publication)
+        assignment = self.recorded_assignment(task_id)
+        # The runner holds this lock for every invoke/approve/resume; a run left `running` by a kill does not.
+        lock = self._runs.invocation_lock(assignment.assignment_id) if assignment is not None else None
+        if lock is not None:
+            try:
+                lock.acquire()
+            except FileLockTimeout as error:
+                raise PermissionError("The managed run for this delivery is executing; retire is refused") from error
+        try:
+            return await _delivery_call(lambda: self._worker.retire_delivery(
+                preview_id, actor_id=self.operator_id, github=github, reason=reason,
+                allow_mock_publication=allow_mock_publication))
+        finally:
+            if lock is not None:
+                lock.release()
+
     def follow_up_status(self, run_id: str) -> dict[str, JsonValue] | None:
         return self._reviews.follow_up_status(run_id) if self._reviews is not None else None
 
@@ -671,7 +704,8 @@ class ManagedOrganizationService:
         reviews = self._reviews
         if self.approval_policy.correction == "automatic" and run.state == "completed" and run.cleanup_succeeded is True:
             assignment = self._assignments.get(run.assignment_id)
-            if assignment is not None and assignment.task_id.startswith("published-correction-"):
+            preview = self._previews.get(preview_id)
+            if assignment is not None and preview is not None and is_correction_task(preview):
                 record = await _delivery_call(lambda: self._worker.get(preview_id))
                 if record is not None and record.state in {"verified", "publishing", "published"}:
                     await self.publish_correction_by_policy(preview_id)
