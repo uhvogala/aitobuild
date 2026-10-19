@@ -292,10 +292,11 @@ class AssignmentService:
         return record, budget.expired_deadline()
 
     def _revalidate_scope(self, assignment_id: str) -> tuple[TaskAssignment, DeveloperTaskBudget]:
-        record = self._assignments.get(assignment_id)
+        # One snapshot for the record and its task owner, like ManagedOrganizationService._assignment (#77).
+        record, owner = self._assignments.get_with_owner(assignment_id)
         if record is None or record.state != "claimed":
             raise PermissionError("Managed execution requires a claimed assignment")
-        if self._assignments.for_task(record.task_id) != record:
+        if owner != record:
             raise PermissionError("Assignment no longer owns its task")
         snapshot = self._definitions.get(record.organization_id, record.revision)
         if snapshot is None:
