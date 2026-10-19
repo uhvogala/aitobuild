@@ -11,6 +11,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess, TimeoutExpired
+import sys
 import time
 
 from agent_framework.openai import OpenAIChatCompletionClient
@@ -29,6 +30,10 @@ from aitobuild.tools.github import GhCliGitHubAdapter, MockGitHubAdapter
 from conftest import approve_preview
 from test_dispatcher import approved_delivery as approved_delivery
 from test_organization_planning import native_reply, planning_fixture, proposal
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "trials"))
+
+import common as trials  # noqa: E402
 
 TLS = 'Get "https://api.github.com/repos/fixture/widgets/commits/{sha}": net/http: TLS handshake timeout'
 POLICY = ApprovalPolicy(task_admission="automatic", pm_issue_creation="human", pm_dependency_links="automatic")
@@ -161,7 +166,10 @@ def test_transient_recheck_failure_keeps_the_run_waiting_then_lands_once(
         try:
             await _until(lambda: worker.diagnostics()["transient_retries"].get(child_id, 0) >= 3)
             job = worker.store.get(child_id)
-            assert job.state == "queued" and "Deferred on a GitHub transport failure" in job.error
+            assert job.state == "queued" and job.error is None  # reads exactly like any queued job
+            reason = "TLS handshake timeout" if failure == "tls" else "gh api timed out"
+            assert reason in worker.diagnostics()["transient_deferrals"][child_id]
+            _assert_harness_sees_deferred_as_pending(tmp_path, job, service.recorded_run(task_id))
             assert set(github.calls_per_inspection) == {attempts}  # bounded read retry inside the adapter
             run = service.recorded_run(task_id)
             assert run.state == "waiting" and run.pending == waiting.pending and run.decisions == ()
@@ -182,7 +190,12 @@ def test_transient_recheck_failure_keeps_the_run_waiting_then_lands_once(
     asyncio.run(exercise())
 
 
-def test_recheck_failing_past_the_budget_deadline_ends_through_the_expiry_path(tmp_path, approved_delivery, monkeypatch):
+def test_recheck_failing_past_the_budget_deadline_fails_through_the_existing_error_path(
+    tmp_path, approved_delivery, monkeypatch,
+):
+    """A re-check still failing once the budget deadline has passed is not deferred again: the job fails through
+    the worker's existing error path (job failed with the transport error, run cancelled, budget aborted), nothing
+    is recorded, and the worker never drives the decision itself (no direct service.decide/respond)."""
     github = FailingCommitLookup(repository_ids={"fixture/widgets": 101},
                                  commit_files={("fixture/widgets", approved_delivery[4]): {}})
     tools: list[str] = []
@@ -190,6 +203,16 @@ def test_recheck_failing_past_the_budget_deadline_ends_through_the_expiry_path(t
     task_id = FileWorkerStore(store).get(child_id).task_id
     worker, _ = _approve(service, store, child_id)
     github.fail_with(monkeypatch, "tls")
+    direct: list[str] = []
+
+    def refuse(name):
+        async def call(*args, **kwargs):
+            direct.append(name)
+            raise AssertionError(f"service.{name} must not be called past the deadline")
+        return call
+
+    monkeypatch.setattr(service, "decide", refuse("decide"))
+    monkeypatch.setattr(service, "respond", refuse("respond"))
 
     async def exercise():
         await worker.start()
@@ -203,10 +226,10 @@ def test_recheck_failing_past_the_budget_deadline_ends_through_the_expiry_path(t
         finally:
             await worker.close()
         run = service.recorded_run(task_id)
-        assert job.state == "failed" and job.error == "TimeoutError"
-        assert run.state == "failed" and run.error == "TimeoutError"  # the runner's expiry label, not a cancel
-        assert run.decisions == () and tools == []
-        assert service.recorded_assignment(task_id).state == "failed"
+        assert job.state == "failed" and "TLS handshake timeout" in job.error  # the transport error, as reported
+        assert run.state == "cancelled" and run.decisions == () and tools == []  # today's existing path (#78 label)
+        assert _budget(service, child_id).get("aborted") is True
+        assert direct == [] and child_id not in worker.diagnostics()["transient_retries"]
 
     asyncio.run(exercise())
 
@@ -265,3 +288,32 @@ def test_enqueueing_a_decision_does_not_block_the_event_loop(tmp_path, test_conf
             assert response.status_code == 200, response.text
 
     asyncio.run(exercise())
+
+
+def _assert_harness_sees_deferred_as_pending(tmp_path: Path, job, run) -> None:
+    """The pilot harness's readers on a real deferred job (queued, ``error`` empty, run waiting on the request):
+    it is not a failure for ``drive``'s phase check and nothing is re-sent; ``_decision_landed`` reports it landed,
+    which is right: the decision is in the worker's journal (a re-sent approval would be refused, 409)."""
+    deferred = {"managed_admission": job.model_dump(mode="json"), "managed_run": run.model_dump(mode="json")}
+    done = {"managed_admission": {"state": "completed"}, "managed_run": {"state": "completed", "pending": []}}
+    reads: list[str] = []
+
+    class Client:
+        def get(self, path, **_):
+            reads.append(path)
+            if path == "/internal/organization/worker":
+                return httpx.Response(200, json={"health": {"workers_alive": 1, "workers_expected": 1}})
+            return httpx.Response(200, json=deferred if reads.count(path) <= 3 else done)
+
+        def post(self, path, **_):
+            raise AssertionError(f"nothing is re-sent for a deferred decision: {path}")
+
+    operator = trials.Operator(Client(), "token", trials.Recorder(tmp_path / "harness"), poll=0.001, timeout=5,
+                               sleep=lambda _: None)
+    assert operator._decision_landed(job.preview_id, run.pending[0].request_id) is True
+    reads.clear()
+    assert operator.drive(job.preview_id, "child")["managed_run"]["state"] == "completed"  # never seen as failed
+    assert "/internal/organization/worker" in reads  # a queued job only checks for a live worker loop
+    events = [json.loads(line) for line in operator.recorder.events.read_text().splitlines()]
+    statuses = [event for event in events if event["kind"] == "status"]
+    assert statuses[0]["job"] == "queued" and statuses[0]["run"] == "waiting" and statuses[0]["error"] is None

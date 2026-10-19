@@ -16,7 +16,7 @@ from filelock import FileLock, Timeout as LockTimeout
 from pydantic import AwareDatetime, Field, JsonValue, StrictBool, StrictInt, StrictStr, model_validator
 
 from aitobuild.durable_files import atomic_write_text
-from aitobuild.developer_isolation import BudgetDeadlineExpired, DeveloperTaskBudget, developer_task_bundle_from_payload
+from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.organization import DefinitionModel
 from aitobuild.organization_assignments import AssignmentCapacityError, AssignmentProposal, Digest
 from aitobuild.organization_runner import TERMINAL, ApprovalPolicyChanged
@@ -241,7 +241,7 @@ class ManagedOrganizationWorker:
         # #72: in-memory retry schedule for decisions deferred on a GitHub transport failure: preview id ->
         # (attempts so far, monotonic time before which the queued job is not picked up). A restart forgets it
         # and simply retries at once.
-        self._transient_retries: dict[str, tuple[int, float]] = {}
+        self._transient_retries: dict[str, tuple[int, float, str]] = {}  # attempts, not before, last error
         self._recover = recover_approved
         self._startup_limit = startup_limit
         self._queue_follow_ups = queue_follow_ups
@@ -284,7 +284,9 @@ class ManagedOrganizationWorker:
                 "health": self.health(),
                 "active_previews": tuple(self._active), "errors": tuple(self._errors),
                 "job_errors": tuple(f"{preview_id}: {error}" for (preview_id, _), error in self._job_errors.items()),
-                "transient_retries": {preview_id: attempts for preview_id, (attempts, _) in self._transient_retries.items()},
+                "transient_retries": {preview_id: attempts for preview_id, (attempts, _, _) in self._transient_retries.items()},
+                "transient_deferrals": {preview_id: f"attempt {attempts}: {error}"
+                                        for preview_id, (attempts, _, error) in self._transient_retries.items()},
                 "refused_follow_ups": tuple(self._refused),
                 "approval_policy_revision": self.service.approval_policy.revision,
                 "automatic_approval_stages": self.service.approval_policy.automatic_stages,
@@ -688,10 +690,11 @@ class ManagedOrganizationWorker:
         Only when nothing landed (the run still waits on exactly this command's request, which it has not decided)
         the job goes back to ``queued`` with the error, untouched run and budget, and is retried after a capped
         backoff that never runs past the budget deadline. The adapter has already retried the read (bounded).
-        Once the deadline has passed, the decision goes to the runner, whose existing expiry path refuses it before
-        recording or running anything and fails the run ("TimeoutError"). Returns False (the caller fails the job
-        as for any other error) for anything else: a run command, a decision that may have landed, an aborted or
-        unreadable budget."""
+        The job's ``error`` stays empty while it is deferred, so a deferred job reads exactly like any queued job
+        (the reason is in the log and in ``diagnostics()["transient_deferrals"]``). Returns False, and the caller
+        fails the job through the existing error path, for anything else: a run command, a decision that may have
+        landed, and an expired, aborted or unreadable budget. So a re-check still failing at the deadline ends the
+        job (and the run) as any other failure does; this path never drives a decision itself."""
         command = job.commands[-1]
         assignment = self.service.recorded_assignment(job.task_id)
         run = self.service.recorded_run(job.task_id)
@@ -704,28 +707,13 @@ class ManagedOrganizationWorker:
             remaining = DeveloperTaskBudget(path=self.service.budget_path(job.preview_id),
                                             bundle=developer_task_bundle_from_payload(json.loads(job.bundle_content)),
                                             create=False).remaining_seconds()
-        except BudgetDeadlineExpired:
+        except Exception:  # an expired (BudgetDeadlineExpired), aborted or unreadable budget
             self._transient_retries.pop(job.preview_id, None)
-            if command.kind == "approve" and type(command.value) is not bool:
-                return False
-            self._update(job, state="running")
-            try:
-                if command.kind == "approve":
-                    expired = await self.service.decide(assignment.assignment_id, request_id=command.request_id,
-                                                        approved=bool(command.value))
-                else:
-                    expired = await self.service.respond(assignment.assignment_id, request_id=command.request_id,
-                                                         response=command.value)
-            except Exception:
-                return False  # the caller fails the job as for any other error
-            self._update(job, state=expired.state, error=expired.error)
-            return True
-        except Exception:
             return False
-        attempts = self._transient_retries.get(job.preview_id, (0, 0.0))[0] + 1
+        attempts = self._transient_retries.get(job.preview_id, (0, 0.0, ""))[0] + 1
         delay = min(self._transient_cap, self._transient_base * 2 ** min(attempts - 1, 16), remaining)
-        self._transient_retries[job.preview_id] = (attempts, time.monotonic() + delay)
+        self._transient_retries[job.preview_id] = (attempts, time.monotonic() + delay, str(error)[:500])
         logger.warning("GitHub transport failure re-checking %s; decision deferred (attempt %d, retry in %.1f s): %s",
                        job.preview_id, attempts, delay, error)
-        self._update(job, state="queued", error=f"Deferred on a GitHub transport failure (attempt {attempts}): {error}")
+        self._update(job, state="queued", error=None)
         return True
