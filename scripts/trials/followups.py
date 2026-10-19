@@ -59,6 +59,9 @@ from correction_cycle import (  # noqa: E402
     VERIFY_COMMAND,
 )
 
+#: Report kind of a correction or correction re-review the harness admits as a scripted human step; evidence never
+#: counts it as an automatic admission or as review inheritance (common.collect_evidence).
+SCRIPTED_HUMAN_ADMISSION = "scripted_human_admission"
 PLANNING_EVENT = "pm.planning.requested"
 PLANNER_INSTRUCTIONS = (
     "Plan the operator's objective for the pinned target as the smallest set of independent issues (prefer one). "
@@ -387,6 +390,63 @@ class HandsOff:
                 endpoint="POST /internal/developer/preview/approve (approval endpoint did the enqueue)",
             )
 
+    def correction_automatic(self) -> bool:
+        """Whether this session's pinned policy makes the ``correction`` stage automatic."""
+        modes = (self.report.get("approval_policy") or {}).get("modes") or {}
+        return modes.get("correction") == "automatic"
+
+    def correction_child(self, preview_id: str, what: str, *, reason: str) -> None:
+        """Admit a correction or a correction's re-review (``reason``: ``correction`` or ``correction_rereview``).
+
+        Vertti's Oct 12 rule and #39: a correction's re-review inherits eligibility from the correction, so both are
+        admitted automatically only when ``correction`` is automatic. Then the worker's own pickup is used (``child``).
+        Otherwise the harness waits the pickup gate, records that nothing admitted the task, and admits it through
+        ``admit_task(Human)`` (the human approval endpoint) as a scripted human step. It never sends the run trigger or
+        any automatic/agent request for it, so there is no 409 path."""
+        if self.correction_automatic():
+            self.child(preview_id, what)
+            return
+        deadline, polls = time.monotonic() + self.pickup, 0
+        admission = None
+        while True:
+            admission = self.operator.task(preview_id).get("managed_admission")
+            polls += 1
+            if admission or time.monotonic() >= deadline:
+                break
+            time.sleep(self.operator.poll)
+        entry: dict[str, Any] = {
+            "at": now(),
+            "kind": SCRIPTED_HUMAN_ADMISSION,
+            "reason": reason,
+            "what": what,
+            "preview_id": preview_id,
+            "gate_seconds": self.pickup,
+            "polls": polls,
+            "auto_admitted": bool(admission),
+        }
+        records = self.report.setdefault("scripted_human_admissions", [])
+        if admission:
+            entry["unexpected_admission"] = admission
+            records.append(entry)
+            self.operator.recorder.event("scripted_human_admission_refused", **entry)
+            self.operator.recorder.save()
+            raise RuntimeError(f"{what} {preview_id} was admitted without a human: {admission}")
+        result = self.operator.approve_preview(preview_id, what)
+        entry.update(
+            evidence_kind="human",
+            admission=(result.get("managed_admission") or {}).get("state"),
+            endpoint="POST /internal/developer/preview/approve (admit_task(Human), scripted human step)",
+        )
+        records.append(entry)
+        self.action(
+            SCRIPTED_HUMAN_ADMISSION,
+            what,
+            preview_id=preview_id,
+            reason=reason,
+            admission=entry["admission"],
+            endpoint=entry["endpoint"],
+        )
+
     def planned_children(self, timeout: float = 180) -> list[str]:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -664,7 +724,7 @@ def main() -> int:
                 report["phases"].append(
                     {"phase": "correction", "started_at": now(), "preview_id": correction_id}
                 )
-                hands.child(correction_id, "Correction")
+                hands.correction_child(correction_id, "Correction", reason="correction")
                 status = operator.drive(correction_id, "correction")
                 report["phases"][-1].update(
                     ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
@@ -690,7 +750,9 @@ def main() -> int:
                     report["phases"].append(
                         {"phase": "re-review", "started_at": now(), "preview_id": rereview_id}
                     )
-                    hands.child(rereview_id, "Architect re-review")
+                    hands.correction_child(
+                        rereview_id, "Architect re-review", reason="correction_rereview"
+                    )
                     status = operator.drive(rereview_id, "re-review")
                     report["phases"][-1].update(
                         ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")

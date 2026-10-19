@@ -127,6 +127,23 @@ human override in `report.policy_overrides`; the harness then records the servic
 `report.evidence` judges each phase, and each run decision, by the policy recorded for it, never by the latest
 session's policy (pilot trial 4 reported 29 start-phase decisions against the resume policy).
 
+Correction and re-review admission (harness only; Vertti's Oct 12 rule and #39): a correction is admitted
+automatically only when the `correction` stage is automatic, and a correction's re-review inherits its eligibility
+from the correction, so it is automatic under the same condition and no other. The trial locks keep `correction`
+human, so after automatic task admission the service refuses both by design (the worker logs them in
+`refused_follow_ups`). `pilot.py` and `followups.py` then admit each one as a **scripted human step**
+(`HandsOff.correction_child`): the harness waits the `--pickup-seconds` gate, records that nothing admitted the
+task, and admits it through `POST /internal/developer/preview/approve` (`admit_task(Human)`). It never sends the run
+trigger or any automatic request for them, so there is no 409 path (pilot trial4-20261019-021602 stopped on that
+409 at the re-review). If something admits the task during the gate, the run fails. Each step lands in
+`report.scripted_human_admissions` (`kind: scripted_human_admission`, `reason: correction|correction_rereview`,
+`auto_admitted: false`, `evidence_kind: human`) and as a `scripted_human_admission` operator action, separate from
+`worker_pickups` and run triggers. `report.evidence` expects that human step for every correction re-review and
+reports its `admission_path`. It never counts a scripted human step as an automatic admission or as review
+inheritance: `evidence.inherited_reviews` lists only reviews the service admitted automatically as
+`inherited_review`, and a scripted step on a task expected to be automatic is a problem. If `correction` were
+automatic, the harness waits for the worker instead and the evidence expects the re-review as `inherited_review`.
+
 Worker liveness (#69): while it drives a phase, the harness checks `GET /internal/organization/worker` whenever the
 job is `queued`. If no managed worker loop is alive (or the status has no health signal), the run fails at once with
 the reason and the loop errors recorded in `report.stalls`, instead of waiting out `--stage-timeout`.

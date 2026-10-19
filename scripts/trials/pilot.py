@@ -376,6 +376,7 @@ def phase(
     what: str,
     *,
     human_admission: bool = False,
+    correction_admission: str | None = None,
 ) -> dict[str, Any]:
     report["phases"].append(
         {
@@ -387,7 +388,11 @@ def phase(
         }
     )
     # Since #31 planning tasks never auto-admit, so the planning phase admits as a human (as in followups, #35).
-    hands.child(preview_id, what, human_admission=human_admission)
+    if correction_admission is not None:
+        # A correction or a correction's re-review: human-gated unless `correction` is automatic (Oct 12 rule, #39).
+        hands.correction_child(preview_id, what, reason=correction_admission)
+    else:
+        hands.child(preview_id, what, human_admission=human_admission)
     status = operator.drive(preview_id, label)
     report["phases"][-1].update(
         ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
@@ -443,7 +448,15 @@ def deliver_to_merge_point(
             branch=branch,
             head_sha=point["head_sha"],
         )
-        phase(operator, hands, report, correction_id, f"correction:{label}", f"Correction {label}")
+        phase(
+            operator,
+            hands,
+            report,
+            correction_id,
+            f"correction:{label}",
+            f"Correction {label}",
+            correction_admission="correction",
+        )
         staged = operator.post(
             "/internal/organization/corrections/stage-publication",
             {"correction_preview_id": correction_id},
@@ -469,6 +482,7 @@ def deliver_to_merge_point(
                 rereview,
                 f"re-review:{label}",
                 f"Architect re-review {label}",
+                correction_admission="correction_rereview",
             )
     pull = gh_json(
         "pr",

@@ -25,6 +25,7 @@ from aitobuild.developer_preview import (
     PLANNED_CHILD_TASK_PREFIXES,
     PLANNING_TASK_PREFIX,
     REVIEW_TASK_PREFIX,
+    is_correction_task,
 )
 
 HELSINKI = ZoneInfo("Europe/Helsinki")
@@ -350,17 +351,37 @@ def finish(report: dict[str, Any], recorder: Recorder) -> int:
     return 0 if report["result"] == "pass" else 1
 
 
+#: Report kind of a task the harness admitted as a scripted human step (followups.HandsOff.correction_child).
+SCRIPTED_HUMAN_ADMISSION = "scripted_human_admission"
+
+
+def reviews_correction(source_payload: dict[str, Any] | None, preview_of: Any) -> bool:
+    """Whether a staged review task reviews a correction: its ``published_review`` target is a correction preview
+    (the full ``is_correction_task`` rule). A missing target or preview is not a correction re-review."""
+    target = (source_payload or {}).get("published_review")
+    if not isinstance(target, dict) or not isinstance(target.get("preview_id"), str):
+        return False
+    parent = preview_of(target["preview_id"])
+    return parent is not None and is_correction_task(parent)
+
+
 def expected_evidence_kind(
-    task_id: str, source_payload: dict[str, Any] | None = None, correction_automatic: bool = False
+    task_id: str,
+    source_payload: dict[str, Any] | None = None,
+    correction_automatic: bool = False,
+    rereviews_correction: bool = False,
 ) -> str:
     """The admit_task evidence kind a task gets under automatic task admission: planning (#31) and corrections
-    (correction: human) stay human-admitted."""
+    (correction: human) stay human-admitted. A correction's re-review inherits from the correction (Vertti's Oct 12
+    rule, #39): ``inherited_review`` only when ``correction`` is automatic, otherwise a human admission."""
     if task_id.startswith(PLANNING_TASK_PREFIX):
         return "human"
     if task_id.startswith(CORRECTION_TASK_PREFIX) or "correction_from_review" in (source_payload or {}):
         # correction: automatic lets the service admit corrections automatically; otherwise they stay human.
         return "operator_policy" if correction_automatic else "human"
     if task_id.startswith(REVIEW_TASK_PREFIX):
+        if rereviews_correction and not correction_automatic:
+            return "human"
         return "inherited_review"
     if task_id.startswith(PLANNED_CHILD_TASK_PREFIXES):
         return "planned_child"
@@ -375,17 +396,37 @@ def admission_problem(
     modes: dict[str, Any],
     revision: str,
     source_payload: dict[str, Any] | None = None,
+    rereviews_correction: bool = False,
+    scripted_human: dict[str, Any] | None = None,
 ) -> str | None:
     """Verdict on one phase's task admission. With automatic task admission, planning tasks must be human-admitted
     (#31) and corrections must be human-admitted (no policy decision, evidence kind human) and every other task must be an automatic policy decision at the
-    pinned revision through its expected evidence kind (planned child, inherited review, operator policy)."""
+    pinned revision through its expected evidence kind (planned child, inherited review, operator policy).
+
+    A correction's re-review under a non-automatic ``correction`` stage must be human-admitted through the harness's
+    recorded ``scripted_human_admission`` step (gate passed, not auto-admitted). A scripted human step never counts as
+    an automatic admission: any task expected to be admitted automatically (review inheritance included) that carries
+    one fails."""
     if modes.get("task_admission") != "automatic":
         return None
-    want = expected_evidence_kind(task_id, source_payload, modes.get("correction") == "automatic")
+    correction_automatic = modes.get("correction") == "automatic"
+    want = expected_evidence_kind(
+        task_id, source_payload, correction_automatic, rereviews_correction
+    )
     if want == "human":
         if admission is not None or evidence_kind != "human":
             return f"{phase}: planning/correction task not human-admitted (evidence={evidence_kind})"
+        if task_id.startswith(REVIEW_TASK_PREFIX) and rereviews_correction:
+            if (
+                scripted_human is None
+                or scripted_human.get("kind") != SCRIPTED_HUMAN_ADMISSION
+                or scripted_human.get("auto_admitted") is not False
+                or scripted_human.get("evidence_kind") != "human"
+            ):
+                return f"{phase}: correction re-review has no recorded scripted human admission after its gate"
         return None
+    if scripted_human is not None:
+        return f"{phase}: scripted human admission recorded where {want} admission was expected"
     if (
         not admission
         or admission.get("source") != "operator_policy"
@@ -493,6 +534,12 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
         policy.revision, policy.model_dump(mode="json")
     )
     phases, problems = [], []
+    scripted = {
+        item["preview_id"]: item
+        for item in report.get("scripted_human_admissions", [])
+        if item.get("kind") == SCRIPTED_HUMAN_ADMISSION
+    }
+    inherited: list[str] = []
     for phase in report["phases"]:
         revision = phase_policy_revision(report, phase)
         modes = recorded_policy_modes(report, revision)
@@ -521,13 +568,31 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
             for item in decisions
             if item["policy"] and item["policy"]["source"] == "operator_policy"
         )
+        task_id = str((preview.bundle_payload if preview else {}).get("task_id", ""))
+        source_payload = preview.source_payload if preview else None
+        rereview = task_id.startswith(REVIEW_TASK_PREFIX) and reviews_correction(
+            source_payload, previews.get
+        )
+        script = scripted.get(phase["preview_id"])
+        evidence_kind = preview.evidence_kind if preview else None
+        admission_path = (
+            SCRIPTED_HUMAN_ADMISSION
+            if script is not None
+            else "automatic"
+            if admission and admission.get("source") == "operator_policy"
+            else "human"
+        )
+        if admission_path == "automatic" and evidence_kind == "inherited_review":
+            inherited.append(phase["phase"])  # a scripted human step is never counted here
         phases.append(
             {
                 "phase": phase["phase"],
                 "preview_id": phase["preview_id"],
                 "policy_revision": revision,
                 "admission": admission,
-                "evidence_kind": preview.evidence_kind if preview else None,
+                "evidence_kind": evidence_kind,
+                "admission_path": admission_path,
+                "rereviews_correction": rereview,
                 "run_policy_revision": run.approval_policy_revision if run else None,
                 "run_policy_overrides": [
                     item.model_dump(mode="json") for item in getattr(run, "policy_overrides", ())
@@ -538,12 +603,14 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
         )
         problem = admission_problem(
             phase["phase"],
-            str((preview.bundle_payload if preview else {}).get("task_id", "")),
+            task_id,
             admission,
-            preview.evidence_kind if preview else None,
+            evidence_kind,
             modes,
             revision,
-            preview.source_payload if preview else None,
+            source_payload,
+            rereview,
+            script,
         )
         if problem:
             problems.append(problem)
@@ -576,6 +643,8 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
         "max_automatic_decisions": policy.max_automatic_decisions,
         "policy_revision": policy.revision,
         "phases": phases,
+        "inherited_reviews": inherited,
+        "scripted_human_admissions": sorted(scripted),
     }
 
 
