@@ -184,6 +184,15 @@ def test_worker_failure_on_a_waiting_run_fails_the_run_with_the_real_error(tmp_p
     assert _budget(approved_delivery, preview_id).get("aborted") is True
 
 
+@pytest.mark.parametrize("state", ["cancelled", "failed", "completed"])
+def test_terminate_refuses_the_operator_label_for_any_state(tmp_path, approved_delivery, state):
+    _, service, waiting = _waiting(tmp_path, approved_delivery)
+    with pytest.raises(ValueError, match="operator-cancel label"):
+        asyncio.run(service.terminate(waiting.assignment_id, state=state, error=OPERATOR_CANCELLED))  # type: ignore[arg-type]
+    run = FileRunStore(tmp_path / "service-runs").get(waiting.assignment_id)
+    assert run.state == "waiting" and run.error is None
+
+
 def test_only_an_operator_cancel_can_record_the_operator_label(tmp_path, approved_delivery):
     _, service, waiting = _waiting(tmp_path, approved_delivery)
     with pytest.raises(ValueError, match="operator-cancel label"):

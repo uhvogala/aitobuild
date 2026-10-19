@@ -857,10 +857,10 @@ class ManagedWorkflowRunner:
         The managed worker uses it when a job fails (the run ends ``failed`` with the real error) or is interrupted
         by shutdown (``cancelled`` with that reason). The same states and the same terminal path as ``cancel``; only
         the recorded label differs, so the operator-cancel label stays reserved for an actual cancel command."""
+        if error == OPERATOR_CANCELLED:  # refused for any state, not only ``cancelled``
+            raise ValueError("Only an operator cancel command records the operator-cancel label")
         if state not in {"failed", "cancelled"} or not isinstance(error, str) or not error.strip():
             raise ValueError("Terminating a managed run requires a failed/cancelled outcome and a diagnostic")
-        if state == "cancelled" and error == OPERATOR_CANCELLED:
-            raise ValueError("Only an operator cancel command records the operator-cancel label")
         return await self._end(assignment_id, state, error)
 
     async def _end(self, assignment_id: str, state: Literal["failed", "cancelled"], error: str) -> ManagedRun:
