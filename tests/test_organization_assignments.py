@@ -366,3 +366,27 @@ def test_invalid_or_expired_completion_cannot_release_a_claim(tmp_path, monkeypa
         service.finish(first.assignment_id, state="completed", outcome="Operator completion")
     assert assignments.get(first.assignment_id) == first
     assert service.finish(first.assignment_id, state="cancelled", outcome="Expired task stopped").state == "cancelled"
+
+def test_revalidate_reads_ownership_from_one_snapshot_when_finish_lands_between_reads(tmp_path):
+    """#77: a finish() right after revalidate's first store read must not surface as 'no longer owns its task'."""
+    service, snapshot, previews, assignments = setup_service(tmp_path)
+    first = assign(service, snapshot, approved_task(tmp_path, previews), **coordinator_proposal())
+    finished = []
+
+    def finish_after_first_read(name):
+        real = getattr(assignments, name)
+
+        def read(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if not finished:
+                finished.append(assignments.finish(first.assignment_id, state="completed", outcome="done"))
+            return result
+        return read
+
+    for name in ("get", "for_task", "get_with_owner"):
+        if hasattr(assignments, name):
+            setattr(assignments, name, finish_after_first_read(name))
+    assert service.revalidate(first.assignment_id) == first  # the snapshot it read: claimed and the owner
+    assert finished and finished[0].state == "completed"
+    with pytest.raises(PermissionError, match="requires a claimed assignment"):  # the real state afterwards
+        service.revalidate(first.assignment_id)

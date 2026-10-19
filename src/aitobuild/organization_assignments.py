@@ -116,6 +116,8 @@ class AssignmentStore(Protocol):
 
     def for_task(self, task_id: str) -> TaskAssignment | None: ...
 
+    def get_with_owner(self, assignment_id: str) -> tuple[TaskAssignment | None, TaskAssignment | None]: ...
+
     def claim(self, assignment: TaskAssignment) -> TaskAssignment: ...
 
     def finish(
@@ -151,6 +153,19 @@ class FileAssignmentStore:
     def for_task(self, task_id: str) -> TaskAssignment | None:
         with FileLock(self._lock_path, timeout=10):
             return next((record for record in self._load().assignments if record.task_id == task_id), None)
+
+    def get_with_owner(self, assignment_id: str) -> tuple[TaskAssignment | None, TaskAssignment | None]:
+        """The record and the current owner of its task, from one journal snapshot.
+
+        Separate get() and for_task() calls can straddle a finish() (claimed -> terminal), so comparing their
+        results would refuse an assignment that is still the owner of its task (#77).
+        """
+        with FileLock(self._lock_path, timeout=10):
+            assignments = self._load().assignments
+        record = next((item for item in assignments if item.assignment_id == assignment_id), None)
+        if record is None:
+            return None, None
+        return record, next((item for item in assignments if item.task_id == record.task_id), None)
 
     def claim(self, assignment: TaskAssignment) -> TaskAssignment:
         candidate = TaskAssignment.model_validate(assignment.model_dump())
@@ -277,10 +292,11 @@ class AssignmentService:
         return record, budget.expired_deadline()
 
     def _revalidate_scope(self, assignment_id: str) -> tuple[TaskAssignment, DeveloperTaskBudget]:
-        record = self._assignments.get(assignment_id)
+        # One snapshot for the record and its task owner, like ManagedOrganizationService._assignment (#77).
+        record, owner = self._assignments.get_with_owner(assignment_id)
         if record is None or record.state != "claimed":
             raise PermissionError("Managed execution requires a claimed assignment")
-        if self._assignments.for_task(record.task_id) != record:
+        if owner != record:
             raise PermissionError("Assignment no longer owns its task")
         snapshot = self._definitions.get(record.organization_id, record.revision)
         if snapshot is None:
