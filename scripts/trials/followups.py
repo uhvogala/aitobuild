@@ -52,6 +52,7 @@ from common import (  # noqa: E402
     now,
     positive,
     prepare_docker_wrapper,
+    require_completed,
 )
 from correction_cycle import (  # noqa: E402
     ARCHITECT_INSTRUCTIONS,
@@ -701,6 +702,7 @@ def main() -> int:
             report["phases"][-1].update(
                 ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
             )
+            require_completed(status, "Architect review")  # #83: the service-recorded run must have completed
             followup = operator.wait_follow_up(review_id, "review")
             if followup and followup.get("state") == "staged":
                 correction_id = followup["next_preview_id"]
@@ -727,6 +729,7 @@ def main() -> int:
                 report["phases"][-1].update(
                     ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
                 )
+                require_completed(status, "Correction")  # #83: the service-recorded run must have completed
                 staged = operator.post(
                     "/internal/organization/corrections/stage-publication",
                     {"correction_preview_id": correction_id},
@@ -755,6 +758,7 @@ def main() -> int:
                     report["phases"][-1].update(
                         ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
                     )
+                    require_completed(status, "Architect re-review")  # #83: the service-recorded run must have completed
             report["review_outcome"] = (followup or {}).get("state")
             report["worker_diagnostics"] = client.get(
                 "/internal/organization/worker", headers=operator.headers

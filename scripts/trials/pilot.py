@@ -43,6 +43,7 @@ from common import (  # noqa: E402
     ALL_STAGES,
     ALLOWED_AUTOMATIC_STAGES,
     DEFAULT_ENDPOINT,
+    REVIEWED_OUTCOMES,
     DEFAULT_REPOSITORY,
     HELSINKI,
     Operator,
@@ -57,6 +58,7 @@ from common import (  # noqa: E402
     now,
     positive,
     prepare_docker_wrapper,
+    require_completed,
 )
 
 SERVICE_ROOT = Path(__file__).resolve().parents[2]
@@ -397,7 +399,9 @@ def phase(
     report["phases"][-1].update(
         ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
     )
-    return status
+    # #83: no phase (planning, delivery, review, correction, re-review) goes on unless the service-recorded run
+    # completed; a failed review must stop the session instead of becoming a merge point.
+    return require_completed(status, f"{what} ({label})")
 
 
 def deliver_to_merge_point(
@@ -410,11 +414,7 @@ def deliver_to_merge_point(
     label: str,
     issue_key: str | None,
 ) -> dict[str, Any]:
-    status = phase(operator, hands, report, preview_id, f"delivery:{label}", f"Developer {label}")
-    if (status.get("managed_run") or {}).get("state") != "completed":
-        raise RuntimeError(
-            f"Delivery {label} did not complete: " + json.dumps(status, default=str)[:1500]
-        )
+    phase(operator, hands, report, preview_id, f"delivery:{label}", f"Developer {label}")
     record = client.get(
         "/internal/developer/delivery/" + preview_id, headers=operator.headers
     ).json()
@@ -432,6 +432,9 @@ def deliver_to_merge_point(
     phase(operator, hands, report, review_id, f"review:{label}", f"Architect review {label}")
     followup = operator.wait_follow_up(review_id, f"review:{label}")
     point["review_outcome"] = (followup or {}).get("state")
+    if point["review_outcome"] not in REVIEWED_OUTCOMES:
+        # #83: a merge point needs the completed review's follow-up outcome; anything else is not a reviewed head.
+        raise RuntimeError(f"Review {label} has no review outcome, so there is no merge point: {followup}")
     if followup and followup.get("state") == "staged":
         correction_id, branch = followup["next_preview_id"], point["branch"]
         git(
@@ -703,11 +706,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     operator, hands, report, planning.preview_id, "planning", "PM planning task",
                     human_admission=True,
                 )
-                run = status.get("managed_run") or {}
-                if run.get("state") != "completed":
-                    raise RuntimeError(
-                        "Planning did not complete: " + json.dumps(status, default=str)[:1500]
-                    )
+                run = status["managed_run"]  # phase() already required the service-recorded run to complete
                 plan = holder["planning_holder"]["planning"].plans.get(run["assignment_id"])
                 report["plan"] = {
                     "planning_assignment_id": run["assignment_id"],

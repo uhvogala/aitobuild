@@ -105,7 +105,7 @@ def _phase_state(policy, task_id, tool_source):
         bundle_payload={"task_id": task_id}, source_payload={})
     tool = SimpleNamespace(request_id=f"{task_id}-tools", kind="service_approval", actor_id="operator",
                            approval_policy=_decision(policy, ApprovalStage.DEVELOPER_TOOLS, tool_source))
-    run = Run(approval_policy_revision=policy.revision, policy_overrides=(), decisions=(tool,))
+    run = Run(state="completed", approval_policy_revision=policy.revision, policy_overrides=(), decisions=(tool,))
     return preview, run
 
 
@@ -147,7 +147,7 @@ def test_run_decisions_after_a_service_override_use_the_override_policy():
                             approval_policy=_decision(RESUME, ApprovalStage.DEVELOPER_TOOLS, "human"))
     override = SimpleNamespace(revision=RESUME.revision, after_decisions=1,
                                model_dump=lambda mode=None: {"revision": RESUME.revision})
-    run = Run(approval_policy_revision=START.revision, policy_overrides=(override,), decisions=(*run.decisions, later))
+    run = Run(state="completed", approval_policy_revision=START.revision, policy_overrides=(override,), decisions=(*run.decisions, later))
     evidence = common.collect_evidence(_holder({"p1": preview}, {"p1": run}), report, RESUME)
     assert evidence["ok"], evidence["problems"]
     assert [item["pinned_policy_revision"] for item in evidence["phases"][0]["decisions"]] == [START.revision, RESUME.revision]
