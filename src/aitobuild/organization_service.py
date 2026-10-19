@@ -912,9 +912,19 @@ class ManagedOrganizationService:
             self._actor.reset(token)
 
     async def cancel(self, assignment_id: str) -> ManagedRun:
+        """An operator's cancel command (#78: the only path that records "Operator cancelled workflow")."""
         self._assignment(assignment_id)
         token = self._actor.set(self._operator)
         try:
             return await self._runner.cancel(assignment_id)
+        finally:
+            self._actor.reset(token)
+
+    async def terminate(self, assignment_id: str, *, state: Literal["failed", "cancelled"], error: str) -> ManagedRun:
+        """#78: end a live run with its real outcome (a worker failure or shutdown), not as an operator cancel."""
+        self._assignment(assignment_id)
+        token = self._actor.set(self._operator)
+        try:
+            return await self._runner.terminate(assignment_id, state=state, error=error)
         finally:
             self._actor.reset(token)

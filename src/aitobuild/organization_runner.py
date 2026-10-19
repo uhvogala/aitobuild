@@ -39,6 +39,7 @@ from aitobuild.policy import ActionClass, AgentRole, assert_role_action_allowed
 RunState = Literal["ready", "running", "waiting", "finalizing", "completed", "failed", "cancelled"]
 InputKind = Literal["human_input", "service_approval"]
 TERMINAL = {"completed", "failed", "cancelled"}
+OPERATOR_CANCELLED = "Operator cancelled workflow"  # #78: recorded only for an operator cancel command
 
 
 @dataclass(frozen=True, slots=True)
@@ -847,6 +848,22 @@ class ManagedWorkflowRunner:
             return updated
 
     async def cancel(self, assignment_id: str) -> ManagedRun:
+        """An operator's cancel command: the only path that records "Operator cancelled workflow" (#78)."""
+        return await self._end(assignment_id, "cancelled", OPERATOR_CANCELLED)
+
+    async def terminate(self, assignment_id: str, *, state: Literal["failed", "cancelled"], error: str) -> ManagedRun:
+        """#78: end a live run with the caller's own outcome and diagnostic, when no operator cancelled it.
+
+        The managed worker uses it when a job fails (the run ends ``failed`` with the real error) or is interrupted
+        by shutdown (``cancelled`` with that reason). The same states and the same terminal path as ``cancel``; only
+        the recorded label differs, so the operator-cancel label stays reserved for an actual cancel command."""
+        if error == OPERATOR_CANCELLED:  # refused for any state, not only ``cancelled``
+            raise ValueError("Only an operator cancel command records the operator-cancel label")
+        if state not in {"failed", "cancelled"} or not isinstance(error, str) or not error.strip():
+            raise ValueError("Terminating a managed run requires a failed/cancelled outcome and a diagnostic")
+        return await self._end(assignment_id, state, error)
+
+    async def _end(self, assignment_id: str, state: Literal["failed", "cancelled"], error: str) -> ManagedRun:
         if self._actor().kind != "operator":
             raise PermissionError("Cancellation requires trusted operator context")
         with self._runs.invocation_lock(assignment_id):
@@ -859,7 +876,7 @@ class ManagedWorkflowRunner:
                 return run
             if run.state == "finalizing":
                 return self._finalize(run)
-            return await self._terminate(run, self._context(run, assignment), "cancelled", "Operator cancelled workflow")
+            return await self._terminate(run, self._context(run, assignment), state, error)
 
     def _workflow(self, context: ManagedTaskContext, storage: _RunCheckpoints) -> Any:
         definition = context.snapshot.definition
