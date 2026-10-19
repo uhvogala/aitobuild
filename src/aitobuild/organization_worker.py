@@ -19,7 +19,7 @@ from aitobuild.durable_files import atomic_write_text
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.organization import DefinitionModel
 from aitobuild.organization_assignments import AssignmentCapacityError, AssignmentProposal, Digest
-from aitobuild.organization_runner import TERMINAL, ApprovalPolicyChanged
+from aitobuild.organization_runner import TERMINAL, ApprovalPolicyChanged, ManagedRun
 from aitobuild.organization_service import AdmissionRefused, ManagedOrganizationService, ManagedRoute
 from aitobuild.tools.github import GitHubTransientError
 
@@ -211,6 +211,21 @@ class FileWorkerStore:
         return FileLock(self._checked(path), timeout=0)
 
 
+def job_end_state(run: ManagedRun | None, state: Literal["failed", "cancelled"],
+                  error: str) -> tuple[Literal["completed", "failed", "cancelled"], str | None]:
+    """#78, the one rule for how a worker job ends when the worker ends it (failure, shutdown or operator cancel).
+
+    A job that owns a run ends as that run's recorded end state: a completed run gives a completed job (never
+    ``cancelled``), and the job is ``cancelled`` only when its run was cancelled. When the run ended with the outcome
+    the worker meant, the job keeps the worker's own diagnostic; otherwise it takes the run's. Only a job with no
+    terminal run (none started, or no claimed assignment to end) falls back to the worker's outcome."""
+    if run is not None and run.state in TERMINAL:
+        if run.state == state:
+            return state, error
+        return run.state, run.error  # type: ignore[return-value]
+    return state, error
+
+
 _LOCAL_CANCEL_LOCK_SECONDS = 5.0
 _LOCAL_CANCEL_LOCK_RETRY_SECONDS = 0.01
 
@@ -239,8 +254,8 @@ class ManagedOrganizationWorker:
             raise ValueError("Transient GitHub retry delays must be positive and bounded")
         self._transient_base, self._transient_cap = float(transient_retry_seconds), float(transient_retry_cap_seconds)
         # #72: in-memory retry schedule for decisions deferred on a GitHub transport failure: preview id ->
-        # (attempts so far, monotonic time before which the queued job is not picked up). A restart forgets it
-        # and simply retries at once.
+        # (attempts so far, monotonic time before which the queued job is not picked up, last error). A restart
+        # forgets it and simply retries at once.
         self._transient_retries: dict[str, tuple[int, float, str]] = {}  # attempts, not before, last error
         self._recover = recover_approved
         self._startup_limit = startup_limit
@@ -284,8 +299,7 @@ class ManagedOrganizationWorker:
                 "health": self.health(),
                 "active_previews": tuple(self._active), "errors": tuple(self._errors),
                 "job_errors": tuple(f"{preview_id}: {error}" for (preview_id, _), error in self._job_errors.items()),
-                "transient_retries": {preview_id: attempts for preview_id, (attempts, _, _) in self._transient_retries.items()},
-                "transient_deferrals": {preview_id: f"attempt {attempts}: {error}"
+                "transient_deferrals": {preview_id: {"attempts": attempts, "error": error}
                                         for preview_id, (attempts, _, error) in self._transient_retries.items()},
                 "refused_follow_ups": tuple(self._refused),
                 "approval_policy_revision": self.service.approval_policy.revision,
@@ -436,8 +450,7 @@ class ManagedOrganizationWorker:
             if current is None:
                 raise ValueError("Worker admission disappeared")
             if current.state not in {"completed", "failed", "cancelled"}:
-                await self._abort(current)
-                self._update(current, state="cancelled", error="Operator cancelled worker admission")
+                await self._end(current, state="cancelled", error="Operator cancelled worker admission", operator=True)
         finally:
             lock.release()
         result = self.store.get(preview_id)
@@ -606,28 +619,48 @@ class ManagedOrganizationWorker:
         if job.commands[-1].actor_id != self.service.operator_id:
             raise PermissionError("Worker operator context changed")
 
-    async def _abort(self, job: WorkerJob) -> None:
+    async def _abort(self, job: WorkerJob, *, state: Literal["failed", "cancelled"], error: str,
+                     operator: bool) -> ManagedRun | None:
+        """End the job's live run and close its budget; returns the run as recorded afterwards (#78).
+
+        Only an operator cancel (``operator``: a cancel command exists for this job) goes through the service's
+        cancel, which records "Operator cancelled workflow". Anything else ends the run with the worker's own
+        outcome and diagnostic. A run that already ended is left as recorded, and the budget of a completed run
+        is not aborted (a shutdown landing after the run completed, as in trial4-20261019-034521)."""
         assignment = self.service.recorded_assignment(job.task_id)
+        run = self.service.recorded_run(job.task_id)
         if assignment is not None and assignment.state == "claimed":
-            await self.service.cancel(assignment.assignment_id)
+            if operator and state == "cancelled":
+                run = await self.service.cancel(assignment.assignment_id)
+            else:
+                run = await self.service.terminate(assignment.assignment_id, state=state, error=error)
         path = self.service.budget_path(job.preview_id)
-        if path.exists():
+        if path.exists() and (run is None or run.state != "completed"):
             DeveloperTaskBudget(
                 path=path, bundle=developer_task_bundle_from_payload(json.loads(job.bundle_content)),
                 create=False, allow_aborted=True,
             ).abort()
+        return run
+
+    async def _end(self, job: WorkerJob, *, state: Literal["failed", "cancelled"], error: str,
+                   operator: bool = False) -> None:
+        """#78: the one place the worker ends a job it could not finish normally: end the run, then record the job
+        as the run's end state (``job_end_state``)."""
+        run = await self._abort(job, state=state, error=error, operator=operator)
+        end, label = job_end_state(run, state, error)
+        self._update(job, state=end, error=label)
 
     async def _execute(self, job: WorkerJob) -> None:
         try:
             if job.cancel_requested:
-                await self._abort(job)
-                self._update(job, state="cancelled", error="Operator cancelled worker admission")
+                await self._end(job, state="cancelled", error="Operator cancelled worker admission", operator=True)
                 return
             command = job.commands[-1]
             assignment = self.service.recorded_assignment(job.task_id)
             run = self.service.recorded_run(job.task_id)
             if run is not None and run.state == "finalizing" and assignment is not None:
                 self._update(job, state="running")
+                # A finalizing run only completes its recorded end state; cancel() records no label for it.
                 run = await self.service.cancel(assignment.assignment_id)
                 self._update(job, state=run.state, error=run.error)
                 return
@@ -662,8 +695,12 @@ class ManagedOrganizationWorker:
                                                  activation=job.activation)
             self._update(job, state=run.state if run is not None else "waiting", error=run.error if run else None)
         except asyncio.CancelledError:
-            await self._abort(job)
-            self._update(job, state="cancelled", error="Worker invocation cancelled")
+            # An operator cancel interrupts the task the same way a shutdown does; the journal tells them apart.
+            latest = self.store.get(job.preview_id)
+            if latest is not None and latest.cancel_requested:
+                await self._end(job, state="cancelled", error="Operator cancelled worker admission", operator=True)
+            else:
+                await self._end(job, state="cancelled", error="Worker invocation cancelled")
             raise
         except (AssignmentCapacityError, LockTimeout) as error:
             self._update(job, state="queued", error=str(error))
@@ -679,8 +716,10 @@ class ManagedOrganizationWorker:
             run = self.service.recorded_run(job.task_id)
             if run is not None and run.state == "finalizing":
                 raise
-            await self._abort(job)
-            self._update(job, state="failed", error=str(error))
+            await self._end(job, state="failed", error=str(error))
+            ended = self.store.get(job.preview_id)
+            if ended is not None and ended.state != "failed":
+                self._contain(job.preview_id, error)  # its run had already ended (#78); keep the error visible
         else:
             self._transient_retries.pop(job.preview_id, None)
 
@@ -688,13 +727,14 @@ class ManagedOrganizationWorker:
         """#72: a GitHub transport failure while re-checking a saved decision before the runner recorded it.
 
         Only when nothing landed (the run still waits on exactly this command's request, which it has not decided)
-        the job goes back to ``queued`` with the error, untouched run and budget, and is retried after a capped
-        backoff that never runs past the budget deadline. The adapter has already retried the read (bounded).
-        The job's ``error`` stays empty while it is deferred, so a deferred job reads exactly like any queued job
-        (the reason is in the log and in ``diagnostics()["transient_deferrals"]``). Returns False, and the caller
-        fails the job through the existing error path, for anything else: a run command, a decision that may have
-        landed, and an expired, aborted or unreadable budget. So a re-check still failing at the deadline ends the
-        job (and the run) as any other failure does; this path never drives a decision itself."""
+        the job goes back to ``queued`` with its ``error`` empty, untouched run and budget, and is retried after a
+        capped backoff that never runs past the budget deadline. The adapter has already retried the read
+        (bounded). So a deferred job reads exactly like any queued job; the reason is in the log and in
+        ``diagnostics()["transient_deferrals"]`` (attempts and last error). Returns False, and the caller fails the
+        job through the existing error path, for anything else: a run command, a decision that may have landed,
+        and an expired, aborted or unreadable budget. So a re-check still failing at the deadline ends the job
+        (and the run, ``failed`` with the transport error, #78) as any other failure does; this path never drives
+        a decision itself."""
         command = job.commands[-1]
         assignment = self.service.recorded_assignment(job.task_id)
         run = self.service.recorded_run(job.task_id)

@@ -67,7 +67,7 @@ def test_worker_abort_does_not_hide_budget_lock_timeout(tmp_path, approved_deliv
 
     monkeypatch.setattr(worker_module, "DeveloperTaskBudget", locked_budget)
     with pytest.raises(LockTimeout):
-        asyncio.run(worker._abort(job))
+        asyncio.run(worker._abort(job, state="failed", error="worker failure", operator=False))
     assert path.read_bytes() == before
 
 
@@ -78,8 +78,8 @@ def test_worker_abort_reopens_already_aborted_budget_without_reset(tmp_path, app
     job = worker.enqueue(preview_id)
     path = delivery.budget_path(preview_id)
     before = json.loads(path.read_text())
-    asyncio.run(worker._abort(job))
-    asyncio.run(worker._abort(job))
+    asyncio.run(worker._abort(job, state="failed", error="worker failure", operator=False))
+    asyncio.run(worker._abort(job, state="failed", error="worker failure", operator=False))
     assert json.loads(path.read_text()) == before | {"aborted": True}
 
 

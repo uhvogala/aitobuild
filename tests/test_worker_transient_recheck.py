@@ -164,11 +164,12 @@ def test_transient_recheck_failure_keeps_the_run_waiting_then_lands_once(
     async def exercise():
         await worker.start()
         try:
-            await _until(lambda: worker.diagnostics()["transient_retries"].get(child_id, 0) >= 3)
+            await _until(lambda: worker.diagnostics()["transient_deferrals"].get(child_id, {}).get("attempts", 0) >= 3)
             job = worker.store.get(child_id)
             assert job.state == "queued" and job.error is None  # reads exactly like any queued job
             reason = "TLS handshake timeout" if failure == "tls" else "gh api timed out"
-            assert reason in worker.diagnostics()["transient_deferrals"][child_id]
+            assert reason in worker.diagnostics()["transient_deferrals"][child_id]["error"]
+            assert "transient_retries" not in worker.diagnostics()  # one entry (#78 nit)
             _assert_harness_sees_deferred_as_pending(tmp_path, job, service.recorded_run(task_id))
             assert set(github.calls_per_inspection) == {attempts}  # bounded read retry inside the adapter
             run = service.recorded_run(task_id)
@@ -183,7 +184,7 @@ def test_transient_recheck_failure_keeps_the_run_waiting_then_lands_once(
             run = service.recorded_run(task_id)
             assert run.state == "completed" and [item.request_id for item in run.decisions] == [request_id]
             assert tools == [child_id]  # landed exactly once
-            assert child_id not in worker.diagnostics()["transient_retries"]
+            assert child_id not in worker.diagnostics()["transient_deferrals"]
         finally:
             await worker.close()
 
@@ -194,8 +195,9 @@ def test_recheck_failing_past_the_budget_deadline_fails_through_the_existing_err
     tmp_path, approved_delivery, monkeypatch,
 ):
     """A re-check still failing once the budget deadline has passed is not deferred again: the job fails through
-    the worker's existing error path (job failed with the transport error, run cancelled, budget aborted), nothing
-    is recorded, and the worker never drives the decision itself (no direct service.decide/respond)."""
+    the worker's existing error path, nothing is recorded, and the worker never drives the decision itself (no
+    direct service.decide/respond). #78, the trial4-20261019-052917 stop: the job and the run both end ``failed``
+    with the transport error; no "Operator cancelled workflow", since no cancel was sent."""
     github = FailingCommitLookup(repository_ids={"fixture/widgets": 101},
                                  commit_files={("fixture/widgets", approved_delivery[4]): {}})
     tools: list[str] = []
@@ -217,7 +219,7 @@ def test_recheck_failing_past_the_budget_deadline_fails_through_the_existing_err
     async def exercise():
         await worker.start()
         try:
-            await _until(lambda: worker.diagnostics()["transient_retries"].get(child_id, 0) >= 2)
+            await _until(lambda: worker.diagnostics()["transient_deferrals"].get(child_id, {}).get("attempts", 0) >= 2)
             path = service.budget_path(child_id)
             state = json.loads(path.read_text())
             state["deadline"] = time.time() - 1
@@ -227,16 +229,18 @@ def test_recheck_failing_past_the_budget_deadline_fails_through_the_existing_err
             await worker.close()
         run = service.recorded_run(task_id)
         assert job.state == "failed" and "TLS handshake timeout" in job.error  # the transport error, as reported
-        assert run.state == "cancelled" and run.decisions == () and tools == []  # today's existing path (#78 label)
+        assert run.state == "failed" and "TLS handshake timeout" in run.error and run.decisions == () and tools == []
+        assert "Operator cancelled" not in run.error and not FileWorkerStore(store).get(child_id).cancel_requested
+        assert service.recorded_assignment(task_id).state == "failed"
         assert _budget(service, child_id).get("aborted") is True
-        assert direct == [] and child_id not in worker.diagnostics()["transient_retries"]
+        assert direct == [] and child_id not in worker.diagnostics()["transient_deferrals"]
 
     asyncio.run(exercise())
 
 
 def test_a_non_transient_recheck_failure_still_fails_as_before(tmp_path, approved_delivery, monkeypatch):
-    """Only GitHubTransientError defers: an API answer (404) fails the job, cancels the run and aborts the budget
-    exactly as on master (that end-state label is #78's, unchanged here)."""
+    """Only GitHubTransientError defers: an API answer (404) fails the job and aborts the budget as before, and
+    (#78) the run ends ``failed`` with that error, not as an operator cancel."""
     github = FailingCommitLookup(repository_ids={"fixture/widgets": 101},
                                  commit_files={("fixture/widgets", approved_delivery[4]): {}})
     tools: list[str] = []
@@ -256,9 +260,9 @@ def test_a_non_transient_recheck_failure_still_fails_as_before(tmp_path, approve
     assert job.state == "failed" and "HTTP 404" in job.error
     assert github.calls_per_inspection[0] == 1  # an API answer is never retried
     run = service.recorded_run(task_id)
-    assert run.state == "cancelled" and run.decisions == () and tools == []
+    assert run.state == "failed" and "HTTP 404" in run.error and run.decisions == () and tools == []
     assert _budget(service, child_id).get("aborted") is True
-    assert not worker.diagnostics()["transient_retries"]
+    assert not worker.diagnostics()["transient_deferrals"]
 
 
 def test_enqueueing_a_decision_does_not_block_the_event_loop(tmp_path, test_config, approved_delivery, monkeypatch):
