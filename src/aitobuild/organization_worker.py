@@ -9,6 +9,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import time
 from typing import Annotated, Literal, Protocol, Self
 
 from filelock import FileLock, Timeout as LockTimeout
@@ -20,6 +21,7 @@ from aitobuild.organization import DefinitionModel
 from aitobuild.organization_assignments import AssignmentCapacityError, AssignmentProposal, Digest
 from aitobuild.organization_runner import TERMINAL, ApprovalPolicyChanged
 from aitobuild.organization_service import AdmissionRefused, ManagedOrganizationService, ManagedRoute
+from aitobuild.tools.github import GitHubTransientError
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +220,7 @@ class ManagedOrganizationWorker:
         self, *, service: ManagedOrganizationService, store: WorkerStore,
         max_workers: int = 1, poll_seconds: float = 1, recover_approved: bool = False,
         startup_limit: int = 500, queue_follow_ups: bool = False,
+        transient_retry_seconds: float = 5.0, transient_retry_cap_seconds: float = 60.0,
     ) -> None:
         if (type(max_workers) is not int or not 1 <= max_workers <= 64 or type(poll_seconds) not in {float, int} or
             not math.isfinite(poll_seconds) or poll_seconds <= 0):
@@ -230,6 +233,15 @@ class ManagedOrganizationWorker:
             raise ValueError("Startup recovery must be explicit and bounded")
         if type(queue_follow_ups) is not bool:
             raise ValueError("Follow-up queueing must be explicit")
+        if (type(transient_retry_seconds) not in {float, int} or type(transient_retry_cap_seconds) not in {float, int}
+                or not 0 < transient_retry_seconds <= transient_retry_cap_seconds
+                or not math.isfinite(transient_retry_cap_seconds)):
+            raise ValueError("Transient GitHub retry delays must be positive and bounded")
+        self._transient_base, self._transient_cap = float(transient_retry_seconds), float(transient_retry_cap_seconds)
+        # #72: in-memory retry schedule for decisions deferred on a GitHub transport failure: preview id ->
+        # (attempts so far, monotonic time before which the queued job is not picked up). A restart forgets it
+        # and simply retries at once.
+        self._transient_retries: dict[str, tuple[int, float, str]] = {}  # attempts, not before, last error
         self._recover = recover_approved
         self._startup_limit = startup_limit
         self._queue_follow_ups = queue_follow_ups
@@ -242,6 +254,19 @@ class ManagedOrganizationWorker:
         # admission was refused (left for a human); both bounded, keyed so a persistent error is reported once.
         self._job_errors: dict[tuple[str, str], str] = {}
         self._refused: dict[str, str] = {}
+        self._event_loop: asyncio.AbstractEventLoop | None = None
+
+    def _notify(self, event: asyncio.Event) -> None:
+        """Set a loop event from any thread (#72: enqueueing and re-checks run off the event loop)."""
+        loop = self._event_loop
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is None or running is loop or loop.is_closed():
+            event.set()
+        else:
+            loop.call_soon_threadsafe(event.set)
 
     @property
     def queue_follow_ups(self) -> bool:
@@ -259,6 +284,9 @@ class ManagedOrganizationWorker:
                 "health": self.health(),
                 "active_previews": tuple(self._active), "errors": tuple(self._errors),
                 "job_errors": tuple(f"{preview_id}: {error}" for (preview_id, _), error in self._job_errors.items()),
+                "transient_retries": {preview_id: attempts for preview_id, (attempts, _, _) in self._transient_retries.items()},
+                "transient_deferrals": {preview_id: f"attempt {attempts}: {error}"
+                                        for preview_id, (attempts, _, error) in self._transient_retries.items()},
                 "refused_follow_ups": tuple(self._refused),
                 "approval_policy_revision": self.service.approval_policy.revision,
                 "automatic_approval_stages": self.service.approval_policy.automatic_stages,
@@ -270,7 +298,7 @@ class ManagedOrganizationWorker:
             if error is not None:
                 logger.error("Managed worker loop stopped", exc_info=error)
                 self._errors.append(str(error)[:4000])
-                self._changed.set()
+                self._notify(self._changed)
 
     def enqueue(self, preview_id: str, *, proposal: AssignmentProposal | None = None) -> WorkerJob | None:
         admission = self.service.admission(preview_id)
@@ -297,10 +325,10 @@ class ManagedOrganizationWorker:
                         "commands": (*original.commands, command), "state": "queued", "error": None, "refusal": None,
                         "updated_at": datetime.now(tz=UTC),
                     }))
-                self._wake.set()
+                self._notify(self._wake)
                 return self.store.get(preview_id)
             self._validate(original)
-            self._wake.set()
+            self._notify(self._wake)
             return original
         self.service.validate_selection(route, proposal)
         content = json.dumps(preview.bundle_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -314,7 +342,7 @@ class ManagedOrganizationWorker:
             commands=(WorkerCommand(kind="run", actor_id=self.service.operator_id, created_at=now, proposal=proposal),),
             created_at=now, updated_at=now,
         ))
-        self._wake.set()
+        self._notify(self._wake)
         return job
 
     def enqueue_decision(self, assignment_id: str, *, request_id: str, kind: Literal["approve", "resume"],
@@ -334,7 +362,8 @@ class ManagedOrganizationWorker:
             updated = job.model_copy(update={"commands": (*job.commands, command), "state": "queued", "error": None, "refusal": None,
                                              "updated_at": datetime.now(tz=UTC)})
             self.store.save(updated)
-        self._wake.set()
+            self._transient_retries.pop(preview_id, None)
+        self._notify(self._wake)
         return WorkerJob.model_validate(updated.model_dump())
 
     def requeue_after_policy_override(self, preview_id: str) -> WorkerJob | None:
@@ -352,7 +381,7 @@ class ManagedOrganizationWorker:
             updated = job.model_copy(update={"state": "queued", "error": None, "refusal": None,
                                              "updated_at": datetime.now(tz=UTC)})
             self.store.save(updated)
-        self._wake.set()
+        self._notify(self._wake)
         return WorkerJob.model_validate(updated.model_dump())
 
     async def start(self) -> None:
@@ -361,6 +390,7 @@ class ManagedOrganizationWorker:
         self.store.list()
         self._wake = asyncio.Event()
         self._changed = asyncio.Event()
+        self._event_loop = asyncio.get_running_loop()
         if self._recover:
             for preview in self.service.approved_previews(limit=self._startup_limit):
                 if (self.store.get(preview.preview_id) is None and self.service.admission(preview.preview_id) is not None and
@@ -457,7 +487,7 @@ class ManagedOrganizationWorker:
             self._job_errors[key] = key[1]
             logger.error("Managed worker contained an error for %s; the loop keeps running", preview_id,
                          exc_info=error)
-            self._changed.set()
+            self._notify(self._changed)
 
     def _queue_follow_ups_of(self, job: WorkerJob) -> None:
         child_id = self.service.follow_up_preview_id(job.preview_id)
@@ -477,7 +507,7 @@ class ManagedOrganizationWorker:
                         self._refused.pop(next(iter(self._refused)))
                     self._refused[next_id] = str(refusal)
                     logger.info("Follow-up %s of %s waits for a human admission: %s", next_id, job.preview_id, refusal)
-                    self._changed.set()
+                    self._notify(self._changed)
 
     async def _run_owned(self, current: WorkerJob) -> None:
         parent = asyncio.current_task()
@@ -512,11 +542,15 @@ class ManagedOrganizationWorker:
     async def _dispatch(self, job: WorkerJob) -> None:
         if self._queue_follow_ups and job.state == "completed":
             try:
-                self._queue_follow_ups_of(job)
+                # #72: discovering follow-ups re-reads GitHub (blocking gh calls); keep it off the event loop.
+                await asyncio.to_thread(self._queue_follow_ups_of, job)
             except LockTimeout:
                 return
         if job.state not in {"queued", "running"} and not (job.state == "waiting" and job.cancel_requested):
             return
+        retry = self._transient_retries.get(job.preview_id)
+        if retry is not None and retry[1] > time.monotonic() and not job.cancel_requested:
+            return  # a decision deferred on a GitHub transport failure (#72) waits out its backoff
         try:
             with self.store.invocation_lock(job.preview_id):
                 current = self.store.get(job.preview_id)
@@ -556,7 +590,7 @@ class ManagedOrganizationWorker:
                                                        "updated_at": datetime.now(tz=UTC)}))
         except Exception as failure:
             raise _ReceiptError(str(failure)) from failure
-        self._changed.set()
+        self._notify(self._changed)
 
     def _validate(self, job: WorkerJob) -> None:
         admission = self.service.admission(job.preview_id)
@@ -597,7 +631,8 @@ class ManagedOrganizationWorker:
                 run = await self.service.cancel(assignment.assignment_id)
                 self._update(job, state=run.state, error=run.error)
                 return
-            self._validate(job)
+            # #72: the re-check can read GitHub (blocking gh calls); keep it off the event loop.
+            await asyncio.to_thread(self._validate, job)
             if job.state == "running":
                 if assignment is None:
                     raise RuntimeError("Interrupted worker admission; automatic replay is blocked")
@@ -639,8 +674,46 @@ class ManagedOrganizationWorker:
         except _ReceiptError:
             raise
         except Exception as error:
+            if isinstance(error, GitHubTransientError) and await self._defer_transient(job, error):
+                return
             run = self.service.recorded_run(job.task_id)
             if run is not None and run.state == "finalizing":
                 raise
             await self._abort(job)
             self._update(job, state="failed", error=str(error))
+        else:
+            self._transient_retries.pop(job.preview_id, None)
+
+    async def _defer_transient(self, job: WorkerJob, error: GitHubTransientError) -> bool:
+        """#72: a GitHub transport failure while re-checking a saved decision before the runner recorded it.
+
+        Only when nothing landed (the run still waits on exactly this command's request, which it has not decided)
+        the job goes back to ``queued`` with the error, untouched run and budget, and is retried after a capped
+        backoff that never runs past the budget deadline. The adapter has already retried the read (bounded).
+        The job's ``error`` stays empty while it is deferred, so a deferred job reads exactly like any queued job
+        (the reason is in the log and in ``diagnostics()["transient_deferrals"]``). Returns False, and the caller
+        fails the job through the existing error path, for anything else: a run command, a decision that may have
+        landed, and an expired, aborted or unreadable budget. So a re-check still failing at the deadline ends the
+        job (and the run) as any other failure does; this path never drives a decision itself."""
+        command = job.commands[-1]
+        assignment = self.service.recorded_assignment(job.task_id)
+        run = self.service.recorded_run(job.task_id)
+        if (command.kind not in {"approve", "resume"} or command.request_id is None or assignment is None or
+                run is None or run.state != "waiting" or
+                not any(item.request_id == command.request_id for item in run.pending) or
+                any(decision.request_id == command.request_id for decision in run.decisions)):
+            return False
+        try:
+            remaining = DeveloperTaskBudget(path=self.service.budget_path(job.preview_id),
+                                            bundle=developer_task_bundle_from_payload(json.loads(job.bundle_content)),
+                                            create=False).remaining_seconds()
+        except Exception:  # an expired (BudgetDeadlineExpired), aborted or unreadable budget
+            self._transient_retries.pop(job.preview_id, None)
+            return False
+        attempts = self._transient_retries.get(job.preview_id, (0, 0.0, ""))[0] + 1
+        delay = min(self._transient_cap, self._transient_base * 2 ** min(attempts - 1, 16), remaining)
+        self._transient_retries[job.preview_id] = (attempts, time.monotonic() + delay, str(error)[:500])
+        logger.warning("GitHub transport failure re-checking %s; decision deferred (attempt %d, retry in %.1f s): %s",
+                       job.preview_id, attempts, delay, error)
+        self._update(job, state="queued", error=None)
+        return True

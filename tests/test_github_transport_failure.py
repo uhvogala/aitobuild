@@ -35,14 +35,14 @@ TLS = 'Get "https://api.github.com/repos/fixture/widgets/commits/{sha}": net/htt
 
 
 class FlakyCommitLookup(MockGitHubAdapter):
-    """The mock adapter, except that when armed the next target inspection goes through the real gh adapter, whose
-    commit lookup gh answers with the pilot's TLS handshake timeout on every attempt."""
+    """The mock adapter, except that while armed each target inspection goes through the real gh adapter, whose
+    commit lookup gh answers with the pilot's TLS handshake timeout on every attempt. Each armed inspection's
+    commit-lookup calls and sleeps are recorded (the worker may inspect concurrently, e.g. for follow-ups)."""
 
     def arm(self, monkeypatch) -> None:
-        self.armed, self.gh_calls, self.sleeps = True, [], []
+        self.armed, self.inspections = True, []
 
         def fake_run(command, **kwargs):
-            self.gh_calls.append(command[-1])
             if "/commits/" in command[-1]:
                 raise CalledProcessError(1, command, stderr=TLS.format(sha=command[-1].rsplit("/", 1)[1]))
             return CompletedProcess(command, 0, stdout=json.dumps({"id": 101, "full_name": "fixture/widgets"}), stderr="")
@@ -51,12 +51,26 @@ class FlakyCommitLookup(MockGitHubAdapter):
 
     def inspect_planning_target(self, *, repository, repository_id, base_revision):
         if getattr(self, "armed", False):
-            self.armed = False
-            GhCliGitHubAdapter(allowed_repositories=(repository,), sleep=self.sleeps.append, jitter=lambda: 1.0
-                               ).inspect_planning_target(repository=repository, repository_id=repository_id,
-                                                         base_revision=base_revision)
+            gh = _CountingAdapter(allowed_repositories=(repository,), jitter=lambda: 1.0)
+            try:
+                gh.inspect_planning_target(repository=repository, repository_id=repository_id, base_revision=base_revision)
+            finally:
+                self.inspections.append((gh.commit_calls, gh.sleeps))
         return super().inspect_planning_target(repository=repository, repository_id=repository_id,
                                                base_revision=base_revision)
+
+
+class _CountingAdapter(GhCliGitHubAdapter):
+    """The real gh adapter, counting its commit-lookup calls and recording its retry sleeps."""
+
+    def __init__(self, **kwargs) -> None:
+        self.commit_calls, self.sleeps = 0, []
+        super().__init__(sleep=self.sleeps.append, **kwargs)
+
+    def _api_once(self, endpoint, *, method, payload):
+        if "/commits/" in endpoint:
+            self.commit_calls += 1
+        return super()._api_once(endpoint, method=method, payload=payload)
 
 
 def test_failed_commit_lookup_during_a_tool_approval_is_503_transient_and_retries_land_once(
@@ -134,8 +148,8 @@ def test_failed_commit_lookup_during_a_tool_approval_is_503_transient_and_retrie
         body = failed.json()
         assert body["transient"] is True and body["github_status"] is None
         assert "commits/" in body["detail"] and "TLS handshake timeout" in body["detail"]
-        lookups = [call for call in github.gh_calls if "/commits/" in call]
-        assert len(lookups) == 4 and github.sleeps == [0.5, 1.0, 2.0]  # bounded read retry inside the adapter
+        github.armed = False
+        assert github.inspections and all(item == (4, [0.5, 1.0, 2.0]) for item in github.inspections)  # bounded
 
         after = http.get(f"/internal/organization/tasks/{child_id}", headers=HEADERS).json()
         assert after["managed_run"] == waiting and after["managed_admission"]["state"] == "waiting"
