@@ -575,6 +575,33 @@ def runs_needing_policy_override(report: dict[str, Any], task_of: Any, revision:
     return found
 
 
+#: Follow-up outcomes of a review run that make a merge point a reviewed one (#83). ``None`` (no follow-up, as after
+#: a failed review), ``error`` and ``escalated`` are not.
+REVIEWED_OUTCOMES = frozenset({"no_correction", "staged"})
+
+
+def incomplete_run(label: str, run: Any) -> str | None:
+    """#83: a problem when the service-recorded run of a phase did not complete; ``None`` when it completed.
+
+    ``run`` is the service's own record (``ManagedRun`` or its status JSON), never the harness's lists."""
+    if isinstance(run, dict):
+        state, error = run.get("state"), run.get("error")
+    else:
+        state, error = getattr(run, "state", None), getattr(run, "error", None)
+    if state == "completed":
+        return None
+    detail = f": {str(error)[:300]}" if error else ""
+    return f"{label}: service-recorded run is {state or 'missing'}, not completed{detail}"
+
+
+def require_completed(status: dict[str, Any], label: str) -> dict[str, Any]:
+    """#83: stop the session unless the service-recorded run behind ``status`` completed."""
+    problem = incomplete_run(label, status.get("managed_run"))
+    if problem is not None:
+        raise RuntimeError(problem + " | status: " + json.dumps(status, default=str)[:1500])
+    return status
+
+
 def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any) -> dict[str, Any]:
     """Read saved preview/run state and classify every recorded decision as automatic or human.
 
@@ -596,6 +623,10 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
         modes = recorded_policy_modes(report, revision)
         preview = previews.get(phase["preview_id"])
         run = service.status(phase["preview_id"])
+        # #83: every phase counts only when the service-recorded run completed, whatever the harness wrote.
+        unfinished = incomplete_run(phase["phase"], run)
+        if unfinished is not None:
+            problems.append(unfinished)
         if modes is None:
             problems.append(f"{phase['phase']}: phase policy {revision} was never recorded")
             continue
@@ -633,8 +664,9 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
             if admission and admission.get("source") == "operator_policy"
             else "human"
         )
-        if admission_path == "automatic" and evidence_kind == "inherited_review":
-            inherited.append(phase["phase"])  # a scripted human step is never counted here
+        if admission_path == "automatic" and evidence_kind == "inherited_review" and unfinished is None:
+            # A scripted human step is never counted here, and neither is a review whose run did not complete (#83).
+            inherited.append(phase["phase"])
         phases.append(
             {
                 "phase": phase["phase"],
@@ -643,6 +675,7 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
                 "admission": admission,
                 "evidence_kind": evidence_kind,
                 "admission_path": admission_path,
+                "run_state": getattr(run, "state", None),
                 "rereviews_correction": rereview,
                 "run_policy_revision": run.approval_policy_revision if run else None,
                 "run_policy_overrides": [
@@ -688,6 +721,16 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
         limit = modes.get("max_automatic_decisions", policy.max_automatic_decisions)
         if count > limit:
             problems.append(f"{phase['phase']}: {count} automatic decisions exceed max {limit}")
+    if "review_outcome" in report and report["review_outcome"] not in REVIEWED_OUTCOMES:
+        # #83: a session-level review outcome (followups.py, correction_cycle.py) must be a completed review's.
+        problems.append(f"review_outcome {report['review_outcome']!r} is not a completed review")
+    for point in report.get("merge_points", []):
+        # #83: a merge point is a reviewed one only with the review run's follow-up outcome.
+        if point.get("review_outcome") not in REVIEWED_OUTCOMES:
+            problems.append(
+                f"merge point {point.get('label')} (PR #{point.get('pull_number')}): review_outcome "
+                f"{point.get('review_outcome')!r} is not a completed review"
+            )
     return {
         "ok": not problems,
         "problems": problems,

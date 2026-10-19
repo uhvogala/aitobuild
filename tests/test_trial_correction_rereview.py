@@ -177,7 +177,9 @@ def _evidence(policy: ApprovalPolicy, rereview: Any, scripted: list[dict[str, An
         "corr": _preview("published-correction-x", "human", source={"correction_from_review": "rev"}),
         "dev": _preview("planned-issue-x", "planned_child", _admission(policy)),
     }
-    run = SimpleNamespace(approval_policy_revision=policy.revision, policy_overrides=(), decisions=())
+    # #83: evidence counts a phase only when its service-recorded run completed.
+    run = SimpleNamespace(state="completed", approval_policy_revision=policy.revision, policy_overrides=(),
+                          decisions=())
     holder = {"previews": SimpleNamespace(get=previews.get), "service": SimpleNamespace(status={"rr": run}.get)}
     return common.collect_evidence(holder, report, policy)
 

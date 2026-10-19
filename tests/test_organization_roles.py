@@ -839,6 +839,12 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         return
                     with pytest.raises(PermissionError):
                         reviews.offer_correction(preview.preview_id, waiting)
+                    # #84: a failed review run never counts as passed: no follow-up and no correction from it.
+                    failed = done.model_copy(update={"state": "failed", "error": "content_filter"})
+                    with pytest.raises(PermissionError, match="completed cleaned-up run"):
+                        reviews.follow_up(preview.preview_id, failed)
+                    with pytest.raises(PermissionError, match="completed approved review"):
+                        reviews.offer_correction(preview.preview_id, failed)
                     if outcome == "correction_missing_delivery":
                         target_id = reviews.target_for(preview.preview_id).preview_id
                         saved = worker.get

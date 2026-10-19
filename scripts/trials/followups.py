@@ -40,6 +40,7 @@ from common import (  # noqa: E402
     DEFAULT_ENDPOINT,
     DEFAULT_REPOSITORY,
     HELSINKI,
+    REVIEWED_OUTCOMES,
     SCRIPTED_HUMAN_ADMISSION,
     Operator,
     Recorder,
@@ -52,6 +53,7 @@ from common import (  # noqa: E402
     now,
     positive,
     prepare_docker_wrapper,
+    require_completed,
 )
 from correction_cycle import (  # noqa: E402
     ARCHITECT_INSTRUCTIONS,
@@ -701,7 +703,13 @@ def main() -> int:
             report["phases"][-1].update(
                 ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
             )
+            require_completed(status, "Architect review")  # #83: the service-recorded run must have completed
             followup = operator.wait_follow_up(review_id, "review")
+            # #83: a completed review counts only with its follow-up outcome (as pilot.deliver_to_merge_point);
+            # without one (``None``, ``error``, ``escalated``) the session stops before any evidence is collected.
+            report["review_outcome"] = (followup or {}).get("state")
+            if report["review_outcome"] not in REVIEWED_OUTCOMES:
+                raise RuntimeError(f"Architect review has no review outcome: {followup}")
             if followup and followup.get("state") == "staged":
                 correction_id = followup["next_preview_id"]
                 branch, head = report["pull_request"]["branch"], report["pull_request"]["head_sha"]
@@ -727,6 +735,7 @@ def main() -> int:
                 report["phases"][-1].update(
                     ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
                 )
+                require_completed(status, "Correction")  # #83: the service-recorded run must have completed
                 staged = operator.post(
                     "/internal/organization/corrections/stage-publication",
                     {"correction_preview_id": correction_id},
@@ -755,7 +764,7 @@ def main() -> int:
                     report["phases"][-1].update(
                         ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
                     )
-            report["review_outcome"] = (followup or {}).get("state")
+                    require_completed(status, "Architect re-review")  # #83: the service-recorded run must have completed
             report["worker_diagnostics"] = client.get(
                 "/internal/organization/worker", headers=operator.headers
             ).json()
