@@ -151,3 +151,12 @@ the reason and the loop errors recorded in `report.stalls`, instead of waiting o
 `resume` refuses a seed with uncommitted changes, a seed without the base branch checked out and a seed whose base
 branch diverged from origin (git's error is included). Any failure, including one before the service starts, is
 recorded in `report.json` as `result: fail` with the error and an end time.
+
+GitHub transport failures (#72): the service answers a GitHub transport or availability failure (TLS handshake
+timeout, EOF, connection reset, gh timeout, gateway 5xx) with `503` and `"transient": true`; `409` stays reserved
+for policy refusals. The harness's one HTTP helper (`Operator._request`) retries a `transient` 503 at most
+`len(TRANSIENT_RETRY_DELAYS)` times. A status read retries as is. A write retries only when it carries a state
+re-read (`landed=`) that shows nothing landed (today: tool and stage approvals in `Operator.drive`); a write without
+one, or one whose re-read shows it landed, stops the run. Every 409 stays fatal. Each retry is recorded in
+`report.transient_retries` (method, path, attempt, delay, detail) and as a `transient_retry` event. Wrappers that
+patch `Operator.post` must pass its keyword arguments (`landed=`) through.

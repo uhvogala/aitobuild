@@ -549,7 +549,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command == "resume":
         recorder.report = json.loads(report_path.read_text())
     report = recorder.report
-    for key in ("operator_actions", "worker_pickups", "sessions"):
+    for key in ("operator_actions", "worker_pickups", "sessions", "transient_retries"):
         report.setdefault(key, [])
     report["sessions"].append({"command": arguments.command, "started_at": now()})
     report["metrics"] = {
