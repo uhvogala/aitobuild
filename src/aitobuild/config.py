@@ -44,6 +44,8 @@ class GitHubConfig:
     adapter: str = "mock"
     default_repository: str | None = None
     allowed_repositories: tuple[str, ...] = ()
+    # #72: the one bound on a single gh call, in seconds (1..59, under gh's own 60 s).
+    call_timeout_seconds: int = 20
 
 
 @dataclass(slots=True, frozen=True)
@@ -130,7 +132,7 @@ _CONFIG_ENV = {
     "policy": {"require_human_approval_for_repo_writes": "REQUIRE_APPROVAL_FOR_REPO_WRITES"},
     "security": {"require_internal_auth": "REQUIRE_INTERNAL_AUTH", "internal_api_token": "INTERNAL_API_TOKEN"},
     "github": {"adapter": "GITHUB_ADAPTER", "default_repository": "GITHUB_DEFAULT_REPOSITORY",
-               "allowed_repositories": "GITHUB_ALLOWED_REPOS"},
+               "allowed_repositories": "GITHUB_ALLOWED_REPOS", "call_timeout_seconds": "GITHUB_CALL_TIMEOUT_SECONDS"},
     "web_search": {"adapter": "WEB_SEARCH_ADAPTER"},
     "managed_worker": {"queue_follow_ups": "MANAGED_WORKER_QUEUE_FOLLOW_UPS"},
     "developer": {"require_preview_before_dispatch": "REQUIRE_DEVELOPER_PREVIEW", "execution_mode": "DEVELOPER_EXECUTION_MODE",
@@ -491,8 +493,11 @@ def load_config() -> AppConfig:
         adapter=github_adapter_mode,
         default_repository=default_repository,
         allowed_repositories=tuple(allowed_repositories),
+        call_timeout_seconds=int(getenv("AITOBUILD_GITHUB_CALL_TIMEOUT_SECONDS", "20")),
     )
 
+    if not 1 <= github.call_timeout_seconds <= 59:
+        raise ValueError("AITOBUILD_GITHUB_CALL_TIMEOUT_SECONDS must be 1..59")
     if github.adapter not in {"mock", "gh", "gh_cli", "cli"}:
         raise ValueError("AITOBUILD_GITHUB_ADAPTER must be mock or gh_cli")
     if github.adapter in {"gh", "gh_cli", "cli"} and not github.allowed_repositories:

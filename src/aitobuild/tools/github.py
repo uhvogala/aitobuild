@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from hashlib import sha1, sha256
@@ -24,6 +25,15 @@ from aitobuild.policy import (
 )
 
 AdvanceOutcome = Literal["parent", "ours", "moved"]
+
+# #72: the one bound on a single gh call (seconds), well under gh's own 60 s; configurable via
+# AITOBUILD_GITHUB_CALL_TIMEOUT_SECONDS / settings.github.call_timeout_seconds.
+DEFAULT_CALL_TIMEOUT_SECONDS = 20
+MAX_CALL_TIMEOUT_SECONDS = 59
+# Commit reads by full SHA are immutable, so the adapter caches them (#72). Refs, branches, short SHAs and
+# everything else are always read live.
+_FULL_SHA_COMMIT = re.compile(r"repos/[^/?#]+/[^/?#]+/(?:git/)?commits/[0-9a-f]{40}")
+_COMMIT_CACHE_LIMIT = 512
 
 # GitHub gateway/availability errors that a later identical request can succeed past.
 TRANSIENT_HTTP_STATUSES = frozenset({502, 503, 504})
@@ -51,8 +61,8 @@ class GitHubTransientError(GitHubAPIError):
     a write is never retried, so the caller must treat the write as uncertain (it may have landed) and reconcile by
     reading, never by repeating it. The app maps it to HTTP 503 with a `transient` marker (409 stays for refusals).
 
-    `retryable` is False only for a gh call that hit its own local timeout: that attempt already spent the whole
-    per-call timeout, so the adapter does not repeat it on the request path (#72 part 2 bounds that timeout)."""
+    `retryable` is False only for a gh call that hit the adapter's call timeout: that attempt already spent the
+    whole per-call bound, so the adapter does not repeat it."""
 
     def __init__(self, message: str, *, status: int | None = None, retryable: bool = True) -> None:
         super().__init__(message, status=status)
@@ -997,11 +1007,17 @@ class GhCliGitHubAdapter:
         backoff_cap: float = 8.0,
         sleep: Callable[[float], object] = time.sleep,
         jitter: Callable[[], float] = random.random,
+        call_timeout_seconds: int = DEFAULT_CALL_TIMEOUT_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if type(read_attempts) is not int or read_attempts < 1 or backoff_base < 0 or backoff_cap < backoff_base:
             raise ValueError("GitHub read retries require at least one attempt and a bounded backoff")
+        if type(call_timeout_seconds) is not int or not 1 <= call_timeout_seconds <= MAX_CALL_TIMEOUT_SECONDS:
+            raise ValueError(f"GitHub call timeout must be 1..{MAX_CALL_TIMEOUT_SECONDS} seconds")
         self.read_attempts, self.backoff_base, self.backoff_cap = read_attempts, backoff_base, backoff_cap
-        self._sleep, self._jitter = sleep, jitter
+        self.call_timeout_seconds = call_timeout_seconds
+        self._sleep, self._jitter, self._clock = sleep, jitter, clock
+        self._commit_cache: OrderedDict[str, str] = OrderedDict()
         self.default_repository = (
             normalize_repository_name(default_repository) if default_repository else None
         )
@@ -1037,29 +1053,40 @@ class GhCliGitHubAdapter:
         method: str = "GET",
         payload: dict[str, Any] | None = None,
     ) -> Any:
-        # Read retry bound (#41): with the defaults (4 attempts, 0.5 s base doubling, 8 s cap, jitter scaling each
-        # delay into [0.5, 1.0)), one read sleeps at most 0.5 + 1 + 2 = 3.5 s in total, plus up to 4 gh calls of up to
-        # 60 s each. The bound is per read: a lookup that pages through several reads multiplies it (about 35 s of
-        # sleep at 10 pages). The retry loop does not consult the task budget deadline; callers' budget checks run
-        # around it.
+        # Read retry bound (#41, #72): each gh call is bounded by `call_timeout_seconds` (default 20 s). A retry
+        # starts only while the read has used less than one call timeout, and at most `read_attempts` (4) calls run,
+        # with 0.5 s base doubling, 8 s cap and jitter between them; so one read takes at most about two call
+        # timeouts plus 3.5 s of sleep. The bound is per read: a lookup that pages through several reads multiplies
+        # it. The retry loop does not consult the task budget deadline; callers' budget checks run around it.
         # Only reads are retried (#41), and only on GitHubTransientError (gateway 5xx or, since #72, a transport
         # failure such as a TLS handshake timeout or EOF); an API refusal is never retried. A write can fail after
         # GitHub applied it, so writes surface GitHubTransientError at once and callers reconcile by reading
-        # (e.g. publication markers). A gh call that hit its local timeout is transient but not repeated here.
+        # (e.g. publication markers). A gh call that hit the call timeout is transient but not repeated here.
+        cacheable = method == "GET" and payload is None and _FULL_SHA_COMMIT.fullmatch(endpoint) is not None
+        if cacheable and endpoint in self._commit_cache:
+            self._commit_cache.move_to_end(endpoint)
+            return json.loads(self._commit_cache[endpoint])
         attempts = self.read_attempts if method == "GET" else 1
+        started = self._clock()
         text = ""
         for attempt in range(1, attempts + 1):
             try:
                 text = self._api_once(endpoint, method=method, payload=payload)
                 break
             except GitHubTransientError as error:
-                if attempt >= attempts or not error.retryable:
+                if (attempt >= attempts or not error.retryable or
+                        self._clock() - started >= self.call_timeout_seconds):
                     raise
                 delay = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
                 self._sleep(delay * (0.5 + self._jitter() / 2))
         if not text:
             return {}
-        return json.loads(text)
+        parsed = json.loads(text)
+        if cacheable and isinstance(parsed, dict) and parsed.get("sha") == endpoint.rsplit("/", 1)[1]:
+            self._commit_cache[endpoint] = text
+            if len(self._commit_cache) > _COMMIT_CACHE_LIMIT:
+                self._commit_cache.popitem(last=False)
+        return parsed
 
     def _api_once(self, endpoint: str, *, method: str, payload: dict[str, Any] | None) -> str:
         command = ["gh", "api", "-X", method, endpoint]
@@ -1074,10 +1101,11 @@ class GhCliGitHubAdapter:
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=self.call_timeout_seconds,
             )
         except TimeoutExpired as exc:
-            raise GitHubTransientError(f"gh api timed out for {method} {endpoint}", retryable=False) from exc
+            raise GitHubTransientError(f"gh api timed out after {self.call_timeout_seconds} s for {method} {endpoint}",
+                                       retryable=False) from exc
         except CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             message = f"gh api failed for {method} {endpoint}: {detail}"
@@ -2163,6 +2191,7 @@ def build_github_adapter(
     mode: str = "mock",
     default_repository: str | None = None,
     allowed_repositories: tuple[str, ...] | None = None,
+    call_timeout_seconds: int = DEFAULT_CALL_TIMEOUT_SECONDS,
 ) -> MockGitHubAdapter | GhCliGitHubAdapter:
     normalized = mode.strip().lower()
     allowed = tuple(allowed_repositories or ())
@@ -2178,6 +2207,7 @@ def build_github_adapter(
             default_repository=default_repository,
             allowed_repositories=allowed,
             enforce_allowlist=True,
+            call_timeout_seconds=call_timeout_seconds,
         )
     raise ValueError("AITOBUILD_GITHUB_ADAPTER must be mock or gh_cli")
 

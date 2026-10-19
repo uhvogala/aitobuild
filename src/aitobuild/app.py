@@ -412,6 +412,7 @@ def create_app(
         mode=app_config.github.adapter,
         default_repository=app_config.github.default_repository,
         allowed_repositories=app_config.github.allowed_repositories,
+        call_timeout_seconds=app_config.github.call_timeout_seconds,
     )
     web_search_adapter = build_web_search_adapter(mode=app_config.web_search.adapter)
     architect_memory = ArchitectMemoryStore(developer_state_dir / "architect_memory.jsonl")
@@ -1073,20 +1074,24 @@ def create_app(
                             raise
                     preview_id = managed_service.assignment_preview(assignment_id)
                     if managed_worker is not None:
-                        managed_worker.requeue_after_policy_override(preview_id)
-                    return _run_metadata(managed_service.status(preview_id))
+                        worker = managed_worker
+                        await _delivery_call(lambda: worker.requeue_after_policy_override(preview_id))
+                    return _run_metadata(await _delivery_call(lambda: managed_service.status(preview_id)))
                 if managed_worker is not None:
+                    # #72: enqueueing re-checks admission, which can read GitHub (blocking gh calls); run it off the
+                    # event loop so a slow or failing GitHub never stalls other requests or the worker loop.
+                    worker = managed_worker
                     if operation == "run":
                         proposal = AssignmentProposal.model_validate(payload["proposal"]) if "proposal" in payload else None
-                        job = managed_worker.enqueue(payload["preview_id"], proposal=proposal)
+                        job = await _delivery_call(lambda: worker.enqueue(payload["preview_id"], proposal=proposal))
                         if job is None:
                             raise ValueError("Task requires an activated approved repository route")
                     elif operation in {"approve", "resume"}:
-                        job = managed_worker.enqueue_decision(
+                        job = await _delivery_call(lambda: worker.enqueue_decision(
                             payload["assignment_id"], request_id=payload["request_id"],
                             kind="approve" if operation == "approve" else "resume",
                             value=payload["approved"] if operation == "approve" else payload["response"],
-                        )
+                        ))
                     else:
                         preview_id = payload.get("preview_id") or managed_service.assignment_preview(payload["assignment_id"])
                         job = await managed_worker.cancel(preview_id)
