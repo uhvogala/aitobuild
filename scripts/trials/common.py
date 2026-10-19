@@ -721,6 +721,9 @@ def collect_evidence(holder: dict[str, Any], report: dict[str, Any], policy: Any
         limit = modes.get("max_automatic_decisions", policy.max_automatic_decisions)
         if count > limit:
             problems.append(f"{phase['phase']}: {count} automatic decisions exceed max {limit}")
+    if "review_outcome" in report and report["review_outcome"] not in REVIEWED_OUTCOMES:
+        # #83: a session-level review outcome (followups.py, correction_cycle.py) must be a completed review's.
+        problems.append(f"review_outcome {report['review_outcome']!r} is not a completed review")
     for point in report.get("merge_points", []):
         # #83: a merge point is a reviewed one only with the review run's follow-up outcome.
         if point.get("review_outcome") not in REVIEWED_OUTCOMES:

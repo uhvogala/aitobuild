@@ -6,6 +6,7 @@ the failed review under ``inherited_reviews``."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from aitobuild.approval_policy import ApprovalPolicy, ApprovalStage
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "trials"))
 
 import common  # noqa: E402
+import followups  # noqa: E402
 import pilot  # noqa: E402
 
 AUTO = ApprovalPolicy(task_admission="automatic", developer_tools="automatic")  # the pilot's flags
@@ -283,11 +285,143 @@ def test_planning_phase_stops_on_an_incomplete_run(state: str) -> None:
     assert report["phases"][0]["run_state"] == state
 
 
-def test_followups_harness_requires_each_review_and_correction_run_to_complete() -> None:
-    source = (Path(pilot.__file__).parent / "followups.py").read_text()
-    for drive, label in (('operator.drive(review_id, "review")', "Architect review"),
-                         ('operator.drive(correction_id, "correction")', "Correction"),
-                         ('operator.drive(rereview_id, "re-review")', "Architect re-review")):
-        after = source[source.index(drive):]
-        # the very next statement after the phase's run_state stamp
-        assert after.index(f'require_completed(status, "{label}")') < after.index("run_state=") + 200
+# --- followups.main driven end to end with a fake operator: the session stops, evidence is never collected -------
+
+
+REPO = {"full_name": "uhvogala/aitobuild_example", "id": 1, "default_branch": "main"}
+
+
+class _FollowupsOperator(_Operator):
+    def __init__(self, runs: dict[str, dict[str, Any]], followups: dict[str, dict[str, Any] | None]) -> None:
+        super().__init__(runs, followups)
+        self.recorder: Any = None
+
+
+class _FollowupsHands(_Hands):
+    def planned_children(self) -> list[str]:
+        return ["delivery"]
+
+
+class _TestClient:
+    def __init__(self, app: Any) -> None:
+        pass
+
+    def __enter__(self) -> _Client:
+        return _Client()
+
+    def __exit__(self, *exc: Any) -> None:
+        pass
+
+
+def _followups_main(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runs: dict[str, dict[str, Any]],
+                    followups_by_preview: dict[str, dict[str, Any] | None]) -> tuple[Any, dict[str, Any], _Operator]:
+    """Run ``followups.main`` with every outside effect (GitHub, git, the service app) replaced; returns its exit code
+    (or the exception it raised), the saved report and the fake operator."""
+    import aitobuild.app
+    import aitobuild.config
+    import fastapi.testclient
+
+    operator = _FollowupsOperator(runs, followups_by_preview)
+    evidence_calls: list[dict[str, Any]] = []
+
+    def operator_factory(client: Any, token: str, recorder: Any, *args: Any) -> _Operator:
+        operator.recorder = recorder
+        return operator
+
+    def collect(holder: Any, report: dict[str, Any], policy: Any) -> dict[str, Any]:
+        evidence_calls.append(report)
+        return {"ok": True, "problems": []}
+
+    planning = SimpleNamespace(offer=lambda **_: SimpleNamespace(preview_id="plan"))
+    monkeypatch.setattr(sys, "argv", ["followups.py", "--work-root", str(tmp_path), "--poll-seconds", "0.01",
+                                      "--allowed-issue-author", "uhvogala"])
+    monkeypatch.setattr(followups, "gh_json", lambda *args: REPO)
+    monkeypatch.setattr(followups, "git", lambda *args: "a" * 40)
+    monkeypatch.setattr(followups, "subprocess", SimpleNamespace(run=lambda *args, **kwargs: None))
+    monkeypatch.setattr(followups, "os", SimpleNamespace(chdir=lambda path: None))
+    monkeypatch.setattr(followups, "build_trial_environment", lambda *args, **kwargs: {})
+    monkeypatch.setattr(followups, "configure_trial_environment", lambda **kwargs: None)
+    monkeypatch.setattr(followups, "check_policy", lambda *args: {"revision": "r"})
+    monkeypatch.setattr(followups, "build_factories",
+                        lambda **kwargs: (None, None, {"planning_admission": planning}))
+    monkeypatch.setattr(followups, "Operator", operator_factory)
+    monkeypatch.setattr(followups, "HandsOff", lambda *args: _FollowupsHands())
+    monkeypatch.setattr(followups, "collect_evidence", collect)
+    monkeypatch.setattr(aitobuild.config, "load_config", lambda: SimpleNamespace(approvals=HUMAN))
+    monkeypatch.setattr(aitobuild.app, "create_app", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fastapi.testclient, "TestClient", _TestClient)
+    outcome: Any
+    try:
+        outcome = followups.main()
+    except RuntimeError as error:
+        outcome = error
+    report_path, = (tmp_path / "artifacts").glob("trial2-*/report.json")
+    report = json.loads(report_path.read_text())
+    assert bool(evidence_calls) == (outcome == 0)  # evidence is collected only when the session went all the way
+    return outcome, report, operator
+
+
+FOLLOWUP_RUNS = {"plan": DONE, "delivery": DONE, "review": DONE, "correction": DONE, "rereview": DONE}
+TO_REVIEW = {"delivery": {"state": "staged", "next_preview_id": "review"}}
+TO_CORRECTION = {**TO_REVIEW, "review": {"state": "staged", "next_preview_id": "correction"}}
+
+
+@pytest.mark.parametrize("outcome", [None, "error", "escalated"])
+def test_followups_completed_review_without_an_outcome_stops_the_session(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str | None) -> None:
+    review_followup = None if outcome is None else {"state": outcome}
+    result, report, operator = _followups_main(monkeypatch, tmp_path, FOLLOWUP_RUNS,
+                                               {**TO_REVIEW, "review": review_followup})
+    assert isinstance(result, RuntimeError) and "Architect review has no review outcome" in str(result)
+    assert report["result"] == "fail" and "evidence" not in report
+    assert report["review_outcome"] == outcome
+    assert operator.posts == []  # nothing is staged for publication
+
+
+@pytest.mark.parametrize("followups_by_preview, posts", [
+    ({**TO_REVIEW, "review": {"state": "no_correction"}}, 0),
+    (TO_CORRECTION, 2),
+])
+def test_followups_completed_review_with_an_outcome_passes(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path, followups_by_preview: dict[str, Any], posts: int) -> None:
+    result, report, operator = _followups_main(monkeypatch, tmp_path, FOLLOWUP_RUNS, followups_by_preview)
+    assert result == 0 and report["result"] == "pass" and report["evidence"]["ok"]
+    assert report["review_outcome"] in common.REVIEWED_OUTCOMES
+    assert len(operator.posts) == posts
+    assert {phase["run_state"] for phase in report["phases"]} == {"completed"}
+
+
+@pytest.mark.parametrize("failing, message", [
+    ("plan", "Planning did not complete"),
+    ("delivery", "Delivery did not complete"),
+    ("review", "Architect review: service-recorded run is failed"),
+    ("correction", "Correction: service-recorded run is failed"),
+    ("rereview", "Architect re-review: service-recorded run is failed"),
+])
+def test_followups_incomplete_run_stops_the_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                    failing: str, message: str) -> None:
+    result, report, operator = _followups_main(monkeypatch, tmp_path, {**FOLLOWUP_RUNS, failing: FAILED},
+                                               TO_CORRECTION)
+    assert isinstance(result, RuntimeError) and message in str(result)
+    assert report["result"] == "fail" and "evidence" not in report
+    assert report["phases"][-1]["run_state"] == "failed"
+    if failing == "correction":  # a failed correction is never staged for publication
+        assert operator.posts == []
+
+
+@pytest.mark.parametrize("outcome", [None, "error", "escalated"])
+def test_a_session_review_outcome_must_be_a_completed_reviews(outcome: str | None) -> None:
+    report = _report(HUMAN, ["review:a"])
+    report["review_outcome"] = outcome
+    evidence = common.collect_evidence(
+        _holder({"review:a": _preview("published-review-x")}, {"review:a": _run(HUMAN)}), report, HUMAN)
+    assert not evidence["ok"]
+    assert evidence["problems"] == [f"review_outcome {outcome!r} is not a completed review"]
+
+
+@pytest.mark.parametrize("outcome", sorted(common.REVIEWED_OUTCOMES))
+def test_a_reviewed_session_outcome_is_evidence(outcome: str) -> None:
+    report = _report(HUMAN, ["review:a"])
+    report["review_outcome"] = outcome
+    assert common.collect_evidence(
+        _holder({"review:a": _preview("published-review-x")}, {"review:a": _run(HUMAN)}), report, HUMAN)["ok"]

@@ -148,8 +148,9 @@ Completed runs only (#83): `report.evidence` is based on the service's recorded 
 (`service.status(preview_id)`), not on the harness's own lists. Every phase (planning, delivery, review, correction,
 re-review) is a problem unless its service-recorded run `completed`, `evidence.phases[].run_state` shows that state,
 and `evidence.inherited_reviews` lists only reviews whose run completed. A merge point needs a completed review's
-follow-up outcome (`review_outcome` `no_correction` or `staged`). `pilot.py` and `followups.py` stop the session as
-soon as a phase's run ends in any other state, so a failed review (pilot trial4-20261019-071847: model
+follow-up outcome (`review_outcome` `no_correction` or `staged`), and so does a session-level `report.review_outcome`
+(`followups.py`, `correction_cycle.py`). `pilot.py` and `followups.py` stop the session as soon as a phase's run ends
+in any other state or a completed review has no such outcome, so a failed review (pilot trial4-20261019-071847: model
 content-filter 400) never becomes a merge point or `evidence.ok: true`.
 
 Worker liveness (#69): while it drives a phase, the harness checks `GET /internal/organization/worker` whenever the
