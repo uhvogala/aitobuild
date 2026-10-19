@@ -838,7 +838,8 @@ class ManagedOrganizationService:
             self._actor.reset(token)
 
     def _assignment(self, assignment_id: str) -> TaskAssignment:
-        assignment = self._assignments.get(assignment_id)
+        # One snapshot for the record and its task owner, so a concurrent finish() cannot tear the check (#77).
+        assignment, owner = self._assignments.get_with_owner(assignment_id)
         if assignment is None:
             raise ValueError("Assignment not found")
         issue = assignment.bundle.issue_context
@@ -846,13 +847,13 @@ class ManagedOrganizationService:
             if self._planning is None:
                 raise PermissionError("Planning assignment requires its trusted admission binding")
             planning_route = self._planning.owned_route(assignment.task_id, assignment.preview_id)
-            if (planning_route.organization_id != assignment.organization_id or self._assignments.for_task(assignment.task_id) != assignment):
+            if planning_route.organization_id != assignment.organization_id or owner != assignment:
                 raise PermissionError("Planning assignment is outside this managed activation")
             return assignment
         route = next((route for route in (*self._routes, *self._review_routes, *self._correction_routes, *self._dependency_routes) if issue is not None and
                       (route.repository, route.repository_id, route.organization_id) ==
                       (issue.repository, issue.repository_id, assignment.organization_id)), None)
-        if route is None or self._assignments.for_task(assignment.task_id) != assignment:
+        if route is None or owner != assignment:
             raise PermissionError("Assignment is outside this managed activation")
         return assignment
 

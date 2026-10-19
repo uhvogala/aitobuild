@@ -50,7 +50,8 @@ def test_status_read_overlapping_finish_returns_the_final_state(tmp_path, approv
     """Hold the reader after its Nth assignment-store read until the worker has finished the assignment.
 
     Wherever the finish lands between the reader's store reads, the read must not be refused: it returns the
-    run, and once the reader saw the finish (it was held) that run is the final, completed one. On master,
+    run, which is past running once the reader was held through the finish, and the next read through the same
+    path returns the final, completed run. On master,
     hold_after=2 lands between `_assignment`'s `get` and its `for_task` and reproduces the pilot's 409.
     """
     _, _, preview_id, _, _ = approved_delivery
@@ -109,9 +110,11 @@ def test_status_read_overlapping_finish_returns_the_final_state(tmp_path, approv
         assert result is not None
         assert result.assignment_id == waiting.assignment_id
         if len(reads) >= hold_after:
-            assert result.state == "completed"
+            # The reader resumed after finish(); the run is saved completed right after it (finalizing until then).
+            assert result.state in {"finalizing", "completed"}
         else:
             assert result.state == "waiting"
+        assert _read(service, read, task_id, preview_id).state == "completed"
 
     asyncio.run(exercise())
 
