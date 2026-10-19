@@ -17,7 +17,7 @@ from pathlib import Path
 import subprocess
 import time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -116,6 +116,21 @@ def queued_without_worker(diagnostics: dict[str, Any]) -> str | None:
     )
 
 
+#: Waits before each retry of a ``transient`` 503 (#72); their count is the per-call retry bound.
+TRANSIENT_RETRY_DELAYS = (2.0, 5.0, 10.0)
+
+
+def is_transient_failure(response: Any) -> bool:
+    """The service's GitHub transport/availability answer (#72): 503 with ``transient: true``. A 409 never is."""
+    if response.status_code != 503:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("transient") is True
+
+
 class Operator:
     def __init__(
         self,
@@ -125,6 +140,8 @@ class Operator:
         poll: float,
         timeout: float,
         automatic_stages: tuple[str, ...] = (),
+        transient_retry_delays: tuple[float, ...] = TRANSIENT_RETRY_DELAYS,
+        sleep: Callable[[float], object] = time.sleep,
     ) -> None:
         self.automatic_stages = automatic_stages
         self.automatic = bool(automatic_stages)
@@ -134,22 +151,53 @@ class Operator:
         self.poll = poll
         self.timeout = timeout
         self.decided: set[str] = set()
+        self.transient_retry_delays = transient_retry_delays
+        self._sleep = sleep
 
-    def post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        response = self.client.post(path, headers=self.headers, json=body)
-        if response.status_code != 200:
-            raise RuntimeError(f"{path} -> {response.status_code}: {response.text[:2000]}")
-        return response.json()
+    def _request(self, method: str, path: str, label: str, body: dict[str, Any] | None = None,
+                 landed: Callable[[], bool] | None = None) -> dict[str, Any]:
+        """The harness's one HTTP helper. Anything but 200 is fatal, with one exception (#72): a ``transient`` 503
+        is retried, at most ``len(transient_retry_delays)`` times. A read retries as is; a write retries only when
+        its ``landed`` re-read of state shows nothing landed, and a write without one never retries. A 409 (a
+        policy refusal) always stays fatal. Each retry is counted in ``report.transient_retries``."""
+        for attempt in range(len(self.transient_retry_delays) + 1):
+            if method == "GET":
+                response = self.client.get(path, headers=self.headers)
+            else:
+                response = self.client.post(path, headers=self.headers, json=body)
+            if response.status_code == 200:
+                return response.json()
+            failure = f"{label} -> {response.status_code}: {response.text[:2000]}"
+            if (not is_transient_failure(response) or attempt >= len(self.transient_retry_delays)
+                    or (method != "GET" and landed is None)):
+                raise RuntimeError(failure)
+            if method != "GET" and landed is not None and landed():
+                raise RuntimeError(failure + " (state re-read shows the write landed; not retried)")
+            delay = self.transient_retry_delays[attempt]
+            self.recorder.report.setdefault("transient_retries", []).append(
+                {"at": now(), "method": method, "path": path, "attempt": attempt + 1, "delay_seconds": delay,
+                 "detail": str(response.json().get("detail"))[:500]}
+            )
+            self.recorder.event("transient_retry", method=method, path=path, attempt=attempt + 1)
+            self.recorder.save()
+            self._sleep(delay)
+        raise RuntimeError("Internal invariant violated: transient retry loop exited")
+
+    def post(self, path: str, body: dict[str, Any], *, landed: Callable[[], bool] | None = None) -> dict[str, Any]:
+        return self._request("POST", path, path, body, landed)
 
     def task(self, preview_id: str) -> dict[str, Any]:
-        response = self.client.get(
-            f"/internal/organization/tasks/{preview_id}", headers=self.headers
-        )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"task status {preview_id} -> {response.status_code}: {response.text[:2000]}"
-            )
-        return response.json()
+        return self._request("GET", f"/internal/organization/tasks/{preview_id}", f"task status {preview_id}")
+
+    def _decision_landed(self, preview_id: str, request_id: str) -> bool:
+        """Re-read state after a transient decision failure: did the decision land? It did not only while the job
+        (if any) and the run still wait on exactly this request."""
+        status = self.task(preview_id)
+        job = status.get("managed_admission") or {}
+        run = status.get("managed_run") or {}
+        pending = job.get("state") in {None, "waiting"} and run.get("state") == "waiting" and any(
+            item.get("request_id") == request_id for item in run.get("pending", []))
+        return not pending
 
     def admit(
         self, preview_id: str, what: str, base_revision: str | None = None, timeout: float = 120
@@ -300,6 +348,7 @@ class Operator:
                             "request_id": item["request_id"],
                             "approved": True,
                         },
+                        landed=lambda request_id=item["request_id"]: self._decision_landed(preview_id, request_id),
                     )
                     self.recorder.save()
             time.sleep(self.poll)

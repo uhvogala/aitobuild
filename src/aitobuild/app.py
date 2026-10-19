@@ -21,6 +21,9 @@ from filelock import Timeout as FileLockTimeout
 
 from agent_framework import AgentSession, Content, FileSessionStore, FunctionInvocationContext, function_middleware
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from aitobuild.agent_tools import DeveloperToolContext, build_role_tools
 from aitobuild.config import AppConfig, RepositorySourceConfig, load_config, validate_automatic_admission_sources
@@ -55,6 +58,7 @@ from aitobuild.tools import (
     build_web_search_adapter,
 )
 from aitobuild.triggers import InMemoryDedupeStore, TriggerEngine
+from aitobuild.tools.github import GitHubTransientError
 from aitobuild.tools.mcp_adapters import build_browser_tool
 from aitobuild.tools.bash import _normalize_session_id
 from aitobuild.tool_outputs import MAX_PROMPT_BYTES, build_output_guard
@@ -281,6 +285,40 @@ def _configured_task_base(preview: Any, sources: Any) -> str | None:
     return source.base_revision
 
 
+def transient_github_failure(error: BaseException) -> GitHubTransientError | None:
+    """The GitHub transport/availability failure behind a route error, or None (#72).
+
+    It is the error itself, or the direct cause of the HTTPException a route raised `from` it. Only the direct cause
+    counts: a deliberate refusal that wraps a transient failure (for example "issue creation is uncertain") stays
+    the refusal it is."""
+    if isinstance(error, GitHubTransientError):
+        return error
+    cause = error.__cause__ if isinstance(error, StarletteHTTPException) else None
+    return cause if isinstance(cause, GitHubTransientError) else None
+
+
+def transient_github_response(error: GitHubTransientError) -> JSONResponse:
+    """503 with a `transient` marker: GitHub did not answer (gateway 5xx or transport failure), which is not a policy
+    refusal (409). A caller re-reads state before any retry; a write may still have landed."""
+    return JSONResponse(status_code=503, content={"detail": str(error), "transient": True,
+                                                  "github_status": error.status})
+
+
+def _install_error_mapping(app: FastAPI) -> None:
+    """The app's one error-mapping place for GitHub transport failures, so every route answers them alike (#72)."""
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, error: StarletteHTTPException) -> Response:
+        transient = transient_github_failure(error)
+        if transient is not None:
+            return transient_github_response(transient)
+        return await http_exception_handler(request, error)
+
+    @app.exception_handler(GitHubTransientError)
+    async def _transient_error(request: Request, error: GitHubTransientError) -> Response:
+        return transient_github_response(error)
+
+
 def create_app(
     config: AppConfig | None = None, *,
     managed_service_factory: Callable[[ManagedServiceContext], ManagedOrganizationService] | None = None,
@@ -303,6 +341,7 @@ def create_app(
     validate_automatic_admission_sources(app_config)
 
     app = FastAPI(title="aitobuild")
+    _install_error_mapping(app)
     workspace_root = Path.cwd()
     developer_state_dir = (workspace_root / app_config.developer.state_dir).resolve()
     trigger_engine = TriggerEngine(dedupe_store=InMemoryDedupeStore())

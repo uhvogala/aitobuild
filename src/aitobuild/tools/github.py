@@ -44,8 +44,19 @@ def http_status(detail: str) -> int | None:
 
 
 class GitHubTransientError(GitHubAPIError):
-    """A GitHub 502/503/504. For a read it is raised only after bounded retries; a write is never retried, so the
-    caller must treat the write as uncertain (it may have landed) and reconcile by reading, never by repeating it."""
+    """The one transport/availability failure type at the GitHub adapter boundary (#41, #72): a gateway 502/503/504,
+    or a transport failure where GitHub never answered (gh timed out, TLS handshake timeout, EOF, connection
+    reset/refused, DNS); `status` is the gateway status or None for transport. It is never a GitHub refusal: an API
+    answer such as 403/404/409/422 stays a plain GitHubAPIError. For a read it is raised only after bounded retries;
+    a write is never retried, so the caller must treat the write as uncertain (it may have landed) and reconcile by
+    reading, never by repeating it. The app maps it to HTTP 503 with a `transient` marker (409 stays for refusals).
+
+    `retryable` is False only for a gh call that hit its own local timeout: that attempt already spent the whole
+    per-call timeout, so the adapter does not repeat it on the request path (#72 part 2 bounds that timeout)."""
+
+    def __init__(self, message: str, *, status: int | None = None, retryable: bool = True) -> None:
+        super().__init__(message, status=status)
+        self.retryable = retryable
 
 
 def transient_http_status(detail: str) -> int | None:
@@ -54,6 +65,22 @@ def transient_http_status(detail: str) -> int | None:
         return None
     status = int(match.group(1))
     return status if status in TRANSIENT_HTTP_STATUSES else None
+
+
+# Transport-level failures gh reports (Go net/http and gh's own connection error) when GitHub never answered.
+# Only consulted when gh reported no HTTP status, so an API answer (even one whose message quotes these words) is
+# never mistaken for a transport failure.
+_TRANSPORT_FAILURE = re.compile(
+    r"TLS handshake timeout|\bunexpected EOF\b|:\s*EOF\s*$|connection reset by peer|connection refused|broken pipe|"
+    r"i/o timeout|context deadline exceeded|Client\.Timeout exceeded|no such host|network is unreachable|"
+    r"server misbehaving|error connecting to api\.github\.com",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def is_transport_failure(detail: str) -> bool:
+    """True when a failed gh call's output is a transport failure (no HTTP status, a known transport error)."""
+    return http_status(detail) is None and _TRANSPORT_FAILURE.search(detail) is not None
 
 
 def normalize_repository_name(repository: str) -> str:
@@ -1015,16 +1042,18 @@ class GhCliGitHubAdapter:
         # 60 s each. The bound is per read: a lookup that pages through several reads multiplies it (about 35 s of
         # sleep at 10 pages). The retry loop does not consult the task budget deadline; callers' budget checks run
         # around it.
-        # Only reads are retried (#41). A write can fail with a 5xx after GitHub applied it, so writes surface
-        # GitHubTransientError at once and callers reconcile by reading (e.g. publication markers).
+        # Only reads are retried (#41), and only on GitHubTransientError (gateway 5xx or, since #72, a transport
+        # failure such as a TLS handshake timeout or EOF); an API refusal is never retried. A write can fail after
+        # GitHub applied it, so writes surface GitHubTransientError at once and callers reconcile by reading
+        # (e.g. publication markers). A gh call that hit its local timeout is transient but not repeated here.
         attempts = self.read_attempts if method == "GET" else 1
         text = ""
         for attempt in range(1, attempts + 1):
             try:
                 text = self._api_once(endpoint, method=method, payload=payload)
                 break
-            except GitHubTransientError:
-                if attempt >= attempts:
+            except GitHubTransientError as error:
+                if attempt >= attempts or not error.retryable:
                     raise
                 delay = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
                 self._sleep(delay * (0.5 + self._jitter() / 2))
@@ -1048,12 +1077,12 @@ class GhCliGitHubAdapter:
                 timeout=60,
             )
         except TimeoutExpired as exc:
-            raise RuntimeError(f"gh api timed out for {method} {endpoint}") from exc
+            raise GitHubTransientError(f"gh api timed out for {method} {endpoint}", retryable=False) from exc
         except CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             message = f"gh api failed for {method} {endpoint}: {detail}"
             status = http_status(detail)
-            if transient_http_status(detail) is not None:
+            if transient_http_status(detail) is not None or is_transport_failure(detail):
                 raise GitHubTransientError(message, status=status) from exc
             raise GitHubAPIError(message, status=status) from exc
         return completed.stdout.strip()

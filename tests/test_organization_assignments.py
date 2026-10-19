@@ -367,6 +367,7 @@ def test_invalid_or_expired_completion_cannot_release_a_claim(tmp_path, monkeypa
     assert assignments.get(first.assignment_id) == first
     assert service.finish(first.assignment_id, state="cancelled", outcome="Expired task stopped").state == "cancelled"
 
+
 def test_revalidate_reads_ownership_from_one_snapshot_when_finish_lands_between_reads(tmp_path):
     """#77: a finish() right after revalidate's first store read must not surface as 'no longer owns its task'."""
     service, snapshot, previews, assignments = setup_service(tmp_path)
