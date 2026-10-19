@@ -16,12 +16,12 @@ import re
 from pathlib import Path
 import subprocess
 import time
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from aitobuild.developer_preview import (
-    CORRECTION_TASK_PREFIX,
     PLANNED_CHILD_TASK_PREFIXES,
     PLANNING_TASK_PREFIX,
     REVIEW_TASK_PREFIX,
@@ -352,6 +352,7 @@ def finish(report: dict[str, Any], recorder: Recorder) -> int:
 
 
 #: Report kind of a task the harness admitted as a scripted human step (followups.HandsOff.correction_child).
+#: Defined only here; followups.py imports it, so the harness and the evidence check cannot drift apart.
 SCRIPTED_HUMAN_ADMISSION = "scripted_human_admission"
 
 
@@ -376,7 +377,8 @@ def expected_evidence_kind(
     rule, #39): ``inherited_review`` only when ``correction`` is automatic, otherwise a human admission."""
     if task_id.startswith(PLANNING_TASK_PREFIX):
         return "human"
-    if task_id.startswith(CORRECTION_TASK_PREFIX) or "correction_from_review" in (source_payload or {}):
+    task = SimpleNamespace(bundle_payload={"task_id": task_id}, source_payload=dict(source_payload or {}))
+    if is_correction_task(task):  # the one shared correction rule (#54/#61), never a hand-written copy here
         # correction: automatic lets the service admit corrections automatically; otherwise they stay human.
         return "operator_policy" if correction_automatic else "human"
     if task_id.startswith(REVIEW_TASK_PREFIX):

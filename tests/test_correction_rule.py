@@ -1,4 +1,4 @@
-"""#54/#61: `is_correction_task` is the one correction rule in src.
+"""#54/#61: `is_correction_task` is the one correction rule in src and in the trial harnesses (scripts/trials).
 
 Modeled on the `_approve_admission` route guard (test_admission_route.py). The scan is static: it reads every
 source line (so comments and docstrings count too), attribute access, and every string built from literals
@@ -14,7 +14,12 @@ import pytest
 
 from test_admission_route import _fold
 
-SRC = Path(__file__).resolve().parents[1] / "src"
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+# The operator trial harnesses classify tasks too (#75 follow-up): they get the same scan with no allowlist, plus a
+# ban on the hand-written `correction_from_review` source check. They must call is_correction_task(preview).
+TRIALS = ROOT / "scripts" / "trials"
+SOURCE_KEY = "correction_from_review"
 NAME = "CORRECTION_TASK_PREFIX"
 LITERAL = "published-correction"  # also catches the prefix without its trailing dash
 # The only places in src that may name the constant or spell the prefix, all in aitobuild/developer_preview.py:
@@ -120,11 +125,31 @@ def _scan(text: str, rel: str) -> set[tuple[str, str]]:
     return found
 
 
+def _scan_trial_script(text: str, rel: str) -> set[tuple[str, str]]:
+    """A trial harness script: nothing is allowlisted (``rel`` is never ALLOWED_FILE), and any code use of the
+    correction source key, e.g. ``"correction_from_review" in source``, is a hand-written copy of the full rule."""
+    found = _scan(text, rel)
+    for node in ast.walk(ast.parse(text, filename=rel)):
+        if isinstance(node, (ast.Constant, ast.BinOp, ast.JoinedStr, ast.Call)) and _fold(node) == SOURCE_KEY:
+            found.add((rel, f"{node.lineno}: hand-written correction source check {SOURCE_KEY!r}"))
+    return found
+
+
 def _references() -> list[tuple[str, str]]:
     found: set[tuple[str, str]] = set()
     for path in sorted(SRC.rglob("*.py")):
         found |= _scan(path.read_text(), path.relative_to(SRC).as_posix())
     return sorted(found)
+
+
+def _trial_references() -> tuple[list[tuple[str, str]], set[str]]:
+    """Findings in every trial harness script, and the names of the scripts scanned."""
+    found: set[tuple[str, str]] = set()
+    scanned: set[str] = set()
+    for path in sorted(TRIALS.rglob("*.py")):
+        found |= _scan_trial_script(path.read_text(), path.relative_to(ROOT).as_posix())
+        scanned.add(path.name)
+    return sorted(found), scanned
 
 
 STRAY = [
@@ -164,6 +189,31 @@ def test_allowlist_covers_only_its_own_definitions(snippet: str) -> None:
 
 def test_only_the_correction_rule_names_the_correction_prefix() -> None:
     assert _references() == []
+
+
+def test_trial_harnesses_use_the_shared_correction_rule() -> None:
+    found, scanned = _trial_references()
+    assert {"common.py", "correction_cycle.py", "followups.py", "pilot.py"} <= scanned
+    assert found == []
+
+
+@pytest.mark.parametrize("snippet", [
+    *STRAY,
+    'ok = "correction_from_review" in (source_payload or {})',
+    'ok = "correction_from_review" not in source',
+    'ok = source.get("correction_from_review") is not None',
+    'ok = bool(source["correction_from_" "review"])',
+])
+def test_trial_scan_catches_hand_written_correction_checks(snippet: str) -> None:
+    assert _scan_trial_script(snippet + "\n", "scripts/trials/common.py"), snippet
+
+
+def test_trial_scan_allows_the_shared_rule() -> None:
+    snippet = "from aitobuild.developer_preview import is_correction_task\nok = is_correction_task(preview)\n"
+    assert _scan_trial_script(snippet, "scripts/trials/common.py") == set()
+    # The allowlist of developer_preview.py does not carry over to a harness file of any name.
+    text = (SRC / ALLOWED_FILE).read_text()
+    assert _scan_trial_script(text, "scripts/trials/developer_preview.py")
 
 
 def test_the_allowlisted_rule_and_builder_still_use_the_constant() -> None:

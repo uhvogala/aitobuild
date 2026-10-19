@@ -40,6 +40,7 @@ from common import (  # noqa: E402
     DEFAULT_ENDPOINT,
     DEFAULT_REPOSITORY,
     HELSINKI,
+    SCRIPTED_HUMAN_ADMISSION,
     Operator,
     Recorder,
     check_policy,
@@ -59,9 +60,6 @@ from correction_cycle import (  # noqa: E402
     VERIFY_COMMAND,
 )
 
-#: Report kind of a correction or correction re-review the harness admits as a scripted human step; evidence never
-#: counts it as an automatic admission or as review inheritance (common.collect_evidence).
-SCRIPTED_HUMAN_ADMISSION = "scripted_human_admission"
 PLANNING_EVENT = "pm.planning.requested"
 PLANNER_INSTRUCTIONS = (
     "Plan the operator's objective for the pinned target as the smallest set of independent issues (prefer one). "
