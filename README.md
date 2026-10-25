@@ -1364,7 +1364,10 @@ with `finish_reason: content_filter`, prompt or response side) is retried once.
 A second refusal fails the run with `Model output blocked by content filter
 (response; label '...')` (or `Model input ...` for the prompt side) as its error;
 other 400s are not retried. Worker diagnostics report the counts under
-`model_content_filter`.
+`model_content_filter`; they are process-wide (shared by every worker in the
+process, not kept per worker), which `model_content_filter_scope: "process"`
+states. A streamed reply cut off by the content filter is not detected; that is
+fine today because no model call streams.
 
 ## API endpoints
 

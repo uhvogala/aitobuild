@@ -16,8 +16,8 @@ from filelock import FileLock, Timeout as LockTimeout
 from pydantic import AwareDatetime, Field, JsonValue, StrictBool, StrictInt, StrictStr, model_validator
 
 from aitobuild.durable_files import atomic_write_text
-from aitobuild.model_content_filter import CONTENT_FILTER_STATS
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
+from aitobuild.model_content_filter import CONTENT_FILTER_STATS
 from aitobuild.organization import DefinitionModel
 from aitobuild.organization_assignments import AssignmentCapacityError, AssignmentProposal, Digest
 from aitobuild.organization_runner import TERMINAL, ApprovalPolicyChanged, ManagedRun
@@ -305,6 +305,8 @@ class ManagedOrganizationWorker:
                 "refused_follow_ups": tuple(self._refused),
                 # #84: process-wide content-filter refusal and retry-once counts from the model-call layer.
                 "model_content_filter": CONTENT_FILTER_STATS.snapshot(),
+                # The counts above are shared by every worker in this process, not kept per worker instance.
+                "model_content_filter_scope": "process",
                 "approval_policy_revision": self.service.approval_policy.revision,
                 "automatic_approval_stages": self.service.approval_policy.automatic_stages,
                 "warnings": self.service.approval_policy.safety_warnings}

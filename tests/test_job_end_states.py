@@ -99,6 +99,7 @@ def test_failure_after_the_run_completed_keeps_the_job_completed_and_reports_the
     assert service.recorded_run(job.task_id).state == "completed"
     assert any("follow-up staging failed" in error for error in worker.diagnostics()["job_errors"])
     assert set(worker.diagnostics()["model_content_filter"]) == {"refusals", "retries", "recovered", "failed"}
+    assert worker.diagnostics()["model_content_filter_scope"] == "process"
 
 
 def test_operator_cancel_of_a_waiting_run_records_the_operator_label(tmp_path, approved_delivery):

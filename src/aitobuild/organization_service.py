@@ -209,7 +209,7 @@ class ManagedOrganizationService:
             # #86: a prerequisite is ready only after its Architect review chain ends with a reviewed outcome. A manager
             # that already carries review evidence belongs to someone else and is refused (bind also refuses a rebind).
             if dependencies.prerequisite_review_bound:
-                raise ValueError("Dependency handoff manager already has bound prerequisite review evidence")
+                raise PermissionError("Dependency handoff manager already has bound prerequisite review evidence")
             dependencies.bind_prerequisite_review(self._prerequisite_review)
         self._routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in routes)
         self._review_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in reviews.routes) if reviews else ()
