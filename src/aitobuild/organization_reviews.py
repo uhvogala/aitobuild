@@ -11,6 +11,7 @@ from typing import Annotated, Any, Callable, Literal, Self
 from filelock import FileLock
 from pydantic import Field, StrictStr, model_validator
 
+from aitobuild.approval_consent import MAX_CORRECTION_ROUNDS
 from aitobuild.durable_files import atomic_write_text
 from aitobuild.developer_delivery import DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
@@ -63,8 +64,8 @@ class _ReviewReceipt(DefinitionModel):
     budget_path: StrictStr | None = None
     deadline: Annotated[float, Field(strict=True, allow_inf_nan=False)] | None = None
     root_preview_id: StrictStr | None = None
-    correction_round: Annotated[int, Field(strict=True, ge=0, le=32)] = 0
-    max_correction_rounds: Annotated[int, Field(strict=True, ge=0, le=32)] = 1
+    correction_round: Annotated[int, Field(strict=True, ge=0, le=MAX_CORRECTION_ROUNDS)] = 0
+    max_correction_rounds: Annotated[int, Field(strict=True, ge=0, le=MAX_CORRECTION_ROUNDS)] = 1
 
 
 class _CorrectionReceipt(DefinitionModel):
@@ -100,8 +101,8 @@ class PublishedReviewAdmission:
                  worker: DeveloperDeliveryWorker, github: GitHubAdapter, state_dir: Path,
                  routes: tuple[PublishedReviewRoute, ...], correction_routes: tuple[PublishedReviewRoute, ...] = (),
                  max_correction_rounds: int = 1) -> None:
-        if type(max_correction_rounds) is not int or not 0 <= max_correction_rounds <= 32:
-            raise ValueError("Correction round limit must be an integer from 0 to 32")
+        if type(max_correction_rounds) is not int or not 0 <= max_correction_rounds <= MAX_CORRECTION_ROUNDS:
+            raise ValueError(f"Correction round limit must be an integer from 0 to {MAX_CORRECTION_ROUNDS}")
         self._max_rounds = max_correction_rounds
         self._definitions = definitions
         self._previews = previews
@@ -491,7 +492,7 @@ class PublishedReviewAdmission:
         with FileLock(str(self._path) + ".lock", timeout=10):
             journal = self._load()
         target, prefix = published_preview_id, "review"
-        for _ in range(34):  # the original review plus at most 32 correction re-reviews (the round limit's bound)
+        for _ in range(1 + MAX_CORRECTION_ROUNDS):  # the original review plus one re-review per correction round
             receipts = [receipt for receipt in journal.receipts.values() if receipt.target.preview_id == target]
             if len(receipts) > 1:
                 raise PermissionError("Published target has ambiguous review staging receipts")

@@ -901,8 +901,10 @@ publication; exact repository/issue/PR/head/branches; GitHub-reported `merged_by
 of type `User`; and merge ancestry in the proposed current base-branch head.
 It also requires a completed Architect review of that publication with a recorded
 reviewed outcome: `no_correction`, or a staged correction whose latest attempt is
-published and whose re-review chain ends the same way (#86). The service binds this
-review evidence to the dependency binding; a missing, unadmitted, not started,
+published and whose re-review chain ends the same way (#86). Only the owning service
+binds this review evidence to the dependency binding, exactly once: there is no
+constructor override, a second bind is refused, and the service refuses a manager
+that is already bound. A missing, unadmitted, not started,
 in-progress, failed, cancelled, escalated or unrecorded review (outcomes are
 recorded by automatic follow-ups or `/internal/organization/followups/offer`)
 keeps the prerequisite at `state=waiting` with `ready: false` and a reason such as

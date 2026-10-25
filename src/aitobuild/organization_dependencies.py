@@ -52,12 +52,10 @@ PrerequisiteReview = Callable[[str], str | None]
 class ManagedDependencies:
     def __init__(self, *, planning: ManagedPlanning, worker: DeveloperDeliveryWorker, state_dir: Path,
                  routes: tuple[PlanningRoute, ...], lookup_max_receipts: int = 100,
-                 prerequisite_workers: tuple[DeveloperDeliveryWorker, ...] = (),
-                 prerequisite_review: PrerequisiteReview | None = None) -> None:
+                 prerequisite_workers: tuple[DeveloperDeliveryWorker, ...] = ()) -> None:
         self.planning, self.worker, self.routes = planning, worker, routes
-        # An explicit evaluator wins; otherwise the owning service binds its review evidence (bind_prerequisite_review).
-        # Unbound, every published prerequisite stays not ready ("review_unbound"): readiness never skips the review.
-        self._explicit_review = prerequisite_review
+        # Only the owning service binds the review evidence (bind_prerequisite_review), exactly once; there is no
+        # constructor override. Unbound, every published prerequisite stays not ready ("review_unbound").
         self._bound_review: PrerequisiteReview | None = None
         if len(prerequisite_workers) > 8 or len({id(owner) for owner in (worker, *prerequisite_workers)}) != 1 + len(prerequisite_workers):
             raise ValueError("Prerequisite receipt owners must be explicit, unique and bounded")
@@ -227,12 +225,20 @@ class ManagedDependencies:
         cache[issue_key] = tuple(evidence)
         return cache[issue_key]
 
+    @property
+    def prerequisite_review_bound(self) -> bool:
+        return self._bound_review is not None
+
     def bind_prerequisite_review(self, evidence: PrerequisiteReview) -> None:
-        """Bind the owning service's Architect review evidence; an explicit constructor evaluator is never replaced."""
+        """Bind the owning service's Architect review evidence. It binds once and is never replaced."""
+        if self._bound_review is not None:
+            raise PermissionError("Prerequisite review evidence is already bound")
+        if not callable(evidence):
+            raise TypeError("Prerequisite review evidence must be callable")
         self._bound_review = evidence
 
     def _prerequisite_review(self, preview_id: str) -> str | None:
-        evaluate = self._explicit_review or self._bound_review
+        evaluate = self._bound_review
         return "review_unbound" if evaluate is None else evaluate(preview_id)
 
     def offer(self, *, planning_assignment_id: str, issue_key: str, base_revision: str) -> dict[str, Any]:

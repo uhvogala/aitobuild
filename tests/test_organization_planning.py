@@ -147,6 +147,26 @@ def reviewed(preview_id):
     return None
 
 
+def review_bound(manager, evidence):
+    """#86: stub a standalone handoff manager's review evidence through its only binding seam."""
+    if evidence is not None:
+        manager.bind_prerequisite_review(evidence)
+    return manager
+
+
+class ServiceReviewStub(ManagedDependencies):
+    """#86: a manager whose owning service's bind_prerequisite_review call binds a test evaluator instead.
+
+    The service still performs its one bind; only the bound evaluator is the stand-in.
+    """
+    def __init__(self, *, prerequisite_stub, **kwargs):
+        super().__init__(**kwargs)
+        self._prerequisite_stub = prerequisite_stub
+
+    def bind_prerequisite_review(self, evidence):
+        super().bind_prerequisite_review(self._prerequisite_stub)
+
+
 def planning_fixture(tmp_path, profile, worker, *, limits=PlanningLimits(), github=None, previews=None, dependencies_enabled=False,
                      repository="example/target", repository_id=1, base_revision="a" * 40, handoff_operation=None,
                      approval_policy=ApprovalPolicy(), implementation_followups=False, prerequisite_review=reviewed):
@@ -182,9 +202,11 @@ def planning_fixture(tmp_path, profile, worker, *, limits=PlanningLimits(), gith
 
         roles = NativeManagedRoles(runtime_for=runtime_for, state_dir=tmp_path / "planning-roles", proposal_event="github.issue.ready",
                                    planning=planning)
-        dependencies = ManagedDependencies(planning=planning, worker=worker, state_dir=tmp_path / "dependency-handoffs", routes=(
-            PlanningRoute(repository=repository, repository_id=repository_id, organization_id=snapshot.organization_id,
-                          revision=snapshot.revision, event="github.issue.ready"),), prerequisite_review=prerequisite_review) if dependencies_enabled else None
+        handoff_routes = (PlanningRoute(repository=repository, repository_id=repository_id, organization_id=snapshot.organization_id,
+                                        revision=snapshot.revision, event="github.issue.ready"),)
+        handoff = dict(planning=planning, worker=worker, state_dir=tmp_path / "dependency-handoffs", routes=handoff_routes)
+        dependencies = (None if not dependencies_enabled else ManagedDependencies(**handoff) if prerequisite_review is None
+                        else ServiceReviewStub(prerequisite_stub=prerequisite_review, **handoff))
         from aitobuild.organization_service import ManagedRoute
 
         delivery_routes = (ManagedRoute(repository=repository, repository_id=repository_id, organization_id=snapshot.organization_id,
@@ -590,8 +612,9 @@ def test_dependency_handoff_stages_only_immutable_unapproved_scope(tmp_path, app
                     return review["reason"] if preview_id == first_id else None
 
                 def manager():
-                    return ManagedDependencies(planning=restart()[1], worker=approved_delivery[1], state_dir=tmp_path / "dependency-handoffs", routes=(route,),
-                                               prerequisite_review=None if case == "review_unbound" else review_evidence)
+                    return review_bound(ManagedDependencies(planning=restart()[1], worker=approved_delivery[1],
+                                                            state_dir=tmp_path / "dependency-handoffs", routes=(route,)),
+                                        None if case == "review_unbound" else review_evidence)
 
                 dependencies = manager()
                 arguments = {"planning_assignment_id": run.assignment_id, "issue_key": "second", "base_revision": "b" * 40}
@@ -1219,8 +1242,8 @@ def test_dependency_admission_uses_real_pinned_checkout_and_separate_budget(tmp_
                     fresh_worker = DeveloperDeliveryWorker(preview_registry=registry, state_dir=tmp_path / "fresh-handoff-worker", service_root=Path.cwd(),
                         repository_sources=(LocalRepositorySource("fixture/widgets", 101, source, ("pytest -q",)),))
                     arguments = {"planning_assignment_id": run.assignment_id, "issue_key": "second", "base_revision": merged}
-                    fresh = ManagedDependencies(planning=planning, worker=fresh_worker, state_dir=tmp_path / "fresh-handoffs",
-                        routes=service._dependencies.routes, prerequisite_workers=(delivery,), prerequisite_review=reviewed)
+                    fresh = review_bound(ManagedDependencies(planning=planning, worker=fresh_worker, state_dir=tmp_path / "fresh-handoffs",
+                        routes=service._dependencies.routes, prerequisite_workers=(delivery,)), reviewed)
                     assert fresh_worker.get(first_id) is None
                     staged = fresh.offer(**arguments)
                     fresh_id = staged["handoff_preview"]["preview_id"]
@@ -1816,17 +1839,41 @@ def test_existing_marker_before_creation_refuses_without_writing(tmp_path, appro
     asyncio.run(exercise())
 
 
-def test_service_binds_prerequisite_review_evidence_and_never_skips_it(tmp_path, approved_delivery):
-    """#86: the owning service binds its Architect review evidence; with no review binding nothing is ever reviewed."""
+def test_service_binds_prerequisite_review_evidence_and_never_skips_it(tmp_path, approved_delivery, monkeypatch):
+    """#86: only the owning service binds the Architect review evidence, once; nothing can replace or skip it."""
     async def exercise():
         async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply([]))) as transport:
             async with AsyncOpenAI(api_key="test", http_client=transport) as client:
                 profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
                 service = planning_fixture(tmp_path, profile, approved_delivery[1], dependencies_enabled=True, prerequisite_review=None)[0]
                 dependencies = service._dependencies
+                assert dependencies.prerequisite_review_bound and dependencies._bound_review == service._prerequisite_review
+                assert dependencies._prerequisite_review("dp-published") == "review_unbound"  # no review admission bound
+                with pytest.raises(PermissionError, match="already bound"):
+                    dependencies.bind_prerequisite_review(reviewed)  # the service's evidence is never replaced
                 assert dependencies._bound_review == service._prerequisite_review
-                assert dependencies._prerequisite_review("dp-published") == "review_unbound"
-                explicit = planning_fixture(tmp_path / "explicit", profile, approved_delivery[1], dependencies_enabled=True)[0]
-                assert explicit._dependencies._prerequisite_review("dp-published") is None  # the explicit evaluator wins
+                with pytest.raises(TypeError, match="prerequisite_review"):
+                    ManagedDependencies(planning=dependencies.planning, worker=dependencies.worker, state_dir=tmp_path / "override",
+                                        routes=dependencies.routes, prerequisite_review=reviewed)  # no constructor override
+                unbound = ManagedDependencies(planning=dependencies.planning, worker=dependencies.worker, state_dir=tmp_path / "unbound",
+                                              routes=dependencies.routes)
+                assert not unbound.prerequisite_review_bound and unbound._prerequisite_review("dp-published") == "review_unbound"
+                with pytest.raises(TypeError, match="callable"):
+                    unbound.bind_prerequisite_review(None)
+                assert not unbound.prerequisite_review_bound
+                unbound.bind_prerequisite_review(reviewed)
+                with pytest.raises(PermissionError, match="already bound"):
+                    unbound.bind_prerequisite_review(reviewed)
+                # A service refuses a manager that someone else already bound.
+                _, _, _, _, _, _, make_service, _ = planning_fixture(tmp_path / "taken", profile, approved_delivery[1],
+                                                                     dependencies_enabled=True, prerequisite_review=None)
+                original = ManagedDependencies.__init__
+
+                def prebound(self, **kwargs):
+                    original(self, **kwargs)
+                    self.bind_prerequisite_review(reviewed)
+                monkeypatch.setattr(ManagedDependencies, "__init__", prebound)
+                with pytest.raises(ValueError, match="already has bound prerequisite review evidence"):
+                    make_service()
 
     asyncio.run(exercise())
