@@ -205,6 +205,12 @@ class ManagedOrganizationService:
         if type(automatic_review_followups) is not bool or automatic_review_followups and reviews is None:
             raise ValueError("Automatic review follow-ups require an explicit review admission binding")
         self._automatic_followups = automatic_review_followups
+        if dependencies is not None:
+            # #86: a prerequisite is ready only after its Architect review chain ends with a reviewed outcome. A manager
+            # that already carries review evidence belongs to someone else and is refused (bind also refuses a rebind).
+            if dependencies.prerequisite_review_bound:
+                raise ValueError("Dependency handoff manager already has bound prerequisite review evidence")
+            dependencies.bind_prerequisite_review(self._prerequisite_review)
         self._routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in routes)
         self._review_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in reviews.routes) if reviews else ()
         self._correction_routes = tuple(ManagedRoute.model_validate(route.model_dump()) for route in reviews.correction_routes) if reviews else ()
@@ -526,6 +532,18 @@ class ManagedOrganizationService:
     def recorded_run(self, task_id: str) -> ManagedRun | None:
         assignment = self.recorded_assignment(task_id)
         return self._runs.get(assignment.assignment_id) if assignment is not None else None
+
+    def _prerequisite_review(self, published_preview_id: str) -> str | None:
+        """#86 review evidence for one published prerequisite; without a review binding nothing is ever reviewed."""
+        if self._reviews is None:
+            return "review_unbound"
+        return self._reviews.prerequisite_review(published_preview_id, self._recorded_review_run)
+
+    def _recorded_review_run(self, review: DeveloperPreview) -> ManagedRun | None:
+        assignment = self.recorded_assignment(str(review.bundle_payload["task_id"]))
+        if assignment is None or assignment.preview_id != review.preview_id:
+            return None
+        return self._runs.get(assignment.assignment_id)
 
     def budget_path(self, preview_id: str) -> Path:
         if self._planning is not None:

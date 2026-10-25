@@ -55,12 +55,16 @@ class GitHubHuman(DefinitionModel):
         return f"github:{self.host}:{self.user_id}"
 
 
+# The hard upper bound on Developer correction rounds for one reviewed delivery, shared by consent and review admission.
+MAX_CORRECTION_ROUNDS = 32
+
+
 class ConsentLimits(DefinitionModel):
     max_tasks: StrictInt = Field(default=8, ge=1, le=128)
     max_effects: StrictInt = Field(default=32, ge=1, le=10000)
     max_model_calls: StrictInt = Field(default=32, ge=1, le=10000)
     max_changed_paths: StrictInt = Field(default=32, ge=0, le=10000)
-    max_correction_rounds: StrictInt = Field(default=0, ge=0, le=32)
+    max_correction_rounds: StrictInt = Field(default=0, ge=0, le=MAX_CORRECTION_ROUNDS)
     max_seconds: StrictInt = Field(default=3600, ge=1, le=86400)
 
 

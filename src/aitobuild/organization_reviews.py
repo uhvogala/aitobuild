@@ -6,11 +6,12 @@ from hashlib import sha256
 from glob import escape
 import json
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Callable, Literal, Self
 
 from filelock import FileLock
 from pydantic import Field, StrictStr, model_validator
 
+from aitobuild.approval_consent import MAX_CORRECTION_ROUNDS
 from aitobuild.durable_files import atomic_write_text
 from aitobuild.developer_delivery import DeveloperDeliveryWorker
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
@@ -63,8 +64,8 @@ class _ReviewReceipt(DefinitionModel):
     budget_path: StrictStr | None = None
     deadline: Annotated[float, Field(strict=True, allow_inf_nan=False)] | None = None
     root_preview_id: StrictStr | None = None
-    correction_round: Annotated[int, Field(strict=True, ge=0, le=32)] = 0
-    max_correction_rounds: Annotated[int, Field(strict=True, ge=0, le=32)] = 1
+    correction_round: Annotated[int, Field(strict=True, ge=0, le=MAX_CORRECTION_ROUNDS)] = 0
+    max_correction_rounds: Annotated[int, Field(strict=True, ge=0, le=MAX_CORRECTION_ROUNDS)] = 1
 
 
 class _CorrectionReceipt(DefinitionModel):
@@ -100,8 +101,8 @@ class PublishedReviewAdmission:
                  worker: DeveloperDeliveryWorker, github: GitHubAdapter, state_dir: Path,
                  routes: tuple[PublishedReviewRoute, ...], correction_routes: tuple[PublishedReviewRoute, ...] = (),
                  max_correction_rounds: int = 1) -> None:
-        if type(max_correction_rounds) is not int or not 0 <= max_correction_rounds <= 32:
-            raise ValueError("Correction round limit must be an integer from 0 to 32")
+        if type(max_correction_rounds) is not int or not 0 <= max_correction_rounds <= MAX_CORRECTION_ROUNDS:
+            raise ValueError(f"Correction round limit must be an integer from 0 to {MAX_CORRECTION_ROUNDS}")
         self._max_rounds = max_correction_rounds
         self._definitions = definitions
         self._previews = previews
@@ -477,6 +478,59 @@ class PublishedReviewAdmission:
             journal.followups[run.run_id] = receipt
             self._save(journal)
         return receipt.model_dump(mode="json")
+
+    def prerequisite_review(self, published_preview_id: str,
+                            run_for: Callable[[DeveloperPreview], ManagedRun | None]) -> str | None:
+        """#86: None when the Architect review chain of a published delivery ended with a reviewed outcome, else why not.
+
+        Read-only. It follows only the saved journal: the review receipt for the published target, that review's recorded
+        run (through ``run_for``) and the run's follow-up receipt. ``no_correction`` ends the chain. ``staged`` means a
+        correction was staged; then the latest correction attempt must be published and its re-review must end the same
+        way, round by round. Anything else (no review, unadmitted, not started, in progress, failed or cancelled, no
+        recorded outcome, escalated or error) is a not-ready reason.
+        """
+        with FileLock(str(self._path) + ".lock", timeout=10):
+            journal = self._load()
+        target, prefix = published_preview_id, "review"
+        for _ in range(1 + MAX_CORRECTION_ROUNDS):  # the original review plus one re-review per correction round
+            receipts = [receipt for receipt in journal.receipts.values() if receipt.target.preview_id == target]
+            if len(receipts) > 1:
+                raise PermissionError("Published target has ambiguous review staging receipts")
+            if not receipts or receipts[0].review_preview_id is None:
+                return prefix + "_missing"
+            review = self._previews.get(receipts[0].review_preview_id)
+            if review is None or not review.approved or review.approved_at is None:
+                return prefix + "_unadmitted"
+            run = run_for(review)
+            if run is None:
+                return prefix + "_not_started"
+            if run.state not in {"completed", "failed", "cancelled"}:
+                return prefix + "_in_progress"
+            if run.state != "completed":
+                return prefix + "_" + run.state  # review_failed / review_cancelled: never a reviewed outcome
+            if run.cleanup_succeeded is not True:
+                return prefix + "_cleanup_failed"
+            followup = journal.followups.get(run.run_id)
+            if followup is None:
+                return prefix + "_outcome_missing"
+            if (followup.source_preview_id, followup.run_content) != (review.preview_id, run.model_dump_json()):
+                raise PermissionError("Review follow-up source run changed")
+            if followup.state == "no_correction":
+                return None
+            if followup.state != "staged":
+                return prefix + "_outcome_" + followup.state  # escalated or error: not a reviewed outcome
+            chain = sorted((item for item in journal.corrections.values() if item.review_preview_id == review.preview_id),
+                           key=lambda item: item.attempt)
+            if followup.next_preview_id not in {item.correction_preview_id for item in chain}:
+                raise PermissionError("Staged correction lacks its trusted correction receipt")
+            latest = chain[-1].correction_preview_id  # the chain tip; a retry still staging has no preview yet
+            if latest is None:
+                return "correction_unpublished"
+            target, prefix = latest, "re_review"
+            delivery = self._worker.get(target)
+            if delivery is None or delivery.state != "published":
+                return "correction_unpublished"
+        raise PermissionError("Review chain exceeds its correction round limit")
 
     def follow_up_status(self, run_id: str) -> dict[str, Any] | None:
         with FileLock(str(self._path) + ".lock", timeout=10):
