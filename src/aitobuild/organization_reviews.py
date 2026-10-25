@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from hashlib import sha256
 from glob import escape
 import json
+import re
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, Self
 
@@ -41,6 +43,29 @@ class CorrectionProposal(DefinitionModel):
 
 class CorrectionLimitReached(PermissionError):
     pass
+
+
+@dataclass(frozen=True)
+class PrerequisiteReviewResult:
+    """#86/#90: the one Architect review chain walk's result for a published prerequisite.
+
+    ``reason`` is None when the chain ended with a reviewed outcome, else the not-ready reason. When a reviewed chain
+    went through corrections, ``correction_preview_id`` and ``correction_head_sha`` name the chain tip: the latest
+    correction record's published delivery and the exact head its completed re-review reviewed. Without a correction
+    both are None and the original publication stays the reviewed head. Dependency merge inspection consumes this
+    tip, so the review check and the merge check can never disagree about which correction is the latest one.
+    """
+    reason: str | None
+    correction_preview_id: str | None = None
+    correction_head_sha: str | None = None
+
+    def __post_init__(self) -> None:
+        tip = (self.correction_preview_id, self.correction_head_sha)
+        if (self.reason is not None and (not isinstance(self.reason, str) or not self.reason or tip != (None, None)) or
+                (tip[0] is None) != (tip[1] is None) or tip[0] is not None and (
+                    not isinstance(tip[0], str) or not tip[0] or not isinstance(tip[1], str) or
+                    re.fullmatch(r"[0-9a-f]{40}", tip[1]) is None)):
+            raise ValueError("Prerequisite review result needs a reason, or a reviewed outcome with an exact chain tip")
 
 
 class PublishedReviewRoute(DefinitionModel):
@@ -480,56 +505,69 @@ class PublishedReviewAdmission:
         return receipt.model_dump(mode="json")
 
     def prerequisite_review(self, published_preview_id: str,
-                            run_for: Callable[[DeveloperPreview], ManagedRun | None]) -> str | None:
-        """#86: None when the Architect review chain of a published delivery ended with a reviewed outcome, else why not.
+                            run_for: Callable[[DeveloperPreview], ManagedRun | None]) -> PrerequisiteReviewResult:
+        """#86/#90: whether the Architect review chain of a published delivery ended with a reviewed outcome, and where.
 
         Read-only. It follows only the saved journal: the review receipt for the published target, that review's recorded
         run (through ``run_for``) and the run's follow-up receipt. ``no_correction`` ends the chain. ``staged`` means a
         correction was staged; then the latest correction attempt must be published and its re-review must end the same
         way, round by round. Anything else (no review, unadmitted, not started, in progress, failed or cancelled, no
-        recorded outcome, escalated or error) is a not-ready reason.
+        recorded outcome, escalated or error) is a not-ready reason. A reviewed chain that went through corrections
+        also carries its tip (#90): the latest correction's preview id and the exact published head its completed
+        re-review reviewed. This is the only walk of the correction records; the merge check consumes its tip.
         """
+        def done(reason: str) -> PrerequisiteReviewResult:
+            return PrerequisiteReviewResult(reason)
+
         with FileLock(str(self._path) + ".lock", timeout=10):
             journal = self._load()
-        target, prefix = published_preview_id, "review"
+        target, prefix, tip_head = published_preview_id, "review", None
         for _ in range(1 + MAX_CORRECTION_ROUNDS):  # the original review plus one re-review per correction round
             receipts = [receipt for receipt in journal.receipts.values() if receipt.target.preview_id == target]
             if len(receipts) > 1:
                 raise PermissionError("Published target has ambiguous review staging receipts")
             if not receipts or receipts[0].review_preview_id is None:
-                return prefix + "_missing"
+                return done(prefix + "_missing")
+            if tip_head is not None and receipts[0].target.head_sha != tip_head:
+                raise PermissionError("Correction re-review target differs from the published correction head")
             review = self._previews.get(receipts[0].review_preview_id)
             if review is None or not review.approved or review.approved_at is None:
-                return prefix + "_unadmitted"
+                return done(prefix + "_unadmitted")
             run = run_for(review)
             if run is None:
-                return prefix + "_not_started"
+                return done(prefix + "_not_started")
             if run.state not in {"completed", "failed", "cancelled"}:
-                return prefix + "_in_progress"
+                return done(prefix + "_in_progress")
             if run.state != "completed":
-                return prefix + "_" + run.state  # review_failed / review_cancelled: never a reviewed outcome
+                return done(prefix + "_" + run.state)  # review_failed / review_cancelled: never a reviewed outcome
             if run.cleanup_succeeded is not True:
-                return prefix + "_cleanup_failed"
+                return done(prefix + "_cleanup_failed")
             followup = journal.followups.get(run.run_id)
             if followup is None:
-                return prefix + "_outcome_missing"
+                return done(prefix + "_outcome_missing")
             if (followup.source_preview_id, followup.run_content) != (review.preview_id, run.model_dump_json()):
                 raise PermissionError("Review follow-up source run changed")
             if followup.state == "no_correction":
-                return None
+                if tip_head is None:
+                    return PrerequisiteReviewResult(None)  # no correction: the original publication is the reviewed head
+                return PrerequisiteReviewResult(None, correction_preview_id=target, correction_head_sha=tip_head)
             if followup.state != "staged":
-                return prefix + "_outcome_" + followup.state  # escalated or error: not a reviewed outcome
+                return done(prefix + "_outcome_" + followup.state)  # escalated or error: not a reviewed outcome
             chain = sorted((item for item in journal.corrections.values() if item.review_preview_id == review.preview_id),
                            key=lambda item: item.attempt)
             if followup.next_preview_id not in {item.correction_preview_id for item in chain}:
                 raise PermissionError("Staged correction lacks its trusted correction receipt")
             latest = chain[-1].correction_preview_id  # the chain tip; a retry still staging has no preview yet
             if latest is None:
-                return "correction_unpublished"
+                return done("correction_unpublished")
             target, prefix = latest, "re_review"
             delivery = self._worker.get(target)
             if delivery is None or delivery.state != "published":
-                return "correction_unpublished"
+                return done("correction_unpublished")
+            # #90: the published correction's exact head; its re-review must have reviewed exactly this head.
+            tip_head = delivery.head_revision
+            if not isinstance(tip_head, str) or re.fullmatch(r"[0-9a-f]{40}", tip_head) is None:
+                raise PermissionError("Published correction lacks an exact head")
         raise PermissionError("Review chain exceeds its correction round limit")
 
     def follow_up_status(self, run_id: str) -> dict[str, Any] | None:

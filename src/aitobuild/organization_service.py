@@ -31,7 +31,7 @@ from aitobuild.organization_runner import (
     ManagedOperation, ManagedRun, ManagedTaskContext, ManagedWorkflowRunner, RunStore, RuntimeActor, workflow_input_digest,
 )
 from aitobuild.organization_runtime import WorkflowLimits, WorkflowPredicate
-from aitobuild.organization_reviews import PublishedReviewAdmission
+from aitobuild.organization_reviews import PrerequisiteReviewResult, PublishedReviewAdmission
 from aitobuild.organization_planning import ManagedPlanning, PlanningAdmission
 from aitobuild.organization_dependencies import ManagedDependencies
 from aitobuild.tools.github import GitHubAdapter
@@ -533,10 +533,11 @@ class ManagedOrganizationService:
         assignment = self.recorded_assignment(task_id)
         return self._runs.get(assignment.assignment_id) if assignment is not None else None
 
-    def _prerequisite_review(self, published_preview_id: str) -> str | None:
-        """#86 review evidence for one published prerequisite; without a review binding nothing is ever reviewed."""
+    def _prerequisite_review(self, published_preview_id: str) -> PrerequisiteReviewResult:
+        """#86/#90 review evidence (and reviewed chain tip) for one published prerequisite; without a review binding
+        nothing is ever reviewed."""
         if self._reviews is None:
-            return "review_unbound"
+            return PrerequisiteReviewResult("review_unbound")
         return self._reviews.prerequisite_review(published_preview_id, self._recorded_review_run)
 
     def _recorded_review_run(self, review: DeveloperPreview) -> ManagedRun | None:

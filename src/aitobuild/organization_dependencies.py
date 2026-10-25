@@ -18,6 +18,7 @@ from aitobuild.developer_preview import DeveloperPreview
 from aitobuild.durable_files import atomic_write_text
 from aitobuild.organization import DefinitionModel
 from aitobuild.organization_planning import ManagedPlanning, PlanRevision, PlanningRoute, PlanningScope, canonical
+from aitobuild.organization_reviews import PrerequisiteReviewResult
 from aitobuild.policy import AgentRole
 
 
@@ -44,9 +45,10 @@ class DependencyHandoff(DefinitionModel):
         return "dependent-issue-" + sha256(canonical(document).encode()).hexdigest()
 
 
-# #86: given a published prerequisite's preview id, None when its Architect review chain ended with a reviewed outcome,
-# else the not-ready reason (for example "review_missing", "review_failed", "re_review_in_progress").
-PrerequisiteReview = Callable[[str], str | None]
+# #86/#90: given a published prerequisite's preview id, the one review chain walk's result: reason None when its
+# Architect review chain ended with a reviewed outcome, else the not-ready reason (for example "review_missing",
+# "review_failed", "re_review_in_progress"); a reviewed chain that went through corrections also carries its tip.
+PrerequisiteReview = Callable[[str], PrerequisiteReviewResult]
 
 
 class ManagedDependencies:
@@ -211,12 +213,12 @@ class ManagedDependencies:
                     any(type(item.get("exit_code")) is not int or item["exit_code"] != 0 for item in verification["commands"])):
                 raise PermissionError("Prerequisite lacks successful independent verification and cleanup")
             review = self._prerequisite_review(preview.preview_id)
-            if review is not None:
-                evidence.append({"key": dependency, "preview_id": preview.preview_id, "ready": False, "reason": review})
+            if review.reason is not None:
+                evidence.append({"key": dependency, "preview_id": preview.preview_id, "ready": False, "reason": review.reason})
                 continue
             merged = self.planning.github.inspect_dependency_merge(repository=scope.repository, repository_id=scope.repository_id,
-                pull_number=publication["pull_number"], head_sha=publication["head_sha"], head_branch=publication["branch"],
-                base_branch=scope.base_branch, base_revision=base_revision)
+                pull_number=publication["pull_number"], head_sha=self._reviewed_head(publication, review),
+                head_branch=publication["branch"], base_branch=scope.base_branch, base_revision=base_revision)
             if merged["ready"] is True and preview.preview_id != children[dependency].preview_id:
                 ancestors = self._prerequisites(plan, dependency, children, base_revision, cache)
                 if any(item["ready"] is not True for item in ancestors):
@@ -237,9 +239,29 @@ class ManagedDependencies:
             raise TypeError("Prerequisite review evidence must be callable")
         self._bound_review = evidence
 
-    def _prerequisite_review(self, preview_id: str) -> str | None:
+    def _prerequisite_review(self, preview_id: str) -> PrerequisiteReviewResult:
         evaluate = self._bound_review
-        return "review_unbound" if evaluate is None else evaluate(preview_id)
+        if evaluate is None:
+            return PrerequisiteReviewResult("review_unbound")
+        result = evaluate(preview_id)
+        if not isinstance(result, PrerequisiteReviewResult):
+            raise PermissionError("Prerequisite review evidence returned an unrecognized result")
+        return result
+
+    def _reviewed_head(self, publication: dict[str, Any], review: PrerequisiteReviewResult) -> str:
+        """#90: the head the merge must equal. Without a correction it is the original published head (unchanged).
+        After corrections it is the reviewed chain tip carried by the review walk's result, never a second walk of the
+        correction records. The tip must be a published same-PR correction at exactly that head; otherwise refuse."""
+        if review.correction_preview_id is None:
+            return str(publication["head_sha"])
+        tip = self._delivery(review.correction_preview_id)
+        tip_publication = tip.publication if tip is not None else None
+        if (tip is None or tip.state != "published" or tip.preview_id != review.correction_preview_id or
+                not isinstance(tip_publication, dict) or tip.head_revision != review.correction_head_sha or
+                tip_publication.get("head_sha") != review.correction_head_sha or
+                any(tip_publication.get(key) != publication.get(key) for key in ("repository", "pull_number", "branch"))):
+            raise PermissionError("Reviewed correction tip differs from the prerequisite's published pull request")
+        return str(review.correction_head_sha)
 
     def offer(self, *, planning_assignment_id: str, issue_key: str, base_revision: str) -> dict[str, Any]:
         plan, source, children = self._source(planning_assignment_id, issue_key)

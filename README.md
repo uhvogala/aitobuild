@@ -912,8 +912,17 @@ keeps the prerequisite at `state=waiting` with `ready: false` and a reason such 
 `review_unbound`.
 Closed prerequisite issues are allowed only with unchanged published content.
 The dependent issue must remain open. Missing, ambiguous, malformed or drifted
-evidence refuses staging; an altered PR head, including a correction advance,
-does not silently replace the original publication evidence.
+evidence refuses staging. Without a correction, the merged head must equal the
+original published head. When the review chain went through corrections and the
+latest correction's re-review completed with a reviewed outcome, the same single
+review chain walk returns that chain tip (the latest correction's preview id and
+exact published head), and the merged head must equal that tip exactly (#90).
+The tip must be a published correction of the same repository, PR and branch; the
+correction records are never walked a second time. Merging the original or any
+older head in the chain is not ready (`merge_unproven` without merge evidence, or
+refused when GitHub reports a different merged head); an incomplete re-review keeps
+its `re_review_` reason and never reaches the merge check. The saved
+`publication_content` stays the original publication evidence.
 
 When all prerequisites qualify, the response contains `state=staged` and a fresh
 `handoff_preview`. Original plan, issue content, dependent preview, approvals and
