@@ -25,6 +25,7 @@ from aitobuild.durable_files import atomic_write_text, sync_directory
 from aitobuild.approval_policy import ApprovalDecision, ApprovalPolicy, ApprovalStage
 from aitobuild.developer_isolation import BudgetDeadlineExpired, DeveloperTaskBudget
 from aitobuild.developer_preview import AdmissionEvidenceKind
+from aitobuild.model_content_filter import ModelContentFilterError, content_filter_refusal
 from aitobuild.organization import DefinitionModel, DefinitionSnapshot, DefinitionStore, Identifier
 from aitobuild.organization_assignments import (
     AssignmentProposal, AssignmentService, AssignmentStore, Digest, TaskAssignment,
@@ -297,13 +298,19 @@ def _failure_label(error: BaseException) -> str:
 
     Only an actual deadline expiry is relabelled; aborted ledgers, lock timeouts and every other error keep
     their own message. The native invocation's asyncio timeout carries no message, so it is "TimeoutError" too.
-    A model API failure (openai.APIError anywhere in the chain) also names its exception chain.
+    A model API failure (openai.APIError anywhere in the chain) also names its exception chain. A content-filter
+    refusal (#84) is labelled by what was blocked and which filter labels fired, keeping that chain suffix.
     """
     if type(error) is BudgetDeadlineExpired:
         return "TimeoutError"
     label = str(error) or type(error).__name__
     chain = _exception_chain(error)
-    if any(isinstance(item, APIError) for item in chain):
+    # #84: a content-filter refusal is its own model error, not the generic 400 repr (prompt or response side).
+    refusal = next((found for item in chain if (found := content_filter_refusal(item)) is not None), None)
+    if refusal is not None:
+        failed = next((item for item in chain if isinstance(item, ModelContentFilterError)), None)
+        label = str(failed) if failed is not None else refusal.describe()
+    if refusal is not None or any(isinstance(item, APIError) for item in chain):
         # A model call failure: keep the transport cause (httpx.ConnectTimeout vs httpx.ReadTimeout, ...)
         # so a connect stall can be told apart from a read stall in the failure record.
         label += " [exception chain: " + " <- ".join(_exception_name(item) for item in chain) + "]"

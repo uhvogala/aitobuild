@@ -405,6 +405,8 @@ def test_openai_client_connect_timeout_is_widened_and_read_limit_kept(monkeypatc
     assert timeout.connect is not None and timeout.connect >= 30
     assert (timeout.read, timeout.write, timeout.pool) == (600, 600, 600)
     assert client.max_retries == 1
+    from aitobuild.model_content_filter import ContentFilterRetryMixin
+    assert isinstance(client, ContentFilterRetryMixin)  # #84: the one content-filter retry is in the model-call layer
 
     observed.clear()
     bootstrap_runtime(RuntimeConfig(

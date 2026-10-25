@@ -1348,6 +1348,12 @@ For Azure OpenAI v1, set `AITOBUILD_FOUNDRY_ENDPOINT` to the resource URL ending
 in `/openai/v1` and `AITOBUILD_FOUNDRY_MODEL` to the deployment name. This uses
 the native chat-completions client with refreshable Entra auth, or an optional
 API key from an ignored local environment file. Runtime mode is `openai`.
+In this mode a model call refused by the content filter (a 400 or a completion
+with `finish_reason: content_filter`, prompt or response side) is retried once.
+A second refusal fails the run with `Model output blocked by content filter
+(response; label '...')` (or `Model input ...` for the prompt side) as its error;
+other 400s are not retried. Worker diagnostics report the counts under
+`model_content_filter`.
 
 ## API endpoints
 
