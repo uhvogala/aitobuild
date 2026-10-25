@@ -663,10 +663,7 @@ def main() -> int:
             report["phases"][-1].update(
                 ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
             )
-            if (status.get("managed_run") or {}).get("state") != "completed":
-                raise RuntimeError(
-                    "Planning did not complete: " + json.dumps(status, default=str)[:2000]
-                )
+            require_completed(status, "PM planning task")  # #83: the service-recorded run must have completed
             children = hands.planned_children()
             report["planned_children"] = children
             delivery_id = children[0]
@@ -686,10 +683,7 @@ def main() -> int:
             report["pull_request"] = {
                 key: publication.get(key) for key in ("pull_number", "branch", "head_sha")
             }
-            if (status.get("managed_run") or {}).get("state") != "completed":
-                raise RuntimeError(
-                    "Delivery did not complete: " + json.dumps(status, default=str)[:2000]
-                )
+            require_completed(status, "Planned Developer child")  # #83: the service-recorded run must have completed
 
             followup = operator.wait_follow_up(delivery_id, "delivery")
             if not followup or followup.get("state") != "staged":
