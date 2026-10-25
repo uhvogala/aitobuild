@@ -138,9 +138,18 @@ def test_plan_revision_is_immutable_and_survives_restart(tmp_path):
         store.save("assignment", plan.model_copy(update={"inspections": {}}))
 
 
+def reviewed(preview_id):
+    """#86 stand-in for a completed no_correction Architect review of every published prerequisite.
+
+    The real review-chain evaluation is exercised in test_organization_roles; these tests pin it so they stay about the
+    dependency handoff itself.
+    """
+    return None
+
+
 def planning_fixture(tmp_path, profile, worker, *, limits=PlanningLimits(), github=None, previews=None, dependencies_enabled=False,
                      repository="example/target", repository_id=1, base_revision="a" * 40, handoff_operation=None,
-                     approval_policy=ApprovalPolicy(), implementation_followups=False):
+                     approval_policy=ApprovalPolicy(), implementation_followups=False, prerequisite_review=reviewed):
     document = json.loads((Path(__file__).resolve().parents[1] / "config/organization.example.json").read_text())
     document["workflows"].append({"id": "planning", "document": {
         "format": "python_graph", "start": "plan", "nodes": [{"id": "plan", "kind": "operation", "operation": "pm_plan_issues"}],
@@ -175,7 +184,7 @@ def planning_fixture(tmp_path, profile, worker, *, limits=PlanningLimits(), gith
                                    planning=planning)
         dependencies = ManagedDependencies(planning=planning, worker=worker, state_dir=tmp_path / "dependency-handoffs", routes=(
             PlanningRoute(repository=repository, repository_id=repository_id, organization_id=snapshot.organization_id,
-                          revision=snapshot.revision, event="github.issue.ready"),)) if dependencies_enabled else None
+                          revision=snapshot.revision, event="github.issue.ready"),), prerequisite_review=prerequisite_review) if dependencies_enabled else None
         from aitobuild.organization_service import ManagedRoute
 
         delivery_routes = (ManagedRoute(repository=repository, repository_id=repository_id, organization_id=snapshot.organization_id,
@@ -514,7 +523,9 @@ def test_pm_independent_followup_refuses_changed_or_incomplete_evidence(tmp_path
 
 @pytest.mark.parametrize("case", ["merged", "draft", "issue_drift", "dependent_closed", "parent_unapproved", "verification", "cleanup",
                                   "receipt_drift", "preview_drift", "lost_receipt", "lost_preview", "symlink", "original_approved", "parent_drift",
-                                  "all_dependencies", "chain", "partial_stage", "stale_base", "route_drift", "operator_drift", "unbound"])
+                                  "all_dependencies", "chain", "partial_stage", "stale_base", "route_drift", "operator_drift", "unbound",
+                                  "review_missing", "review_unadmitted", "review_in_progress", "review_failed", "correction_unpublished",
+                                  "re_review_in_progress", "review_unbound", "review_regressed"])
 def test_dependency_handoff_stages_only_immutable_unapproved_scope(tmp_path, approved_delivery, monkeypatch, case):
     bodies = []
     document = proposal()
@@ -571,11 +582,34 @@ def test_dependency_handoff_stages_only_immutable_unapproved_scope(tmp_path, app
                 elif case == "original_approved":
                     approve_preview(previews, second_id)
 
+                review = {"reason": None}  # #86 review evidence of the published prerequisite (None: reviewed outcome)
+                if case.startswith(("review_", "re_review_", "correction_")) and case not in {"review_unbound", "review_regressed"}:
+                    review["reason"] = case
+
+                def review_evidence(preview_id):
+                    return review["reason"] if preview_id == first_id else None
+
                 def manager():
-                    return ManagedDependencies(planning=restart()[1], worker=approved_delivery[1], state_dir=tmp_path / "dependency-handoffs", routes=(route,))
+                    return ManagedDependencies(planning=restart()[1], worker=approved_delivery[1], state_dir=tmp_path / "dependency-handoffs", routes=(route,),
+                                               prerequisite_review=None if case == "review_unbound" else review_evidence)
 
                 dependencies = manager()
                 arguments = {"planning_assignment_id": run.assignment_id, "issue_key": "second", "base_revision": "b" * 40}
+                if review["reason"] is not None or case == "review_unbound":
+                    # #86: published, verified and merged is not enough; an unfinished Architect review keeps it waiting.
+                    merge_reads = []
+                    inspect = github.inspect_dependency_merge
+                    monkeypatch.setattr(github, "inspect_dependency_merge", lambda **kwargs: merge_reads.append(kwargs) or inspect(**kwargs))
+                    blocked = dependencies.offer(**arguments)
+                    assert blocked == {"state": "waiting", "handoff_preview": None, "implementation_approved": False, "prerequisites": (
+                        {"key": "first", "preview_id": first_id, "ready": False, "reason": case},)}
+                    assert not merge_reads and not list(dependencies.directory.glob("*.json"))
+                    assert not [item for item in previews.list_previews(pending_only=False, limit=50)
+                                if item.bundle_payload["task_id"].startswith("dependent-issue-")]
+                    if case == "review_unbound":
+                        return
+                    # The same prerequisite becomes ready once the review (or the correction's re-review) completes.
+                    review["reason"] = None
                 if case in {"issue_drift", "dependent_closed", "parent_unapproved", "verification", "cleanup", "original_approved"}:
                     with pytest.raises(PermissionError):
                         dependencies.offer(**arguments)
@@ -640,9 +674,12 @@ def test_dependency_handoff_stages_only_immutable_unapproved_scope(tmp_path, app
                         elif case == "unbound":
                             with pytest.raises(PermissionError, match="trusted admission"):
                                 restart()[0].admission(fresh.preview_id)
-                        if case not in {"merged", "chain", "partial_stage", "unbound"}:
+                        elif case == "review_regressed":
+                            review["reason"] = "review_failed"
+                        if case not in {"merged", "chain", "partial_stage", "unbound"} and not (
+                                case.startswith(("review_", "re_review_", "correction_")) and case != "review_regressed"):
                             with pytest.raises((PermissionError, ValueError, OSError)):
-                                if case in {"preview_drift", "parent_drift", "stale_base", "route_drift", "operator_drift"}:
+                                if case in {"preview_drift", "parent_drift", "stale_base", "route_drift", "operator_drift", "review_regressed"}:
                                     dependencies.route_for(previews.get(fresh.preview_id))
                                 else:
                                     manager().offer(**arguments)
@@ -1183,7 +1220,7 @@ def test_dependency_admission_uses_real_pinned_checkout_and_separate_budget(tmp_
                         repository_sources=(LocalRepositorySource("fixture/widgets", 101, source, ("pytest -q",)),))
                     arguments = {"planning_assignment_id": run.assignment_id, "issue_key": "second", "base_revision": merged}
                     fresh = ManagedDependencies(planning=planning, worker=fresh_worker, state_dir=tmp_path / "fresh-handoffs",
-                        routes=service._dependencies.routes, prerequisite_workers=(delivery,))
+                        routes=service._dependencies.routes, prerequisite_workers=(delivery,), prerequisite_review=reviewed)
                     assert fresh_worker.get(first_id) is None
                     staged = fresh.offer(**arguments)
                     fresh_id = staged["handoff_preview"]["preview_id"]
@@ -1775,5 +1812,21 @@ def test_existing_marker_before_creation_refuses_without_writing(tmp_path, appro
                 done = await service.decide(waiting.assignment_id, request_id=waiting.pending[0].request_id, approved=True)
                 assert done.state == "failed" and "marker already exists" in str(done.error), done.error
                 assert writes == [] and len(github.issues["example/target"]) == 1
+
+    asyncio.run(exercise())
+
+
+def test_service_binds_prerequisite_review_evidence_and_never_skips_it(tmp_path, approved_delivery):
+    """#86: the owning service binds its Architect review evidence; with no review binding nothing is ever reviewed."""
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply([]))) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service = planning_fixture(tmp_path, profile, approved_delivery[1], dependencies_enabled=True, prerequisite_review=None)[0]
+                dependencies = service._dependencies
+                assert dependencies._bound_review == service._prerequisite_review
+                assert dependencies._prerequisite_review("dp-published") == "review_unbound"
+                explicit = planning_fixture(tmp_path / "explicit", profile, approved_delivery[1], dependencies_enabled=True)[0]
+                assert explicit._dependencies._prerequisite_review("dp-published") is None  # the explicit evaluator wins
 
     asyncio.run(exercise())

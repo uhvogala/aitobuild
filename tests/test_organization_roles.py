@@ -28,6 +28,14 @@ from test_dispatcher import (
 )
 
 
+#: The 071847 trial's failed Architect review: the model service refused the prompt (content filter).
+CONTENT_FILTER = (
+    "service failed to complete the prompt: Error code: 400 - {'finish_reason': 'content_filter', "
+    "'message': \"Response content blocked by label 'MultiSeverity_SexualScore'.\"} "
+    "[exception chain: agent_framework.ChatClientException <- openai.BadRequestError]"
+)
+
+
 def _scripted_reply(message, finish=None):
     finish = finish or ("tool_calls" if message.get("tool_calls") else "stop")
     return httpx.Response(200, json={"id": "reply", "object": "chat.completion", "created": 1, "model": "test-model",
@@ -649,6 +657,8 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                     )
 
                 current = service()
+                # #86: a published delivery is not a ready dependency prerequisite until its review chain is reviewed.
+                assert current._prerequisite_review(published_id) == "review_missing"
                 staged = await current.offer_published_review(published_id)
                 if queued_followups:
                     enqueued = {}
@@ -721,6 +731,12 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                             rereview = current.recorded_run(rereview_job.task_id)
                             assert rereview.state == "completed" and rereview.cleanup_succeeded is True, rereview.error
                             assert current.follow_up_status(rereview.run_id)["state"] == "no_correction"
+                            # #86: review staged a correction, the correction published and its re-review completed
+                            # with no further correction, so the prerequisite is ready.
+                            assert current._prerequisite_review(published_id) is None
+                            failed_rereview = rereview.model_copy(update={"state": "failed", "error": CONTENT_FILTER})
+                            assert reviews.prerequisite_review(published_id, lambda review: failed_rereview
+                                if review.preview_id == rereview_id else current._recorded_review_run(review)) == "re_review_failed"
                     finally:
                         await background.close()
                     jobs = background.store.list()
@@ -774,6 +790,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                     assert developer_budget.read_bytes() == before_developer
                     return
                 assert await current.consume(staged.preview_id) is None and not bodies
+                assert current._prerequisite_review(published_id) == "review_unadmitted"
                 preview = approve_preview(previews, staged.preview_id)
                 if detached:
                     background = ManagedOrganizationWorker(service=current, store=FileWorkerStore(tmp_path / "review-worker.json"))
@@ -799,6 +816,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                     return
                 assert waiting.state == "waiting", waiting.error
                 assert waiting.pending[0].kind == "service_approval" and not github.reviews
+                assert service()._prerequisite_review(published_id) == "review_in_progress"
                 assert worker.get(preview.preview_id) is None
                 budget_before = reviews.budget_path(preview.preview_id).read_bytes()
                 assert preview.bundle_payload["policy"]["max_file_changes"] == 0
@@ -815,6 +833,20 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                     return
                 done = await service().decide(waiting.assignment_id, request_id=waiting.pending[0].request_id, approved=True)
                 assert done.state == "completed", done.error
+                # #86: a failed (the 071847 content-filter shape) or cancelled review is never a reviewed outcome.
+                for state, reason in (("failed", "review_failed"), ("cancelled", "review_cancelled")):
+                    unreviewed = done.model_copy(update={"state": state, "error": CONTENT_FILTER})
+                    assert reviews.prerequisite_review(published_id, lambda review: unreviewed) == reason
+                assert reviews.prerequisite_review(published_id, lambda review: None) == "review_not_started"
+                if native_correcting:
+                    # The automatic follow-up staged a correction: not ready until it publishes and is re-reviewed.
+                    assert service()._prerequisite_review(published_id) == "correction_unpublished"
+                else:
+                    assert service()._prerequisite_review(published_id) == "review_outcome_missing"
+                if outcome == "approve":
+                    # Recording the completed review's outcome (no correction proposed) makes the prerequisite ready.
+                    assert (await service().offer_follow_up(preview.preview_id))["state"] == "no_correction"
+                    assert service()._prerequisite_review(published_id) is None
                 assert len(github.reviews) == 1 and len(bodies) == (4 if correcting else 3)
                 assert await service().consume(preview.preview_id) == done
                 assert reviews.budget_path(preview.preview_id).read_bytes() == budget_before
@@ -1023,6 +1055,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
 
                         waiting = await invoke_native()
                         assert waiting.state == "waiting", waiting.error
+                        assert service()._prerequisite_review(published_id) == "correction_unpublished"
                         if outcome == "correction_native_followup_retry":
                             offer = reviews.offer
                             attempts = []
@@ -1159,6 +1192,7 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         rereview_id = followup["next_preview_id"]
                         assert not previews.get(rereview_id).approved and not reviews.budget_path(rereview_id).exists()
                         assert reviews.target_for(rereview_id).head_sha == record.publication["head_sha"]
+                        assert service()._prerequisite_review(published_id) == "re_review_unadmitted"
                         count = len(developer_bodies)
                         assert await service().consume(correction.preview_id) == completed
                         assert len(developer_bodies) == count
@@ -1170,9 +1204,13 @@ def test_staged_native_review_routes_only_after_fresh_task_approval(tmp_path, pu
                         approve_preview(previews, rereview_id)
                         reviewing = await service().consume(rereview_id)
                         assert reviewing.state == "waiting", reviewing.error
+                        assert service()._prerequisite_review(published_id) == "re_review_in_progress"
                         reviewed = await service().decide(reviewing.assignment_id, request_id=reviewing.pending[0].request_id, approved=True)
                         assert reviewed.state == "completed", reviewed.error
                         escalated = service().follow_up_status(reviewed.run_id)
+                        # #86: a second staged correction is not published yet; an escalated re-review is not reviewed.
+                        assert service()._prerequisite_review(published_id) == (
+                            "correction_unpublished" if outcome == "correction_native_two_rounds" else "re_review_outcome_escalated")
                         if outcome == "correction_native_two_rounds":
                             assert escalated["state"] == "staged"
                             second_correction = previews.get(escalated["next_preview_id"])

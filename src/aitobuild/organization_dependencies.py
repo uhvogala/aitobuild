@@ -7,7 +7,7 @@ from hashlib import sha256
 from itertools import islice
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from filelock import FileLock
 from pydantic import Field, StrictStr
@@ -44,11 +44,21 @@ class DependencyHandoff(DefinitionModel):
         return "dependent-issue-" + sha256(canonical(document).encode()).hexdigest()
 
 
+# #86: given a published prerequisite's preview id, None when its Architect review chain ended with a reviewed outcome,
+# else the not-ready reason (for example "review_missing", "review_failed", "re_review_in_progress").
+PrerequisiteReview = Callable[[str], str | None]
+
+
 class ManagedDependencies:
     def __init__(self, *, planning: ManagedPlanning, worker: DeveloperDeliveryWorker, state_dir: Path,
                  routes: tuple[PlanningRoute, ...], lookup_max_receipts: int = 100,
-                 prerequisite_workers: tuple[DeveloperDeliveryWorker, ...] = ()) -> None:
+                 prerequisite_workers: tuple[DeveloperDeliveryWorker, ...] = (),
+                 prerequisite_review: PrerequisiteReview | None = None) -> None:
         self.planning, self.worker, self.routes = planning, worker, routes
+        # An explicit evaluator wins; otherwise the owning service binds its review evidence (bind_prerequisite_review).
+        # Unbound, every published prerequisite stays not ready ("review_unbound"): readiness never skips the review.
+        self._explicit_review = prerequisite_review
+        self._bound_review: PrerequisiteReview | None = None
         if len(prerequisite_workers) > 8 or len({id(owner) for owner in (worker, *prerequisite_workers)}) != 1 + len(prerequisite_workers):
             raise ValueError("Prerequisite receipt owners must be explicit, unique and bounded")
         self.prerequisite_workers = prerequisite_workers
@@ -202,6 +212,10 @@ class ManagedDependencies:
                     not isinstance(verification.get("commands"), list) or not verification["commands"] or
                     any(type(item.get("exit_code")) is not int or item["exit_code"] != 0 for item in verification["commands"])):
                 raise PermissionError("Prerequisite lacks successful independent verification and cleanup")
+            review = self._prerequisite_review(preview.preview_id)
+            if review is not None:
+                evidence.append({"key": dependency, "preview_id": preview.preview_id, "ready": False, "reason": review})
+                continue
             merged = self.planning.github.inspect_dependency_merge(repository=scope.repository, repository_id=scope.repository_id,
                 pull_number=publication["pull_number"], head_sha=publication["head_sha"], head_branch=publication["branch"],
                 base_branch=scope.base_branch, base_revision=base_revision)
@@ -212,6 +226,14 @@ class ManagedDependencies:
             evidence.append({"key": dependency, "preview_id": preview.preview_id, "publication_content": canonical(publication), **merged})
         cache[issue_key] = tuple(evidence)
         return cache[issue_key]
+
+    def bind_prerequisite_review(self, evidence: PrerequisiteReview) -> None:
+        """Bind the owning service's Architect review evidence; an explicit constructor evaluator is never replaced."""
+        self._bound_review = evidence
+
+    def _prerequisite_review(self, preview_id: str) -> str | None:
+        evaluate = self._explicit_review or self._bound_review
+        return "review_unbound" if evaluate is None else evaluate(preview_id)
 
     def offer(self, *, planning_assignment_id: str, issue_key: str, base_revision: str) -> dict[str, Any]:
         plan, source, children = self._source(planning_assignment_id, issue_key)
