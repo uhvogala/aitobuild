@@ -22,6 +22,7 @@ from aitobuild.organization import FileDefinitionStore, parse_organization_defin
 from aitobuild.organization_assignments import FileAssignmentStore, AssignmentProposal
 from aitobuild.organization_planning import ManagedPlanning, PlanningAdmission, PlanningRoute, PlanningScope
 from aitobuild.organization_dependencies import ManagedDependencies
+from aitobuild.organization_reviews import PrerequisiteReviewResult
 from aitobuild.organization_roles import NativeManagedRoles
 from aitobuild.organization_runner import FileRunStore, ManagedOperation
 from aitobuild.organization_runtime import ModelProfile, bootstrap_organization
@@ -144,7 +145,7 @@ def reviewed(preview_id):
     The real review-chain evaluation is exercised in test_organization_roles; these tests pin it so they stay about the
     dependency handoff itself.
     """
-    return None
+    return PrerequisiteReviewResult(None)
 
 
 def review_bound(manager, evidence):
@@ -547,7 +548,8 @@ def test_pm_independent_followup_refuses_changed_or_incomplete_evidence(tmp_path
                                   "receipt_drift", "preview_drift", "lost_receipt", "lost_preview", "symlink", "original_approved", "parent_drift",
                                   "all_dependencies", "chain", "partial_stage", "stale_base", "route_drift", "operator_drift", "unbound",
                                   "review_missing", "review_unadmitted", "review_in_progress", "review_failed", "correction_unpublished",
-                                  "re_review_in_progress", "review_unbound", "review_regressed"])
+                                  "re_review_in_progress", "review_unbound", "review_regressed",
+                                  "corrected_tip", "corrected_original_head", "corrected_other_pull", "corrected_unknown_result"])
 def test_dependency_handoff_stages_only_immutable_unapproved_scope(tmp_path, approved_delivery, monkeypatch, case):
     bodies = []
     document = proposal()
@@ -607,9 +609,27 @@ def test_dependency_handoff_stages_only_immutable_unapproved_scope(tmp_path, app
                 review = {"reason": None}  # #86 review evidence of the published prerequisite (None: reviewed outcome)
                 if case.startswith(("review_", "re_review_", "correction_")) and case not in {"review_unbound", "review_regressed"}:
                     review["reason"] = case
+                tip, review_calls = "9" * 40, []
+                if case.startswith("corrected_"):
+                    # #90: the prerequisite's review staged a correction on the same PR; its re-review completed with a
+                    # reviewed outcome at the correction head (the chain tip). Only the walk's result names the tip.
+                    correction = replace(delivery, preview_id="dp-correction-tip", head_revision=tip,
+                                         publication=publication | {"head_sha": tip} | ({"pull_number": 9} if case == "corrected_other_pull" else {}))
+                    monkeypatch.setattr(approved_delivery[1], "get", lambda preview_id:
+                        delivery if preview_id == first_id else correction if preview_id == correction.preview_id else None)
+                    if case != "corrected_original_head":
+                        raw["head"]["sha"] = tip  # merged at the tip; otherwise the original head is what was merged
 
                 def review_evidence(preview_id):
-                    return review["reason"] if preview_id == first_id else None
+                    if preview_id != first_id:
+                        return PrerequisiteReviewResult(None)
+                    review_calls.append(preview_id)
+                    if case == "corrected_unknown_result":
+                        return None  # not the walk's result: refused, never read as reviewed
+                    if review["reason"] is not None:
+                        return PrerequisiteReviewResult(review["reason"])
+                    return (PrerequisiteReviewResult(None, correction_preview_id="dp-correction-tip", correction_head_sha=tip)
+                            if case.startswith("corrected_") else PrerequisiteReviewResult(None))
 
                 def manager():
                     return review_bound(ManagedDependencies(planning=restart()[1], worker=approved_delivery[1],
@@ -633,6 +653,29 @@ def test_dependency_handoff_stages_only_immutable_unapproved_scope(tmp_path, app
                         return
                     # The same prerequisite becomes ready once the review (or the correction's re-review) completes.
                     review["reason"] = None
+                if case.startswith("corrected_"):
+                    # #90: the merge check uses exactly the tip head carried by the one review walk's result.
+                    merge_reads = []
+                    inspect = github.inspect_dependency_merge
+                    monkeypatch.setattr(github, "inspect_dependency_merge", lambda **kwargs: merge_reads.append(kwargs) or inspect(**kwargs))
+                    if case != "corrected_tip":
+                        with pytest.raises(PermissionError, match={
+                                "corrected_original_head": "repository/head/base changed",
+                                "corrected_other_pull": "Reviewed correction tip differs",
+                                "corrected_unknown_result": "unrecognized result"}[case]):
+                            dependencies.offer(**arguments)
+                        assert [read["head_sha"] for read in merge_reads] == ([tip] if case == "corrected_original_head" else [])
+                        assert not list(dependencies.directory.glob("*.json"))
+                        assert not [item for item in previews.list_previews(pending_only=False, limit=50)
+                                    if item.bundle_payload["task_id"].startswith("dependent-issue-")]
+                        return
+                    staged = dependencies.offer(**arguments)
+                    assert staged["state"] == "staged" and review_calls == [first_id]
+                    assert [(read["head_sha"], read["pull_number"], read["head_branch"]) for read in merge_reads] == [
+                        (tip, 7, "aitobuild/issue-1")]
+                    assert staged["prerequisites"][0]["ready"] is True and staged["prerequisites"][0]["head_sha"] == tip
+                    assert staged["prerequisites"][0]["publication_content"] == json.dumps(
+                        publication, sort_keys=True, separators=(",", ":"), allow_nan=False)
                 if case in {"issue_drift", "dependent_closed", "parent_unapproved", "verification", "cleanup", "original_approved"}:
                     with pytest.raises(PermissionError):
                         dependencies.offer(**arguments)
@@ -699,7 +742,7 @@ def test_dependency_handoff_stages_only_immutable_unapproved_scope(tmp_path, app
                                 restart()[0].admission(fresh.preview_id)
                         elif case == "review_regressed":
                             review["reason"] = "review_failed"
-                        if case not in {"merged", "chain", "partial_stage", "unbound"} and not (
+                        if case not in {"merged", "chain", "partial_stage", "unbound", "corrected_tip"} and not (
                                 case.startswith(("review_", "re_review_", "correction_")) and case != "review_regressed"):
                             with pytest.raises((PermissionError, ValueError, OSError)):
                                 if case in {"preview_drift", "parent_drift", "stale_base", "route_drift", "operator_drift", "review_regressed"}:
@@ -1848,7 +1891,7 @@ def test_service_binds_prerequisite_review_evidence_and_never_skips_it(tmp_path,
                 service = planning_fixture(tmp_path, profile, approved_delivery[1], dependencies_enabled=True, prerequisite_review=None)[0]
                 dependencies = service._dependencies
                 assert dependencies.prerequisite_review_bound and dependencies._bound_review == service._prerequisite_review
-                assert dependencies._prerequisite_review("dp-published") == "review_unbound"  # no review admission bound
+                assert dependencies._prerequisite_review("dp-published").reason == "review_unbound"  # no review admission bound
                 with pytest.raises(PermissionError, match="already bound"):
                     dependencies.bind_prerequisite_review(reviewed)  # the service's evidence is never replaced
                 assert dependencies._bound_review == service._prerequisite_review
@@ -1857,7 +1900,7 @@ def test_service_binds_prerequisite_review_evidence_and_never_skips_it(tmp_path,
                                         routes=dependencies.routes, prerequisite_review=reviewed)  # no constructor override
                 unbound = ManagedDependencies(planning=dependencies.planning, worker=dependencies.worker, state_dir=tmp_path / "unbound",
                                               routes=dependencies.routes)
-                assert not unbound.prerequisite_review_bound and unbound._prerequisite_review("dp-published") == "review_unbound"
+                assert not unbound.prerequisite_review_bound and unbound._prerequisite_review("dp-published").reason == "review_unbound"
                 with pytest.raises(TypeError, match="callable"):
                     unbound.bind_prerequisite_review(None)
                 assert not unbound.prerequisite_review_bound
