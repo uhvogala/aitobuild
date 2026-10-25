@@ -392,8 +392,8 @@ def test_followups_completed_review_with_an_outcome_passes(
 
 
 @pytest.mark.parametrize("failing, message", [
-    ("plan", "Planning did not complete"),
-    ("delivery", "Delivery did not complete"),
+    ("plan", "PM planning task: service-recorded run is failed"),
+    ("delivery", "Planned Developer child: service-recorded run is failed"),
     ("review", "Architect review: service-recorded run is failed"),
     ("correction", "Correction: service-recorded run is failed"),
     ("rereview", "Architect re-review: service-recorded run is failed"),
