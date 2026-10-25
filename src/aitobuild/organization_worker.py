@@ -16,6 +16,7 @@ from filelock import FileLock, Timeout as LockTimeout
 from pydantic import AwareDatetime, Field, JsonValue, StrictBool, StrictInt, StrictStr, model_validator
 
 from aitobuild.durable_files import atomic_write_text
+from aitobuild.model_content_filter import CONTENT_FILTER_STATS
 from aitobuild.developer_isolation import DeveloperTaskBudget, developer_task_bundle_from_payload
 from aitobuild.organization import DefinitionModel
 from aitobuild.organization_assignments import AssignmentCapacityError, AssignmentProposal, Digest
@@ -302,6 +303,8 @@ class ManagedOrganizationWorker:
                 "transient_deferrals": {preview_id: {"attempts": attempts, "error": error}
                                         for preview_id, (attempts, _, error) in self._transient_retries.items()},
                 "refused_follow_ups": tuple(self._refused),
+                # #84: process-wide content-filter refusal and retry-once counts from the model-call layer.
+                "model_content_filter": CONTENT_FILTER_STATS.snapshot(),
                 "approval_policy_revision": self.service.approval_policy.revision,
                 "automatic_approval_stages": self.service.approval_policy.automatic_stages,
                 "warnings": self.service.approval_policy.safety_warnings}

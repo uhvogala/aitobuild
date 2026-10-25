@@ -21,6 +21,7 @@ from openai import AsyncOpenAI, Timeout
 from aitobuild.agents import AgentSpec, default_agent_specs
 from aitobuild.config import RuntimeConfig
 from aitobuild.meetings import MeetingRecord
+from aitobuild.model_content_filter import content_filter_retrying
 
 
 @dataclass(slots=True, frozen=True)
@@ -197,7 +198,8 @@ def _construct_openai_client(*, bindings: FrameworkBindings, config: RuntimeConf
     return client_class(
         model=config.foundry_model,
         function_invocation_configuration={"include_detailed_errors": True},
-        async_client=AsyncOpenAI(
+        # #84: a content-filter refusal is retried once in the client's request layer, then fails clearly.
+        async_client=content_filter_retrying(AsyncOpenAI)(
             base_url=config.foundry_endpoint, api_key=api_key, max_retries=1,
             timeout=model_http_timeout(config),
         ),
