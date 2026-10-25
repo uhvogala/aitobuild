@@ -655,7 +655,7 @@ def main() -> int:
             report["phases"][-1].update(
                 ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
             )
-            require_completed(status, "Developer correction")  # #83: the service-recorded run must have completed
+            require_completed(status, "Correction")  # #83: the service-recorded run must have completed
             staged = operator.post(
                 "/internal/organization/corrections/stage-publication",
                 {"correction_preview_id": correction_id},
