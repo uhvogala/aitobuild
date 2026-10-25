@@ -1916,7 +1916,7 @@ def test_service_binds_prerequisite_review_evidence_and_never_skips_it(tmp_path,
                     original(self, **kwargs)
                     self.bind_prerequisite_review(reviewed)
                 monkeypatch.setattr(ManagedDependencies, "__init__", prebound)
-                with pytest.raises(ValueError, match="already has bound prerequisite review evidence"):
+                with pytest.raises(PermissionError, match="already has bound prerequisite review evidence"):
                     make_service()
 
     asyncio.run(exercise())
