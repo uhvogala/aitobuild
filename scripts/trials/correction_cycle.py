@@ -48,6 +48,7 @@ from common import (  # noqa: E402
     now,
     positive,
     prepare_docker_wrapper,
+    require_completed,
     signed_issue_webhook,
 )
 
@@ -592,10 +593,7 @@ def main() -> int:
                 "url": publication.get("url") or publication.get("html_url"),
             }
             recorder.save()
-            if (status.get("managed_run") or {}).get("state") != "completed":
-                raise RuntimeError(
-                    "Delivery did not complete: " + json.dumps(status, default=str)[:2000]
-                )
+            require_completed(status, "Planned Developer child")  # #83: the service-recorded run must have completed
 
             followup = operator.wait_follow_up(delivery_id, "delivery")
             if not followup or followup.get("state") != "staged":
@@ -611,10 +609,7 @@ def main() -> int:
                 run_state=(status.get("managed_run") or {}).get("state"),
                 outputs=(status.get("managed_run") or {}).get("outputs"),
             )
-            if (status.get("managed_run") or {}).get("state") != "completed":
-                raise RuntimeError(
-                    "Review did not complete: " + json.dumps(status, default=str)[:2000]
-                )
+            require_completed(status, "Architect review")  # #83: the service-recorded run must have completed
             followup = operator.wait_follow_up(review_id, "review")
             if automatic and followup and followup.get("state") == "no_correction":
                 report["review_outcome"] = "no_correction"
@@ -660,10 +655,7 @@ def main() -> int:
             report["phases"][-1].update(
                 ended_at=now(), run_state=(status.get("managed_run") or {}).get("state")
             )
-            if (status.get("managed_run") or {}).get("state") != "completed":
-                raise RuntimeError(
-                    "Correction did not complete: " + json.dumps(status, default=str)[:2000]
-                )
+            require_completed(status, "Correction")  # #83: the service-recorded run must have completed
             staged = operator.post(
                 "/internal/organization/corrections/stage-publication",
                 {"correction_preview_id": correction_id},
@@ -719,10 +711,7 @@ def main() -> int:
             report["re_review_follow_up"] = operator.wait_follow_up(
                 rereview_id, "re-review", timeout=30
             )
-            if (status.get("managed_run") or {}).get("state") != "completed":
-                raise RuntimeError(
-                    "Re-review did not complete: " + json.dumps(status, default=str)[:2000]
-                )
+            require_completed(status, "Architect re-review")  # #83: the service-recorded run must have completed
             report["worker_diagnostics"] = client.get(
                 "/internal/organization/worker", headers=operator.headers
             ).json()
