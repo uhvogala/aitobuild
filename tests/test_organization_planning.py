@@ -1920,3 +1920,66 @@ def test_service_binds_prerequisite_review_evidence_and_never_skips_it(tmp_path,
                     make_service()
 
     asyncio.run(exercise())
+
+
+def test_planned_child_admission_reads_the_publication_without_its_lock_while_reconcile_refuses(tmp_path, approved_delivery):
+    """#87: admitting a planned child only reads the published record (written atomically, never changed after
+    publication), so it does not take the publication lock and succeeds while another holder has it. Reconcile still
+    refuses at once (timeout=0)."""
+    from filelock import FileLock, Timeout
+
+    from aitobuild.organization_runner import ManagedOperation
+
+    bodies, calls = [], []
+    policy = ApprovalPolicy(task_admission="automatic", pm_issue_creation="human", pm_dependency_links="automatic")
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply(bodies))) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service, planning, _, preview, previews, _, _, _ = planning_fixture(
+                    tmp_path, profile, approved_delivery[1], previews=approved_delivery[0], repository="fixture/widgets", repository_id=101,
+                    base_revision=approved_delivery[4], approval_policy=policy, implementation_followups=True,
+                    handoff_operation=ManagedOperation(lambda context, message: calls.append("implementation")))
+                approve_preview(previews, preview.preview_id)
+                run = await service.consume(preview.preview_id)
+                run = await service.decide(run.assignment_id, request_id=run.pending[0].request_id, approved=True)
+                assert run.state == "completed" and run.cleanup_succeeded is True, run.error
+                first_id, _ = run.outputs[0]["developer_previews"]
+                path = planning.publications.path(run.assignment_id)
+                before = path.read_bytes()
+                with FileLock(str(path) + ".lock", timeout=0):
+                    assert planning.independent_preview_ids(run) == (first_id,)
+                    planning.check_independent_preview(previews.get(first_id), run)
+                    admitted = service.admission(first_id)
+                    assert admitted is not None and admitted[0].preview_id == first_id and previews.get(first_id).approved
+                    with pytest.raises(Timeout):
+                        planning.reconcile(run.assignment_id)
+                assert path.read_bytes() == before and not calls
+
+    asyncio.run(exercise())
+
+
+def test_publish_refuses_while_the_publication_lock_is_held(tmp_path, approved_delivery):
+    """#87: publishing keeps its timeout=0 publication lock; with another holder it refuses and writes nothing."""
+    from filelock import FileLock
+
+    bodies = []
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply(bodies))) as transport:
+            async with AsyncOpenAI(api_key="test", http_client=transport) as client:
+                profile = ModelProfile("openai", OpenAIChatCompletionClient(model="test-model", async_client=client))
+                service, planning, _, preview, previews, github, _, _ = planning_fixture(tmp_path, profile, approved_delivery[1])
+                approve_preview(previews, preview.preview_id)
+                waiting = await service.consume(preview.preview_id)
+                assert waiting.state == "waiting", waiting.error
+                path = planning.publications.path(waiting.assignment_id)
+                before = path.read_bytes()
+                with FileLock(str(path) + ".lock", timeout=0):
+                    done = await service.decide(waiting.assignment_id, request_id=waiting.pending[0].request_id, approved=True)
+                assert done.state == "failed" and "could not be acquired" in str(done.error), done.error
+                assert path.read_bytes() == before and json.loads(before)["state"] == "pending"
+                assert not github.issues
+
+    asyncio.run(exercise())
