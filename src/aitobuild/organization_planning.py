@@ -640,6 +640,14 @@ class ManagedPlanning:
             return self._stage(plan, saved)
 
     def independent_preview_ids(self, run: ManagedRun) -> tuple[str, ...]:
+        return self._independent_children(run)[2]
+
+    def _independent_children(self, run: ManagedRun) -> tuple[PlanRevision, _PlanPublication, tuple[str, ...]]:
+        """One read of a completed handoff's publication, checked against its plan, source and run output.
+
+        No lock (#87): every write replaces the file atomically (atomic_write_text), so this sees one whole version,
+        and a published record's issues and children never change afterwards. Callers check everything else against
+        the returned version instead of reading again."""
         if run.state != "completed" or run.cleanup_succeeded is not True:
             raise PermissionError("Planning handoff requires a completed cleaned-up run")
         plan = self.plans.get(run.assignment_id)
@@ -654,9 +662,7 @@ class ManagedPlanning:
                 plan.pins["scope_digest"] != run.scope_digest or plan.pins["revision"] != run.revision or
                 plan.pins["binding_revision"] != run.binding_revision):
             raise PermissionError("Planning handoff differs from the saved source run")
-        path = self.publications.path(run.assignment_id)
-        with FileLock(str(path) + ".lock", timeout=0):
-            saved = self._load_publication(run.assignment_id, plan)
+        saved = self._load_publication(run.assignment_id, plan)
         if (saved.state != "published" or len(saved.effects) != len(plan.proposal.issues) or
                 any(effect.state != "linked" for effect in saved.effects) or
                 len(saved.developer_previews) != len(saved.effects) or
@@ -676,15 +682,12 @@ class ManagedPlanning:
             draft = next(issue for issue in plan.proposal.issues if issue.key == effect.key)
             if not draft.dependencies:
                 children.append(preview_id)
-        return tuple(children)
+        return plan, saved, tuple(children)
 
     def check_independent_preview(self, preview: DeveloperPreview, run: ManagedRun) -> None:
-        if preview.preview_id not in self.independent_preview_ids(run):
+        plan, saved, children = self._independent_children(run)
+        if preview.preview_id not in children:
             raise PermissionError("Planned implementation requires its exact independent child receipt")
-        plan = self.plans.get(run.assignment_id)
-        path = self.publications.path(run.assignment_id)
-        with FileLock(str(path) + ".lock", timeout=0):
-            saved = self._load_publication(run.assignment_id, plan)
         effect = saved.effects[saved.developer_previews.index(preview.preview_id)]
         if canonical(preview.bundle_payload) != canonical(self._developer_payload(plan, saved, effect)):
             raise PermissionError("Planned implementation scope changed before admission")

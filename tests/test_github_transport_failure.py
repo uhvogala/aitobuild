@@ -14,6 +14,7 @@ import time
 from agent_framework.openai import OpenAIChatCompletionClient
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from filelock import FileLock
 import httpx
 from openai import AsyncOpenAI
 import pytest
@@ -73,16 +74,13 @@ class _CountingAdapter(GhCliGitHubAdapter):
         return super()._api_once(endpoint, method=method, payload=payload)
 
 
-def test_failed_commit_lookup_during_a_tool_approval_is_503_transient_and_retries_land_once(
-    tmp_path, test_config, approved_delivery, monkeypatch,
-):
-    """The pilot's path: an approval of a planned child's Developer tool request re-checks the child's planning
-    target, whose commit lookup fails in transport. The route answers 503 `transient`, nothing is recorded and the
-    request stays pending; the next attempt lands exactly once."""
-    policy = ApprovalPolicy(task_admission="automatic", pm_issue_creation="human", pm_dependency_links="automatic")
-    github = FlakyCommitLookup(repository_ids={"fixture/widgets": 101},
-                               commit_files={("fixture/widgets", approved_delivery[4]): {}})
-    tools: list[str] = []
+POLICY = ApprovalPolicy(task_admission="automatic", pm_issue_creation="human", pm_dependency_links="automatic")
+
+
+def _child_waiting_on_tool_approval(tmp_path, approved_delivery, github, tools, store):
+    """Plan three issues, publish them and run the first planned child until it waits on a Developer tool approval.
+    Returns the service, the child's preview ID and the planning (parent) assignment ID."""
+    policy = POLICY
     bodies: list[object] = []
     document = proposal()
     document["issues"].append({"key": "third", "title": "Third issue", "objective": "Implement third behavior",
@@ -92,7 +90,6 @@ def test_failed_commit_lookup_during_a_tool_approval_is_503_transient_and_retrie
                                                "service_approval", approval_stage=ApprovalStage.DEVELOPER_TOOLS),
         on_response=lambda context, original, approved: tools.append(context.assignment.preview_id) or "read",
         approval_stage=ApprovalStage.DEVELOPER_TOOLS)
-    store = tmp_path / "worker.json"
 
     async def plan_and_wait_on_tool_approval():
         async with httpx.AsyncClient(transport=httpx.MockTransport(native_reply(bodies, document))) as transport:
@@ -127,9 +124,23 @@ def test_failed_commit_lookup_during_a_tool_approval_is_503_transient_and_retrie
                         assert child.state == "waiting", child.error  # the Developer tool approval
                 finally:
                     await worker.close()
-                return service, child_id
+                return service, child_id, run.assignment_id
 
-    service, child_id = asyncio.run(plan_and_wait_on_tool_approval())
+    return asyncio.run(plan_and_wait_on_tool_approval())
+
+
+def test_failed_commit_lookup_during_a_tool_approval_is_503_transient_and_retries_land_once(
+    tmp_path, test_config, approved_delivery, monkeypatch,
+):
+    """The pilot's path: an approval of a planned child's Developer tool request re-checks the child's planning
+    target, whose commit lookup fails in transport. The route answers 503 `transient`, nothing is recorded and the
+    request stays pending; the next attempt lands exactly once."""
+    policy = POLICY
+    github = FlakyCommitLookup(repository_ids={"fixture/widgets": 101},
+                               commit_files={("fixture/widgets", approved_delivery[4]): {}})
+    tools: list[str] = []
+    store = tmp_path / "worker.json"
+    service, child_id, _ = _child_waiting_on_tool_approval(tmp_path, approved_delivery, github, tools, store)
     config = replace(test_config, approvals=policy, managed_worker=ManagedWorkerConfig(queue_follow_ups=True))
     app = create_app(config, managed_service_factory=lambda context: service,
                      managed_worker_factory=lambda bound, context: ManagedOrganizationWorker(
@@ -168,6 +179,32 @@ def test_failed_commit_lookup_during_a_tool_approval_is_503_transient_and_retrie
         assert tools == [child_id]  # landed exactly once
         assert http.post("/internal/organization/tasks/approve", headers=HEADERS, json=decision).status_code == 409
         assert tools == [child_id]
+
+
+
+def test_tool_approval_of_a_planned_child_does_not_wait_for_the_publication_lock(tmp_path, test_config, approved_delivery):
+    """#87: the approve route re-admits a planned child by reading its published plan record. Those reads take no
+    lock (the record is replaced atomically and never changes once published), so while another holder has the
+    publication lock the approval lands at once instead of answering 409 "Managed task invocation is already active"."""
+    github = FlakyCommitLookup(repository_ids={"fixture/widgets": 101},
+                               commit_files={("fixture/widgets", approved_delivery[4]): {}})
+    store = tmp_path / "worker.json"
+    service, child_id, parent_id = _child_waiting_on_tool_approval(tmp_path, approved_delivery, github, [], store)
+    config = replace(test_config, approvals=POLICY, managed_worker=ManagedWorkerConfig(queue_follow_ups=True))
+    app = create_app(config, managed_service_factory=lambda context: service,
+                     managed_worker_factory=lambda bound, context: ManagedOrganizationWorker(
+                         service=bound, store=FileWorkerStore(store), queue_follow_ups=True, poll_seconds=0.01))
+    publication = service._planning_publication.publications.path(parent_id)
+    with TestClient(app) as http:
+        waiting = http.get(f"/internal/organization/tasks/{child_id}", headers=HEADERS).json()["managed_run"]
+        assert waiting["state"] == "waiting"
+        decision = {"assignment_id": waiting["assignment_id"], "request_id": waiting["pending"][0]["request_id"],
+                    "approved": True}
+        commands = len(FileWorkerStore(store).get(child_id).commands)
+        with FileLock(str(publication) + ".lock", timeout=0):
+            landed = http.post("/internal/organization/tasks/approve", headers=HEADERS, json=decision)
+            assert landed.status_code == 200, landed.text
+            assert len(FileWorkerStore(store).get(child_id).commands) == commands + 1  # recorded once
 
 
 def _probe_app(test_config, error: BaseException, *, wrap: bool):
